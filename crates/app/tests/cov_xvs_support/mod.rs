@@ -104,11 +104,77 @@ pub struct Activity {
     finished: AtomicUsize,
 }
 
+/// The listener and everything a served connection needs, shared by the
+/// accept thread and by [`settle`], which both take waiting connections off
+/// the same listener.
+struct Acceptor {
+    listener: TcpListener,
+    seen: Arc<Mutex<Seen>>,
+    exec: ExecResponder,
+    activity: Arc<Activity>,
+}
+
+impl Acceptor {
+    /// Accepts every connection already waiting on the listener, counts each
+    /// one in `started` and serves it on its own std thread. Never waits: the
+    /// listener is non-blocking. Returns whether it accepted any.
+    fn accept_waiting(&self) -> bool {
+        let mut any = false;
+        loop {
+            match self.listener.accept() {
+                Ok((stream, _)) => {
+                    any = true;
+                    self.activity.started.fetch_add(1, Ordering::SeqCst);
+                    // A socket accepted from a non-blocking listener inherits
+                    // that flag on some systems (macOS); `serve_one` reads it
+                    // with blocking calls.
+                    let _ = stream.set_nonblocking(false);
+                    let seen = Arc::clone(&self.seen);
+                    let exec = Arc::clone(&self.exec);
+                    let activity = Arc::clone(&self.activity);
+                    std::thread::spawn(move || {
+                        serve_one(stream, &seen, &exec);
+                        activity.finished.fetch_add(1, Ordering::SeqCst);
+                    });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return any,
+                // A connection reset before it was taken, or an interrupted
+                // call, leaves nothing stuck in the queue: try the next one.
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::ConnectionAborted | std::io::ErrorKind::Interrupted
+                    ) => {}
+                // Any other error (for example the process is out of file
+                // descriptors) can leave the connection queued, so the next
+                // call fails the same way. Return instead of spinning: this
+                // runs on the test's runtime thread inside `settle`, and a
+                // spin there would stop `settle` reaching its real-time
+                // deadline. The accept thread retries after its 1 ms sleep
+                // and `settle` retries on its next slice.
+                Err(_) => return any,
+            }
+        }
+    }
+}
+
+/// How long the accept thread sleeps when no connection is waiting.
+const ACCEPT_POLL: Duration = Duration::from_millis(1);
+
 /// A QuestDB-shaped HTTP server bound to 127.0.0.1:0.
+///
+/// Connections are accepted from two places: a std thread that polls the
+/// listener, so a client that blocks the runtime thread (an inline ILP flush)
+/// is still served, and [`settle`], on the test's runtime thread. The second
+/// is what makes the paused-clock driver safe: a client task connects on the
+/// runtime thread, so by the time `settle` next runs on that thread the
+/// connection is waiting and `settle` takes it, whether or not the accept
+/// thread got a CPU in between.
 pub struct FakeQuestDb {
     pub port: u16,
     pub seen: Arc<Mutex<Seen>>,
     pub activity: Arc<Activity>,
+    acceptor: Arc<Acceptor>,
 }
 
 impl FakeQuestDb {
@@ -117,28 +183,37 @@ impl FakeQuestDb {
     pub fn start(exec: ExecResponder) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1:0");
         let port = listener.local_addr().expect("local addr").port();
+        listener
+            .set_nonblocking(true)
+            .expect("set the listener non-blocking");
         let seen = Arc::new(Mutex::new(Seen::default()));
         let activity = Arc::new(Activity::default());
-        let seen_srv = Arc::clone(&seen);
-        let activity_srv = Arc::clone(&activity);
+        let acceptor = Arc::new(Acceptor {
+            listener,
+            seen: Arc::clone(&seen),
+            exec,
+            activity: Arc::clone(&activity),
+        });
+        let acceptor_thread = Arc::clone(&acceptor);
         std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(stream) = stream else { continue };
-                activity_srv.started.fetch_add(1, Ordering::SeqCst);
-                let seen = Arc::clone(&seen_srv);
-                let exec = Arc::clone(&exec);
-                let activity = Arc::clone(&activity_srv);
-                std::thread::spawn(move || {
-                    serve_one(stream, &seen, &exec);
-                    activity.finished.fetch_add(1, Ordering::SeqCst);
-                });
+            loop {
+                if !acceptor_thread.accept_waiting() {
+                    std::thread::sleep(ACCEPT_POLL);
+                }
             }
         });
         Self {
             port,
             seen,
             activity,
+            acceptor,
         }
+    }
+
+    /// Accepts every connection already waiting, without waiting for one.
+    /// Returns whether it accepted any.
+    pub fn accept_waiting(&self) -> bool {
+        self.acceptor.accept_waiting()
     }
 
     /// Default responder: DDL OK, counts 0, empty datasets.
@@ -325,8 +400,17 @@ pub const REAL_BUDGET: Duration = Duration::from_secs(60);
 /// One slice of real time spent with the paused clock held still.
 const SETTLE_SLICE: Duration = Duration::from_millis(2);
 
-/// The server must stay idle this long (real time) before the clock moves.
-const SETTLE_QUIET: Duration = Duration::from_millis(25);
+/// The server must stay idle for this many slices in a row before the clock
+/// moves. Counted in slices, not in elapsed real time: if the runtime thread
+/// is preempted for a while, that costs one slice, so the woken client tasks
+/// still get the same number of turns on the runtime before the clock moves.
+const SETTLE_QUIET_SLICES: u32 = 12;
+
+/// Times `settle` yields before its first slice, so that tasks woken by the
+/// previous `advance` run to their first IO wait (connect, request write)
+/// first. `advance` ends in a `yield_now`, and the current-thread `block_on`
+/// polls the test's own future before the tasks it just woke.
+const SETTLE_YIELDS: u32 = 8;
 
 /// Smallest and largest virtual step between two settles.
 const MIN_STEP: Duration = Duration::from_secs(5);
@@ -334,7 +418,10 @@ const MAX_STEP: Duration = Duration::from_secs(1_800);
 
 /// Lets REAL time pass while the paused tokio clock stands still, until the
 /// fake server has been idle (no connection open, none new) for
-/// [`SETTLE_QUIET`]. Returns whether any connection was seen meanwhile.
+/// [`SETTLE_QUIET_SLICES`] slices in a row. `seen` is the server activity the
+/// caller has already accounted for; it is updated to the latest value.
+/// Returns whether anything changed against `seen` or a connection was open,
+/// so activity between two settles (during an `advance`) counts as busy.
 ///
 /// The clock stands still because a `spawn_blocking` task is in flight the
 /// whole time: tokio's current-thread runtime does not auto-advance a paused
@@ -343,31 +430,49 @@ const MAX_STEP: Duration = Duration::from_secs(1_800);
 /// jumps the clock to the next timer, so an HTTP call's 30 s timeout fires
 /// before the local server answers (measured: 90 of 100 local GETs under
 /// `start_paused` timed out this way).
-pub async fn settle(srv: &FakeQuestDb, real_deadline: std::time::Instant) -> bool {
-    let first = srv.activity();
-    let mut last = first;
-    let mut quiet_since = std::time::Instant::now();
+///
+/// Each slice also takes any connection already waiting on the listener
+/// ([`FakeQuestDb::accept_waiting`]). A client task connects on this same
+/// runtime thread, so a connection made since the last slice is waiting by
+/// the time this future runs again and is counted here, even when the
+/// server's accept thread has not run.
+pub async fn settle(
+    srv: &FakeQuestDb,
+    real_deadline: std::time::Instant,
+    seen: &mut (usize, usize),
+) -> bool {
+    for _ in 0..SETTLE_YIELDS {
+        tokio::task::yield_now().await;
+    }
+    let mut busy = false;
+    let mut quiet_slices = 0_u32;
     loop {
         let _ = tokio::task::spawn_blocking(|| std::thread::sleep(SETTLE_SLICE)).await;
+        srv.accept_waiting();
         let now = srv.activity();
-        if now != last || now.0 != now.1 {
-            last = now;
-            quiet_since = std::time::Instant::now();
-        } else if quiet_since.elapsed() >= SETTLE_QUIET {
-            break;
+        if now != *seen || now.0 != now.1 {
+            busy = true;
+            *seen = now;
+            quiet_slices = 0;
+        } else {
+            quiet_slices += 1;
+            if quiet_slices >= SETTLE_QUIET_SLICES {
+                break;
+            }
         }
         if std::time::Instant::now() >= real_deadline {
             break;
         }
     }
-    last != first
+    busy
 }
 
 /// Drives a paused tokio clock forward until `done()` holds, `horizon` of
 /// virtual time has passed, or [`REAL_BUDGET`] of real time is spent. Between
 /// steps it [`settle`]s, so the clock never moves while the fake server is
 /// handling (or about to receive) a request; the step doubles while the
-/// server stays idle and drops back to five seconds as soon as it is not.
+/// server stays idle and drops back to five seconds as soon as it is not,
+/// including when the activity happened between two settles.
 /// Returns `done()` at the end. Must run on a `start_paused` current-thread
 /// runtime.
 pub async fn drive_paused(
@@ -378,8 +483,11 @@ pub async fn drive_paused(
     let real_deadline = std::time::Instant::now() + REAL_BUDGET;
     let virtual_start = tokio::time::Instant::now();
     let mut step = MIN_STEP;
+    // Nothing accounted for yet: any server activity before the first settle
+    // counts as busy (at worst one more small step).
+    let mut seen = (0_usize, 0_usize);
     loop {
-        let busy = settle(srv, real_deadline).await;
+        let busy = settle(srv, real_deadline, &mut seen).await;
         if done() {
             return true;
         }
