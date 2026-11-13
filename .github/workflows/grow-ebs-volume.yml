@@ -54,15 +54,15 @@ on:
         description: 'Type the EXACT root volume id to confirm (aws ec2 describe-instances --filters Name=tag:Name,Values=tv-prod-app --query "Reservations[].Instances[].BlockDeviceMappings[0].Ebs.VolumeId").'
         required: true
       target_size_gb:
-        description: 'New size in GB. Must be >= the current size (gp3 cannot shrink) and <= 600 (the variables.tf ebs_gp3_size_gb ceiling, raised 500 -> 600 by operator Quote 22, 2026-09-05, after 300 -> 500 by Quote 20, 2026-09-02).'
+        description: 'New size in GB. Must be >= the current size (gp3 cannot shrink) and <= 150, the size of the rebuilt root (Quotes 32/33, 2026-10-21). Quote 51 (2026-11-07) rules no bigger disk, so a size above 150 needs a fresh dated owner quote AND an edit of this workflow. Keep the default to change only IOPS or throughput.'
         required: true
-        default: '600'
+        default: '150'
       target_iops:
-        description: 'Provisioned IOPS, 3000-16000 (the variables.tf ebs_gp3_iops range). Default 3000 = operator Quote 30, 2026-10-13 (was 6000 per Quote 17). Unlike size this CAN go down.'
+        description: 'Provisioned IOPS. Must be 3000, the free gp3 baseline: Quote 30 (2026-10-13) rejects IOPS above 3,000 without a fresh dated owner quote, so a raise needs that quote AND an edit of this ceiling (audit B2, 2026-11-13).'
         required: true
         default: '3000'
       target_throughput:
-        description: 'Throughput in MiB/s, 125-1000 (the variables.tf ebs_gp3_throughput range). Default 125 = operator Quote 33, 2026-10-21 (was 500 per Quote 17). Unlike size this CAN go down.'
+        description: 'Throughput in MiB/s. Must be 125, the free gp3 baseline: Quotes 32/33 (2026-10-21) set it to 125, so a raise needs a fresh dated owner quote AND an edit of this ceiling (audit B2, 2026-11-13).'
         required: true
         default: '125'
 
@@ -182,19 +182,19 @@ jobs:
             echo "::error::gp3 can NEVER shrink. ${TARGET} < ${CUR} — refusing."
             exit 1
           fi
-          if [ "$TARGET" -gt 600 ]; then
-            echo "::error::${TARGET} exceeds the variables.tf ebs_gp3_size_gb ceiling of 600."
-            echo "Raising it needs a validation edit AND its own dated operator quote."
+          if [ "$TARGET" -gt 150 ]; then
+            echo "::error::${TARGET} GB is above the 150 GB root. Quote 51 (2026-11-07): no bigger disk."
+            echo "Growing needs a fresh dated owner quote AND an edit of this ceiling."
             exit 1
           fi
 
-          # --- iops / throughput: range-bounded, either direction ---
-          if [ "$WANT_IOPS" -lt 3000 ] || [ "$WANT_IOPS" -gt 16000 ]; then
-            echo "::error::target_iops must be 3000-16000 (the variables.tf ebs_gp3_iops range)."
+          # --- iops / throughput: held at the quoted 3000 / 125 (Quotes 30, 32/33) ---
+          if [ "$WANT_IOPS" -lt 3000 ] || [ "$WANT_IOPS" -gt 3000 ]; then
+            echo "::error::target_iops must be 3000. Quote 30 (2026-10-13): no IOPS above 3,000 without a fresh dated owner quote."
             exit 1
           fi
-          if [ "$WANT_TP" -lt 125 ] || [ "$WANT_TP" -gt 1000 ]; then
-            echo "::error::target_throughput must be 125-1000 (the variables.tf ebs_gp3_throughput range)."
+          if [ "$WANT_TP" -lt 125 ] || [ "$WANT_TP" -gt 125 ]; then
+            echo "::error::target_throughput must be 125. Quotes 32/33 (2026-10-21): throughput 125; a raise needs a fresh dated owner quote."
             exit 1
           fi
 

@@ -337,3 +337,55 @@ fn no_latch_leg_names_the_instance_writable_prefix() {
         }
     }
 }
+
+/// Audit B2 finding 10 (2026-11-13): while the box is already stopped, the
+/// guard keeps the daily-start rule disabled when this month's latch holds.
+/// The SSM start automation behind that rule never reads the latch, so this
+/// is the only thing that stops a latch written while the box was stopped
+/// (the kill-switch path) from being undone at 8:30 AM.
+#[test]
+fn the_guard_holds_this_months_budget_stop_while_the_box_is_stopped() {
+    let rs = code_only(&read("crates/aws-lambdas/src/hard_stop_guard.rs"));
+    let run_start = position(&rs, "pub async fn run_guard", "run_guard");
+    let run = &rs[run_start..];
+    let stopped = position(run, "\"stopped\" | \"stopping\"", "stopped branch");
+    let release = position(
+        run,
+        "release_expired_budget_stop(env, sns, events, ssm, now_utc)",
+        "new-month release",
+    );
+    let hold = position(
+        run,
+        "hold_current_month_budget_stop(env, events, budgets, ssm, now_utc)",
+        "current-month hold",
+    );
+    let window = position(run, "if in_up_window(now_utc)", "window branch");
+    assert!(
+        stopped < release && release < hold && hold < window,
+        "the hold must run inside the already-stopped branch, after the release"
+    );
+    let fn_start = position(
+        &rs,
+        "pub async fn hold_current_month_budget_stop",
+        "hold fn",
+    );
+    let body = &rs[fn_start..];
+    let check = position(body, "budget_stop_is_latched(", "hold check");
+    let disable = position(
+        body,
+        "events.disable_rule(&env.start_rule_name)",
+        "hold disable",
+    );
+    assert!(
+        check < disable,
+        "the hold must read the latch before it disables the rule"
+    );
+    // Audit B2 review: the latch alone is not trusted; this month's spend
+    // must be read and compared with the line before the rule is disabled.
+    let spend = position(body, "mtd_usd(budgets, line, now_utc)", "hold spend read");
+    let under = position(body, "if spend < line", "hold line compare");
+    assert!(
+        check < spend && spend < under && under < disable,
+        "the hold must confirm the breach with a spend read before it disables the rule"
+    );
+}

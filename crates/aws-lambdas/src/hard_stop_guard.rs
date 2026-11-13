@@ -828,6 +828,96 @@ trading day. Nothing to do.\n"
     true
 }
 
+/// Keeps the morning auto-start off while the budget stop for THIS billing
+/// month holds and the box is already stopped (audit B2 finding 10,
+/// 2026-11-13). Runs only from the already-stopped branch, after the
+/// new-month release.
+///
+/// Before this, a budget crossing reported while the box was stopped (an
+/// evening or a weekend) reached only the AWS-Budgets kill-switch: it wrote
+/// the latch, but nothing disabled the `daily-start` rule, because the breach
+/// stop that does so runs only for a running box. The EventBridge rule starts
+/// the box through the SSM start automation, which never reads the latch, so
+/// the box started at 8:30 AM the next trading day and the guard then stopped
+/// it again inside the session.
+///
+/// The latch alone is not trusted (audit B2 review, 2026-11-13): the
+/// kill-switch dates its latch by a fixed notification lag, so a late notice
+/// about the previous month can write a latch for the new one. The rule is
+/// disabled only when this guard's own month-to-date read (the free Budgets
+/// API, `mtd_usd`) is at or above this month's effective line. An unknown or
+/// lower reading leaves the rule alone (fail-open, like every latch reader).
+///
+/// No new permission: the guard role may already disable this one rule (the
+/// breach stop uses it) and read the budget. Disabling an already-disabled
+/// rule is a no-op, so running it every hour is safe. A failed disable is
+/// logged with the existing `LAMBDA-AWS-02` code and retried next hour. No
+/// page. Returns `true` when the rule was (re)disabled this run.
+///
+/// Recovery: once this has disabled the rule, deleting the latch alone does
+/// not bring the morning start back (the new-month release reads the latch).
+/// The kill-switch page, the breach page and the watchdog's morning note all
+/// name both steps: delete the latch, then `aws events enable-rule`.
+///
+/// Ordering with the 8:30 AM start (audit B2 review): the guard runs at
+/// minute 50 of every hour (`budget-guards.tf`), so its 02:50 UTC run holds
+/// the rule before the 03:00 UTC daily start. Residual window, stated
+/// honestly: a latch written between 02:50 and 03:00 UTC on a trading day can
+/// still let that morning's start through; the 03:50 UTC run then reads the
+/// box as running in-window and breach-stops it at 09:20 IST if spend is over
+/// the line.
+pub async fn hold_current_month_budget_stop<V: EventsApi, B: BudgetsApi, P: SsmApi>(
+    env: &GuardEnv,
+    events: &V,
+    budgets: &B,
+    ssm: &P,
+    now_utc: DateTime<Utc>,
+) -> bool {
+    if env.start_rule_name.is_empty() {
+        return false;
+    }
+    let raw = ssm.get_parameter(&env.budget_stop_param).await.ok();
+    if !crate::budget_stop_latch::budget_stop_is_latched(raw.as_deref(), now_utc) {
+        return false;
+    }
+    let line = effective_budget_kill_usd(env.budget_kill_usd, now_utc.year(), now_utc.month());
+    let Some(spend) = mtd_usd(budgets, line, now_utc).await else {
+        info!(
+            "this month's budget-stop latch is set but spend is unknown; morning start left alone"
+        );
+        return false;
+    };
+    if spend < line {
+        info!(
+            spend,
+            line,
+            "this month's budget-stop latch is set but spend is under the line; morning start left alone"
+        );
+        return false;
+    }
+    if let Err(e) = events.disable_rule(&env.start_rule_name).await {
+        error!(code = "LAMBDA-AWS-02", error = %e, rule = %env.start_rule_name, "events:DisableRule to hold this month's budget stop failed; retried next hour");
+        return false;
+    }
+    info!(rule = %env.start_rule_name, "box stopped and this month's budget stop holds; morning auto-start kept disabled");
+    true
+}
+
+/// True when `launch_time` falls on the same IST calendar date as `now_utc`
+/// (audit B2 review round 5, 2026-11-13). The pre-open exemption (step 1c in
+/// [`run_guard`]) is for a box started THIS morning, which booted a fresh
+/// process for today. A box still running from an earlier date (one the
+/// drain hold kept up overnight, whose 07:35 IST curfew stop then failed)
+/// must keep the out-of-window stop: before minute 50 the guard's 07:30 IST
+/// run stopped it, and nothing else would until the 08:30 rule found it
+/// running and left yesterday's process to run the session. An unknown
+/// launch time is not exempt. O(1).
+fn launched_on_this_ist_date(launch_time: Option<DateTime<Utc>>, now_utc: DateTime<Utc>) -> bool {
+    launch_time.is_some_and(|launch| {
+        launch.with_timezone(&ist()).date_naive() == now_utc.with_timezone(&ist()).date_naive()
+    })
+}
+
 /// Legacy `lambda_handler` — hourly EventBridge cron entry (event unused).
 pub async fn run_guard<E: Ec2Api, N: SnsApi, V: EventsApi, B: BudgetsApi, P: SsmApi>(
     env: &GuardEnv,
@@ -866,8 +956,13 @@ pub async fn run_guard<E: Ec2Api, N: SnsApi, V: EventsApi, B: BudgetsApi, P: Ssm
         "stopped" | "stopping" | "shutting-down" | "terminated"
     ) {
         let released = release_expired_budget_stop(env, sns, events, ssm, now_utc).await;
-        info!(instance = %env.instance_id, state = %state, released, "already stopped, no-op");
-        return Ok(json!({"ok": true, "noop": true, "state": state, "released": released}));
+        // Audit B2 finding 10 (2026-11-13): a budget stop recorded while the
+        // box was already stopped also keeps the morning start off.
+        let held = hold_current_month_budget_stop(env, events, budgets, ssm, now_utc).await;
+        info!(instance = %env.instance_id, state = %state, released, held, "already stopped, no-op");
+        return Ok(
+            json!({"ok": true, "noop": true, "state": state, "released": released, "held": held}),
+        );
     }
 
     // Plan item J8: a configured Muhurat session window (a weekend or evening
@@ -1018,6 +1113,54 @@ pub async fn run_guard<E: Ec2Api, N: SnsApi, V: EventsApi, B: BudgetsApi, P: Ssm
         );
         return Ok(json!({
             "ok": true, "noop": true, "state": state, "skipped": "drain_hold",
+            "budget_action": action
+        }));
+    }
+    // 1c. The pre-open slot, Mon-Fri 08:00-08:30 IST (audit B2 follow-up,
+    //     2026-11-13). The start watchdog's curfew treats it as operating
+    //     hours (`start_watchdog::is_within_operating_hours`, which opens at
+    //     its 08:00 constant), so a box running here is not one this guard
+    //     may schedule-stop either. The guard used to fire at minute 0 and
+    //     had no run in this slot; at minute 50 it runs at 08:20 IST and
+    //     stopped a box started around 07:10 IST, which the 08:30 rule then
+    //     booted again. Same budget check as the drain hold above: a breach
+    //     still stops (the budget stop is never gated on an exemption).
+    //     Only a box launched on THIS IST date is exempt (B2 review round 5,
+    //     `launched_on_this_ist_date`): one left running from an earlier
+    //     date (drain hold overnight, failed 07:35 curfew run) falls through
+    //     to the out-of-window stop below, as the old 07:30 IST run did.
+    if crate::start_watchdog::is_within_operating_hours(now_utc)
+        && launched_on_this_ist_date(inst.launch_time, now_utc)
+    {
+        let effective_env = GuardEnv {
+            budget_kill_usd: effective_budget_kill_usd(
+                env.budget_kill_usd,
+                now_utc.year(),
+                now_utc.month(),
+            ),
+            ..env.clone()
+        };
+        let usd = mtd_usd(budgets, effective_env.budget_kill_usd, now_utc).await;
+        let action = classify_in_window_action(usd, effective_env.budget_kill_usd);
+        if action == "breach_stop" {
+            return execute_breach_stop(
+                &effective_env,
+                ec2,
+                sns,
+                events,
+                ssm,
+                usd.unwrap_or(0.0),
+                &state,
+                now_utc,
+            )
+            .await;
+        }
+        info!(
+            budget_action = action,
+            "out-of-window guard: curfew operating hours (pre-open); leaving the box alone"
+        );
+        return Ok(json!({
+            "ok": true, "noop": true, "state": state, "skipped": "pre_open",
             "budget_action": action
         }));
     }
@@ -2055,6 +2198,142 @@ aws events enable-rule --name tv-prod-daily-start\n"
         assert_eq!(*ec2.stopped.borrow(), vec![vec!["i-tvapp".to_string()]]);
     }
 
+    /// Audit B2 follow-up (2026-11-13): the guard's minute-50 run at 08:20
+    /// IST on a weekday is inside the curfew's operating hours. A box started
+    /// at 07:10 IST (past the launch grace by then) must not be stopped or
+    /// paged; the 08:30 window opens ten minutes later.
+    #[tokio::test]
+    async fn test_pre_open_slot_leaves_an_early_started_box_alone() {
+        let now = utc(2026, 11, 10, 2, 50); // Tue 08:20 IST
+        let launched = utc(2026, 11, 10, 1, 40); // Tue 07:10 IST
+        let (ec2, sns, events) = (
+            FakeEc2::launched_at("running", launched),
+            FakeSns::default(),
+            FakeEvents::new(),
+        );
+        let ssm = FakeSsm::empty();
+        assert!(!in_up_window(now));
+        assert!(crate::start_watchdog::is_within_operating_hours(now));
+        let out = run_scenario(
+            &ec2,
+            &sns,
+            &events,
+            &FakeBudgets { amount: Some(10.0) },
+            now,
+            &ssm,
+        )
+        .await;
+        assert_eq!(out["skipped"], json!("pre_open"));
+        assert!(ec2.stopped.borrow().is_empty(), "not stopped");
+        assert!(sns.published.borrow().is_empty(), "not paged");
+        assert!(events.disabled.borrow().is_empty());
+    }
+
+    /// The pre-open exemption never gates the budget stop: over the line, the
+    /// 08:20 IST run still takes the breach stop.
+    #[tokio::test]
+    async fn test_pre_open_slot_still_takes_a_budget_breach_stop() {
+        let now = utc(2026, 11, 10, 2, 50);
+        let launched = utc(2026, 11, 10, 1, 40);
+        let (ec2, sns, events) = (
+            FakeEc2::launched_at("running", launched),
+            FakeSns::default(),
+            FakeEvents::new(),
+        );
+        let ssm = FakeSsm::empty();
+        let out = run_scenario(
+            &ec2,
+            &sns,
+            &events,
+            &FakeBudgets {
+                amount: Some(1_000.0),
+            },
+            now,
+            &ssm,
+        )
+        .await;
+        assert_eq!(out["breach"], json!(true));
+        assert_eq!(*ec2.stopped.borrow(), vec![vec!["i-tvapp".to_string()]]);
+    }
+
+    /// Outside the pre-open slot nothing changed: 07:50 IST on the same
+    /// weekday still stops a box past its launch grace.
+    #[tokio::test]
+    async fn test_before_the_curfew_open_still_stops() {
+        let now = utc(2026, 11, 10, 2, 20); // Tue 07:50 IST
+        let launched = utc(2026, 11, 10, 1, 0);
+        let (ec2, sns, events) = (
+            FakeEc2::launched_at("running", launched),
+            FakeSns::default(),
+            FakeEvents::new(),
+        );
+        let ssm = FakeSsm::empty();
+        let out = run_scenario(
+            &ec2,
+            &sns,
+            &events,
+            &FakeBudgets { amount: Some(10.0) },
+            now,
+            &ssm,
+        )
+        .await;
+        assert_eq!(out["noop"], json!(false));
+        assert_eq!(*ec2.stopped.borrow(), vec![vec!["i-tvapp".to_string()]]);
+    }
+
+    /// Audit B2 review round 5 (2026-11-13): the pre-open exemption is only
+    /// for a box launched this IST morning. A box launched the previous
+    /// morning and kept up overnight by the drain hold (written until 07:29
+    /// IST), whose 07:35 IST curfew stop failed, must still be stopped by the
+    /// 08:20 IST run, as the old 07:30 IST run did. With 1c exempting any
+    /// running box it took the `pre_open` arm and yesterday's process ran the
+    /// session.
+    #[tokio::test]
+    async fn test_regression_pre_open_slot_stops_a_box_held_up_from_yesterday() {
+        let now = utc(2026, 11, 10, 2, 50); // Tue 08:20 IST
+        let launched = utc(2026, 11, 9, 3, 0); // Mon 08:30 IST
+        let hold_until = utc(2026, 11, 10, 1, 59); // Tue 07:29 IST
+        let (ec2, sns, events) = (
+            FakeEc2::launched_at("running", launched),
+            FakeSns::default(),
+            FakeEvents::new(),
+        );
+        let ssm = FakeSsm::empty().drain_hold(&hold(
+            "released",
+            hold_until,
+            hold_until - Duration::minutes(5),
+        ));
+        assert!(crate::start_watchdog::is_within_operating_hours(now));
+        let out = run_scenario(
+            &ec2,
+            &sns,
+            &events,
+            &FakeBudgets { amount: Some(10.0) },
+            now,
+            &ssm,
+        )
+        .await;
+        assert_ne!(out["skipped"], json!("pre_open"));
+        assert_eq!(out["noop"], json!(false));
+        assert_eq!(*ec2.stopped.borrow(), vec![vec!["i-tvapp".to_string()]]);
+    }
+
+    #[test]
+    fn test_launched_on_this_ist_date_uses_the_ist_calendar() {
+        let now = utc(2026, 11, 10, 2, 50); // Tue 08:20 IST
+        // Tue 00:00 IST = Mon 18:30 UTC: same IST date.
+        assert!(launched_on_this_ist_date(
+            Some(utc(2026, 11, 9, 18, 30)),
+            now
+        ));
+        // Mon 23:59 IST = Mon 18:29 UTC: the earlier IST date.
+        assert!(!launched_on_this_ist_date(
+            Some(utc(2026, 11, 9, 18, 29)),
+            now
+        ));
+        assert!(!launched_on_this_ist_date(None, now));
+    }
+
     /// The two hourly guards over the same box must judge a manual start
     /// by ONE grace. If the constants ever diverge, an operator's evening
     /// start is left alone by one Lambda and stopped by the other.
@@ -2174,6 +2453,78 @@ aws events enable-rule --name tv-prod-daily-start\n"
         assert_eq!(out["released"], json!(false));
         // No marker: the next hourly run tries again.
         assert!(ssm.writes.borrow().is_empty());
+        assert!(sns.published.borrow().is_empty());
+    }
+
+    /// Audit B2 finding 10: a budget crossing recorded while the box was
+    /// already stopped (the kill-switch wrote the latch, no breach stop ran)
+    /// must keep the morning auto-start off. Before the fix the stopped branch
+    /// returned without touching the rule, so 8:30 AM started the box.
+    #[tokio::test]
+    async fn test_regression_stopped_box_with_this_months_latch_keeps_the_start_rule_disabled() {
+        // in_window() is in July; the latch names July and spend is over.
+        let (ec2, sns, events, _, ssm) = stopped_with_latch(Some("2026-07"));
+        let ce = FakeBudgets {
+            amount: Some(1_000.0),
+        };
+        let out = run_scenario(&ec2, &sns, &events, &ce, in_window(), &ssm).await;
+        assert_eq!(out["noop"], json!(true));
+        assert_eq!(out["held"], json!(true));
+        assert_eq!(*events.disabled.borrow(), vec!["tv-prod-daily-start"]);
+        assert!(events.enabled.borrow().is_empty());
+        assert!(ec2.stopped.borrow().is_empty());
+        assert!(ssm.writes.borrow().is_empty());
+        assert!(sns.published.borrow().is_empty(), "no page for the hold");
+    }
+
+    #[tokio::test]
+    async fn test_stopped_box_without_a_current_latch_leaves_the_start_rule_alone() {
+        // Audit B2 follow-up (2026-11-13): spend OVER the line, so only the
+        // latch check can keep the rule enabled (with the fixture's $0.40
+        // the spend check alone kept it, whatever the latch check did).
+        let over_the_line = || FakeBudgets {
+            amount: Some(1_000.0),
+        };
+        for latch in [None, Some("released-2026-06"), Some("garbage")] {
+            let (ec2, sns, events, _, ssm) = stopped_with_latch(latch);
+            let ce = over_the_line();
+            let out = run_scenario(&ec2, &sns, &events, &ce, in_window(), &ssm).await;
+            assert_eq!(out["held"], json!(false), "latch {latch:?}");
+            assert!(events.disabled.borrow().is_empty(), "latch {latch:?}");
+        }
+        // An earlier month's latch is released, never held.
+        let (ec2, sns, events, _, ssm) = stopped_with_latch(Some("2026-06"));
+        let ce = over_the_line();
+        let out = run_scenario(&ec2, &sns, &events, &ce, in_window(), &ssm).await;
+        assert_eq!(out["released"], json!(true));
+        assert_eq!(out["held"], json!(false));
+        assert!(events.disabled.borrow().is_empty());
+    }
+
+    /// Audit B2 review (2026-11-13): a latch naming this month with spend
+    /// under the line (a late notice about last month dated into this one)
+    /// or unknown leaves the morning start alone.
+    #[tokio::test]
+    async fn test_regression_hold_needs_this_months_spend_over_the_line() {
+        for amount in [Some(0.4), None] {
+            let (ec2, sns, events, _, ssm) = stopped_with_latch(Some("2026-07"));
+            let ce = FakeBudgets { amount };
+            let out = run_scenario(&ec2, &sns, &events, &ce, in_window(), &ssm).await;
+            assert_eq!(out["held"], json!(false), "spend {amount:?}");
+            assert!(events.disabled.borrow().is_empty(), "spend {amount:?}");
+            assert!(sns.published.borrow().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_hold_current_month_budget_stop_with_a_failing_disable_returns_false() {
+        let (ec2, sns, _, _, ssm) = stopped_with_latch(Some("2026-07"));
+        let ce = FakeBudgets {
+            amount: Some(1_000.0),
+        };
+        let events = FakeEvents::failing();
+        let out = run_scenario(&ec2, &sns, &events, &ce, in_window(), &ssm).await;
+        assert_eq!(out["held"], json!(false));
         assert!(sns.published.borrow().is_empty());
     }
 
