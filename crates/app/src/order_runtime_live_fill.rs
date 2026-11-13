@@ -25,12 +25,13 @@
 use tickvault_common::order_types::{
     OrderType, OrderUpdate, OrderValidity, ProductType, TransactionType,
 };
+use tickvault_core::websocket::frame_ring::FrameRingReceiver;
 use tickvault_storage::live_order_events_persistence::{LiveOrderEvent, LiveOrderEventKind};
 use tickvault_trading::brutex_host::engine::Side;
 use tickvault_trading::oms::{ManagedOrder, OmsError, OrderManagementSystem, PlaceOrderRequest};
 use tickvault_trading::risk::engine::RiskEngine;
 use tickvault_trading::risk::types::RiskCheck;
-use tokio::sync::{MutexGuard, mpsc};
+use tokio::sync::MutexGuard;
 use tracing::{error, info};
 
 use super::{BookState, RuntimeCtx, apply_fill, synthesize_paper_fill};
@@ -41,7 +42,7 @@ use tickvault_common::error_code::ErrorCode;
 /// Receives one command while the arm is armed; pends forever without a
 /// receiver (the `select!` arm is also disabled then).
 pub(super) async fn recv_live_fill(
-    rx: &mut Option<MutexGuard<'_, mpsc::Receiver<PaperCmd>>>,
+    rx: &mut Option<MutexGuard<'_, FrameRingReceiver<PaperCmd>>>,
 ) -> Option<PaperCmd> {
     match rx.as_mut() {
         Some(r) => r.recv().await,
@@ -142,14 +143,18 @@ fn emit(
     }
 }
 
-/// One command from the chain (see the module docs).
+/// One command from the chain (see the module docs). Returns whether it
+/// can have changed the order set or a position, so the caller must republish
+/// whether marks are wanted (an O(orders) scan): `false` for a `Mark`, which
+/// only moves a price and re-runs the loss halt (LF-9 finding 4; it used to
+/// pay the scan once per marked second per traded instrument).
 pub(super) async fn handle_live_fill_cmd(
     oms: &mut OrderManagementSystem,
     risk: &mut RiskEngine,
     book: &mut BookState,
     ctx: &RuntimeCtx,
     cmd: PaperCmd,
-) {
+) -> bool {
     match cmd {
         PaperCmd::Mark {
             security_id,
@@ -163,6 +168,7 @@ pub(super) async fn handle_live_fill_cmd(
                 risk.update_market_price_in_segment(security_id, segment, price);
                 risk.evaluate_daily_loss_halt();
             }
+            false
         }
         PaperCmd::Execute(x) => {
             // An exit arriving while earlier exits wait for the order gates
@@ -171,12 +177,16 @@ pub(super) async fn handle_live_fill_cmd(
             // attempt costs an order-budget unit and an alert (LF-6b review
             // round 3, findings 3 and 4). Exits keep their order.
             if x.exit && !book.live_fill_exit_retry.is_empty() {
-                queue_exit_retry(book, ctx, ExitRetry::waiting(x));
-                return;
+                queue_exit_retry(book, risk, ctx, ExitRetry::waiting(x));
+                return true;
             }
-            if let Placed::RetryExit(err) = execute(oms, risk, book, ctx, &x).await {
-                queue_exit_retry(book, ctx, ExitRetry::new(x, err));
+            match execute(oms, risk, book, ctx, &x).await {
+                Placed::RetryExit(err) => {
+                    queue_exit_retry(book, risk, ctx, ExitRetry::new(x, err));
+                }
+                Placed::Done => report_position(risk, ctx, &x),
             }
+            true
         }
     }
 }
@@ -242,9 +252,29 @@ fn place_refusal_rolls_over(err: &OmsError) -> bool {
     )
 }
 
+/// Counter: position reports the chain's channel had no room for (local
+/// `/metrics` only; LF-9 finding 2).
+pub(super) const LIVE_FILL_POSITION_REPORTS_DROPPED_COUNTER: &str =
+    "tv_live_fill_position_reports_dropped_total";
+
+/// Tells the chain what the paper book holds for `x`'s instrument now that
+/// `x` (as the chain sent it) is booked, refused or given up (LF-9 finding
+/// 2). Never waits: a full channel is counted, and the chain then keeps the
+/// shares it counted for `x` until the daily reset. O(1), one risk probe.
+fn report_position(risk: &RiskEngine, ctx: &RuntimeCtx, x: &PaperExecution) {
+    let Some(tx) = ctx.live_fill_positions.as_ref() else {
+        return;
+    };
+    let net = risk.net_lots_for_in_segment(x.security_id, x.segment);
+    if tx.try_send(paper_rows::position_report(x, net)).is_err() {
+        metrics::counter!(LIVE_FILL_POSITION_REPORTS_DROPPED_COUNTER).increment(1);
+    }
+}
+
 /// Keeps `r` for the next housekeeping tick, or gives it up with one Reject
-/// row when the queue is full or its attempts are spent. Cold.
-fn queue_exit_retry(book: &mut BookState, ctx: &RuntimeCtx, r: ExitRetry) {
+/// row when the queue is full or its attempts are spent (the chain is told
+/// nothing was booked). Cold.
+fn queue_exit_retry(book: &mut BookState, risk: &RiskEngine, ctx: &RuntimeCtx, r: ExitRetry) {
     if r.attempts < LIVE_FILL_EXIT_RETRY_MAX_ATTEMPTS
         && book.live_fill_exit_retry.len() < LIVE_FILL_EXIT_RETRY_CAPACITY
     {
@@ -273,6 +303,7 @@ fn queue_exit_retry(book: &mut BookState, ctx: &RuntimeCtx, r: ExitRetry) {
         &mut seq,
         |row| paper_rows::fill_reject(row, &r.x, format!("{};{why}", r.last_err)),
     );
+    report_position(risk, ctx, &r.x);
 }
 
 /// Sends every waiting exit again (the 1 s housekeeping tick). Each one is
@@ -303,11 +334,14 @@ pub(super) async fn retry_live_fill_exits(
             continue;
         }
         sent = sent.saturating_add(1);
-        if let Placed::RetryExit(err) = execute(oms, risk, book, ctx, &r.x).await {
-            r.attempts = r.attempts.saturating_add(1);
-            r.last_err = err;
-            gate_closed = true;
-            queue_exit_retry(book, ctx, r);
+        match execute(oms, risk, book, ctx, &r.x).await {
+            Placed::RetryExit(err) => {
+                r.attempts = r.attempts.saturating_add(1);
+                r.last_err = err;
+                gate_closed = true;
+                queue_exit_retry(book, risk, ctx, r);
+            }
+            Placed::Done => report_position(risk, ctx, &r.x),
         }
     }
     metrics::counter!(LIVE_FILL_EXIT_RETRIES_COUNTER).increment(sent);
@@ -498,6 +532,7 @@ mod tests {
     use tickvault_storage::live_order_events_persistence::{LiveOrderMode, LiveOrderSide};
     use tickvault_trading::oms::{OrderApiClient, OrderRateLimiter, TokenProvider};
     use tokio::sync::Notify;
+    use tokio::sync::mpsc;
 
     struct NoToken;
     impl TokenProvider for NoToken {
@@ -551,7 +586,68 @@ mod tests {
             auth_notify: Arc::new(Notify::new()),
             leg_pnl_tx: None,
             live_fill_events: Some(events),
+            live_fill_positions: None,
         }
+    }
+
+    /// LF-9 finding 4: a Mark changes no order and no position, so the
+    /// runtime is told not to run its O(orders) republish scan after it; an
+    /// Execute (booked or refused) is. The runtime's arm republishes only on
+    /// `true`.
+    #[tokio::test]
+    async fn test_handle_live_fill_cmd_asks_for_the_republish_only_after_an_execute() {
+        let (tx, _rx) = mpsc::channel(64);
+        let ctx = ctx(tx);
+        let mut oms = oms();
+        let mut risk = RiskEngine::new(2.0, 100, 1_000_000.0);
+        let mut book = BookState::new();
+        let mark = PaperCmd::Mark {
+            security_id: 7,
+            segment: ExchangeSegment::NseFno,
+            price: 101.5,
+        };
+        assert!(!handle_live_fill_cmd(&mut oms, &mut risk, &mut book, &ctx, mark).await);
+        let exec = PaperCmd::Execute(Box::new(execution(10, 10)));
+        assert!(handle_live_fill_cmd(&mut oms, &mut risk, &mut book, &ctx, exec).await);
+        // A Mark for a held position still marks it, and still asks for
+        // nothing.
+        let x = execution(10, 10);
+        let mark = PaperCmd::Mark {
+            security_id: x.security_id,
+            segment: x.segment,
+            price: 99.0,
+        };
+        assert!(!handle_live_fill_cmd(&mut oms, &mut risk, &mut book, &ctx, mark).await);
+    }
+
+    /// LF-9 review, finding 11: the gate itself, in the runtime's live-fill
+    /// arm. The test above checks only the returned flag; an arm that ignored
+    /// it and republished after every command (every 1 s Mark of every traded
+    /// instrument paying the O(orders) scan again) passed every test. The
+    /// arm's only republish must sit inside `if changes_orders {`.
+    #[test]
+    fn test_regression_live_fill_arm_republishes_only_when_orders_changed() {
+        let src = include_str!("order_runtime.rs");
+        let prod = src.split("\n#[cfg(test)]").next().unwrap_or(src);
+        let start = prod
+            .find("// ---- Arm 2b (LF-6b): live paper fill commands")
+            .expect("the live-fill arm");
+        let end = prod[start..].find("// ---- Arm 3:").expect("the next arm") + start;
+        let arm = &prod[start..end];
+        let call = "let changes_orders = live_fill_arm::handle_live_fill_cmd(";
+        assert_eq!(arm.matches(call).count(), 1, "one command handler call");
+        assert_eq!(
+            arm.matches("republish_marks_wanted(").count(),
+            1,
+            "exactly one republish in the arm:\n{arm}"
+        );
+        let gate = arm.find("if changes_orders {").expect("the gate");
+        let republish = arm.find("republish_marks_wanted(").expect("republish");
+        let gate_end = gate + arm[gate..].find('}').expect("gate end");
+        assert!(
+            arm.find(call).expect("call") < gate && gate < republish && republish < gate_end,
+            "the republish must sit inside `if changes_orders {{`:\n{arm}"
+        );
     }
 
     fn execution(qty: i64, filled: i64) -> PaperExecution {
@@ -776,6 +872,72 @@ mod tests {
         assert_eq!(rows[0].0, LiveOrderEventKind::Reject);
         assert!(rows[0].2.as_deref().is_some_and(|r| r.starts_with("risk:")));
         assert_eq!(oms.active_order_count(), 0);
+    }
+
+    /// LF-9 finding 2: every Execute the arm finishes, booked or refused,
+    /// sends the chain one position report: the shares the chain counted and
+    /// what the paper book now holds. A risk-refused entry reports 0 held; a
+    /// booked one its lots. Mark commands report nothing.
+    #[tokio::test]
+    async fn test_handle_live_fill_cmd_reports_the_booked_position_to_the_chain() {
+        let (tx, _rx) = mpsc::channel(64);
+        let mut ctx = ctx(tx);
+        let (pos_tx, mut pos_rx) = tickvault_core::websocket::frame_ring::frame_ring::<
+            crate::live_fill::chain::PositionReport,
+        >(8);
+        pos_rx.set_busy_polling(true);
+        ctx.live_fill_positions = Some(pos_tx);
+        let mut oms = oms();
+        // Refused by the risk engine (max position 5 lots).
+        let mut risk = RiskEngine::new(2.0, 5, 1_000_000.0);
+        let mut book = BookState::new();
+        let x = execution(10, 10);
+        let lot = i64::from(x.lot_size.max(1));
+        handle_live_fill_cmd(
+            &mut oms,
+            &mut risk,
+            &mut book,
+            &ctx,
+            PaperCmd::Execute(Box::new(x)),
+        )
+        .await;
+        let r = pos_rx.try_recv().expect("a report for the refused entry");
+        assert_eq!(r.runtime_net_shares, 0, "nothing booked");
+        assert_ne!(
+            r.expected_shares, 0,
+            "the chain's count comes back to be taken off"
+        );
+        // Booked.
+        let mut risk = RiskEngine::new(2.0, 100, 1_000_000.0);
+        handle_live_fill_cmd(
+            &mut oms,
+            &mut risk,
+            &mut book,
+            &ctx,
+            PaperCmd::Execute(Box::new(execution(10, 10))),
+        )
+        .await;
+        let r = pos_rx.try_recv().expect("a report for the booked entry");
+        let held = i64::from(risk.net_lots_for_in_segment(
+            r.security_id,
+            ExchangeSegment::from_byte(r.segment).expect("segment"),
+        ));
+        assert_eq!(r.runtime_net_shares, held * lot);
+        assert_ne!(r.runtime_net_shares, 0);
+        // A mark reports nothing.
+        handle_live_fill_cmd(
+            &mut oms,
+            &mut risk,
+            &mut book,
+            &ctx,
+            PaperCmd::Mark {
+                security_id: r.security_id,
+                segment: ExchangeSegment::from_byte(r.segment).expect("segment"),
+                price: 100.0,
+            },
+        )
+        .await;
+        assert!(pos_rx.try_recv().is_none());
     }
 
     /// Findings 8 and 10 (LF-6b review): a remainder cancel the OMS refuses
@@ -1009,7 +1171,7 @@ mod tests {
             "place_refused:rate".to_owned(),
         );
         spent.attempts = LIVE_FILL_EXIT_RETRY_MAX_ATTEMPTS;
-        queue_exit_retry(&mut book, &ctx, spent);
+        queue_exit_retry(&mut book, &risk, &ctx, spent);
         assert!(book.live_fill_exit_retry.is_empty());
         let last = rx.try_recv().expect("a reject row");
         assert_eq!(
@@ -1024,6 +1186,58 @@ mod tests {
             Placed::RetryExit("a".to_owned()),
             Placed::RetryExit("a".to_owned())
         );
+    }
+
+    /// LF-9 review: an exit the runtime gives up (attempts spent) and an exit
+    /// it books late from the retry queue each send the chain exactly one
+    /// position report: the shares the chain counted for that exit and what
+    /// the paper book holds now.
+    #[tokio::test]
+    async fn test_regression_given_up_and_late_booked_exits_report_their_position() {
+        let (tx, _rx) = mpsc::channel(1_024);
+        let mut ctx = ctx(tx);
+        let (pos_tx, mut pos_rx) = tickvault_core::websocket::frame_ring::frame_ring::<
+            crate::live_fill::chain::PositionReport,
+        >(8);
+        pos_rx.set_busy_polling(true);
+        ctx.live_fill_positions = Some(pos_tx);
+        let mut oms = oms();
+        let mut risk = RiskEngine::new(2.0, 1_000, 1_000_000.0);
+        let mut book = BookState::new();
+        let sid = 6_100;
+        handle_live_fill_cmd(
+            &mut oms,
+            &mut risk,
+            &mut book,
+            &ctx,
+            PaperCmd::Execute(Box::new(execution_for(sid, Side::Buy, false))),
+        )
+        .await;
+        let entry = pos_rx.try_recv().expect("the entry's report");
+        assert_eq!(entry.runtime_net_shares, 1);
+        // Given up: attempts spent. The chain counted -1; the book still
+        // holds the long.
+        let mut spent = ExitRetry::new(
+            Box::new(execution_for(sid, Side::Sell, true)),
+            "place_refused:rate".to_owned(),
+        );
+        spent.attempts = LIVE_FILL_EXIT_RETRY_MAX_ATTEMPTS;
+        queue_exit_retry(&mut book, &risk, &ctx, spent);
+        let r = pos_rx.try_recv().expect("one report for the given-up exit");
+        assert_eq!((r.security_id, r.expected_shares), (sid, -1));
+        assert_eq!(r.runtime_net_shares, 1, "still held");
+        assert!(pos_rx.try_recv().is_none(), "exactly one");
+        // Booked late from the retry queue: one report, flat.
+        book.live_fill_exit_retry.push(ExitRetry::new(
+            Box::new(execution_for(sid, Side::Sell, true)),
+            "place_refused:rate".to_owned(),
+        ));
+        retry_live_fill_exits(&mut oms, &mut risk, &mut book, &ctx).await;
+        assert!(book.live_fill_exit_retry.is_empty());
+        let r = pos_rx.try_recv().expect("one report for the booked exit");
+        assert_eq!((r.security_id, r.expected_shares), (sid, -1));
+        assert_eq!(r.runtime_net_shares, 0, "flat");
+        assert!(pos_rx.try_recv().is_none(), "exactly one");
     }
 
     /// Counts the OMS's rate-limit and budget alerts. TEST DOUBLE.
@@ -1164,7 +1378,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_recv_live_fill_reads_a_command() {
-        let (tx, rx) = mpsc::channel::<PaperCmd>(1);
+        let (tx, rx) = tickvault_core::websocket::frame_ring::frame_ring::<PaperCmd>(1);
         let m = tokio::sync::Mutex::new(rx);
         let mut g = Some(m.lock().await);
         tx.try_send(PaperCmd::Mark {

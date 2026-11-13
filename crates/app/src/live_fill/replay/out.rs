@@ -14,13 +14,15 @@ use tickvault_storage::live_order_events_persistence::{
     LiveOrderEvent, worse_than_model_wire, write_csv_header, write_csv_record,
 };
 use tickvault_trading::brutex_host::InstrumentKey;
-use tickvault_trading::brutex_host::worst_fill::{FillSchedule, SecondBar};
+use tickvault_trading::brutex_host::worst_fill::SecondBar;
 
 use super::drive::{DecisionTiming, ReplayOutput, ReplayStats};
 use super::scripted::parse_segment;
 use crate::live_fill::BootOutcome;
-use crate::live_fill_report::build::{DailyReport, ReportContext, build_report, priced_signal_ids};
-use crate::live_fill_report::recheck::{OrderInputs, Recheck, RecheckKind, recheck_order};
+use crate::live_fill_report::build::{
+    DailyReport, ReportContext, build_report, held_share_known, priced_signal_ids,
+};
+use crate::live_fill_report::recheck::{OrderSeconds, Recheck, recheck_walk, walk_items};
 use crate::live_fill_report::render::{csv_field, render_files};
 use crate::live_fill_report::rows::EventRow;
 
@@ -135,45 +137,40 @@ pub fn event_row_of(e: &LiveOrderEvent) -> EventRow {
 }
 
 /// Re-prices every priced order from the fold's 1 s bars, exactly as the
-/// daily report re-prices from stored `candles_1s`. O(orders × window).
+/// daily report re-prices from stored `candles_1s`: the same walk
+/// (`recheck_walk`), so held orders of one instrument share its seconds the
+/// way the chain shares them (LF-9 finding 3). O(orders × window).
 #[must_use]
 pub fn rechecks(
     rows: &[EventRow],
     seconds: &HashMap<InstrumentKey, BTreeMap<i64, SecondBar>>,
 ) -> Vec<(i64, Recheck)> {
     let targets = priced_signal_ids(rows);
-    let mut out = Vec::new();
-    let mut schedule = FillSchedule::with_capacity(FillSchedule::required_capacity(61, 0));
-    for row in rows
-        .iter()
-        .filter(|r| r.event == "decision" && targets.contains(&r.signal_id))
-    {
-        let r = match OrderInputs::from_decision(row) {
-            None => Recheck::not_run(RecheckKind::Unavailable("no_pricing_inputs")),
-            Some(inp) => {
-                let key = parse_segment(&inp.segment).map(|s| InstrumentKey {
-                    security_id: u64::try_from(inp.security_id).unwrap_or(0),
-                    exchange_segment: s.binary_code(),
-                });
-                let bars = key.and_then(|k| seconds.get(&k));
-                let decision = bars.and_then(|b| b.get(&inp.decision_sec).copied());
-                let mut window: Vec<SecondBar> = bars
-                    .map(|b| {
-                        b.range(inp.decision_sec.saturating_add(1)..=inp.horizon_end())
-                            .map(|(_, s)| *s)
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let need = FillSchedule::required_capacity(inp.max_fill_seconds, 0);
-                if schedule.capacity() < need {
-                    schedule = FillSchedule::with_capacity(need);
-                }
-                recheck_order(&inp, decision, &mut window, &mut schedule)
-            }
+    let held = held_share_known(rows);
+    let items = walk_items(rows, &targets, &held);
+    let mut got = BTreeMap::new();
+    for item in &items {
+        if !item.wants_seconds() {
+            continue;
+        }
+        let Some(inp) = item.inputs.as_ref() else {
+            continue;
         };
-        out.push((row.signal_id, r));
+        let key = parse_segment(&inp.segment).map(|s| InstrumentKey {
+            security_id: u64::try_from(inp.security_id).unwrap_or(0),
+            exchange_segment: s.binary_code(),
+        });
+        let bars = key.and_then(|k| seconds.get(&k));
+        let window: Vec<SecondBar> = bars
+            .map(|b| {
+                b.range(inp.decision_sec..=inp.horizon_end())
+                    .map(|(_, s)| *s)
+                    .collect()
+            })
+            .unwrap_or_default();
+        got.insert(item.row.signal_id, OrderSeconds::Seconds(window));
     }
-    out
+    recheck_walk(&items, &mut got)
 }
 
 /// The day's report from the replay's rows, with the LF-7 builder.

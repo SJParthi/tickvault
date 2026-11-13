@@ -441,6 +441,51 @@ pub fn priced_signal_ids(rows: &[EventRow]) -> BTreeSet<i64> {
     out
 }
 
+/// Every order the chain HELD (a Built row), by signal id, and whether its
+/// share of the instrument's seconds is known (LF-9 finding 3): `true` when
+/// the chain worked its fill out (an Execute reached the runtime, or the fill
+/// model refused, or the runtime's channel was full), `false` when it was
+/// finished unpriced (a taint or a late price refused it after it had already
+/// taken part of a shared second) or its outcome is missing (a restart). The
+/// re-pricing shares each instrument's seconds out in this order and reads an
+/// order whose share depends on an unknown one as unavailable.
+/// O(rows log rows).
+///
+/// LF-9 review (second pass): an order whose Built row was dropped (the
+/// event channel and the outbox drop rows independently) is still held when
+/// any later row shows it was: a finishing Reject (`seq` 2; a refusal before
+/// the hold is `seq` 1) or an Execute's runtime row. Before, such an order was
+/// left out of the walk and the later overlapping orders were re-priced as
+/// if it took no share of their seconds.
+#[must_use]
+pub fn held_share_known(rows: &[EventRow]) -> BTreeMap<i64, bool> {
+    let sorted = sorted_rows(rows);
+    let mut out = BTreeMap::new();
+    for group in sorted.chunk_by(|a, b| a.signal_id == b.signal_id) {
+        let built = group.iter().any(|r| {
+            r.event == "built"
+                || (r.event == "reject" && r.seq >= 2)
+                || matches!(r.event.as_str(), "sent" | "ack" | "fill" | "cancel")
+        });
+        if !built {
+            continue;
+        }
+        let worked_out = group
+            .iter()
+            .any(|r| matches!(r.event.as_str(), "sent" | "ack" | "fill" | "cancel"))
+            || group.iter().any(|r| {
+                r.event == "reject"
+                    && r.reason.as_deref().is_some_and(|why| {
+                        runtime_reject(Some(why), true)
+                            || why.starts_with(FILL_MODEL_REFUSED_PREFIX)
+                            || why == crate::live_fill::PAPER_QUEUE_FULL_REASON
+                    })
+            });
+        out.insert(group[0].signal_id, worked_out);
+    }
+    out
+}
+
 /// Builds the report. See the module docs for the cost. Pure.
 #[must_use]
 pub fn build_report(

@@ -797,3 +797,113 @@ fn test_note_baseline_volume_seeds_raises_never_lowers_and_opens_no_bar() {
     assert_eq!(out.bars().len(), 1);
     assert_eq!(out.bars()[0].volume, 50);
 }
+
+/// LF-9 (findings 8, 9, 10): `on_trade` takes the fold's own per-tick volume.
+/// The day's first trade credits its first-session delta only to the bars of
+/// the buckets holding 09:15:00 (here the 1 s bar at 09:15:00 and the 60 s
+/// bar), every later trade credits its delta everywhere, an older trade never
+/// moves a close, and the book's own cumulative baseline is never read: a
+/// raw cumulative that wrapped past `u32::MAX` does not matter.
+#[test]
+fn test_on_trade_takes_the_folds_volume_and_the_first_session_delta() {
+    assert_eq!(
+        MARKET_OPEN_SECS_OF_DAY,
+        i64::from(crate::candles::tf_index::CANDLE_SESSION_OPEN_SECS_OF_DAY_IST)
+    );
+    let mut b = book(1, &[1, 60]);
+    let mut out = ClosedBars::with_capacity(16);
+    let first = TradeVolume {
+        delta: 0,
+        first_session_delta: 1_000,
+        stale: false,
+        restart: false,
+    };
+    b.on_trade(key(1), OPEN, ns(OPEN) + LAT_NS, 100.0, first, &mut out);
+    let next = TradeVolume {
+        delta: 400,
+        first_session_delta: 400,
+        stale: false,
+        restart: false,
+    };
+    b.on_trade(
+        key(1),
+        OPEN + 59,
+        ns(OPEN + 59) + LAT_NS,
+        101.0,
+        next,
+        &mut out,
+    );
+    // LF-9 review: a trade at the SAME second with another price that is not
+    // stale (an index tick, cumulative 0) moves the close, as the fold's
+    // close does (its guard is only `!stale && secs >= close second`).
+    let same_second = TradeVolume {
+        delta: 0,
+        first_session_delta: 0,
+        stale: false,
+        restart: false,
+    };
+    b.on_trade(
+        key(1),
+        OPEN + 59,
+        ns(OPEN + 59) + LAT_NS + 1,
+        102.0,
+        same_second,
+        &mut out,
+    );
+    // A stale packet (a cumulative regression) inside the open minute:
+    // widens, adds its (zero) delta, never moves the close.
+    let stale = TradeVolume {
+        delta: 0,
+        first_session_delta: 0,
+        stale: true,
+        restart: false,
+    };
+    b.on_trade(
+        key(1),
+        OPEN + 59,
+        ns(OPEN + 59) + LAT_NS + 2,
+        120.0,
+        stale,
+        &mut out,
+    );
+    b.on_clock(ns(OPEN + 61), &mut out);
+    let one_s: Vec<_> = out.bars().iter().filter(|x| x.frame_secs == 1).collect();
+    let minute = out
+        .bars()
+        .iter()
+        .find(|x| x.frame_secs == 60)
+        .expect("the 09:15 minute");
+    assert_eq!(one_s[0].bucket_open_secs, i64::from(OPEN));
+    assert_eq!(one_s[0].volume, 1_000, "the opening trade's own volume");
+    assert_eq!(minute.volume, 1_400, "the opening trade plus the next");
+    assert_eq!(
+        minute.close, 102.0,
+        "a same-second non-stale trade moves the close; a stale one never does"
+    );
+    assert_eq!(minute.high, 120.0, "but it widens the high");
+    // The first trade of an instrument later in the day: its first-session
+    // delta never reaches a bar that does not hold 09:15:00.
+    let mut b = book(1, &[1, 60]);
+    let mut out = ClosedBars::with_capacity(16);
+    let late_first = TradeVolume {
+        delta: 0,
+        first_session_delta: 9_000,
+        stale: false,
+        restart: false,
+    };
+    b.on_trade(
+        key(1),
+        OPEN + 600,
+        ns(OPEN + 600) + LAT_NS,
+        50.0,
+        late_first,
+        &mut out,
+    );
+    b.on_clock(ns(OPEN + 700), &mut out);
+    assert!(out.bars().iter().all(|x| x.volume == 0), "{:?}", out.bars());
+    assert_eq!(
+        b.counters().baseline,
+        0,
+        "the book's own baseline is untouched"
+    );
+}

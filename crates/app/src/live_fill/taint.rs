@@ -454,6 +454,12 @@ impl StreamWatch {
         stepped
     }
 
+    /// The newest loss count seen (the tap's running total, wrapping). O(1).
+    #[must_use]
+    pub fn drop_seq(&self) -> u32 {
+        self.last_drop_seq
+    }
+
     /// Forgets the previous day's seconds and passes. The drop count is kept:
     /// it is the tap's running total, not a per-day value. O(1).
     pub fn reset(&mut self) {
@@ -592,6 +598,7 @@ mod tests {
         );
         w.on_loss_total(2, &mut t);
         assert_eq!(t.added()[TaintReason::TickDropped as usize], 1);
+        assert_eq!(w.drop_seq(), 2, "the newest loss count");
         assert_eq!(
             t.taint_of(T10 - MAX_DROP_LAG_SECS, T10 - MAX_DROP_LAG_SECS + 1),
             Some(TaintReason::TickDropped)
@@ -712,7 +719,9 @@ mod tests {
         assert_eq!(t.taint_of(1_004, 1_005), Some(TaintReason::ClockStep));
         // Wall steps back 3 s.
         assert!(w.on_pass(1_006_200_000_000, 4_000_000_000, &mut t));
+        w.on_loss_total(3, &mut t);
         w.reset();
+        assert_eq!(w.drop_seq(), 3, "the loss count is kept across a day");
         assert!(!w.on_pass(5, 9, &mut t));
     }
 

@@ -750,6 +750,44 @@ pub struct ConsumeStats {
     /// cumulative regression, a backup copy accepted late, an index tick at
     /// an older or the same second with another price). Informational only.
     pub older_trade: bool,
+    /// LF-9 (findings 8, 9, 10): the volume this tick added to every bucket
+    /// it folded into except a day's first session bucket: `cumulative -
+    /// baseline` on the fold's own unwrapped, re-anchored cumulative (0 for
+    /// the seeding tick, a stale regression, a gap end, a counter restart).
+    /// The live paper fill chain adds this to its own bars, so a chain bar
+    /// and the stored candle of the same bucket carry the same volume.
+    /// Informational only. O(1): one subtraction.
+    pub volume_delta: u64,
+    /// LF-9: the volume this tick added to a day's FIRST session bucket (the
+    /// bucket holding 09:15:00): differs from [`Self::volume_delta`] only on
+    /// the seeding tick of a pre-market boot, where that bucket opens on the
+    /// attributable baseline (`first_session_bucket_baseline`). O(1).
+    pub first_bucket_volume_delta: u64,
+    /// LF-9: this tick re-anchored a vendor counter restart: every timeframe's
+    /// next bucket opens on the live cumulative (`chain_broken`), so the tick
+    /// that opens it adds nothing. Informational only.
+    pub cumulative_restarted: bool,
+    /// LF-9 review: this tick was a stale packet (a cumulative below the
+    /// high mark the slot already holds; `is_stale_packet`). Only such a tick
+    /// is kept off a bucket's close: an older trade that is NOT stale (an
+    /// index tick at the same second with another price) still moves it, so
+    /// the live paper fill chain reads this, not `older_trade`, to decide a
+    /// close. Informational only.
+    pub stale_packet: bool,
+    /// LF-9 review (second pass): this tick SEEDED the slot's volume
+    /// baseline (the first packet folded for the instrument this process,
+    /// or after a day roll): the fold credited nothing before it, so the
+    /// live paper fill chain cannot have missed an earlier credit of this
+    /// instrument. Informational only. O(1).
+    pub seeded: bool,
+    /// LF-9 review, third pass: the first LIVE tick that ended a replay gap
+    /// (`gap_now` outside replay mode; typically an instrument's first live
+    /// tick after a mid-session boot re-folded the WAL tail): the fold
+    /// credited it nothing (`volume_delta` 0) and credited no earlier LIVE
+    /// tick of the instrument, so the live paper fill chain, which sees live
+    /// ticks only, cannot have missed an earlier credit of this instrument.
+    /// Informational only. O(1).
+    pub gap_reseed: bool,
     /// Timeframes whose seal or late amendment was NOT emitted because a WAL
     /// replay could only partly see that bar (plan ITEM 47). The complete bar
     /// the live process stored survives. `0..=TF_COUNT`.
@@ -929,10 +967,10 @@ const CUMULATIVE_RESTART_DROP_FLOOR: u64 = 1 << 31;
 /// 24). 2^28 units (~268 million) is far more than one instrument trades
 /// between two packets we receive, and far less than the gap between a wrap
 /// and any other counter restart the fold has seen.
-const CUMULATIVE_WRAP_WINDOW: u64 = 1 << 28;
+pub const CUMULATIVE_WRAP_WINDOW: u64 = 1 << 28;
 
 /// One full turn of the vendor's `u32` day-cumulative counter.
-const CUMULATIVE_WRAP_SPAN: u64 = 1 << 32;
+pub const CUMULATIVE_WRAP_SPAN: u64 = 1 << 32;
 
 /// Widens the vendor's `u32` day-cumulative to the monotonic `u64` axis the
 /// fold keeps in `last_cumulative`, whose bits above 32 count the wraps seen
@@ -2410,7 +2448,15 @@ impl MultiTfAggregator {
                 }
             }
         }
-        let mut stats = ConsumeStats::default();
+        // LF-9: the per-tick volume the buckets below are credited with, for
+        // the live paper fill chain (two subtractions, O(1)).
+        let mut stats = ConsumeStats {
+            volume_delta: cumulative_volume.saturating_sub(baseline),
+            first_bucket_volume_delta: cumulative_volume.saturating_sub(first_base),
+            seeded: seeded_now,
+            gap_reseed: gap_now && !replay_mode,
+            ..ConsumeStats::default()
+        };
 
         // `prices` was widened above the price gate — ONCE per tick, not once
         // per timeframe. The three source fields are identical across all
@@ -2606,6 +2652,7 @@ impl MultiTfAggregator {
             // the same breath, preserving what each has already counted, and
             // drops every unattributed carry with them.
             slot.cell.rebase_open_buckets(cumulative_volume);
+            stats.cumulative_restarted = true;
             crate::candles::fold_counters::fold_counters()
                 .cumulative_reanchored
                 .increment(1);
@@ -2975,6 +3022,7 @@ impl MultiTfAggregator {
         stats.advanced = advanced;
         stats.fresh_first = fresh_first;
         stats.older_trade = older_trade;
+        stats.stale_packet = is_stale_packet;
         stats
     }
 
@@ -10753,6 +10801,14 @@ mod tests {
             // Informational (LF-6b): fresh first packet, older real trade.
             fresh_first: _,
             older_trade: _,
+            // Informational (LF-9): the per-tick volume for the live fill tap.
+            volume_delta: _,
+            first_bucket_volume_delta: _,
+            cumulative_restarted: _,
+            stale_packet: _,
+            seeded: _,
+            // Informational (LF-9 review, third pass): a live replay-gap end.
+            gap_reseed: _,
             // Not a refusal either: the tick WAS folded; only the output of a
             // bar a replay could partly see was held back (plan ITEM 47).
             replay_partial_suppressed: _,
