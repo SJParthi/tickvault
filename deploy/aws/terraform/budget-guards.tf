@@ -369,10 +369,15 @@ resource "aws_cloudwatch_log_group" "tv_hard_stop_guard" {
 # at 90%/100% spend regardless (but only ONCE per month-crossing — this Lambda
 # is what keeps the box down for the rest of the month).
 # 1 invocation/hour is well within the Lambda free tier (1M/mo).
+# Minute 50, not 0 (audit B2 review, 2026-11-13): the guard's stopped-box
+# budget hold must disable the daily-start rule BEFORE that rule fires at
+# 03:00 UTC (08:30 IST); two rules firing in the same minute have no order.
+# The 02:50 UTC run (08:20 IST) comes first. Residual window: a latch
+# written 02:50-03:00 UTC can still let that morning's start through.
 resource "aws_cloudwatch_event_rule" "tv_hard_stop_guard" {
   name                = "tv-prod-hard-stop-guard"
   description         = "Hourly out-of-window force-stop + in-window change-only budget ping — budget never-cross safety net"
-  schedule_expression = "cron(0 * * * ? *)"
+  schedule_expression = "cron(50 * * * ? *)"
 }
 
 resource "aws_cloudwatch_event_target" "tv_hard_stop_guard" {

@@ -88,7 +88,11 @@ use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::{Bytes as WsBytes, Message};
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async_tls_with_config};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+
+// 2026-11-13 (audit B2 finding 7): the dial goes through our own TCP connect so
+// the socket has SO_KEEPALIVE on; same arguments as the library call it replaced.
+use super::ws_dial::dial_ws_tls_with_keepalive;
 use tracing::{debug, error, warn};
 use zeroize::Zeroizing;
 
@@ -2008,7 +2012,9 @@ impl<T: FeedTokenSource> DhanFeedSocket for DhanFeedSocketImpl<T> {
         // affect the depth-200 no-ALPN carve-out above (a socket option and a
         // TLS config are orthogonal), and is standard practice for trading
         // sockets. Pinned by `dial_disables_nagle_on_every_endpoint`.
-        let dial = connect_async_tls_with_config(request, config, true, Some(connector));
+        // The TCP socket also has SO_KEEPALIVE on (`ws_dial`, 2026-11-13), so the
+        // kernel keepalive ladder in the sysctl file is the backstop it claims.
+        let dial = dial_ws_tls_with_keepalive(request, config, true, Some(connector));
         let outcome = match tokio::time::timeout(DIAL_TIMEOUT, dial).await {
             Ok(result) => result,
             Err(_elapsed) => {
@@ -4141,7 +4147,7 @@ mod tests {
             "the dial must build an explicit config"
         );
         assert!(
-            !production.contains("connect_async_tls_with_config(request, None"),
+            !production.contains("dial_ws_tls_with_keepalive(request, None"),
             "no dial may pass None for the WebSocket config"
         );
         assert!(

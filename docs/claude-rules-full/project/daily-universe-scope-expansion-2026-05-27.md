@@ -743,7 +743,7 @@ threshold.
 > | | AWS-native budget action | `tv_hard_stop_guard` (ours) |
 > |---|---|---|
 > | Owner | AWS Budgets | this repository, `hard_stop_guard.rs` |
-> | Cadence | on budget threshold | **hourly**, `cron(0 * * * ? *)` |
+> | Cadence | on budget threshold | **hourly**, `cron(50 * * * ? *)` (minute 0 until 2026-11-13, audit B2: the 02:50 UTC run disables the start rule before its 03:00 UTC fire; the 08:00-08:30 IST pre-open slot is left alone like the curfew) |
 > | Reads spend from | AWS Budgets internals | Cost Explorer, `ce:GetCostAndUsage` |
 > | On breach | `STOP_EC2_INSTANCES` | stops the box, **disables the morning auto-start**, and pages |
 > | Permission | the `budget_action` role | `ec2:StopInstances` scoped by the `tv-<env>-app` Name tag |

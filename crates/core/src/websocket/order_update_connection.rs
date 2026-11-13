@@ -14,11 +14,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use super::connection::DIAL_TIMEOUT;
+use super::ws_dial::{DialedWs, dial_ws_tls_with_keepalive};
 use futures_util::{SinkExt, StreamExt};
 use secrecy::ExposeSecret;
 use tokio::sync::broadcast;
 use tokio::time;
-use tokio_tungstenite::connect_async_tls_with_config;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
@@ -711,14 +712,16 @@ async fn connect_and_listen(
     // standard practice for trading sockets. Receive-only paper mode today,
     // so the present blast radius is small — but this is the socket the live
     // order path re-uses, and the disconnect it prevents is the expensive one.
-    let (ws_stream, _response) = connect_async_tls_with_config(
-        request,
-        Some(order_update_websocket_config()),
-        true,
-        Some(tls_connector),
-    )
-    .await
-    .map_err(|err| OrderUpdateConnectionError::Connect(err.to_string()))?;
+    //
+    // 2026-11-13 (audit B2 findings 6 and 7): the dial is bounded by the same
+    // `DIAL_TIMEOUT` (15 s) as the main feed, and its TCP socket has
+    // SO_KEEPALIVE on (`ws_dial`). Before, a peer that accepted the TCP
+    // connection and never answered the TLS hello or the upgrade parked this
+    // task for the rest of the session: the session watchdog is built only
+    // after the dial returns, so nothing counted a failure and the outage page
+    // never fired. A timed-out dial is now an ordinary `Connect` error and
+    // takes the same reconnect and paging path as a refused one.
+    let ws_stream = dial_order_update_socket(request, tls_connector, DIAL_TIMEOUT).await?;
     // O(1) EXEMPT: end
 
     info!("order update WebSocket connected");
@@ -775,6 +778,33 @@ async fn connect_and_listen(
         },
     )
     .await
+}
+
+/// Dials the order-update socket: keepalive TCP, TLS, upgrade, all bounded by
+/// `limit`. A dial that does not finish inside `limit` is a `Connect` error, so
+/// the run loop counts it and reconnects exactly as for a refused dial.
+async fn dial_order_update_socket(
+    request: tokio_tungstenite::tungstenite::handshake::client::Request,
+    tls_connector: tokio_tungstenite::Connector,
+    limit: Duration,
+) -> Result<DialedWs, OrderUpdateConnectionError> {
+    // Third argument is `disable_nagle` (kept `true`, see the comment above).
+    let dial = dial_ws_tls_with_keepalive(
+        request,
+        Some(order_update_websocket_config()),
+        true,
+        Some(tls_connector),
+    );
+    match time::timeout(limit, dial).await {
+        Ok(Ok((ws_stream, _response))) => Ok(ws_stream),
+        // O(1) EXEMPT: begin, cold path, once per failed dial
+        Ok(Err(err)) => Err(OrderUpdateConnectionError::Connect(err.to_string())),
+        Err(_elapsed) => Err(OrderUpdateConnectionError::Connect(format!(
+            "dial timed out after {} s (TCP, TLS or upgrade never finished)",
+            limit.as_secs()
+        ))),
+        // O(1) EXEMPT: end
+    }
 }
 
 /// Owns the connected-socket gauge until login/read finishes or is dropped.
@@ -1750,6 +1780,10 @@ mod active_gauge_tests;
 #[cfg(test)]
 #[path = "order_update_connection/idle_probe_tests.rs"]
 mod idle_probe_tests;
+
+#[cfg(test)]
+#[path = "order_update_connection/dial_timeout_tests.rs"]
+mod dial_timeout_tests;
 
 #[cfg(test)]
 mod tests {
