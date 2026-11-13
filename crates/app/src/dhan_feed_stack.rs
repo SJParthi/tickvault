@@ -99,6 +99,9 @@ mod shutdown_residue;
 mod ws_lag_class;
 // Plan item LF-6b (2026-11-12): the live paper fill chain's tap on this drain.
 pub mod live_fill_tap;
+// Plan item LF-8 (2026-11-12): the drain's per-tick fold verdict, pure, shared
+// with the offline replay so the two cannot drift.
+pub mod fold_verdict;
 use std::time::Instant;
 
 use secrecy::ExposeSecret;
@@ -3308,19 +3311,17 @@ impl LiveIngest {
         // idempotent) and skips the bar. A connect snapshot
         // (`receipt_day_mismatch`) and a no-receipt frame stay HARD.
         // `websocket-connection-scope-lock.md` 2026-09-23 (THIRD).
-        let prior_session_replay = stats.stale_trading_day
-            && !stats.receipt_day_mismatch
-            && tick.received_at_nanos > 0
-            && !stats.refused_price
-            && !stats.refused_timestamp;
-        let hard_refusal = stats.refused_price
-            || stats.refused_timestamp
-            || (stats.stale_trading_day && !prior_session_replay)
-            || stats.future_trading_day;
+        //
+        // 2026-11-12 (plan item LF-8): the three bindings (`prior_session_replay`,
+        // `hard_refusal`, `candle_only_refusal`) moved UNCHANGED into the pure
+        // `fold_verdict::fold_verdict`, so the offline replay reaches the same
+        // verdict; the reasoning stays here, beside the counters.
+        let verdict = fold_verdict::fold_verdict(&stats, tick.received_at_nanos);
 
         // Two refuse only the CANDLE and keep the row — see above. They are
-        // mutually exclusive with the three by construction, which is why this
-        // reads as a plain `!hard_refusal` rather than repeating them.
+        // mutually exclusive with the three by construction, which is why the
+        // candle-only set in `fold_verdict::fold_verdict` reads as a plain
+        // `!hard_refusal` rather than repeating them.
         // `stale_trading_day` joins the candle-only set on 2026-08-26.
         //
         // Dhan sends the LAST TRADE TIME, so a dormant contract snapshotted
@@ -3372,15 +3373,9 @@ impl LiveIngest {
         // describes them as candle-only and is annotated rather than rewritten,
         // per house convention — its REASONING is the record of why the row was
         // kept, and why that reasoning failed for `ticks` specifically.
-        let candle_only_refusal = (stats.out_of_session
-            || stats.untraded_sentinel
-            || stats.untraded_timestamp
-            || stats.out_of_band_timestamp
-            || stats.slot_exhausted
-            || prior_session_replay)
-            && !hard_refusal;
-
-        if hard_refusal {
+        // (`candle_only_refusal` is computed in `fold_verdict::fold_verdict`,
+        // see the 2026-11-12 note above.)
+        if let fold_verdict::FoldVerdict::HardRefusal { wrong_day } = verdict {
             let reason = if stats.refused_price {
                 self.refused_price = self.refused_price.saturating_add(1);
                 "price"
@@ -3411,7 +3406,7 @@ impl LiveIngest {
             // `receipt_day_mismatch` only ever rides a day refusal, and price
             // and timestamp are judged first above — so this is exactly "the
             // day rule refused it, and nothing else did".
-            if stats.receipt_day_mismatch && !stats.refused_price && !stats.refused_timestamp {
+            if wrong_day {
                 // Item 45h (zero loss, 2026-09-29): the prior-day connect
                 // snapshot is a real received packet. It must never reach
                 // `ticks` (2026-09-10 directive) and never a candle, so it is
@@ -3445,7 +3440,7 @@ impl LiveIngest {
         // while every metric reports success.
         self.pending_rows = self.pending_rows.saturating_add(1);
         counters().ingest_ticks.increment(1);
-        if candle_only_refusal {
+        if verdict == fold_verdict::FoldVerdict::CandleOnly {
             // Counted under the SAME `out_of_session` reason as before, so the
             // existing 30s delta report and any dashboard built on it keep
             // meaning what they meant: "this many ticks opened no candle
@@ -6315,7 +6310,7 @@ pub const CATCHUP_SEAL_STEP_SLOTS: usize = 256;
 /// margin applied: a WAL replay judges late ticks by the SAME margin the live
 /// catch-up seal uses (plan ITEM 47, review round 7). One allocation of the
 /// slot table and one of the index, at construction only.
-fn live_fold(capacity: usize) -> MultiTfAggregator {
+pub(crate) fn live_fold(capacity: usize) -> MultiTfAggregator {
     let mut aggregator = MultiTfAggregator::with_capacity(FeedStrategy::DEFAULT, capacity);
     aggregator.set_catch_up_margin_secs(CATCHUP_LATENESS_MARGIN_SECS);
     aggregator
@@ -9056,7 +9051,11 @@ pub fn drain_main_feed_frame(
                                     fresh_first,
                                     older_trade,
                                     ..
-                                } => (advanced || fresh_first, older_trade),
+                                } => fold_verdict::tap_trade_flags(
+                                    advanced,
+                                    fresh_first,
+                                    older_trade,
+                                ),
                                 _ => (false, false),
                             };
                             let _queued = tap.offer(tick, best, new_trade, older_trade);

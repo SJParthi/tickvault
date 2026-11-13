@@ -245,6 +245,9 @@ pub mod strategy_recipe_fetch;
 // Plan item 45e-1 (2026-10-02): raw WAL segments uploaded to the cold bucket,
 // verified, and marked, before any WAL prune may delete them.
 pub mod raw_frame_upload;
+// Plan item LF-8 (2026-11-12): read-only fetch of one day of raw segments
+// for the offline live-fill replay (List + Get only).
+pub mod raw_frame_fetch;
 // Plan item 66 (2026-10-21, Quotes 32/33/34): the one-off 2026-10-22
 // rebuild's file-copy and restore primitives were DELETED 2026-10-29 with
 // the rebuild and wipe tools that used them (rust-only lock §§0.13/0.14).

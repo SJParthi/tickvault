@@ -38,6 +38,11 @@ pub mod chain;
 pub mod fill_window;
 pub mod taint;
 pub mod timing;
+// Plan item LF-8: the paper order rows, shared by the order runtime and the
+// offline replay; and the replay itself (never on the live path: a source
+// scan, `live_fill_replay_isolation_guard.rs`, keeps it there).
+pub mod paper_rows;
+pub mod replay;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};

@@ -1,11 +1,19 @@
 //! A tick we cannot FOLD is not a tick we cannot STORE.
 //!
-//! This guard pins the one line in `dhan_feed_stack.rs` that decides whether a
-//! refused tick keeps its row in `ticks` or is discarded outright:
+//! This guard pins the one binding that decides whether a refused tick keeps
+//! its row in `ticks` or is discarded outright:
 //!
 //! ```ignore
 //! let hard_refusal = stats.refused_price || stats.refused_timestamp;
 //! ```
+//!
+//! Since 2026-11-12 (plan item LF-8) the binding lives in the pure
+//! `dhan_feed_stack/fold_verdict.rs::fold_verdict`, shared with the offline
+//! replay, and the drain (`LiveIngest::ingest_tick_at` in
+//! `dhan_feed_stack.rs`) MUST route its decision through that call and bind
+//! none of the three verdicts itself
+//! (`the_drain_takes_its_verdict_from_fold_verdict`): an inline copy in the
+//! drain would escape every check below.
 //!
 //! # Why a guard exists for one boolean
 //!
@@ -48,6 +56,17 @@ fn feed_stack_src() -> String {
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
+/// The pure verdict the drain calls (plan item LF-8, 2026-11-12): the
+/// `hard_refusal` binding moved here UNCHANGED out of `ingest_tick_at`, so
+/// the offline replay and the live drain share it. The first binding in the
+/// file is the production function's; the test oracle below it repeats the
+/// expression on purpose and is never reached by `find`.
+fn verdict_src() -> String {
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/dhan_feed_stack/fold_verdict.rs");
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+}
+
 /// The `hard_refusal` binding, with `//` comments stripped.
 ///
 /// Comment-stripping is load-bearing: the reasoning for this rule is written
@@ -58,7 +77,7 @@ fn feed_stack_src() -> String {
 fn hard_refusal_expr(src: &str) -> String {
     let start = src
         .find("let hard_refusal =")
-        .expect("dhan_feed_stack.rs must bind `hard_refusal`");
+        .expect("fold_verdict.rs (the drain's verdict) must bind `hard_refusal`");
     let end = start
         + src[start..]
             .find(';')
@@ -137,7 +156,7 @@ const MUST_NEVER_BE_HARD: &[&str] = &[
 
 #[test]
 fn a_foldable_failure_never_costs_the_row() {
-    let expr = hard_refusal_expr(&feed_stack_src());
+    let expr = hard_refusal_expr(&verdict_src());
 
     for field in MUST_NEVER_BE_HARD {
         assert!(
@@ -162,7 +181,7 @@ fn a_foldable_failure_never_costs_the_row() {
 
 #[test]
 fn only_the_two_corrupting_conditions_are_hard() {
-    let expr = hard_refusal_expr(&feed_stack_src());
+    let expr = hard_refusal_expr(&verdict_src());
 
     for field in MAY_BE_HARD {
         assert!(
@@ -201,7 +220,7 @@ fn guard_self_test_reads_code_and_ignores_prose() {
 /// The real file must be non-vacuous: the binding exists and names something.
 #[test]
 fn scanner_is_not_vacuous_against_the_real_file() {
-    let expr = hard_refusal_expr(&feed_stack_src());
+    let expr = hard_refusal_expr(&verdict_src());
     assert!(
         expr.contains("stats."),
         "extracted `hard_refusal` expression looks empty — the scanner is not \
@@ -235,4 +254,89 @@ fn the_wrong_day_return_keeps_the_packet_in_feed_aux() {
         !window.contains("append_tick_with_seq"),
         "and never written to `ticks`"
     );
+}
+
+/// The body of `fn ingest_tick_at(` (to its matching `}`), `//` comments
+/// stripped, or `None`.
+fn ingest_body(src: &str) -> Option<String> {
+    let code: String = src
+        .lines()
+        .map(|line| line.split_once("//").map_or(line, |(before, _)| before))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let start = code.find("fn ingest_tick_at(")?;
+    let open = start + code[start..].find('{')?;
+    let mut depth = 0usize;
+    for (i, ch) in code[open..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(code[open..=open + i].to_owned());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// What the drain's body does wrong against the shared verdict.
+fn drain_verdict_violations(src: &str) -> Vec<String> {
+    let Some(body) = ingest_body(src) else {
+        return vec!["`fn ingest_tick_at(` not found in dhan_feed_stack.rs".to_owned()];
+    };
+    let mut v = Vec::new();
+    if !body.contains("fold_verdict::fold_verdict(&stats, tick.received_at_nanos)") {
+        v.push(
+            "the drain no longer calls `fold_verdict::fold_verdict(&stats, \
+             tick.received_at_nanos)`"
+                .to_owned(),
+        );
+    }
+    for binding in [
+        "let hard_refusal",
+        "let candle_only_refusal",
+        "let prior_session_replay",
+    ] {
+        if body.contains(binding) {
+            v.push(format!(
+                "the drain binds `{binding}` itself: the verdict must come from \
+                 `fold_verdict::fold_verdict`, where this guard reads it"
+            ));
+        }
+    }
+    v
+}
+
+/// LF-8 moved the binding out of the drain. The guard above reads it in
+/// `fold_verdict.rs`; this test pins that the drain actually USES it, so a
+/// merge that re-inlines the old bindings in `ingest_tick_at` fails here
+/// instead of passing the checks above while the drain discards rows.
+#[test]
+fn the_drain_takes_its_verdict_from_fold_verdict() {
+    let v = drain_verdict_violations(&feed_stack_src());
+    assert!(v.is_empty(), "{v:#?}");
+}
+
+#[test]
+fn bite_an_inline_verdict_in_the_drain_is_caught() {
+    let good = "pub fn ingest_tick_at(&mut self) {\n    let verdict = \
+                fold_verdict::fold_verdict(&stats, tick.received_at_nanos);\n}";
+    assert!(drain_verdict_violations(good).is_empty());
+    let inline = "pub fn ingest_tick_at(&mut self) {\n    let verdict = \
+                  fold_verdict::fold_verdict(&stats, tick.received_at_nanos);\n    \
+                  let hard_refusal = stats.refused_price || stats.slot_exhausted;\n}";
+    assert!(!drain_verdict_violations(inline).is_empty());
+    let bypass = "pub fn ingest_tick_at(&mut self) {\n    \
+                  let hard_refusal = stats.refused_price;\n}";
+    assert_eq!(drain_verdict_violations(bypass).len(), 2);
+    let commented = "pub fn ingest_tick_at(&mut self) {\n    // fold_verdict::fold_verdict(&stats, \
+                     tick.received_at_nanos)\n}";
+    assert!(
+        !drain_verdict_violations(commented).is_empty(),
+        "a call in a comment is not a call"
+    );
+    assert!(!drain_verdict_violations("fn other() {}").is_empty());
 }
