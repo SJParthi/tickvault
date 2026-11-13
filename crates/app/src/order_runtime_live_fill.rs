@@ -32,7 +32,7 @@ use tickvault_trading::oms::{ManagedOrder, OmsError, OrderManagementSystem, Plac
 use tickvault_trading::risk::engine::RiskEngine;
 use tickvault_trading::risk::types::RiskCheck;
 use tokio::sync::MutexGuard;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use super::{BookState, RuntimeCtx, apply_fill, synthesize_paper_fill};
 use crate::live_fill::chain::{PaperCmd, PaperExecution};
@@ -254,8 +254,7 @@ fn place_refusal_rolls_over(err: &OmsError) -> bool {
 
 /// Counter: position reports the chain's channel had no room for (local
 /// `/metrics` only; LF-9 finding 2).
-pub(super) const LIVE_FILL_POSITION_REPORTS_DROPPED_COUNTER: &str =
-    "tv_live_fill_position_reports_dropped_total";
+pub(super) const POSITION_REPORTS_DROPPED: &str = "tv_live_fill_position_reports_dropped_total";
 
 /// Tells the chain what the paper book holds for `x`'s instrument now that
 /// `x` (as the chain sent it) is booked, refused or given up (LF-9 finding
@@ -267,7 +266,17 @@ fn report_position(risk: &RiskEngine, ctx: &RuntimeCtx, x: &PaperExecution) {
     };
     let net = risk.net_lots_for_in_segment(x.security_id, x.segment);
     if tx.try_send(paper_rows::position_report(x, net)).is_err() {
-        metrics::counter!(LIVE_FILL_POSITION_REPORTS_DROPPED_COUNTER).increment(1);
+        // Rare: the channel is sized to every Execute that can be in flight.
+        // One line per drop, per finished paper order, never per tick.
+        warn!(
+            code = ErrorCode::OrderReady01GateRefused.code_str(),
+            source = "live_fill_position_report_dropped",
+            security_id = x.security_id,
+            "live paper fill chain: a position report found its channel full; the \
+             chain keeps the shares it counted for this instrument until the daily \
+             reset (paper only, no order is placed)"
+        );
+        metrics::counter!(POSITION_REPORTS_DROPPED).increment(1);
     }
 }
 
