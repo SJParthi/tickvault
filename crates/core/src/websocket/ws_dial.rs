@@ -25,7 +25,7 @@
 //! Cold path: runs once per dial, never per frame.
 
 use std::future::Future;
-use std::net::SocketAddr;
+use core::net::SocketAddr;
 use std::time::Duration;
 
 use tokio::net::{TcpSocket, TcpStream};
