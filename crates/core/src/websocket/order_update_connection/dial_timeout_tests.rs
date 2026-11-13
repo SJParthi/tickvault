@@ -30,14 +30,16 @@ async fn test_regression_order_update_dial_times_out_on_a_silent_peer() {
     )
     .await;
     server.abort();
-    match outcome {
-        Ok(Err(OrderUpdateConnectionError::Connect(msg))) => {
-            assert!(msg.contains("timed out"), "unexpected message: {msg}");
+    let verdict: Result<String, String> = match outcome {
+        Ok(Err(OrderUpdateConnectionError::Connect(msg))) => Ok(msg),
+        Ok(Err(other)) => Err(format!("expected a Connect timeout, got {other}")),
+        Ok(Ok(_)) => Err("a silent peer must never complete the dial".to_string()),
+        Err(_) => {
+            Err("the order-update dial is unbounded: it did not return within 5 s".to_string())
         }
-        Ok(Err(other)) => panic!("expected a Connect timeout, got {other}"),
-        Ok(Ok(_)) => panic!("a silent peer must never complete the dial"),
-        Err(_) => panic!("the order-update dial is unbounded: it did not return within 5 s"),
-    }
+    };
+    let msg = verdict.expect("order-update dial outcome");
+    assert!(msg.contains("timed out"), "unexpected message: {msg}");
 }
 
 #[tokio::test]
