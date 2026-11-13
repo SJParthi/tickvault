@@ -1056,12 +1056,175 @@ impl LiveOrderEventsWriter {
 }
 
 // ---------------------------------------------------------------------------
+// CSV form (plan item LF-8, the offline replay's `events.csv`)
+// ---------------------------------------------------------------------------
+
+/// An IST epoch-nanosecond instant as `YYYY-MM-DDTHH:MM:SS.nnnnnnnnn` (IST
+/// wall clock, no zone suffix). O(1).
+fn csv_ts(nanos: i64) -> String {
+    let secs = nanos.div_euclid(1_000_000_000);
+    let sub = u32::try_from(nanos.rem_euclid(1_000_000_000)).unwrap_or(0);
+    chrono::DateTime::from_timestamp(secs, sub).map_or_else(
+        || nanos.to_string(),
+        |d| d.format("%Y-%m-%dT%H:%M:%S%.9f").to_string(),
+    )
+}
+
+/// A text cell, quoted (inner `"` doubled) when it holds a comma, a quote, a
+/// CR or a LF. O(len).
+fn csv_text(v: &str) -> String {
+    if v.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", v.replace('"', "\"\""))
+    } else {
+        v.to_owned()
+    }
+}
+
+fn csv_opt<T: ToString>(v: Option<T>) -> String {
+    v.map(|x| x.to_string()).unwrap_or_default()
+}
+
+/// One row as `(column, cell)` pairs: `ts` first, then
+/// [`LIVE_ORDER_EVENTS_COLUMNS`] in order. A `None` is an empty cell. O(1)
+/// apart from the text it formats.
+fn csv_cells(e: &LiveOrderEvent) -> [(&'static str, String); 46] {
+    let ts = |v: Option<i64>| v.map(csv_ts).unwrap_or_default();
+    [
+        ("ts", csv_ts(e.ts_ist_nanos)),
+        ("event", e.event.as_str().to_owned()),
+        ("signal_id", e.signal_id.to_string()),
+        ("seq", e.seq.to_string()),
+        ("feed", csv_text(e.feed)),
+        ("mode", e.mode.as_str().to_owned()),
+        ("recipe", csv_text(&e.recipe)),
+        ("recipe_version", e.recipe_version.to_string()),
+        ("security_id", e.security_id.to_string()),
+        ("segment", e.segment.as_str().to_owned()),
+        ("symbol", csv_text(&e.symbol)),
+        ("side", e.side.as_str().to_owned()),
+        ("qty", e.qty.to_string()),
+        ("slot_paise", e.slot_paise.to_string()),
+        ("candle_start", ts(e.candle_start_ist_nanos)),
+        ("candle_end", ts(e.candle_end_ist_nanos)),
+        ("last_tick_exchange_ts", ts(e.last_tick_exchange_ist_nanos)),
+        ("last_tick_receipt_ts", ts(e.last_tick_receipt_ist_nanos)),
+        (
+            "close_by",
+            csv_opt(e.close_by.map(LiveCandleCloseBy::as_str)),
+        ),
+        ("decision_ts", ts(e.decision_ist_nanos)),
+        ("best_bid_paise", csv_opt(e.best_bid_paise)),
+        ("best_bid_qty", csv_opt(e.best_bid_qty)),
+        ("best_ask_paise", csv_opt(e.best_ask_paise)),
+        ("best_ask_qty", csv_opt(e.best_ask_qty)),
+        ("ltp_paise", csv_opt(e.ltp_paise)),
+        ("second_volume", csv_opt(e.second_volume)),
+        ("limit_paise", csv_opt(e.limit_paise)),
+        (
+            "limit_bound",
+            csv_opt(e.limit_bound.map(LiveLimitBound::as_str)),
+        ),
+        ("queue_wait_us", csv_opt(e.queue_wait_us)),
+        ("feed_lag_us", csv_opt(e.feed_lag_us)),
+        ("api_rtt_us", csv_opt(e.api_rtt_us)),
+        (
+            "order_id",
+            e.order_id.as_deref().map(csv_text).unwrap_or_default(),
+        ),
+        ("exchange_order_ts", ts(e.exchange_order_ist_nanos)),
+        ("exchange_trade_ts", ts(e.exchange_trade_ist_nanos)),
+        ("fill_qty", csv_opt(e.fill_qty)),
+        ("fill_price_paise", csv_opt(e.fill_price_paise)),
+        ("avg_price_paise", csv_opt(e.avg_price_paise)),
+        ("remainder_qty", csv_opt(e.remainder_qty)),
+        ("model_price_paise", csv_opt(e.model_price_paise)),
+        (
+            "worse_than_model",
+            csv_opt(worse_than_model_wire(e.worse_than_model)),
+        ),
+        (
+            "reason",
+            e.reason.as_deref().map(csv_text).unwrap_or_default(),
+        ),
+        ("charges_paise", csv_opt(e.charges_paise)),
+        ("tick_paise", csv_opt(e.tick_paise)),
+        ("lot_size", csv_opt(e.lot_size)),
+        ("participation_bps", csv_opt(e.participation_bps)),
+        ("max_fill_seconds", csv_opt(e.max_fill_seconds)),
+    ]
+}
+
+/// The CSV header: `ts`, then every column in table order. O(columns).
+///
+/// # Errors
+/// The writer failed.
+pub fn write_csv_header(w: &mut impl std::io::Write) -> std::io::Result<()> {
+    let mut line = String::from("ts");
+    for (name, _) in LIVE_ORDER_EVENTS_COLUMNS {
+        line.push(',');
+        line.push_str(name);
+    }
+    line.push('\n');
+    w.write_all(line.as_bytes())
+}
+
+/// One row in the [`write_csv_header`] column order: timestamps as IST text
+/// to the nanosecond, symbols as their wire values, `None` as an empty cell.
+/// Offline only (the replay CLI), never on the live path. O(1) per row.
+///
+/// # Errors
+/// The writer failed.
+pub fn write_csv_record(e: &LiveOrderEvent, w: &mut impl std::io::Write) -> std::io::Result<()> {
+    let cells = csv_cells(e);
+    let mut line = String::with_capacity(512);
+    for (i, (_, v)) in cells.iter().enumerate() {
+        if i > 0 {
+            line.push(',');
+        }
+        line.push_str(v);
+    }
+    line.push('\n');
+    w.write_all(line.as_bytes())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The CSV header and every record follow `ts` + the table's column list,
+    /// and a record has exactly as many cells as the header (text with a
+    /// comma is quoted).
+    #[test]
+    fn test_write_csv_header_and_write_csv_record_writes_every_column_in_order() {
+        let names: Vec<&str> = csv_cells(&full_event()).iter().map(|(n, _)| *n).collect();
+        let mut want = vec!["ts"];
+        want.extend(LIVE_ORDER_EVENTS_COLUMNS.iter().map(|(n, _)| *n));
+        assert_eq!(names, want, "cells follow the table's column order");
+        let mut header = Vec::new();
+        write_csv_header(&mut header).expect("header");
+        assert_eq!(
+            String::from_utf8(header).expect("utf8"),
+            format!("{}\n", want.join(","))
+        );
+        let mut e = full_event();
+        e.reason = Some("a,b \"c\"".to_owned());
+        e.ts_ist_nanos = 1_795_000_000_123_456_789;
+        let mut rec = Vec::new();
+        write_csv_record(&e, &mut rec).expect("record");
+        let text = String::from_utf8(rec).expect("utf8");
+        assert!(text.starts_with("2026-11-18T"), "{text}");
+        assert!(text.contains(".123456789,"), "nanosecond text: {text}");
+        assert!(text.contains("\"a,b \"\"c\"\"\""), "quoted reason: {text}");
+        let mut bare = Vec::new();
+        write_csv_record(&bare_event(), &mut bare).expect("record");
+        let bare = String::from_utf8(bare).expect("utf8");
+        assert_eq!(bare.trim_end().split(',').count(), want.len());
+        assert_eq!(csv_ts(-1), "1969-12-31T23:59:59.999999999");
+    }
     use std::collections::BTreeSet;
 
     /// A row with every optional column set, so the ILP line carries all of them.

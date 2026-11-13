@@ -1,0 +1,54 @@
+Replay of Wed 2026-11-18: 5 pretend orders on 5 candles; 3 filled, 1 part filled and cancelled, 0 not filled, 1 skipped, 0 rejected. Nothing real was sent: no broker, no order system, no database, no bucket write.
+Worst-case check: 0 fills worse than the model they were priced from (must be 0); re-priced from the replay's own 1 s bars: 4 match, 0 worse, 0 better, 0 not checked. Report light: amber (partial).
+Day: INCOMPLETE (the last frame came at 2026-11-18T09:21:00.002000000, before 15:30).
+
+chain started at: 2026-11-18T08:30:00.000000000 (--boot-ist, or the first frame if earlier)
+frames before --boot-ist: 0
+segments: 2
+damaged segments: 1
+largest segment read, bytes: 151592
+frames: 722
+records of another transport (TrueData, old order updates), skipped: 0
+frames from another day: 0
+frames with no receipt (refused): 0
+packets: 1260
+abandoned frame bytes: 0
+ticks: 1260
+backup copies dropped: 1
+ticks folded: 1258
+ticks tapped: 1258
+ticks kept as rows only: 1
+ticks refused: 0
+loss count at the end: 1
+losses wholly before the day's chain (not handed to it): 0
+chain passes: 488501
+decisions: 5
+decisions skipped for a late price: 1
+decisions refused on an untrusted stretch: 0
+paper orders booked: 4
+marks: 501
+longest in-session silence, ms: 1000.000
+
+Honest limits:
+- A process restart on the recorded day is not reproduced: live started a new chain, a new candle fold and a flat paper position at each boot (orders it held were lost, and an exit after the boot found no position), while the replay keeps one chain, one fold and one paper position for the whole day. A restart shows only as a silence in the frames (named in the incomplete reason when over 30 s); read events after it with care.
+- No live losses are replayed: the loss count moves only where the replay itself lost frames (a damaged stretch of a segment, the rest of a segment whose read stopped, or an abandoned frame tail); the live tap's own ring drops and frames shed before the drain are not reproduced, so live can refuse a candle the replay trusts.
+- Main-feed socket outages are invisible: a socket that was down delivered no frames, so they are not in the recorded WAL either, and a replayed frame carries no socket. Live counts a loss while any main-feed socket is down and refuses the candles it touched; the replay builds that socket's instruments' bars short (missing the trades of the outage), trusts them, and can decide and fill on them. The other sockets keep the stream busy, so the feed-gap watch does not fire either. Check the day's socket audit before reading a decision as one live would have made.
+- Frame order is the WAL's write order, which can differ from the live drain's order by up to about a second (the reorder slack between sockets).
+- Decision times are on the replay's pass grid (1 ms by default); the live thread naps 1 ms, or 5 ms after 50 idle passes, so live can decide up to about 5 ms later. --compare shows it.
+- No risk check and no order gates: the risk engine's pre-trade check and the OMS rate, budget and circuit gates are skipped, so an order the runtime would refuse shows as placed and filled.
+- Backup copies: without --backup-history the second copy of a backed-up contract's packet is not dropped; its book quote can overwrite once (the fold already prevents double volume).
+- Cost: fetching a day from the bucket costs data transfer, plus a retrieval fee for frames older than 30 days; the download cap and the printed total bound it.
+- No real decisions: orders come only from the scripted test schedule, never a strategy. This measures candle timing and the worst-case fill model, not any strategy.
+
+To compare with the live day, export its decisions as CSV with:
+  SELECT event, security_id, segment, candle_start, candle_end, decision_ts FROM live_order_events WHERE ts IN '2026-11-18' AND event = 'decision' ORDER BY candle_end, security_id, candle_start, decision_ts
+and pass it with --compare <file>.
+
+Files (sha-256):
+6ce9cf66495624ebcb911f31c5a27ce57f715ed89eff509e50e09bcf9337a043  events.csv
+2238434a92191b1dcb07ff9eb68c14b572983c7a228648bdf13b199f286ff417  decisions.csv
+7392efbd51e7dfa98a524b18d7bb0dddec0e6ed99835072b13f16b64cbb8d6f5  report-2026-11-18.json
+df242ac2d699f1e4ca2d7a6e570ca543e9a7e615bf59b7db312f8b90b384bc99  orders-2026-11-18.csv
+26c29adc4d69fba4ebdb10c32bd992ef5dfebf3ff9f5d08003758efb7781e96e  fill-seconds-2026-11-18.csv
+24bcfdfe70ca34288eae1bea6949d098e1be38374b18178dcde7c40e9f0e83b0  latency-2026-11-18.csv
+241bd0c57356d9c7aca82a8e08a9c4cb454c69c0a217429798b47ab713dbdac0  rejects-2026-11-18.csv

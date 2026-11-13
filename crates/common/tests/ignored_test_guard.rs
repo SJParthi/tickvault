@@ -277,6 +277,18 @@ const ALLOWED_IGNORED: &[(&str, &str)] = &[
         "crates/app/src/subscribe_reconcile.rs",
         "sweep_cost_at_the_authorized_ceiling",
     ),
+    // Added 2026-11-13 with plan item LF-8: times the offline live-fill
+    // replay over a synthetic full day and prints the cost. Same shape as the
+    // harnesses above: a wall-clock figure on a shared CI runner is a flake,
+    // so it is run in release by hand and never gates a merge. The replay's
+    // behaviour is gated by the ordinary tests in the same file and by the
+    // golden day (`live_fill_replay_golden.rs`).
+    //
+    //   cargo test --release -p tickvault-app --lib replay_full_day_cost_harness -- --ignored --nocapture
+    (
+        "crates/app/src/live_fill/replay/replay_tests.rs",
+        "replay_full_day_cost_harness",
+    ),
     (
         "crates/storage/tests/critical_errcode_alarm_coverage_guard.rs",
         "report_critical_paging_coverage",

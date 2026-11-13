@@ -143,3 +143,9 @@ ignored = ["chrono-tz", "clap", "signal-hook"]
 [[bin]]
 name = "tv-guarantees"
 path = "src/bin/tv_guarantees.rs"
+
+# Plan item LF-8 (2026-11-12): the offline live-fill replay. Paper only, never
+# on the live path; see `src/live_fill/replay/mod.rs`.
+[[bin]]
+name = "tv-live-fill-replay"
+path = "src/bin/tv_live_fill_replay.rs"

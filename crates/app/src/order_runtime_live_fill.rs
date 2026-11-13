@@ -35,6 +35,7 @@ use tracing::{error, info};
 
 use super::{BookState, RuntimeCtx, apply_fill, synthesize_paper_fill};
 use crate::live_fill::chain::{PaperCmd, PaperExecution};
+use crate::live_fill::paper_rows::{self, clamp_exit};
 use tickvault_common::error_code::ErrorCode;
 
 /// Receives one command while the arm is armed; pends forever without a
@@ -132,11 +133,9 @@ fn emit(
     let Some(tx) = ctx.live_fill_events.as_ref() else {
         return;
     };
-    let mut row = base.clone();
-    row.ts_ist_nanos = crate::live_fill::wall_ist_ns();
-    row.event = kind;
-    row.seq = *seq;
-    *seq = seq.saturating_add(1);
+    // The row and each step's fields are built by `live_fill::paper_rows`
+    // (plan item LF-8), the same builder the offline replay uses.
+    let mut row = paper_rows::order_row(base, crate::live_fill::wall_ist_ns(), kind, seq);
     fill(&mut row);
     if tx.try_send(row).is_err() {
         metrics::counter!(crate::live_fill::EVENTS_DROPPED_COUNTER).increment(1);
@@ -272,10 +271,7 @@ fn queue_exit_retry(book: &mut BookState, ctx: &RuntimeCtx, r: ExitRetry) {
         &r.x.base,
         LiveOrderEventKind::Reject,
         &mut seq,
-        |row| {
-            row.remainder_qty = Some(r.x.qty.max(0));
-            row.reason = Some(format!("{};{why}", r.last_err));
-        },
+        |row| paper_rows::fill_reject(row, &r.x, format!("{};{why}", r.last_err)),
     );
 }
 
@@ -317,26 +313,8 @@ pub(super) async fn retry_live_fill_exits(
     metrics::counter!(LIVE_FILL_EXIT_RETRIES_COUNTER).increment(sent);
 }
 
-/// An exit sized to the opposite-signed paper position held (`held_lots`,
-/// signed): `None` when nothing is held on the side it would close, else the
-/// execution with its order, fill and row quantities cut to the position.
-/// Cold, one clone per exit.
-fn clamp_exit(held_lots: i32, x: &PaperExecution) -> Option<PaperExecution> {
-    let can_lots = match x.side {
-        Side::Sell if held_lots > 0 => i64::from(held_lots),
-        Side::Buy if held_lots < 0 => i64::from(held_lots).saturating_neg(),
-        _ => 0,
-    };
-    if can_lots == 0 {
-        return None;
-    }
-    let can = can_lots.saturating_mul(i64::from(x.lot_size.max(1)));
-    let mut c = x.clone();
-    c.qty = c.qty.min(can);
-    c.filled_qty = c.filled_qty.min(c.qty);
-    c.base.qty = c.qty;
-    Some(c)
-}
+// The exit clamp (`clamp_exit`) moved to `live_fill::paper_rows` unchanged
+// (plan item LF-8), shared with the offline replay.
 
 async fn execute(
     oms: &mut OrderManagementSystem,
@@ -353,8 +331,7 @@ async fn execute(
     let x = if x.exit {
         let Some(c) = clamp_exit(risk.net_lots_for_in_segment(x.security_id, x.segment), x) else {
             emit(ctx, &x.base, LiveOrderEventKind::Reject, &mut seq, |r| {
-                r.remainder_qty = Some(x.qty.max(0));
-                r.reason = Some("exit_without_position".to_owned());
+                paper_rows::fill_reject(r, x, "exit_without_position".to_owned());
             });
             return Placed::Done;
         };
@@ -365,8 +342,7 @@ async fn execute(
     };
     let reject = |seq: &mut i32, reason: String| {
         emit(ctx, &x.base, LiveOrderEventKind::Reject, seq, |r| {
-            r.remainder_qty = Some(x.qty.max(0));
-            r.reason = Some(reason);
+            paper_rows::fill_reject(r, x, reason);
         });
     };
     if !oms.is_dry_run() {
@@ -441,11 +417,10 @@ async fn execute(
         return Placed::Done;
     }
     emit(ctx, &x.base, LiveOrderEventKind::Sent, &mut seq, |r| {
-        r.order_id = Some(order_id.clone());
-        r.api_rtt_us = Some(rtt_us);
+        paper_rows::fill_sent(r, &order_id, Some(rtt_us));
     });
     emit(ctx, &x.base, LiveOrderEventKind::Ack, &mut seq, |r| {
-        r.order_id = Some(order_id.clone());
+        paper_rows::fill_ack(r, &order_id);
     });
     let segment_code = x.segment.binary_code();
     let mut filled = 0i64;
@@ -459,13 +434,7 @@ async fn execute(
                 apply_fill(risk, book, &fill, ctx.leg_pnl_tx.as_ref());
                 filled = update.traded_qty;
                 emit(ctx, &x.base, LiveOrderEventKind::Fill, &mut seq, |r| {
-                    r.order_id = Some(order_id.clone());
-                    r.fill_qty = Some(filled);
-                    r.fill_price_paise = x.avg_price_paise;
-                    r.avg_price_paise = x.avg_price_paise;
-                    r.remainder_qty = Some(x.qty.saturating_sub(filled));
-                    // The paper fill IS the worst-case model's price.
-                    r.worse_than_model = Some(false);
+                    paper_rows::fill_fill(r, &order_id, x, filled);
                 });
             }
             Ok(None) | Err(_) => {
@@ -475,11 +444,7 @@ async fn execute(
     }
     if filled < x.qty {
         let remainder = x.qty.saturating_sub(filled);
-        let why = if filled == 0 {
-            "no_fill_in_window"
-        } else {
-            "remainder_after_window"
-        };
+        let why = paper_rows::remainder_reason(filled);
         // The OMS cancel runs the order book, budget, rate and circuit gates
         // before its dry-run arm, so several paper orders finishing together
         // can have the cancel refused. The remainder must never stay open (a
@@ -494,9 +459,7 @@ async fn execute(
         };
         match closed {
             Ok(reason) => emit(ctx, &x.base, LiveOrderEventKind::Cancel, &mut seq, |r| {
-                r.order_id = Some(order_id.clone());
-                r.remainder_qty = Some(remainder);
-                r.reason = Some(reason);
+                paper_rows::fill_cancel(r, &order_id, remainder, reason);
             }),
             Err(reason) => {
                 error!(
