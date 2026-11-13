@@ -2057,7 +2057,9 @@ measured 8.2 to 8.7 µs per edge on the x86 dev container (the
 and the woken thread can preempt the drain on a 2-core host. The wake runs
 after the frame's stage timings, so its cost is not counted in the
 `drain_main_frame`, `drain_main_tick` or `receipt_to_fold` stages (PR C
-review, 2026-11-13; the first placement timed it as fold work). Reachability today: none (the tap is armed
+review, 2026-11-13; the first placement timed it as fold work). It IS counted
+in `drain_frame_post` (audit B3, merged the same day), which times the
+drain's work after the fold, so the cost shows there. Reachability today: none (the tap is armed
 only when an approved strategy engine exists).
 `[live_fill] enabled` stays `false` by default.
 
