@@ -1,7 +1,7 @@
 //! Ratchet guard for the B7 coverage-honesty sweep (2026-07-03).
 //!
 //! The executable truth is `quality/crate-coverage-thresholds.toml` — ratcheted
-//! per-crate LINE-coverage floors (app 72.6 … common 99.4; floors only move up,
+//! per-crate LINE-coverage floors (app 86.4 … common 99.4 since 2026-11-13; floors only move up,
 //! 100% is the target), enforced by `scripts/coverage-gate.sh` on every PR inside
 //! All Green and again after merge (corrected 2026-10-11: this said
 //! "post-merge"; `all-green` needs `coverage-and-perf`). The
@@ -47,7 +47,7 @@ fn coverage_claims_in_ci_yml_are_honest() {
 }
 
 /// CLAUDE.md must not claim a 100% minimum for all crates — the enforced
-/// floors are 72.6–99.4 (target 100%).
+/// floors are 86.4–99.4 on the gate figure since 2026-11-13 (target 100%).
 #[test]
 fn claude_md_does_not_claim_100pct_minimum_for_all_crates() {
     let claude_md = read("CLAUDE.md");
@@ -136,9 +136,19 @@ fn groww_e2e_lane_retired_with_live_feed() {
 fn enforced_floors() -> Vec<(String, f64)> {
     let body = read("quality/crate-coverage-thresholds.toml");
     let mut out = Vec::new();
+    // Only `default` (before any table) and the `[crates]` table are gate
+    // floors. B3 (2026-11-13) added a `[production]` table that repeats the
+    // crate names with production-only floors; reading it here would compare
+    // the documents against the wrong number.
+    let mut section = String::new();
     for raw in body.lines() {
         let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') || line.starts_with('[') {
+        if line.starts_with('[') {
+            section = line.to_string();
+            continue;
+        }
+        let gate_floor = section.is_empty() || section == "[crates]";
+        if line.is_empty() || line.starts_with('#') || !gate_floor {
             continue;
         }
         let Some((name, value)) = line.split_once('=') else {
@@ -160,6 +170,166 @@ fn enforced_floors() -> Vec<(String, f64)> {
         out.len()
     );
     out
+}
+
+/// The `[production]` table of `quality/crate-coverage-thresholds.toml`
+/// (production-only floors, B3 2026-11-13), parsed from `body`. Same
+/// hand-rolled scan as [`enforced_floors`], reading only that table.
+fn production_floors_from(body: &str) -> Vec<(String, f64)> {
+    let mut out = Vec::new();
+    let mut in_production = false;
+    for raw in body.lines() {
+        let line = raw.trim();
+        if line.starts_with('[') {
+            in_production = line == "[production]";
+            continue;
+        }
+        if !in_production || line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((name, value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = value.split('#').next().unwrap_or("").trim();
+        if let Ok(parsed) = value.parse::<f64>() {
+            out.push((name.trim().to_string(), parsed));
+        }
+    }
+    out
+}
+
+fn production_floors() -> Vec<(String, f64)> {
+    let out = production_floors_from(&read("quality/crate-coverage-thresholds.toml"));
+    assert!(
+        out.len() >= 8,
+        "production-floor parser found only {} entries in the [production] \
+         table, expected 8 crates. A parser that finds nothing would let the \
+         production-column check pass vacuously.",
+        out.len()
+    );
+    out
+}
+
+/// The production-only floor a coverage-table row claims, or `None`.
+///
+/// B3 review (2026-11-13): CLAUDE.md's floor table has two number columns,
+/// `| **app** | **86.4** | **71.4** |` (gate floor, then production-only
+/// floor). [`floor_claims_on_line`] reads only the FIRST number after a crate
+/// name, so the production column was never compared with anything: a
+/// ratchet of `[production] app` would leave CLAUDE.md's figure stale with
+/// every guard green. This reads the THIRD cell of a pipe-table row whose
+/// first cell is a crate in the `[production]` table and whose second and
+/// third cells are both decimal numbers.
+fn production_column_claim(raw: &str, prod: &[(String, f64)]) -> Option<(String, f64)> {
+    let row = raw.trim_start().trim_start_matches(['>', ' ']);
+    if !row.starts_with('|') {
+        return None;
+    }
+    let cells: Vec<String> = row
+        .split('|')
+        .map(|c| c.replace(['*', '`'], "").trim().to_string())
+        .collect();
+    // `| a | b | c |` splits to ["", a, b, c, ""].
+    let (name, gate, production) = (cells.get(1)?, cells.get(2)?, cells.get(3)?);
+    if !prod.iter().any(|(n, _)| n == name) {
+        return None;
+    }
+    let decimal = |s: &str| s.contains('.').then(|| s.parse::<f64>().ok()).flatten();
+    decimal(gate)?;
+    Some((name.clone(), decimal(production)?))
+}
+
+/// Compares every production-column claim in `body` with `prod`. Returns the
+/// number compared and the mismatches.
+fn production_column_mismatches(
+    doc: &str,
+    body: &str,
+    prod: &[(String, f64)],
+) -> (usize, Vec<String>) {
+    let mut compared = 0usize;
+    let mut wrong = Vec::new();
+    for (lineno, raw) in body.lines().enumerate() {
+        let Some((name, claimed)) = production_column_claim(raw, prod) else {
+            continue;
+        };
+        compared += 1;
+        let floor = prod
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, f)| *f)
+            .unwrap_or_default();
+        if (claimed - floor).abs() > f64::EPSILON {
+            wrong.push(format!(
+                "{doc}:{} claims a production-only floor of `{name} {claimed}` but \
+                 [production] says {floor}",
+                lineno + 1
+            ));
+        }
+    }
+    (compared, wrong)
+}
+
+/// The production-column parser must find the CLAUDE.md row shape, ignore
+/// one-column rows and non-crate rows, and report a planted wrong value.
+#[test]
+fn production_column_parser_self_test() {
+    let prod =
+        production_floors_from("[crates]\napp = 1.0\n[production]\napp = 71.4\ncore = 88.4\n");
+    assert_eq!(
+        prod.len(),
+        2,
+        "only the [production] table is read: {prod:?}"
+    );
+    let claim = |l: &str| production_column_claim(l, &prod);
+
+    assert_eq!(
+        claim("> | **app** | **86.4** | **71.4** |"),
+        Some(("app".into(), 71.4))
+    );
+    assert_eq!(claim("| core | 94.5 | 88.4 |"), Some(("core".into(), 88.4)));
+    // A one-column floor row, a row naming no [production] crate, the
+    // default row and prose are not production claims.
+    assert_eq!(claim("> | common | 99.4 |"), None);
+    assert_eq!(claim("| api | 98.6 | 96.6 |"), None);
+    assert_eq!(
+        claim("| *(any crate not listed)* | *default 63.0* | *(none)* |"),
+        None
+    );
+    assert_eq!(claim("app 86.4 and 71.4"), None);
+    assert_eq!(
+        claim("| Crate | Gate floor | Production-only floor |"),
+        None
+    );
+
+    // Bite: a stale production column is reported; the right one is not.
+    let stale = "> | **app** | **86.4** | **71.4** |\n> | core | 94.5 | 80.0 |\n";
+    let (compared, wrong) = production_column_mismatches("fixture", stale, &prod);
+    assert_eq!(compared, 2);
+    assert_eq!(wrong.len(), 1, "{wrong:?}");
+    assert!(wrong[0].contains("core 80"), "{wrong:?}");
+}
+
+/// Every production-only floor CLAUDE.md quotes must equal the `[production]`
+/// table (B3 review, 2026-11-13).
+#[test]
+fn every_documented_production_floor_matches_the_production_table() {
+    let prod = production_floors();
+    let (compared, wrong) = production_column_mismatches("CLAUDE.md", &read("CLAUDE.md"), &prod);
+    // 8 is the MEASURED count on 2026-11-13: one row per [production] crate
+    // in CLAUDE.md's coverage table. Dropping the column (or a row) fails
+    // here and must be re-measured on purpose.
+    assert!(
+        compared >= 8,
+        "CLAUDE.md production-column scan compared only {compared} rows, \
+         expected 8 (one per [production] crate)"
+    );
+    assert!(
+        wrong.is_empty(),
+        "documented production-only floors have drifted from the [production] \
+         table of quality/crate-coverage-thresholds.toml. Ratcheting a floor \
+         means updating the prose in the SAME PR:\n  {}",
+        wrong.join("\n  ")
+    );
 }
 
 /// Every documented coverage floor must equal the enforced floor.
@@ -502,5 +672,209 @@ fn rule_files_match_coverage_gate_timing() {
          all-green needs coverage-and-perf, so a floor breach blocks merge. \
          Strike each claim and add a dated correction:\n  {}",
         wrong.join("\n  ")
+    );
+}
+
+/// The lines of the two-space-indented job `name` in a workflow, from its
+/// `  name:` line to the next job header. Empty when the job is absent.
+fn workflow_job<'a>(yml: &'a str, name: &str) -> Vec<&'a str> {
+    let header = format!("  {name}:");
+    let mut out = Vec::new();
+    let mut inside = false;
+    for line in yml.lines() {
+        let is_job_header = line.starts_with("  ")
+            && !line.starts_with("   ")
+            && line.trim_end().ends_with(':')
+            && !line.trim_start().starts_with('#');
+        if is_job_header {
+            inside = line.trim_end() == header;
+            if inside {
+                out.push(line);
+            }
+            continue;
+        }
+        if inside {
+            out.push(line);
+        }
+    }
+    out
+}
+
+/// Every problem with the production-coverage gate's wiring in `ci_yml`:
+/// the coverage job missing or allowed to fail, the production step missing,
+/// allowed to fail, or run without the thresholds file (which gates nothing),
+/// or All Green no longer needing the coverage job.
+fn production_gate_wiring_problems(ci_yml: &str) -> Vec<String> {
+    let mut problems = Vec::new();
+    let job = workflow_job(ci_yml, "coverage-and-perf");
+    if job.is_empty() {
+        problems.push("ci.yml has no coverage-and-perf job".to_string());
+        return problems;
+    }
+    let step_start = job
+        .iter()
+        .position(|l| l.trim() == "- name: Enforce production-only coverage floors");
+    let Some(step_start) = step_start else {
+        problems.push(
+            "coverage-and-perf has no 'Enforce production-only coverage floors' step".to_string(),
+        );
+        return problems;
+    };
+    let step_indent = job[step_start].len() - job[step_start].trim_start().len();
+    let mut step: Vec<&str> = vec![job[step_start]];
+    for line in &job[step_start + 1..] {
+        let indent = line.len() - line.trim_start().len();
+        if !line.trim().is_empty() && indent <= step_indent {
+            break;
+        }
+        step.push(line);
+    }
+    if step
+        .iter()
+        .any(|l| l.trim_start().starts_with("continue-on-error"))
+    {
+        problems.push("the production-coverage step has continue-on-error".to_string());
+    }
+    // B3 review (2026-11-13): a step `if:` other than `always()` can skip the
+    // step on PRs (or always), and a skipped step leaves the job green.
+    if let Some(cond) = step.iter().find_map(|l| l.trim_start().strip_prefix("if:"))
+        && cond.trim() != "always()"
+    {
+        problems.push(format!(
+            "the production-coverage step has `if: {}`; only `always()` (or no `if:`) \
+             keeps it running on every PR",
+            cond.trim()
+        ));
+    }
+    let run = step.iter().find(|l| l.trim_start().starts_with("run:"));
+    match run {
+        None => problems.push("the production-coverage step has no run line".to_string()),
+        Some(run) => {
+            if !run.contains("crates/common/src/bin/coverage_prod_report.rs") {
+                problems.push(
+                    "the production-coverage step does not build coverage_prod_report".to_string(),
+                );
+            }
+            if !run.contains("coverage.json quality/crate-coverage-thresholds.toml") {
+                problems.push(
+                    "the production-coverage step does not pass the thresholds file as the \
+                     second argument, so it gates nothing"
+                        .to_string(),
+                );
+            }
+            // B3 review (2026-11-13): `|| true`, `; true`, `& ...` or a pipe
+            // after the report would swallow its exit status. The run line
+            // must END with the thresholds argument of the report call.
+            let tail = run
+                .rfind("coverage-prod-report ")
+                .map_or("", |at| &run[at..]);
+            if tail.contains(['|', ';', '&'])
+                || !run
+                    .trim_end()
+                    .ends_with("coverage.json quality/crate-coverage-thresholds.toml")
+            {
+                problems.push(
+                    "the production-coverage run line does not end with the thresholds \
+                     argument, or has `||`, `;`, `&` or `|` after the report call, which \
+                     can hide its exit status"
+                        .to_string(),
+                );
+            }
+        }
+    }
+    // A job-level continue-on-error (before the first step) also turns it off.
+    let steps_at = job
+        .iter()
+        .position(|l| l.trim() == "steps:")
+        .unwrap_or(job.len());
+    if job[..steps_at]
+        .iter()
+        .any(|l| l.trim_start().starts_with("continue-on-error"))
+    {
+        problems.push("the coverage-and-perf job has continue-on-error".to_string());
+    }
+    let all_green = workflow_job(ci_yml, "all-green");
+    if !all_green.iter().any(|l| l.trim() == "- coverage-and-perf") {
+        problems.push("all-green no longer needs coverage-and-perf".to_string());
+    }
+    problems
+}
+
+/// B3 review (2026-11-13): the `[production]` floors are enforced only by one
+/// ci.yml step, and `coverage_prod_report` gates nothing without its second
+/// argument. Putting back `continue-on-error`, dropping the thresholds path
+/// or taking the job out of All Green must fail here, not pass silently.
+#[test]
+fn production_coverage_gate_step_is_wired_and_cannot_fail_open() {
+    let ci = read(".github/workflows/ci.yml");
+    let problems = production_gate_wiring_problems(&ci);
+    assert!(problems.is_empty(), "B3: {problems:#?}");
+}
+
+#[test]
+fn production_gate_wiring_checker_bites_on_each_way_to_turn_it_off() {
+    let ci = read(".github/workflows/ci.yml");
+    assert!(production_gate_wiring_problems(&ci).is_empty());
+
+    let step = "      - name: Enforce production-only coverage floors\n";
+    assert!(ci.contains(step), "the step header is where the plants go");
+    let allowed = ci.replacen(step, &format!("{step}        continue-on-error: true\n"), 1);
+    assert!(
+        production_gate_wiring_problems(&allowed)
+            .iter()
+            .any(|p| p.contains("continue-on-error"))
+    );
+    let no_thresholds = ci.replacen(
+        "coverage.json quality/crate-coverage-thresholds.toml",
+        "coverage.json",
+        1,
+    );
+    assert!(
+        production_gate_wiring_problems(&no_thresholds)
+            .iter()
+            .any(|p| p.contains("gates nothing"))
+    );
+    // B3 review (2026-11-13): three more ways to turn it off with both run
+    // strings still present.
+    let thresholds = "coverage.json quality/crate-coverage-thresholds.toml";
+    for swallow in [" || true", "; true", " | cat", " & wait"] {
+        let swallowed = ci.replacen(thresholds, &format!("{thresholds}{swallow}"), 1);
+        assert_ne!(swallowed, ci);
+        assert!(
+            production_gate_wiring_problems(&swallowed)
+                .iter()
+                .any(|p| p.contains("hide its exit status")),
+            "`{swallow}` after the report must be flagged"
+        );
+    }
+    for skip in ["github.event_name == 'push'", "false"] {
+        let skipped = ci.replacen(
+            &format!("{step}        if: always()\n"),
+            &format!("{step}        if: {skip}\n"),
+            1,
+        );
+        assert_ne!(
+            skipped, ci,
+            "the step's `if: always()` is where the plant goes"
+        );
+        assert!(
+            production_gate_wiring_problems(&skipped)
+                .iter()
+                .any(|p| p.contains("only `always()`")),
+            "`if: {skip}` must be flagged"
+        );
+    }
+    let not_needed = ci.replacen("      - coverage-and-perf\n", "", 1);
+    assert_ne!(not_needed, ci);
+    assert!(
+        production_gate_wiring_problems(&not_needed)
+            .iter()
+            .any(|p| p.contains("all-green"))
+    );
+    let renamed = ci.replacen(step, "      - name: Something else\n", 1);
+    assert!(
+        production_gate_wiring_problems(&renamed)
+            .iter()
+            .any(|p| p.contains("has no 'Enforce"))
     );
 }

@@ -36,18 +36,21 @@
 //!
 //! ## 2. Boot crash-gap row
 //!
-//! At boot, inside the session (09:15 to 15:40 IST) on a trading day, the
+//! At boot, inside the session (09:15 to 15:40 IST on a trading day, or the
+//! published Muhurat window on a Muhurat date, see [`session_window_nanos`]), the
 //! downtime since the previous process's last WAL receipt is written as one
 //! `feed_gap_audit` row: `reason = process_down`, `ws_type = main_feed`,
 //! `connection_index = -1` (the whole process, never a socket slot). The
 //! table's DEDUP key is unchanged. Outside the window, with no previous
 //! frame, or with a gap at or under five seconds, nothing is written. A
-//! previous frame from before today's 09:15 open starts the gap at the open.
+//! previous frame from before the day's session open starts the gap at the
+//! open.
 //!
 //! ## Where it runs
 //!
 //! Its own tokio task, never the frame drain. Market-hours aware: the daily
-//! check sleeps until 15:45 IST on a trading day and skips the day when the
+//! check sleeps until 15:45 IST on a session day (a trading day or a Muhurat
+//! date, `TradingCalendar::is_session_day`) and skips the day when the
 //! process starts at or after it.
 //!
 //! ## Honest limits
@@ -61,6 +64,11 @@
 //!   mismatch.
 //! - The session close is 15:40 IST since the 2026-08-03 NSE change, so the
 //!   crash-gap window is 09:15 to 15:40, not 15:30.
+//! - A Muhurat date's check also runs at 15:45 IST. That fits the 2026
+//!   session (14:05 to 15:40); a session that ended after 15:40 would be
+//!   checked before its end (the `ticks` persist window closes at 15:40
+//!   anyway). A Muhurat date with no published times gets the daily row but
+//!   no downtime row, and its coverage reads against 09:00 like any day.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -217,27 +225,47 @@ pub fn tick_count_sql(table: &str, day: NaiveDate) -> String {
     )
 }
 
+/// The session NSE holds on `day`, as IST nanos of day `(open, close)`,
+/// close exclusive, or `None` when there is none. A regular trading day is
+/// 09:15 to 15:40. A calendar-listed Muhurat session (operator Quote 49,
+/// 2026-10-30: a Muhurat session is a session day; it can fall on a weekend
+/// or a weekday holiday) is its own published window from
+/// `config/base.toml`. A Muhurat date whose times are not published yet, an
+/// ordinary weekend and a holiday are `None`. Pure, O(1).
+#[must_use]
+pub fn session_window_nanos(calendar: &TradingCalendar, day: NaiveDate) -> Option<(i64, i64)> {
+    if calendar.is_trading_day(day) {
+        return Some((MARKET_OPEN_IST_NANOS, MARKET_CLOSE_IST_NANOS));
+    }
+    calendar.muhurat_session_secs(day).map(|(open, close)| {
+        (
+            i64::from(open) * NANOS_PER_SEC,
+            i64::from(close) * NANOS_PER_SEC,
+        )
+    })
+}
+
 /// The `feed_gap_audit` row for the downtime before this boot, or `None`
-/// (see the module header). Inputs are UTC epoch nanos. Pure.
+/// (see the module header). Times are UTC epoch nanos; `session` is the
+/// day's session from [`session_window_nanos`] (`None` on a day with no
+/// session). Pure.
 #[must_use]
 pub fn process_down_gap_row(
     previous_receipt_utc_nanos: Option<i64>,
     now_utc_nanos: i64,
-    is_trading_day: bool,
+    session: Option<(i64, i64)>,
 ) -> Option<FeedGapRow> {
-    if !is_trading_day {
-        return None;
-    }
+    let (open, close) = session?;
     let previous = previous_receipt_utc_nanos?;
     let now_ist = now_utc_nanos.saturating_add(IST_UTC_OFFSET_NANOS);
     let day_start = now_ist - now_ist.rem_euclid(NANOS_PER_DAY);
     let now_of_day = now_ist - day_start;
-    if !(MARKET_OPEN_IST_NANOS..MARKET_CLOSE_IST_NANOS).contains(&now_of_day) {
+    if !(open..close).contains(&now_of_day) {
         return None;
     }
     let start = previous
         .saturating_add(IST_UTC_OFFSET_NANOS)
-        .max(day_start + MARKET_OPEN_IST_NANOS);
+        .max(day_start + open);
     if now_ist.saturating_sub(start) <= PROCESS_DOWN_MIN_GAP_NANOS {
         return None;
     }
@@ -255,7 +283,13 @@ pub fn process_down_gap_row(
     })
 }
 
-fn now_utc_nanos() -> i64 {
+/// The wall clock, UTC epoch nanos. Named `wall_now_...` on purpose (B3
+/// review, 2026-11-13): the clocked task's functions take their clock as a
+/// parameter named `now_utc_nanos`. If this function had that name too, a
+/// refactor that dropped the parameter would still compile, the call would
+/// bind here, and the task would read the wall clock again with every test
+/// still green. With distinct names, a dropped parameter fails to compile.
+fn wall_now_utc_nanos() -> i64 {
     chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
 }
 
@@ -268,18 +302,57 @@ fn secs_of_day(ist_nanos: i64) -> u32 {
     u32::try_from(ist_nanos.rem_euclid(NANOS_PER_DAY) / NANOS_PER_SEC).unwrap_or(0)
 }
 
-/// Spawns the boot crash-gap write and the daily check on their own task.
-/// Returns the task handle.
-// TEST-EXEMPT: tokio::spawn wrapper over the unit-tested pure parts (classify, process_covers_day, secs_until_check, process_down_gap_row, tick_count_sql); spawn site pinned by test_main_wires_spawn_tick_conservation.
+/// Spawns the boot crash-gap write and the daily check on their own task,
+/// reading the wall clock. Returns the task handle.
+// TEST-EXEMPT: tokio::spawn wrapper over the unit-tested pure parts (classify, process_covers_day, secs_until_check, process_down_gap_row, tick_count_sql); spawn site pinned by test_main_wires_spawn_tick_conservation; the task body is driven end to end through spawn_tick_conservation_with_clock in tests/cov_xvs_tick_conservation_spawn.rs.
 pub fn spawn_tick_conservation(
     questdb: QuestDbConfig,
     calendar: Arc<TradingCalendar>,
     process_start_ist_nanos: i64,
     previous_receipt_utc_nanos: Option<i64>,
 ) -> tokio::task::JoinHandle<()> {
+    spawn_tick_conservation_with_clock(
+        questdb,
+        calendar,
+        process_start_ist_nanos,
+        previous_receipt_utc_nanos,
+        wall_now_utc_nanos,
+    )
+}
+
+/// [`spawn_tick_conservation`] with the clock passed in: `now_utc_nanos`
+/// returns the current UTC epoch nanos and is read at every point the task
+/// reads the time (the downtime decision, each day's check decision, the
+/// sleep to the next IST midnight, and the row's `checked_at`). Production
+/// passes the wall clock; a test passes a clock that starts at a chosen
+/// instant and moves with tokio's paused clock, so every branch (in
+/// session, after the check time, a weekend, across IST midnight) runs on
+/// every test run instead of only when CI happens to start at that hour.
+/// That the midnight sleep reads this clock (not the wall) is pinned by a
+/// source scan, `test_run_daily_checks_loop_reads_only_the_injected_clock`,
+/// because the spawn harness alone catches a wall read there only at some
+/// hours.
+/// The sleeps are tokio sleeps either way. O(1) per call.
+// TEST-EXEMPT: tokio::spawn wrapper; driven end to end with a fixed clock by tests/cov_xvs_tick_conservation_spawn.rs (in session, after the check, weekend, IST midnight).
+pub fn spawn_tick_conservation_with_clock<C>(
+    questdb: QuestDbConfig,
+    calendar: Arc<TradingCalendar>,
+    process_start_ist_nanos: i64,
+    previous_receipt_utc_nanos: Option<i64>,
+    now_utc_nanos: C,
+) -> tokio::task::JoinHandle<()>
+where
+    C: Fn() -> i64 + Send + Sync + 'static,
+{
     tokio::spawn(async move {
-        write_process_down_row(&questdb, &calendar, previous_receipt_utc_nanos).await;
-        run_daily_checks(&questdb, &calendar, process_start_ist_nanos).await;
+        write_process_down_row(
+            &questdb,
+            &calendar,
+            previous_receipt_utc_nanos,
+            &now_utc_nanos,
+        )
+        .await;
+        run_daily_checks(&questdb, &calendar, process_start_ist_nanos, &now_utc_nanos).await;
     })
 }
 
@@ -287,14 +360,15 @@ async fn write_process_down_row(
     questdb: &QuestDbConfig,
     calendar: &TradingCalendar,
     previous_receipt_utc_nanos: Option<i64>,
+    now_utc_nanos: &impl Fn() -> i64,
 ) {
     use tickvault_storage::feed_gap_audit_persistence::{
         FeedGapAuditWriter, ensure_feed_gap_audit_table,
     };
     let now = now_utc_nanos();
     let today = ist_date_of(now.saturating_add(IST_UTC_OFFSET_NANOS));
-    let trading = today.is_some_and(|d| calendar.is_trading_day(d));
-    let Some(row) = process_down_gap_row(previous_receipt_utc_nanos, now, trading) else {
+    let session = today.and_then(|d| session_window_nanos(calendar, d));
+    let Some(row) = process_down_gap_row(previous_receipt_utc_nanos, now, session) else {
         return;
     };
     ensure_feed_gap_audit_table(questdb).await;
@@ -322,18 +396,29 @@ async fn run_daily_checks(
     questdb: &QuestDbConfig,
     calendar: &TradingCalendar,
     process_start_ist_nanos: i64,
+    now_utc_nanos: &impl Fn() -> i64,
 ) {
     use tickvault_storage::tick_conservation_audit_persistence::ensure_tick_conservation_audit_table;
     ensure_tick_conservation_audit_table(questdb).await;
     loop {
         let now_ist = now_utc_nanos().saturating_add(IST_UTC_OFFSET_NANOS);
         let today = ist_date_of(now_ist);
-        let trading = today.is_some_and(|d| calendar.is_trading_day(d));
+        // A session day, Muhurat included (operator Quote 49): before B3
+        // this read `is_trading_day`, so a Muhurat session on a weekend or a
+        // holiday, whose ticks the ledger counts, got no row at all.
+        let session_day = today.is_some_and(|d| calendar.is_session_day(d));
         if let (true, Some(day), Some(wait)) =
-            (trading, today, secs_until_check(secs_of_day(now_ist)))
+            (session_day, today, secs_until_check(secs_of_day(now_ist)))
         {
             tokio::time::sleep(Duration::from_secs(wait)).await;
-            run_one_check(questdb, day, now_ist, process_start_ist_nanos).await;
+            run_one_check(
+                questdb,
+                day,
+                now_ist,
+                process_start_ist_nanos,
+                now_utc_nanos,
+            )
+            .await;
         }
         // Sleep to just past the next IST midnight (a multi-day process).
         let now_ist = now_utc_nanos().saturating_add(IST_UTC_OFFSET_NANOS);
@@ -377,6 +462,7 @@ async fn run_one_check(
     day: NaiveDate,
     day_ist_nanos: i64,
     process_start_ist_nanos: i64,
+    now_utc_nanos: &impl Fn() -> i64,
 ) {
     let ledger = tickvault_storage::tick_conservation_ledger::ledger();
     let ledger_day = TickConservationLedger::ist_day_of(day_ist_nanos);
@@ -478,6 +564,92 @@ mod tests {
 
     fn at(secs_of_day: i64) -> i64 {
         DAY + secs_of_day * NANOS_PER_SEC
+    }
+
+    /// The regular session, 09:15 to 15:40 IST.
+    const REGULAR: Option<(i64, i64)> = Some((MARKET_OPEN_IST_NANOS, MARKET_CLOSE_IST_NANOS));
+
+    /// A calendar with one Muhurat Sunday (2026-11-08, 14:05 to 15:40, the
+    /// session `config/base.toml` carries), one Muhurat date with no
+    /// published times (2026-11-15) and one weekday holiday (2026-11-09).
+    fn muhurat_calendar() -> TradingCalendar {
+        use tickvault_common::config::{MuhuratTradingEntry, NseHolidayEntry, TradingConfig};
+        let cfg = TradingConfig {
+            market_open_time: "09:15:00".to_owned(),
+            market_close_time: "15:30:00".to_owned(),
+            order_cutoff_time: "15:29:00".to_owned(),
+            data_collection_start: "09:00:00".to_owned(),
+            data_collection_end: "16:00:00".to_owned(),
+            timezone: "Asia/Kolkata".to_owned(),
+            max_orders_per_second: 10,
+            nse_holidays: vec![NseHolidayEntry {
+                date: "2026-11-09".to_owned(),
+                name: "a weekday holiday".to_owned(),
+            }],
+            muhurat_trading_dates: vec![
+                MuhuratTradingEntry {
+                    date: "2026-11-08".to_owned(),
+                    name: "Muhurat".to_owned(),
+                    session_start_ist: "14:05".to_owned(),
+                    session_end_ist: "15:40".to_owned(),
+                },
+                MuhuratTradingEntry {
+                    date: "2026-11-15".to_owned(),
+                    name: "Muhurat, times not published".to_owned(),
+                    session_start_ist: String::new(),
+                    session_end_ist: String::new(),
+                },
+            ],
+            nse_mock_trading_dates: Vec::new(),
+        };
+        TradingCalendar::from_config(&cfg).expect("calendar builds")
+    }
+
+    /// Regression: 2026-11-13 (B3 review). The downtime row was gated on
+    /// `is_trading_day`, which is false for a Muhurat session on a weekend,
+    /// and used the fixed 09:15 to 15:40 window. A Muhurat date now reads
+    /// its own published window; a holiday and an unpublished Muhurat read
+    /// no session.
+    #[test]
+    fn test_session_window_nanos_reads_the_muhurat_window() {
+        let cal = muhurat_calendar();
+        let d = |y, m, dd| NaiveDate::from_ymd_opt(y, m, dd).expect("date");
+        assert_eq!(session_window_nanos(&cal, d(2026, 11, 10)), REGULAR);
+        assert_eq!(
+            session_window_nanos(&cal, d(2026, 11, 8)),
+            Some((
+                (14 * 3600 + 5 * 60) * NANOS_PER_SEC,
+                (15 * 3600 + 40 * 60) * NANOS_PER_SEC
+            )),
+            "the Muhurat Sunday reads its published window"
+        );
+        assert_eq!(session_window_nanos(&cal, d(2026, 11, 9)), None, "holiday");
+        assert_eq!(
+            session_window_nanos(&cal, d(2026, 11, 14)),
+            None,
+            "Saturday"
+        );
+        assert_eq!(
+            session_window_nanos(&cal, d(2026, 11, 15)),
+            None,
+            "a Muhurat date with no published times has no window"
+        );
+    }
+
+    /// The Muhurat window decides the downtime row: a restart at 15:00 after
+    /// a frame at 13:00 starts the gap at the 14:05 open (3,300 s), never at
+    /// 09:15, and a restart before 14:05 writes nothing.
+    #[test]
+    fn test_process_down_gap_row_uses_the_muhurat_window() {
+        let muhurat = Some((
+            (14 * 3600 + 5 * 60) * NANOS_PER_SEC,
+            (15 * 3600 + 40 * 60) * NANOS_PER_SEC,
+        ));
+        let prev = Some(utc(at(13 * 3600)));
+        let row = process_down_gap_row(prev, utc(at(15 * 3600)), muhurat).expect("row");
+        assert_eq!(row.gap_start_ist_nanos, at(14 * 3600 + 5 * 60));
+        assert_eq!(row.down_secs(), 3_300);
+        assert!(process_down_gap_row(prev, utc(at(11 * 3600)), muhurat).is_none());
     }
 
     fn inputs(accepted: u64, not_landed: u64, db: Option<u64>) -> ConservationInputs {
@@ -637,7 +809,7 @@ mod tests {
     fn test_process_down_gap_row_inside_the_session() {
         let prev = utc(at(10 * 3600));
         let now = utc(at(10 * 3600 + 120));
-        let row = process_down_gap_row(Some(prev), now, true).expect("row");
+        let row = process_down_gap_row(Some(prev), now, REGULAR).expect("row");
         assert_eq!(row.gap_start_ist_nanos, at(10 * 3600));
         assert_eq!(row.gap_end_ist_nanos, at(10 * 3600 + 120));
         assert_eq!(row.down_secs(), 120);
@@ -652,7 +824,7 @@ mod tests {
     fn test_process_down_gap_row_starts_at_the_open_for_an_older_frame() {
         let prev = utc(at(15 * 3600 + 40 * 60) - NANOS_PER_DAY); // yesterday's close
         let now = utc(at(9 * 3600 + 20 * 60));
-        let row = process_down_gap_row(Some(prev), now, true).expect("row");
+        let row = process_down_gap_row(Some(prev), now, REGULAR).expect("row");
         assert_eq!(row.gap_start_ist_nanos, at(9 * 3600 + 15 * 60));
         assert_eq!(row.down_secs(), 300);
     }
@@ -661,21 +833,21 @@ mod tests {
     fn test_process_down_gap_row_none_outside_the_window_or_without_a_frame() {
         let prev = Some(utc(at(10 * 3600)));
         // Before 09:15, at 15:40 (exclusive close), and after.
-        assert!(process_down_gap_row(prev, utc(at(9 * 3600 + 14 * 60)), true).is_none());
-        assert!(process_down_gap_row(prev, utc(at(56_400)), true).is_none());
-        assert!(process_down_gap_row(prev, utc(at(20 * 3600)), true).is_none());
+        assert!(process_down_gap_row(prev, utc(at(9 * 3600 + 14 * 60)), REGULAR).is_none());
+        assert!(process_down_gap_row(prev, utc(at(56_400)), REGULAR).is_none());
+        assert!(process_down_gap_row(prev, utc(at(20 * 3600)), REGULAR).is_none());
         // No previous frame.
-        assert!(process_down_gap_row(None, utc(at(11 * 3600)), true).is_none());
+        assert!(process_down_gap_row(None, utc(at(11 * 3600)), REGULAR).is_none());
         // Holiday.
-        assert!(process_down_gap_row(prev, utc(at(11 * 3600)), false).is_none());
+        assert!(process_down_gap_row(prev, utc(at(11 * 3600)), None).is_none());
     }
 
     #[test]
     fn test_process_down_gap_row_none_for_a_short_or_negative_gap() {
         let now = utc(at(11 * 3600));
-        assert!(process_down_gap_row(Some(now - 5 * NANOS_PER_SEC), now, true).is_none());
-        assert!(process_down_gap_row(Some(now + NANOS_PER_SEC), now, true).is_none());
-        assert!(process_down_gap_row(Some(now - 6 * NANOS_PER_SEC), now, true).is_some());
+        assert!(process_down_gap_row(Some(now - 5 * NANOS_PER_SEC), now, REGULAR).is_none());
+        assert!(process_down_gap_row(Some(now + NANOS_PER_SEC), now, REGULAR).is_none());
+        assert!(process_down_gap_row(Some(now - 6 * NANOS_PER_SEC), now, REGULAR).is_some());
     }
 
     #[test]
@@ -692,5 +864,88 @@ mod tests {
             .expect("probe");
         let writer = prod.find("WsFrameSpill::new_with_guard(").expect("writer");
         assert!(lock < probe && probe < writer);
+    }
+
+    /// B3 review (2026-11-13): production must keep reading the WALL clock.
+    /// `spawn_tick_conservation_with_clock` exists so tests can pass a fixed
+    /// one; the production spawn passes `wall_now_utc_nanos` (chrono's UTC now)
+    /// and nothing else.
+    #[test]
+    fn test_spawn_tick_conservation_with_clock_gets_the_wall_clock_in_production() {
+        let me = include_str!("tick_conservation.rs");
+        let prod = me.split("\n#[cfg(test)]").next().unwrap_or(me);
+        let outer = prod
+            .find("pub fn spawn_tick_conservation(")
+            .expect("production spawn");
+        let inner = prod
+            .find("pub fn spawn_tick_conservation_with_clock<")
+            .expect("clock spawn");
+        let body = &prod[outer..inner];
+        assert!(body.contains("spawn_tick_conservation_with_clock("));
+        assert!(body.contains("wall_now_utc_nanos,"));
+        assert!(prod.contains("chrono::Utc::now().timestamp_nanos_opt()"));
+        assert!(wall_now_utc_nanos() > 1_700_000_000_000_000_000);
+        // The wall-clock fn must not share the clock parameter's name, or a
+        // dropped parameter would still compile and read the wall clock.
+        assert!(
+            !prod.contains("fn now_utc_nanos("),
+            "the wall-clock fn is named wall_now_utc_nanos, never now_utc_nanos"
+        );
+    }
+
+    /// B3 review round 3 (2026-11-13): the midnight-rollover sleep in
+    /// `run_daily_checks` is the one clock read the spawn harness checks
+    /// only through which day's row appears, and that depends on the hour CI
+    /// runs (a wall read there passes whenever the wall time is past about
+    /// 08:15 IST). So the loop body is pinned line by line here, and no
+    /// clocked function may read the wall clock directly.
+    #[test]
+    fn test_run_daily_checks_loop_reads_only_the_injected_clock() {
+        let me = include_str!("tick_conservation.rs");
+        let prod = me.split("\n#[cfg(test)]").next().unwrap_or(me);
+        let body_of = |start: &str, end: &str| -> &str {
+            let from = prod.find(start).expect("fn start");
+            let to = from + prod[from..].find(end).expect("next fn");
+            &prod[from..to]
+        };
+        let daily = body_of("async fn run_daily_checks(", "async fn read_tick_count(");
+        let steps = [
+            "loop {",
+            "let now_ist = now_utc_nanos().saturating_add(IST_UTC_OFFSET_NANOS);",
+            "let today = ist_date_of(now_ist);",
+            "tokio::time::sleep(Duration::from_secs(wait)).await;",
+            "run_one_check(",
+            "let now_ist = now_utc_nanos().saturating_add(IST_UTC_OFFSET_NANOS);",
+            "let to_midnight = NANOS_PER_DAY - now_ist.rem_euclid(NANOS_PER_DAY);",
+            "tokio::time::sleep(Duration::from_secs(secs)).await;",
+        ];
+        let mut at = 0;
+        for step in steps {
+            let found = daily[at..].find(step);
+            assert!(found.is_some(), "loop step missing or out of order: {step}");
+            at += found.unwrap_or_default() + step.len();
+        }
+        assert_eq!(daily.matches("now_utc_nanos()").count(), 2);
+        for (name, body) in [
+            ("run_daily_checks", daily),
+            (
+                "write_process_down_row",
+                body_of(
+                    "async fn write_process_down_row(",
+                    "async fn run_daily_checks(",
+                ),
+            ),
+            (
+                "run_one_check",
+                body_of("async fn run_one_check(", "fn report("),
+            ),
+        ] {
+            for wall in ["Utc::now", "wall_now_utc_nanos", "SystemTime", "Local::now"] {
+                assert!(
+                    !body.contains(wall),
+                    "{name} must read only the injected clock, found `{wall}`"
+                );
+            }
+        }
     }
 }

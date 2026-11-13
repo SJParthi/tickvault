@@ -69,9 +69,13 @@ const PINNED_CRATE_FLOORS: &[(&str, f64)] = &[
     // current measured value. Editing this pin in the same PR IS the visible
     // review this test exists to force. Up-only resumes from here.
     ("common", 99.4),
-    ("core", 91.6),
-    ("trading", 96.9),
-    ("storage", 90.1),
+    // B3 (2026-11-13): core, trading, storage, app, aws-lambdas and
+    // tickvault-logs-mcp raised to the minimum gate figure of four green main
+    // CI runs (43319207393, 43255665898, 43124168055, 43070508690), rounded
+    // down to one decimal, minus 0.3. Figures in the TOML header.
+    ("core", 94.5),
+    ("trading", 97.1),
+    ("storage", 93.7),
     ("api", 98.6),
     // app pin 68.3 -> 72.6 (2026-09-06): up-only ratchet from TWO independent
     // CI Coverage & Perf measurements on different trees — main @ e1a1584cd
@@ -80,10 +84,11 @@ const PINNED_CRATE_FLOORS: &[(&str, f64)] = &[
     // 0.12, matching what the 2026-07-20 app ratchet actually did and what the
     // `common` correction above argues for. Editing this pin in the same PR IS
     // the visible review this test exists to force. Rationale in the TOML.
-    ("app", 72.6),
-    ("aws-lambdas", 81.1),
+    // B3 (2026-11-13): 72.6 -> 86.4 (min 86.77 over the four runs above).
+    ("app", 86.4),
+    ("aws-lambdas", 90.5),
     // 2026-07-20: 80.0 -> 87.3 - the ratchet promised above (first CI Coverage & Perf measurement 87.64 on runs 29739772946 + 29745302463; PR #1694).
-    ("tickvault-logs-mcp", 87.3),
+    ("tickvault-logs-mcp", 92.0),
 ];
 
 fn read_thresholds_toml() -> String {
@@ -259,4 +264,233 @@ fn coverage_lockdown_pinned_floors_are_sane() {
              ({PINNED_DEFAULT_FLOOR}) — pins must not under-cut the default"
         );
     }
+}
+
+/// B3 (2026-11-13): production-only floors (the `[production]` table, read
+/// and enforced by `coverage_prod_report` in the Coverage & Perf job). Same
+/// up-only rule as `PINNED_CRATE_FLOORS`: the four-run minimum of the
+/// production-only figure, rounded down to one decimal, minus 0.3.
+const PINNED_PRODUCTION_FLOORS: &[(&str, f64)] = &[
+    ("api", 96.6),
+    ("app", 71.4),
+    ("aws-lambdas", 77.8),
+    ("common", 99.2),
+    ("core", 88.4),
+    ("storage", 87.8),
+    ("tickvault-logs-mcp", 88.1),
+    ("trading", 94.9),
+];
+
+/// Every problem with the `[production]` table of `content`: a missing or
+/// empty table, an unparseable line, a crate written twice (quotes trimmed,
+/// so `app` and `"app"` are one crate), a crate with no pin, a lost pin, or
+/// a floor below its pin. Every `[production]` line is checked, in every
+/// `[production]` header the file carries.
+///
+/// B3 review (2026-11-13): the first version read only the FIRST line for
+/// each pinned crate, while `coverage_prod_report` kept the LAST, so a
+/// second `app = 1.0` under the pinned line lowered the gate to 1% with this
+/// test still green.
+fn production_floor_violations(content: &str) -> Vec<String> {
+    let mut problems = Vec::new();
+    let mut in_production = false;
+    let mut found: Vec<(String, f64)> = Vec::new();
+    for line in canonical_lines(content) {
+        if line.starts_with('[') {
+            in_production = line == "[production]";
+            continue;
+        }
+        if !in_production {
+            continue;
+        }
+        let Some((name, value)) = parse_threshold_line(&line) else {
+            problems.push(format!("unparseable [production] line: {line}"));
+            continue;
+        };
+        let name = name.trim_matches('"').to_string();
+        if found.iter().any(|(n, _)| *n == name) {
+            problems.push(format!(
+                "[production] writes `{name}` twice; the report tool would gate the last line"
+            ));
+            continue;
+        }
+        found.push((name, value));
+    }
+    if found.is_empty() {
+        problems.push(
+            "the [production] table is missing or empty, so production-only coverage is no \
+             longer floored"
+                .to_string(),
+        );
+        return problems;
+    }
+    for (name, value) in &found {
+        if !PINNED_PRODUCTION_FLOORS.iter().any(|(p, _)| p == name) {
+            problems.push(format!(
+                "[production] `{name}` has no pin in PINNED_PRODUCTION_FLOORS"
+            ));
+        }
+        if !value.is_finite() {
+            problems.push(format!("[production] `{name}` = {value} is not a number"));
+        }
+    }
+    for (name, floor) in PINNED_PRODUCTION_FLOORS {
+        match found.iter().find(|(n, _)| n == name) {
+            None => problems.push(format!("[production] lost the {name} floor")),
+            Some((_, value)) if *value < *floor => problems.push(format!(
+                "[production] {name} = {value} is BELOW the pinned {floor}; floors only move up"
+            )),
+            Some(_) => {}
+        }
+    }
+    problems
+}
+
+/// Regression (B3): the gate counted test code inside src as covered and
+/// nothing floored production coverage. The `[production]` table must exist,
+/// list every pinned crate once, and keep each at or above its pin, so
+/// deleting the table (which turns the second check off) fails here.
+#[test]
+fn coverage_lockdown_production_floors_present_and_at_or_above_pins() {
+    let content = read_thresholds_toml();
+    let problems = production_floor_violations(&content);
+    assert!(problems.is_empty(), "B3: {problems:#?}");
+}
+
+#[test]
+fn production_floor_checker_refuses_duplicates_unpinned_and_lowered_floors() {
+    let real = read_thresholds_toml();
+    assert!(production_floor_violations(&real).is_empty());
+
+    let insert_after_app =
+        |extra: &str| real.replacen("app = 71.4\n", &format!("app = 71.4\n{extra}\n"), 1);
+    for planted in ["app = 1.0", "\"app\" = 1.0", "app = 99.0"] {
+        let text = insert_after_app(planted);
+        assert_ne!(text, real, "the plant must land in the real file");
+        let problems = production_floor_violations(&text);
+        assert!(
+            problems.iter().any(|p| p.contains("twice")),
+            "{planted:?} -> {problems:?}"
+        );
+    }
+    let second_table = format!("{real}\n[production]\napp = 1.0\n");
+    assert!(
+        production_floor_violations(&second_table)
+            .iter()
+            .any(|p| p.contains("twice"))
+    );
+    let unpinned = insert_after_app("ghost = 1.0");
+    assert!(
+        production_floor_violations(&unpinned)
+            .iter()
+            .any(|p| p.contains("no pin"))
+    );
+    let lowered = real.replacen("app = 71.4\n", "app = 71.3\n", 1);
+    assert!(
+        production_floor_violations(&lowered)
+            .iter()
+            .any(|p| p.contains("BELOW"))
+    );
+    assert!(
+        production_floor_violations("default = 63.0\n[crates]\napp = 1.0\n")
+            .iter()
+            .any(|p| p.contains("missing or empty"))
+    );
+}
+
+/// Every problem with a production pin list: not exactly one pin per crate
+/// pinned in `crate_pins` (by name, in any order), a pin out of (0, 100], or
+/// a pin under `default_floor`.
+///
+/// B3 review (2026-11-13): `production_floor_violations` only compares the
+/// toml with the pins, so dropping one crate from BOTH places, or a typo
+/// such as 7.14 for 71.4 written in both, passed every test. This mirrors
+/// `coverage_lockdown_pinned_floors_are_sane` for the `[crates]` pins.
+fn production_pin_problems(
+    pins: &[(&str, f64)],
+    crate_pins: &[(&str, f64)],
+    default_floor: f64,
+) -> Vec<String> {
+    let mut problems = Vec::new();
+    if pins.len() != crate_pins.len() {
+        problems.push(format!(
+            "expected {} production pins (one per pinned crate), found {}",
+            crate_pins.len(),
+            pins.len()
+        ));
+    }
+    for (name, _) in crate_pins {
+        let count = pins.iter().filter(|(p, _)| p == name).count();
+        if count != 1 {
+            problems.push(format!(
+                "crate {name} has {count} production pins; it needs exactly one"
+            ));
+        }
+    }
+    for (name, floor) in pins {
+        if !crate_pins.iter().any(|(c, _)| c == name) {
+            problems.push(format!("production pin {name} names no pinned crate"));
+        }
+        if !(*floor > 0.0 && *floor <= 100.0) {
+            problems.push(format!("production pin for {name} out of range: {floor}"));
+        } else if *floor < default_floor {
+            problems.push(format!(
+                "production pin for {name} ({floor}) is under the default floor \
+                 ({default_floor}); a typo such as 7.14 for 71.4 looks like this"
+            ));
+        }
+    }
+    problems
+}
+
+#[test]
+fn coverage_lockdown_production_pins_are_sane() {
+    let problems = production_pin_problems(
+        PINNED_PRODUCTION_FLOORS,
+        PINNED_CRATE_FLOORS,
+        PINNED_DEFAULT_FLOOR,
+    );
+    assert!(problems.is_empty(), "B3: {problems:#?}");
+    assert_eq!(PINNED_PRODUCTION_FLOORS.len(), 8);
+}
+
+#[test]
+fn production_pin_sanity_bites_on_a_dropped_or_mistyped_pin() {
+    let real = PINNED_PRODUCTION_FLOORS;
+    let dropped: Vec<(&str, f64)> = real.iter().copied().filter(|(n, _)| *n != "app").collect();
+    let problems = production_pin_problems(&dropped, PINNED_CRATE_FLOORS, PINNED_DEFAULT_FLOOR);
+    assert!(
+        problems.iter().any(|p| p.contains("crate app has 0")),
+        "{problems:?}"
+    );
+    let typo: Vec<(&str, f64)> = real
+        .iter()
+        .map(|(n, f)| if *n == "app" { (*n, 7.14) } else { (*n, *f) })
+        .collect();
+    let problems = production_pin_problems(&typo, PINNED_CRATE_FLOORS, PINNED_DEFAULT_FLOOR);
+    assert!(
+        problems
+            .iter()
+            .any(|p| p.contains("under the default floor")),
+        "{problems:?}"
+    );
+    let out_of_range: Vec<(&str, f64)> = real
+        .iter()
+        .map(|(n, f)| if *n == "core" { (*n, 101.0) } else { (*n, *f) })
+        .collect();
+    let problems =
+        production_pin_problems(&out_of_range, PINNED_CRATE_FLOORS, PINNED_DEFAULT_FLOOR);
+    assert!(
+        problems.iter().any(|p| p.contains("out of range")),
+        "{problems:?}"
+    );
+    let renamed: Vec<(&str, f64)> = real
+        .iter()
+        .map(|(n, f)| if *n == "api" { ("apii", *f) } else { (*n, *f) })
+        .collect();
+    let problems = production_pin_problems(&renamed, PINNED_CRATE_FLOORS, PINNED_DEFAULT_FLOOR);
+    assert!(
+        problems.iter().any(|p| p.contains("names no pinned crate")),
+        "{problems:?}"
+    );
 }

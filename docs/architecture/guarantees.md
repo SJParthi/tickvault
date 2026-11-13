@@ -95,7 +95,7 @@ But we CAN mechanically guarantee:
 
 | Claim | Proof file | Test name / gate |
 |---|---|---|
-| Ratcheted per-crate LINE-coverage floors (app 72.6 · core 91.6 · storage 90.1 · trading 96.9 · api 98.6 · common 99.4 · default 63.0; floors only move up, 100% is the target — LINE coverage only, no branch gate) | `quality/crate-coverage-thresholds.toml` | `scripts/coverage-gate.sh`, ~~post-merge only (not a PR blocker)~~ **⚠ CORRECTED 2026-10-11:** runs on every PR and is in the All Green fan-in (ci.yml `all-green` needs `coverage-and-perf`), so a floor breach blocks merge |
+| Ratcheted per-crate LINE-coverage floors (app 86.4 · core 94.5 · storage 93.7 · trading 97.1 · api 98.6 · common 99.4 · default 63.0, raised 2026-11-13 (B3); these are TEST-INCLUSIVE gate figures, and the production-only floors in the `[production]` table are checked beside them; floors only move up, 100% is the target — LINE coverage only, no branch gate) | `quality/crate-coverage-thresholds.toml` | `scripts/coverage-gate.sh`, ~~post-merge only (not a PR blocker)~~ **⚠ CORRECTED 2026-10-11:** runs on every PR and is in the All Green fan-in (ci.yml `all-green` needs `coverage-and-perf`), so a floor breach blocks merge |
 | Mutation score: zero survivors | `.github/workflows/mutation.yml` | lines 103-113 fail if any `SURVIVED` |
 | Fuzz targets run weekly, zero crashes | `.github/workflows/fuzz.yml` | nightly schedule |
 | `cargo fmt --check` clean | CI | pre-commit + PR gate |
@@ -165,7 +165,7 @@ no shell, no curl, no grep:
 | `cargo audit` | YES | every push |
 | `cargo deny` | YES | every push |
 | 30-check validate-automation | YES | every push |
-| Ratcheted per-crate LINE-coverage floors (72.6–99.4, target 100%; no branch gate) | YES | ~~post-merge only (not a PR blocker)~~ **⚠ CORRECTED 2026-10-11:** every PR, inside All Green (`all-green` needs `coverage-and-perf`) |
+| Ratcheted per-crate LINE-coverage floors (86.4–99.4 on the test-inclusive gate figure since 2026-11-13, plus production-only `[production]` floors; target 100%; no branch gate) | YES | ~~post-merge only (not a PR blocker)~~ **⚠ CORRECTED 2026-10-11:** every PR, inside All Green (`all-green` needs `coverage-and-perf`) |
 | Mutation zero-survivors | YES | weekly |
 | Fuzz 0 crashes | YES | weekly |
 

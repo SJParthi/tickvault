@@ -698,6 +698,38 @@ pub fn weekday_calendar() -> Arc<tickvault_common::trading_calendar::TradingCale
     )
 }
 
+/// A calendar with one Muhurat Sunday (2026-11-08, 14:05 to 15:40 IST, the
+/// session `config/base.toml` carries) and one weekday holiday (Monday
+/// 2026-11-09). B3 review (2026-11-13): `weekday_calendar` lists neither, so
+/// no harness drove a Muhurat or a weekday-holiday instant.
+pub fn session_calendar() -> Arc<tickvault_common::trading_calendar::TradingCalendar> {
+    use tickvault_common::config::{MuhuratTradingEntry, NseHolidayEntry};
+    let cfg = tickvault_common::config::TradingConfig {
+        market_open_time: "09:15:00".to_owned(),
+        market_close_time: "15:30:00".to_owned(),
+        order_cutoff_time: "15:29:00".to_owned(),
+        data_collection_start: "09:00:00".to_owned(),
+        data_collection_end: "16:00:00".to_owned(),
+        timezone: "Asia/Kolkata".to_owned(),
+        max_orders_per_second: 10,
+        nse_holidays: vec![NseHolidayEntry {
+            date: "2026-11-09".to_owned(),
+            name: "a weekday holiday".to_owned(),
+        }],
+        muhurat_trading_dates: vec![MuhuratTradingEntry {
+            date: "2026-11-08".to_owned(),
+            name: "Muhurat".to_owned(),
+            session_start_ist: "14:05".to_owned(),
+            session_end_ist: "15:40".to_owned(),
+        }],
+        nse_mock_trading_dates: Vec::new(),
+    };
+    Arc::new(
+        tickvault_common::trading_calendar::TradingCalendar::from_config(&cfg)
+            .expect("calendar builds"),
+    )
+}
+
 /// Whether `d` is Monday to Friday.
 pub fn is_weekday(d: chrono::NaiveDate) -> bool {
     use chrono::Datelike as _;

@@ -1438,10 +1438,21 @@ fn main() {
     // contain the character. Same class of error as the DHAT count above, and
     // caught the same way: by checking the tool's output against the file
     // instead of trusting that the tool was obviously right.
+    // Only `default` and the `[crates]` table are crate floors: B3
+    // (2026-11-13) added a `[production]` table that repeats the crate names,
+    // which this count would otherwise read as eight more crates.
+    let mut section = "";
     let floors = cov
         .lines()
         .map(str::trim_start)
-        .filter(|l| !l.starts_with('#') && !l.starts_with('['))
+        .filter(|l| {
+            if l.starts_with('[') {
+                section = l.trim();
+                return false;
+            }
+            section.is_empty() || section == "[crates]"
+        })
+        .filter(|l| !l.starts_with('#'))
         .filter(|l| {
             l.split_once('=').is_some_and(|(k, _)| {
                 let k = k.trim();
