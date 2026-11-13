@@ -92,6 +92,7 @@ fn driver_booted(schedule: &str, pass_ns: i64, boot: BootInstant) -> ReplayDrive
         engine_frames_secs: frames,
         universe,
         contracts,
+        trading_day: DAY / 86_400,
     };
     ReplayDriver::new(engine, setup, params(), DAY * NS, pass_ns, None, boot).expect("driver")
 }
@@ -1303,6 +1304,7 @@ fn test_replay_driver_new_refuses_a_schedule_outside_the_universe() {
         engine_frames_secs: frames,
         universe,
         contracts,
+        trading_day: DAY / 86_400,
     };
     assert!(
         ReplayDriver::new(

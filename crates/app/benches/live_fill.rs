@@ -22,7 +22,9 @@ use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 
-use tickvault_app::dhan_feed_stack::live_fill_tap::{LiveFillTap, TapTick, live_fill_tap_ring};
+use tickvault_app::dhan_feed_stack::live_fill_tap::{
+    LiveFillTap, TapTick, TapVolume, live_fill_tap_ring,
+};
 use tickvault_app::live_fill::chain::{ChainParams, ChainSetup, ContractSpec, LiveFillChain};
 use tickvault_common::tick_types::ParsedTick;
 use tickvault_trading::brutex_host::InstrumentKey;
@@ -47,15 +49,17 @@ fn bench_tap(c: &mut Criterion) {
     let mut tap = LiveFillTap::new(tx);
     c.bench_function("live_fill/tap_accept", |b| {
         b.iter(|| {
-            black_box(tap.offer(black_box(&parsed), None, true, false));
+            black_box(tap.offer(black_box(&parsed), None, true, false, TapVolume::default()));
             black_box(rx.try_recv());
         });
     });
     let (full_tx, _full_rx) = live_fill_tap_ring(1);
     let mut full = LiveFillTap::new(full_tx);
-    let _ = full.offer(&parsed, None, true, false);
+    let _ = full.offer(&parsed, None, true, false, TapVolume::default());
     c.bench_function("live_fill/tap_full", |b| {
-        b.iter(|| black_box(full.offer(black_box(&parsed), None, true, false)));
+        b.iter(|| {
+            black_box(full.offer(black_box(&parsed), None, true, false, TapVolume::default()))
+        });
     });
 }
 
@@ -89,6 +93,7 @@ fn chain() -> LiveFillChain<ReferenceDouble> {
         engine_frames_secs: vec![60],
         universe,
         contracts,
+        trading_day: DAY / 86_400,
     };
     let params = ChainParams {
         wait_ms: 1_000,
@@ -122,6 +127,12 @@ fn bench_chain(c: &mut Criterion) {
                     segment: 2,
                     new_trade: true,
                     older_trade: false,
+                    volume_delta: 10,
+                    first_bucket_volume_delta: 10,
+                    cumulative_restarted: false,
+                    stale_packet: false,
+                    fold_seed: false,
+                    fold_gap_reseed: false,
                 }));
             }
             let t = sec * NS + 500_000_000;

@@ -1430,6 +1430,10 @@ pub enum IngestOutcome {
         /// A real trade older than the newest one seen
         /// (`ConsumeStats::older_trade`, LF-6b).
         older_trade: bool,
+        /// The fold's per-tick volume (`ConsumeStats::volume_delta` and
+        /// `first_bucket_volume_delta`, LF-9): handed to the live fill tap so
+        /// the chain's bars carry the stored candle's volume.
+        volume: live_fill_tap::TapVolume,
     },
     /// The frame sequence would not narrow onto `capture_seq` (year-2262
     /// class). Nothing was folded, nothing was written.
@@ -3543,6 +3547,7 @@ impl LiveIngest {
             advanced: stats.advanced,
             fresh_first: stats.fresh_first,
             older_trade: stats.older_trade,
+            volume: live_fill_tap::TapVolume::from_stats(&stats),
         }
     }
 
@@ -9074,20 +9079,24 @@ pub fn drain_main_feed_frame(
                                 ParsedFrame::TickWithDepth(_, levels) => levels.first(),
                                 _ => None,
                             };
-                            let (new_trade, older_trade) = match outcome {
+                            let (new_trade, older_trade, volume) = match outcome {
                                 IngestOutcome::Folded {
                                     advanced,
                                     fresh_first,
                                     older_trade,
+                                    volume,
                                     ..
-                                } => fold_verdict::tap_trade_flags(
-                                    advanced,
-                                    fresh_first,
-                                    older_trade,
-                                ),
-                                _ => (false, false),
+                                } => {
+                                    let (n, o) = fold_verdict::tap_trade_flags(
+                                        advanced,
+                                        fresh_first,
+                                        older_trade,
+                                    );
+                                    (n, o, volume)
+                                }
+                                _ => (false, false, live_fill_tap::TapVolume::default()),
                             };
-                            let _queued = tap.offer(tick, best, new_trade, older_trade);
+                            let _queued = tap.offer(tick, best, new_trade, older_trade, volume);
                         }
                     }
                     IngestOutcome::WrittenOutOfSession => {

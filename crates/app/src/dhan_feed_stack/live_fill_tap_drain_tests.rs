@@ -155,12 +155,12 @@ fn test_live_fill_tap_call_sits_inside_the_folded_arm_behind_both_gates() {
     let src = include_str!("../dhan_feed_stack.rs");
     let prod = src.split("\n#[cfg(test)]").next().unwrap_or(src);
     assert_eq!(
-        prod.matches("tap.offer(tick, best, new_trade, older_trade)")
+        prod.matches("tap.offer(tick, best, new_trade, older_trade, volume)")
             .count(),
         1
     );
     let call = prod
-        .find("tap.offer(tick, best, new_trade, older_trade)")
+        .find("tap.offer(tick, best, new_trade, older_trade, volume)")
         .expect("tap call");
     let arm = prod[..call]
         .rfind("IngestOutcome::Folded { .. } => {")
@@ -338,5 +338,107 @@ fn test_write_failed_tick_moves_drop_seq_note_live_fill_loss() {
     assert!(
         prod[arm..arm + end].contains("ingest.note_live_fill_loss(frame.connection_index);"),
         "a folded tick whose row failed must count as a live fill loss"
+    );
+}
+
+fn quote(security_id: u32, ltp: f32, ltt: u32, volume: u32) -> [u8; 50] {
+    let mut p = [0u8; 50];
+    p[0] = 4; // quote
+    p[1..3].copy_from_slice(&50u16.to_le_bytes());
+    p[3] = ExchangeSegment::NseFno.binary_code();
+    p[4..8].copy_from_slice(&security_id.to_le_bytes());
+    p[8..12].copy_from_slice(&ltp.to_le_bytes());
+    p[14..18].copy_from_slice(&ltt.to_le_bytes());
+    p[22..26].copy_from_slice(&volume.to_le_bytes());
+    p
+}
+
+/// LF-9 review, finding 8: the volume the frame drain hands the chain is the
+/// fold's own, field for field, through the drain's real plumbing (the
+/// `IngestOutcome::Folded` construction and the tap's `offer`), not a test's
+/// copy of it. A pre-market boot's opening trade, a stale regression, a
+/// `u32` wrap and a counter drop go through `drain_main_feed_frame`; a twin
+/// fold built the same way consumes the same packets, and every tapped
+/// tick's four volume fields must equal the twin's `ConsumeStats`.
+#[test]
+fn test_regression_drain_hands_the_chain_the_folds_own_volume_tap_volume_from_stats() {
+    let ltt = in_session_ltt();
+    let day = ltt - ltt % 86_400;
+    let open = day + 33_300;
+    let t0 = open; // the opening trade: the fold credits the 09:15 bucket
+    let (tx, mut rx) = live_fill_tap_ring(64);
+    let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8)
+        .with_live_fill_tap(LiveFillTap::with_shed_source(tx, || 0));
+    ingest.aggregator.set_live_capture_start(day + 30_600); // an 08:30 boot
+    let mut twin = live_fold(8);
+    twin.set_live_capture_start(day + 30_600);
+    let script: [(u32, u32); 7] = [
+        (t0, 1_000),
+        (t0 + 1, 1_500),
+        (t0 + 2, 1_200), // a stale regression
+        (t0 + 3, 2_000),
+        (t0 + 4, u32::MAX - 10),
+        (t0 + 5, 40), // a u32 wrap
+        (t0 + 6, 5),  // a drop again
+    ];
+    let (mut tapped, mut stale, mut moved, mut seeds) = (0, 0, 0, 0);
+    let mut first_differs = false;
+    for (k, &(secs, cum)) in script.iter().enumerate() {
+        let recv = recv_nanos_for(secs);
+        let bytes = quote(2885, 100.0 + k as f32, secs, cum);
+        drain_main_feed_frame(
+            &mut ingest,
+            &frame(&bytes, 0, recv),
+            recv,
+            1_000 + k as u64,
+            counters(),
+        );
+        // The packet as the parser reads it (every field the quote does not
+        // set is 0, as here).
+        let parsed = tickvault_common::tick_types::ParsedTick {
+            security_id: 2885,
+            exchange_segment_code: ExchangeSegment::NseFno.binary_code(),
+            last_traded_price: 100.0 + k as f32,
+            exchange_timestamp: secs,
+            received_at_nanos: recv,
+            volume: cum,
+            ..tickvault_common::tick_types::ParsedTick::default()
+        };
+        let stats = twin.consume_tick(Feed::Dhan, &parsed, None, |_, _, _, _, _| {});
+        if let Some(t) = rx.try_recv() {
+            tapped += 1;
+            let sat = |v: u64| u64::from(u32::try_from(v).unwrap_or(u32::MAX));
+            assert_eq!(
+                u64::from(t.volume_delta),
+                sat(stats.volume_delta),
+                "tick {k}"
+            );
+            assert_eq!(
+                u64::from(t.first_bucket_volume_delta),
+                sat(stats.first_bucket_volume_delta),
+                "tick {k}"
+            );
+            assert_eq!(
+                t.cumulative_restarted, stats.cumulative_restarted,
+                "tick {k}"
+            );
+            assert_eq!(t.stale_packet, stats.stale_packet, "tick {k}");
+            assert_eq!(t.fold_seed, stats.seeded, "tick {k}");
+            seeds += usize::from(t.fold_seed);
+            stale += usize::from(t.stale_packet);
+            first_differs |= t.first_bucket_volume_delta != t.volume_delta;
+            moved += usize::from(t.volume_delta > 0);
+        }
+    }
+    assert!(tapped >= 5, "the script reached the tap: {tapped}");
+    assert!(moved >= 3, "volume moved on the tapped ticks: {moved}");
+    assert!(stale >= 1, "the regression reached the tap as stale");
+    assert_eq!(
+        seeds, 1,
+        "the seeding tick reached the tap marked as the seed"
+    );
+    assert!(
+        first_differs,
+        "the opening trade credits the 09:15 bucket apart"
     );
 }

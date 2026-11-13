@@ -434,12 +434,13 @@ pub fn spawn_order_runtime(params: OrderRuntimeParams) -> tokio::task::JoinHandl
         } = params;
         // LF-6b: like the mark receiver, the paper-command receiver survives
         // inner respawns behind a tokio Mutex.
-        let (live_fill_rx, live_fill_events) = match live_fill {
+        let (live_fill_rx, live_fill_events, live_fill_positions) = match live_fill {
             Some(link) => (
                 Some(Arc::new(tokio::sync::Mutex::new(link.cmds))),
                 Some(link.events),
+                Some(link.positions),
             ),
-            None => (None, None),
+            None => (None, None, None),
         };
         // The mark receiver survives inner respawns behind a tokio Mutex —
         // the inner run holds the guard for its lifetime; an (unwind-build)
@@ -467,6 +468,7 @@ pub fn spawn_order_runtime(params: OrderRuntimeParams) -> tokio::task::JoinHandl
                 auth_notify: Arc::clone(&auth_notify),
                 leg_pnl_tx: leg_pnl_tx.clone(),
                 live_fill_events: live_fill_events.clone(),
+                live_fill_positions: live_fill_positions.clone(),
             };
             let mark_rx_shared = Arc::clone(&mark_rx);
             let live_fill_shared = live_fill_rx.clone();
@@ -544,6 +546,13 @@ struct RuntimeCtx {
     /// LF-6b: where the live paper fill arm writes its order event rows.
     live_fill_events:
         Option<mpsc::Sender<tickvault_storage::live_order_events_persistence::LiveOrderEvent>>,
+    /// LF-9 finding 2: where the arm reports what it booked for each paper
+    /// Execute, so the chain's position follows the paper book.
+    live_fill_positions: Option<
+        tickvault_core::websocket::frame_ring::FrameRingSender<
+            crate::live_fill::chain::PositionReport,
+        >,
+    >,
 }
 
 // LF-6b: the live paper fill chain's arm (paper commands → dry-run OMS).
@@ -1318,7 +1327,13 @@ async fn run_order_runtime(
     mut order_rx: broadcast::Receiver<OrderUpdate>,
     mark_rx_shared: Arc<tokio::sync::Mutex<mpsc::Receiver<MarkUpdate>>>,
     live_fill_shared: Option<
-        Arc<tokio::sync::Mutex<mpsc::Receiver<crate::live_fill::chain::PaperCmd>>>,
+        Arc<
+            tokio::sync::Mutex<
+                tickvault_core::websocket::frame_ring::FrameRingReceiver<
+                    crate::live_fill::chain::PaperCmd,
+                >,
+            >,
+        >,
     >,
 ) {
     let config = &ctx.config;
@@ -1534,11 +1549,16 @@ async fn run_order_runtime(
             cmd = live_fill_arm::recv_live_fill(&mut live_fill_rx), if live_fill_open => {
                 match cmd {
                     Some(cmd) => {
-                        live_fill_arm::handle_live_fill_cmd(
+                        // LF-9 finding 4: a Mark changes no order and no
+                        // position, so it skips the O(orders) republish scan
+                        // (one per marked second per traded instrument).
+                        let changes_orders = live_fill_arm::handle_live_fill_cmd(
                             &mut oms, &mut risk, &mut book, &ctx, cmd,
                         )
                         .await;
-                        republish_marks_wanted(&ctx.marks_wanted, &oms, &risk, &self_test);
+                        if changes_orders {
+                            republish_marks_wanted(&ctx.marks_wanted, &oms, &risk, &self_test);
+                        }
                     }
                     None => {
                         warn!("order runtime: live paper fill channel closed — arm disarmed");
@@ -2307,6 +2327,7 @@ mod tests {
             auth_notify: Arc::new(Notify::new()),
             leg_pnl_tx: None,
             live_fill_events: None,
+            live_fill_positions: None,
         }
     }
 
