@@ -108,6 +108,7 @@ use tickvault_common::segment::segment_code_to_str;
 use tickvault_common::tick_types::ParsedTick;
 
 use crate::feed_aux_persistence::{AuxPacketKind, AuxPacketRow, FEED_AUX_ROWS_COUNTER};
+use crate::ilp_table_gate::GatedTable;
 
 // ---------------------------------------------------------------------------
 // Table + key contract
@@ -857,6 +858,86 @@ pub fn ticks_ensure_statements() -> Vec<String> {
 // by the mock-HTTP tokio tests below.
 #[must_use = "a false verdict means the DEDUP key may be missing; retry it"]
 pub async fn ensure_ticks_table(questdb_config: &QuestDbConfig) -> bool {
+    let verdict = ensure_ticks_tables_verdict(questdb_config).await;
+    // 2026-11-07 (`ilp_table_gate`): only now may the spill replay post rows
+    // for these two tables; before, a spilled row could let QuestDB create
+    // them itself with the wrong designated timestamp.
+    if verdict.every_statement_accepted {
+        crate::ilp_table_gate::mark_table_ensured(crate::ilp_table_gate::GatedTable::Ticks);
+        crate::ilp_table_gate::mark_table_ensured(crate::ilp_table_gate::GatedTable::TickQuotes);
+    }
+    // B1 review 3 (2026-11-13): each table is keyed on its OWN key
+    // statements. One chained verdict meant a `tick_quotes` QuestDB had
+    // created itself (its DEDUP refused for good) left `ticks` unkeyed too,
+    // and every live tick of the session went to the spill.
+    for (table, key) in [
+        (crate::ilp_table_gate::GatedTable::Ticks, verdict.ticks),
+        (
+            crate::ilp_table_gate::GatedTable::TickQuotes,
+            verdict.tick_quotes,
+        ),
+    ] {
+        if key.accepted {
+            crate::ilp_table_gate::mark_table_keyed(table);
+        } else if key.refused_by_server {
+            // B1 review 2: name a table QuestDB created itself (it can never
+            // be keyed, so the live feed for it stays held) instead of
+            // holding silently. Only the table whose own key was refused.
+            crate::ilp_table_gate::diagnose_refused_key(questdb_config, table).await;
+        }
+    }
+    verdict.every_statement_accepted
+}
+
+/// One table's key verdict from one ensure (B1 review 3): `accepted` when
+/// every KEY-BEARING statement of that table was accepted (see
+/// `ilp_table_gate::ddl_is_key_bearing`), `refused_by_server` when QuestDB
+/// answered one of them with a refusal (not a transport error).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TableKeyVerdict {
+    pub(crate) accepted: bool,
+    pub(crate) refused_by_server: bool,
+}
+
+impl TableKeyVerdict {
+    const OK: Self = Self {
+        accepted: true,
+        refused_by_server: false,
+    };
+
+    /// Folds one statement's outcome in: `server_refused` true for a non-2xx
+    /// answer, false for a transport error. A column self-heal never counts.
+    fn note_failed(&mut self, ddl: &str, server_refused: bool) {
+        let key = crate::ilp_table_gate::ddl_is_key_bearing(ddl);
+        self.accepted &= !key;
+        self.refused_by_server |= key && server_refused;
+    }
+}
+
+/// What one run of the `ticks` + `tick_quotes` ensure found (B1 review 3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TicksEnsureVerdict {
+    /// Every statement of both tables was accepted.
+    pub(crate) every_statement_accepted: bool,
+    /// `ticks`' own key statements.
+    pub(crate) ticks: TableKeyVerdict,
+    /// `tick_quotes`' own key statements.
+    pub(crate) tick_quotes: TableKeyVerdict,
+}
+
+/// Runs every `ticks` and `tick_quotes` statement and returns the verdicts,
+/// without touching the process gate (so its test cannot open it for the
+/// other tests in this binary). Cold, once per ensure.
+async fn ensure_ticks_tables_verdict(questdb_config: &QuestDbConfig) -> TicksEnsureVerdict {
+    let mut verdict = TicksEnsureVerdict {
+        every_statement_accepted: false,
+        ticks: TableKeyVerdict::OK,
+        tick_quotes: TableKeyVerdict::OK,
+    };
+    let unreachable = TableKeyVerdict {
+        accepted: false,
+        refused_by_server: false,
+    };
     // APPROVED: QuestDB base URL, once per ensure_ticks_table at boot
     let base_url = format!(
         "http://{}:{}/exec",
@@ -878,14 +959,28 @@ pub async fn ensure_ticks_table(questdb_config: &QuestDbConfig) -> bool {
                  ILP write may auto-create the table WITHOUT the 5-key DEDUP, \
                  which collapses intra-second ticks until a later ensure succeeds"
             );
-            return false;
+            verdict.ticks = unreachable;
+            verdict.tick_quotes = unreachable;
+            return verdict;
         }
     };
     let mut every_statement_accepted = true;
     // M5 (2026-10-27): `tick_quotes` is written by the same writer, so it is
     // ensured here with `ticks`, under the same verdict and retry.
+    // B1 review: the live gate and the spill replay need only the key-bearing
+    // statements (CREATE, DEDUP ENABLE); a refused column self-heal on an
+    // already-keyed table must not shut them for the session. B1 review 2:
+    // QuestDB ANSWERED a key statement with a refusal (not a transport
+    // error), so a probe of the table's shape is worth one query. B1 review
+    // 3: judged per table (the `ticks` statements come first).
+    let ticks_statements = ticks_ensure_statements();
     let quotes = crate::tick_quotes_persistence::tick_quotes_ensure_statements(TICKS_COLUMNS);
-    for ddl in ticks_ensure_statements().iter().chain(quotes.iter()) {
+    for (i, ddl) in ticks_statements.iter().chain(quotes.iter()).enumerate() {
+        let own = if i < ticks_statements.len() {
+            &mut verdict.ticks
+        } else {
+            &mut verdict.tick_quotes
+        };
         match client
             .get(&base_url)
             .query(&[("query", ddl.as_str())])
@@ -908,6 +1003,7 @@ pub async fn ensure_ticks_table(questdb_config: &QuestDbConfig) -> bool {
                      which collapses intra-second ticks"
                 );
                 every_statement_accepted = false;
+                own.note_failed(ddl, true);
             }
             Err(err) => {
                 metrics::counter!("tv_tick_persist_errors_total", "stage" => "ensure_ddl")
@@ -920,17 +1016,12 @@ pub async fn ensure_ticks_table(questdb_config: &QuestDbConfig) -> bool {
                     "ticks DDL request failed"
                 );
                 every_statement_accepted = false;
+                own.note_failed(ddl, false);
             }
         }
     }
-    // 2026-11-07 (`ilp_table_gate`): only now may the spill replay post rows
-    // for these two tables; before, a spilled row could let QuestDB create
-    // them itself with the wrong designated timestamp.
-    if every_statement_accepted {
-        crate::ilp_table_gate::mark_table_ensured(crate::ilp_table_gate::GatedTable::Ticks);
-        crate::ilp_table_gate::mark_table_ensured(crate::ilp_table_gate::GatedTable::TickQuotes);
-    }
-    every_statement_accepted
+    verdict.every_statement_accepted = every_statement_accepted;
+    verdict
 }
 
 // ---------------------------------------------------------------------------
@@ -1602,6 +1693,25 @@ pub(crate) fn tick_spill_spec(dir: &Path, feed: Feed) -> IlpSpillSpec<'_> {
         tier: SpillTier::Tick,
         drain_held: Some(&TICK_DRAIN_SPILL_HELD),
         truncate_failed_append: false,
+    }
+}
+
+/// The spill file prefix for rows set aside because their table alone is not
+/// keyed (B1 review 3): `held-<table>`, so the file is
+/// `held-<table>-<feed>-<hour>.ilp` beside the tick rescue files in the same
+/// folder (the replay lists every `.ilp` there and parses the hour from the
+/// last `-` part). Kept apart from `ticks-*.ilp` because the replay holds a
+/// whole file from its first row for a table not yet keyed. O(1).
+#[must_use]
+pub(crate) const fn held_spill_prefix(table: GatedTable) -> &'static str {
+    match table {
+        GatedTable::TickQuotes => "held-tick_quotes",
+        GatedTable::FeedAuxPackets => "held-feed_aux_packets",
+        // Never set aside today (the whole batch is rescued when `ticks` is
+        // not keyed); named so a new caller still gets its own file.
+        GatedTable::Ticks => "held-ticks",
+        GatedTable::MarketDepth => "held-market_depth",
+        GatedTable::MarketDepthBook => "held-market_depth_book",
     }
 }
 
@@ -2448,6 +2558,11 @@ pub struct TickWriter {
     /// `tick_quotes` rows appended by this writer over its life (plan item
     /// M5). The buffer carries both tables, as it does `feed_aux_packets`.
     quote_rows_appended: u64,
+    /// B1 (2026-11-13): whether a batch may be posted now, given the tables
+    /// it can hold rows for. Always [`crate::ilp_table_gate::live_tables_writable`]
+    /// outside this module's tests, which hold it shut regardless of any other
+    /// test that runs an ensure. One call per flush, never per row.
+    table_gate: fn(&[crate::ilp_table_gate::GatedTable]) -> bool,
 }
 
 /// Pre-resolves the per-kind `tv_feed_aux_rows_total` handles (plan item 45h).
@@ -2812,7 +2927,19 @@ impl TickWriter {
             aux_counters: aux_row_counters(),
             aux_rows_appended: 0,
             quote_rows_appended: 0,
+            table_gate: crate::ilp_table_gate::live_tables_writable,
         }
+    }
+
+    /// Test-only: replaces the live table gate (B1).
+    #[cfg(test)]
+    #[must_use]
+    fn with_table_gate_for_test(
+        mut self,
+        gate: fn(&[crate::ilp_table_gate::GatedTable]) -> bool,
+    ) -> Self {
+        self.table_gate = gate;
+        self
     }
 
     /// Test constructor — disconnected writer with an empty buffer.
@@ -3424,6 +3551,23 @@ impl TickWriter {
                  row(s) discarded"
             );
         }
+        // B1: never post into a table this process has not keyed (QuestDB
+        // would create it in a shape that can never take the key). The rows
+        // take the rescue: WAL deferral or the spill, replayed once keyed.
+        // B1 review 2: `ticks` gates the batch; the auxiliary table does only
+        // when the batch holds an aux row (this unsplit arm does not split a
+        // batch; the writer thread does). B1 review 3: `tick_quotes` the
+        // same way. The O(rows) scans run only while their table is not keyed.
+        let held_part =
+            |table: GatedTable| !(self.table_gate)(&[table]) && self.staged.has_rows_for(table);
+        if !(self.table_gate)(&[GatedTable::Ticks])
+            || held_part(GatedTable::TickQuotes)
+            || held_part(GatedTable::FeedAuxPackets)
+        {
+            crate::ilp_table_gate::note_live_batch_held("ticks");
+            let dropped = self.discard_pending();
+            anyhow::bail!("ticks: table not keyed yet; {dropped} pending row(s) rescued");
+        }
         // The synchronous ILP round trip: the other place a flush blocks, so
         // it runs through `off_worker` (the drain calls `flush` bare). PF-4:
         // the staged rows are written as text here too, inside the same
@@ -3537,6 +3681,7 @@ impl TickWriter {
             // PF-4: the batches arrive as staged rows; their text is written
             // here, in the writer's encoder (the sender speaks that one).
             encode_buf: presized_row_buffer(self.encoder),
+            table_gate: self.table_gate,
         };
         self.offload = Some(tx);
         (self, sink, rx)
@@ -4856,6 +5001,8 @@ pub struct TickWriterSink {
     /// The text each batch is written into before it is sent or spilled
     /// (PF-4), in the writer's encoder, reserved once at the split.
     encode_buf: TickRowBuffer,
+    /// The producer's live table gate, copied at the split (B1).
+    table_gate: fn(&[crate::ilp_table_gate::GatedTable]) -> bool,
 }
 
 impl TickWriterSink {
@@ -4926,7 +5073,39 @@ impl TickWriterSink {
         // counted here BEFORE this batch is acknowledged below (owner
         // decision 2026-11-06); `rows` becomes the rows written.
         self.encode_buf.clear();
-        batch.rows = batch.staged.encode_into(self.feed, &mut self.encode_buf);
+        // B1 review 2 (2026-11-13): the `ticks` rows and the
+        // `feed_aux_packets` rows are judged on their own tables; B1 review 3:
+        // so are the `tick_quotes` rows. Before, one gate covered them, so an
+        // auxiliary table that could not be keyed held every live tick out of
+        // QuestDB for the whole session. Each held table's rows are set aside
+        // to their OWN spill file, so a file the replay holds for that table
+        // never holds tick rows behind it. Three gate reads per batch.
+        let gated = self.sender.is_some();
+        let keyed = |gate: fn(&[GatedTable]) -> bool, table: GatedTable| !gated || gate(&[table]);
+        let main_keyed = keyed(self.table_gate, GatedTable::Ticks);
+        let held = [GatedTable::TickQuotes, GatedTable::FeedAuxPackets]
+            .map(|t| (t, !keyed(self.table_gate, t)));
+        batch.rows = if main_keyed && held.iter().any(|(_, h)| *h) {
+            for (table, is_held) in held {
+                if !is_held {
+                    continue;
+                }
+                crate::ilp_table_gate::note_live_batch_held(table.name());
+                self.encode_buf.clear();
+                let rows = batch
+                    .staged
+                    .encode_tables_into(self.feed, &mut self.encode_buf, |t| t == table);
+                self.set_aside_rows(batch, rows, table);
+            }
+            self.encode_buf.clear();
+            batch
+                .staged
+                .encode_tables_into(self.feed, &mut self.encode_buf, |t| {
+                    !held.iter().any(|(h, is_held)| *is_held && *h == t)
+                })
+        } else {
+            batch.staged.encode_into(self.feed, &mut self.encode_buf)
+        };
         if batch.rows == 0 {
             // Every row refused, each already counted and marked unapplied:
             // the batch is done, exactly as an append failure on the drain was.
@@ -4939,6 +5118,12 @@ impl TickWriterSink {
             // questdb-rs wedge.
             self.counters.encoded_over_ceiling.increment(1);
             self.rescue(batch, "encoded batch over the 32 MiB text ceiling");
+            return 0;
+        }
+        // B1 (2026-11-13): not into a table this process has not keyed.
+        if !main_keyed {
+            crate::ilp_table_gate::note_live_batch_held("ticks");
+            self.rescue(batch, "table not keyed yet (boot DDL refused)");
             return 0;
         }
         let Some(sender) = self.sender.as_mut() else {
@@ -5021,6 +5206,67 @@ impl TickWriterSink {
                 let why = format!("{err}"); // APPROVED: rescue arm after a flush already failed, never per row
                 self.rescue(batch, &why);
                 0
+            }
+        }
+    }
+
+    /// Sets the `table` rows of a batch aside to the spill while that table
+    /// alone is not keyed (B1 review 2, for `feed_aux_packets`; B1 review 3,
+    /// for `tick_quotes` too); `encode_buf` holds their text. The batch's
+    /// tick rows are posted after this. The rows go to the table's OWN file
+    /// ([`held_spill_prefix`]), never the tick rescue file: the spill replay
+    /// holds a file from its first row for a table not yet keyed, so a held
+    /// row in the tick file kept every tick rescued later that hour out of
+    /// QuestDB too (B1 review 3). On a spill failure the batch's frame range
+    /// is marked unapplied so the WAL replay re-reads it (the ticks it
+    /// re-folds land again, deduplicated by `capture_seq`). Counted as a
+    /// rescue (`tv_ticks_dropped_total` and `tv_ticks_spilled_total`); logged
+    /// once per process (`note_live_batch_held`), not per batch, since an
+    /// un-keyable table would set rows aside on every flush. Cold.
+    fn set_aside_rows(&mut self, batch: &FlushBatch, aux_rows: usize, table: GatedTable) {
+        if aux_rows == 0 {
+            return;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0_i64, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+        let spec = IlpSpillSpec {
+            file_prefix: held_spill_prefix(table),
+            ..tick_spill_spec(&self.spill_dir, self.feed)
+        };
+        let spilled =
+            spill_failed_ilp_to(&spec, self.encode_buf.as_bytes(), now, SPILL_SYNC_OFF_DRAIN);
+        note_ticks_not_landed(self.feed, aux_rows);
+        self.counters.dropped.increment(aux_rows as u64);
+        match spilled {
+            Ok(path) => {
+                self.counters.spilled.increment(aux_rows as u64);
+                tracing::debug!(
+                    feed = self.feed.as_str(),
+                    rows = aux_rows,
+                    table = table.name(),
+                    path = %path.display(),
+                    "rows set aside to their own tick spill file (table not keyed)"
+                );
+            }
+            Err(err) => {
+                note_rescue_outcome_ticks(false, (batch.min_seq, batch.max_seq), true);
+                error!(
+                    code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                    feed = self.feed.as_str(),
+                    dropped = aux_rows,
+                    table = table.name(),
+                    reason = "table not keyed; spill failed",
+                    fate = crate::wal_applied_watermark::rescue_failure_fate(
+                        batch.min_seq,
+                        batch.max_seq,
+                        batch.unbacked,
+                    ),
+                    spill_error = %err,
+                    "rows could not be set aside to the spill while their table is not \
+                     keyed; their frames are marked for the WAL replay \
+                     (fate=lost means no write-ahead-log record backs them)"
+                );
             }
         }
     }
@@ -7454,6 +7700,256 @@ mod tests {
             1,
             "the payload was RESCUED to the spill tier, not dropped"
         );
+    }
+
+    /// A local ILP endpoint that counts the requests it answers (B1).
+    fn counting_ilp_server() -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = std::sync::Arc::clone(&hits);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut buf = [0u8; 65_536];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n");
+            }
+        });
+        (port, hits)
+    }
+
+    /// Regression, B1 (2026-11-13): with its table not keyed, the live writer
+    /// thread must NOT post (QuestDB would create `ticks` in a shape that can
+    /// never take the DEDUP key); the batch is rescued to the spill instead.
+    /// The open-gate half proves the server would have been reached.
+    #[test]
+    fn test_regression_tick_sink_never_posts_into_an_unkeyed_table() {
+        for (gate_open, expect_hits) in [(false, 0_usize), (true, 1)] {
+            let dir = scratch_dir(if gate_open {
+                "b1-gate-open"
+            } else {
+                "b1-gate-shut"
+            });
+            let (port, hits) = counting_ilp_server();
+            let cfg = QuestDbConfig {
+                host: "127.0.0.1".to_string(),
+                http_port: port,
+                pg_port: 1,
+                ilp_port: 1,
+            };
+            let gate: fn(&[crate::ilp_table_gate::GatedTable]) -> bool =
+                if gate_open { |_| true } else { |_| false };
+            let mut w = TickWriter::new(&cfg, Feed::Dhan).with_table_gate_for_test(gate);
+            w.append_tick_with_seq(&sample_tick(), 1).expect("append");
+            let (mut producer, mut sink, rx) = w.split_for_offload();
+            sink.spill_dir = dir.clone();
+            producer.flush().expect("hand off");
+            let mut batch = rx.try_recv().expect("batch queued");
+            let landed = sink.write(&mut batch);
+            let spilled = std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0);
+            assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), expect_hits);
+            if gate_open {
+                assert_eq!(landed, 1, "an open gate posts");
+            } else {
+                assert_eq!(landed, 0, "a shut gate lands nothing");
+                assert_eq!(spilled, 1, "the rows are rescued to the spill, not dropped");
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// Regression, B1 review 2 (2026-11-13): with `ticks` / `tick_quotes`
+    /// keyed and only `feed_aux_packets` not, the writer thread posts the
+    /// tick rows and sets ONLY the aux rows aside to the spill. Before, one
+    /// gate covered all three tables, so an auxiliary table that could not be
+    /// keyed held every live tick out of QuestDB for the whole session.
+    #[test]
+    fn test_regression_an_unkeyed_aux_table_does_not_hold_the_ticks() {
+        let dir = scratch_dir("b1-aux-only-shut");
+        let (port, hits) = counting_ilp_server();
+        let cfg = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: 1,
+            ilp_port: 1,
+        };
+        let gate: fn(&[crate::ilp_table_gate::GatedTable]) -> bool =
+            |t| !t.contains(&crate::ilp_table_gate::GatedTable::FeedAuxPackets);
+        let mut w = TickWriter::new(&cfg, Feed::Dhan).with_table_gate_for_test(gate);
+        w.append_tick_with_seq(&sample_tick(), 1).expect("append");
+        let aux = AuxPacketRow::from_header(
+            AuxPacketKind::MarketStatus,
+            13,
+            0,
+            1_779_951_600_111_000_000,
+            1_779_951_600_111_000_000,
+        )
+        .expect("row");
+        w.append_aux(&aux).expect("append aux");
+        let (mut producer, mut sink, rx) = w.split_for_offload();
+        sink.spill_dir = dir.clone();
+        producer.flush().expect("hand off");
+        let mut batch = rx.try_recv().expect("batch queued");
+        let landed = sink.write(&mut batch);
+        assert_eq!(landed, 1, "the tick row is posted");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let files: Vec<_> = std::fs::read_dir(&dir)
+            .map(|d| d.flatten().map(|e| e.path()).collect())
+            .unwrap_or_default();
+        assert_eq!(files.len(), 1, "the aux row is set aside, not dropped");
+        let text = std::fs::read_to_string(&files[0]).expect("spill text");
+        assert!(text.starts_with("feed_aux_packets"), "{text}");
+        assert!(!text.contains("\nticks") && !text.starts_with("ticks"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression, B1 review 3 (2026-11-13): with only `ticks` keyed, the
+    /// writer thread posts the tick row and sets the `tick_quotes` and the
+    /// `feed_aux_packets` rows aside, each to its OWN file. A tick batch
+    /// rescued later the same hour lands in the tick rescue file, which holds
+    /// no row of a table the replay is holding. Before, the quote rows held
+    /// the whole batch (one gate for `ticks` and `tick_quotes`) and the aux
+    /// rows went into `ticks-<feed>-<hour>.ilp`, so the replay held every
+    /// later rescued tick of that hour behind `feed_aux_packets`.
+    #[test]
+    fn test_regression_held_tables_are_set_aside_to_their_own_spill_files() {
+        let dir = scratch_dir("b1r3-held-files");
+        let (port, hits) = counting_ilp_server();
+        let cfg = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: 1,
+            ilp_port: 1,
+        };
+        let only_ticks: fn(&[GatedTable]) -> bool = |t| t == [GatedTable::Ticks];
+        let mut w = TickWriter::new(&cfg, Feed::Dhan).with_table_gate_for_test(only_ticks);
+        w.append_tick_with_seq(&sample_tick(), 1).expect("append");
+        w.append_tick_quote_with_seq(&sample_tick(), 2)
+            .expect("append quote");
+        let aux = AuxPacketRow::from_header(
+            AuxPacketKind::MarketStatus,
+            13,
+            0,
+            1_779_951_600_111_000_000,
+            1_779_951_600_111_000_000,
+        )
+        .expect("row");
+        w.append_aux(&aux).expect("append aux");
+        let (mut producer, mut sink, rx) = w.split_for_offload();
+        sink.spill_dir = dir.clone();
+        producer.flush().expect("hand off");
+        let mut batch = rx.try_recv().expect("batch queued");
+        assert_eq!(sink.write(&mut batch), 1, "the tick row is posted");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // A later tick batch rescued the same hour (QuestDB refusing it here
+        // stands in for a stall): it goes to the tick rescue file.
+        producer
+            .append_tick_with_seq(&sample_tick(), 3)
+            .expect("append");
+        producer.flush().expect("hand off");
+        let mut later = rx.try_recv().expect("batch queued");
+        sink.sender = None;
+        assert_eq!(sink.write(&mut later), 0, "rescued");
+        let mut names: Vec<String> = std::fs::read_dir(&dir)
+            .map(|d| {
+                d.flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        assert_eq!(names.len(), 3, "{names:?}");
+        for (name, table) in names
+            .iter()
+            .zip(["feed_aux_packets,", "tick_quotes,", "ticks,"])
+        {
+            let text = std::fs::read_to_string(dir.join(name)).expect("spill text");
+            assert!(!text.is_empty(), "{name}");
+            assert!(
+                text.lines().all(|l| l.starts_with(table)),
+                "{name} must hold only {table} rows: {text}"
+            );
+        }
+        assert!(names[0].starts_with("held-feed_aux_packets-dhan-"));
+        assert!(names[1].starts_with("held-tick_quotes-dhan-"));
+        assert!(names[2].starts_with("ticks-dhan-"));
+        for name in &names {
+            assert!(
+                crate::tick_spill_replay::spill_file_hour(&dir.join(name)).is_some(),
+                "the replay must still read the hour of {name}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression, B1 review 3 (2026-11-13): the ensure judges `ticks` and
+    /// `tick_quotes` on their own key statements. A stand-in that refuses
+    /// only the `tick_quotes` DEDUP (QuestDB created that table itself) must
+    /// leave `ticks` keyed. Before, one chained verdict left `ticks` unkeyed
+    /// too and every live tick of the session went to the spill.
+    #[tokio::test]
+    async fn test_regression_a_refused_tick_quotes_key_leaves_ticks_keyed() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut request = Vec::new();
+                let mut buf = [0u8; 8_192];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => request.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let head = String::from_utf8_lossy(&request);
+                let refuse = head.contains("tick_quotes") && head.contains("DEDUP");
+                let reply: &[u8] = if refuse {
+                    b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                } else {
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"
+                };
+                let _ = stream.write_all(reply);
+            }
+        });
+        let cfg = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: 1,
+            ilp_port: 1,
+        };
+        let verdict = ensure_ticks_tables_verdict(&cfg).await;
+        assert!(!verdict.every_statement_accepted);
+        assert!(verdict.ticks.accepted, "ticks keyed on its own statements");
+        assert!(!verdict.ticks.refused_by_server);
+        assert!(!verdict.tick_quotes.accepted);
+        assert!(
+            verdict.tick_quotes.refused_by_server,
+            "only tick_quotes is probed for an auto-created shape"
+        );
+    }
+
+    /// The unsplit (synchronous) arm: a batch with no aux row is not held by
+    /// an unkeyed auxiliary table (B1 review 2).
+    #[test]
+    fn test_sync_flush_posts_ticks_while_only_the_aux_table_is_unkeyed() {
+        let (port, hits) = counting_ilp_server();
+        let cfg = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: 1,
+            ilp_port: 1,
+        };
+        let gate: fn(&[crate::ilp_table_gate::GatedTable]) -> bool =
+            |t| !t.contains(&crate::ilp_table_gate::GatedTable::FeedAuxPackets);
+        let mut w = TickWriter::new(&cfg, Feed::Dhan).with_table_gate_for_test(gate);
+        w.append_tick_with_seq(&sample_tick(), 1).expect("append");
+        w.flush().expect("a ticks-only batch posts");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     /// The drain must not write the rescue file itself.

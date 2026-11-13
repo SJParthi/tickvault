@@ -17,7 +17,7 @@
 use tickvault_storage::live_order_events_persistence::{LiveOrderEvent, LiveOrderEventKind};
 use tickvault_trading::brutex_host::engine::Side;
 
-use super::chain::PaperExecution;
+use super::chain::{PaperExecution, PositionReport};
 
 /// One row from the signal's template: `kind`, the next `seq` (then moved
 /// on), stamped at `ts_ist_nanos`. The caller fills the step's own fields.
@@ -160,6 +160,24 @@ pub fn clamp_exit(held_lots: i32, x: &PaperExecution) -> Option<PaperExecution> 
     c.filled_qty = c.filled_qty.min(c.qty);
     c.base.qty = c.qty;
     Some(c)
+}
+
+/// The report sent back to the chain once the runtime has booked (or
+/// refused, or given up) Execute `x` and holds `net_lots` of its instrument
+/// (LF-9 finding 2). `x` is the Execute as the chain sent it (before any exit
+/// clamp), so the chain takes back exactly the shares it counted. O(1).
+#[must_use]
+pub fn position_report(x: &PaperExecution, net_lots: i32) -> PositionReport {
+    let filled = x.filled_qty.max(0);
+    PositionReport {
+        security_id: x.security_id,
+        segment: x.segment.binary_code(),
+        expected_shares: match x.side {
+            Side::Buy => filled,
+            Side::Sell => filled.saturating_neg(),
+        },
+        runtime_net_shares: i64::from(net_lots).saturating_mul(i64::from(x.lot_size.max(1))),
+    }
 }
 
 #[cfg(test)]
@@ -352,6 +370,20 @@ mod tests {
     fn test_remainder_reason_names_none_or_part() {
         assert_eq!(remainder_reason(0), "no_fill_in_window");
         assert_eq!(remainder_reason(1), "remainder_after_window");
+    }
+
+    #[test]
+    fn test_position_report_takes_back_the_shares_the_chain_counted() {
+        let mut x = execution(50, 40, false);
+        x.lot_size = 10;
+        x.side = Side::Buy;
+        let r = position_report(&x, 3);
+        assert_eq!(r.expected_shares, 40);
+        assert_eq!(r.runtime_net_shares, 30);
+        assert_eq!(r.segment, ExchangeSegment::NseEquity.binary_code());
+        x.side = Side::Sell;
+        assert_eq!(position_report(&x, -1).expected_shares, -40);
+        assert_eq!(position_report(&x, -1).runtime_net_shares, -10);
     }
 
     #[test]

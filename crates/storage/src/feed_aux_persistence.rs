@@ -510,6 +510,11 @@ pub async fn ensure_feed_aux_table(questdb_config: &QuestDbConfig) -> bool {
         }
     };
     let mut every_statement_accepted = true;
+    // B1 review: the gates need only the key-bearing statements (see
+    // `ilp_table_gate::ddl_is_key_bearing`).
+    let mut key_statements_accepted = true;
+    // B1 review 2: a key statement QuestDB answered with a refusal.
+    let mut key_refused_by_server = false;
     for ddl in &feed_aux_ensure_statements() {
         match client
             .get(&base_url)
@@ -530,6 +535,8 @@ pub async fn ensure_feed_aux_table(questdb_config: &QuestDbConfig) -> bool {
                     "feed_aux_packets DDL returned non-2xx — the DEDUP key may be missing"
                 );
                 every_statement_accepted = false;
+                key_statements_accepted &= !crate::ilp_table_gate::ddl_is_key_bearing(ddl);
+                key_refused_by_server |= crate::ilp_table_gate::ddl_is_key_bearing(ddl);
             }
             Err(err) => {
                 error!(
@@ -540,8 +547,19 @@ pub async fn ensure_feed_aux_table(questdb_config: &QuestDbConfig) -> bool {
                     "feed_aux_packets DDL request failed"
                 );
                 every_statement_accepted = false;
+                key_statements_accepted &= !crate::ilp_table_gate::ddl_is_key_bearing(ddl);
             }
         }
+    }
+    if key_statements_accepted {
+        crate::ilp_table_gate::mark_table_keyed(crate::ilp_table_gate::GatedTable::FeedAuxPackets);
+    } else if key_refused_by_server {
+        // B1 review 2: name a table QuestDB created itself (see `diagnose_refused_key`).
+        crate::ilp_table_gate::diagnose_refused_key(
+            questdb_config,
+            crate::ilp_table_gate::GatedTable::FeedAuxPackets,
+        )
+        .await;
     }
     // 2026-11-07 (`ilp_table_gate`): the spill replay may post this table's
     // rows only from here on.

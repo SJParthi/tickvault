@@ -84,14 +84,13 @@ use tickvault_storage::live_fill_report_persistence::{
 };
 use tickvault_storage::off_worker::off_worker;
 use tickvault_storage::wal_suspension_watcher::{WalTableRow, fetch_wal_tables};
-use tickvault_trading::brutex_host::worst_fill::{FillSchedule, SecondBar};
 
 use build::{DailyReport, OUTSIDE_WORST_CASE_LOG_CAP, ReportContext, build_report};
 use recheck::{
-    OrderInputs, RECHECK_MAX_ORDERS, RECHECK_QUERY_TIMEOUT_SECS, RECHECK_WALL_BUDGET_SECS, Recheck,
-    RecheckKind, read_seconds, recheck_order,
+    OrderSeconds, RECHECK_MAX_ORDERS, RECHECK_QUERY_TIMEOUT_SECS, RECHECK_WALL_BUDGET_SECS,
+    Recheck, RecheckKind, read_seconds,
 };
-use render::{render_files, summary_plain};
+use render::{render_files, report_file_names, summary_plain};
 use rows::REPORT_QUERY_TIMEOUT_SECS;
 use upload::{
     LIVE_FILL_LOGS_DIR, UPLOAD_SPACING_SECS, UPLOAD_TRIES, copy_started, day_dir, folder_complete,
@@ -310,6 +309,51 @@ pub const fn today_step(now_sod: u32, done: Option<usize>) -> Option<(usize, u32
             }
         }
     }
+}
+
+/// Whether a catch-up of a day with no local state repairs its record
+/// instead of rebuilding it (LF-9 finding 7): the bucket already holds some
+/// of its report files, or its summary row says the copy was verified. A
+/// rebuild would upsert a `catch_up_rebuild` row over the original and put a
+/// second build beside the first in the bucket. Pure, O(1).
+#[must_use]
+pub const fn catch_up_repairs_instead(files_in_bucket: usize, row_uploaded: Option<bool>) -> bool {
+    files_in_bucket > 0 || matches!(row_uploaded, Some(true))
+}
+
+/// Whether a catch-up asks the bucket before it builds or copies (LF-9
+/// findings 7 and review): every catch-up whose copy never started, with a
+/// complete local folder or none. A complete folder may be a build made
+/// while the bucket could not be checked; it is copied only once the bucket
+/// is checked. Pure, O(1).
+#[must_use]
+pub const fn catch_up_probes_bucket(catch_up: bool, copy_started: bool) -> bool {
+    catch_up && !copy_started
+}
+
+/// Whether a catch-up whose bucket probe FAILED may build the day locally
+/// (without the copy): only a day with no complete local folder whose summary
+/// row read succeeded and found NO row (LF-9 review, findings 6 and 10). A
+/// failed row read is not "never reported": the day may have been reported
+/// green and copied, and a rebuild would upsert an Amber `s3_uploaded =
+/// false` row over it. Pure, O(1).
+#[must_use]
+pub const fn probe_failure_may_build(
+    folder_complete: bool,
+    row_read: &Result<Option<bool>, String>,
+) -> bool {
+    !folder_complete && matches!(row_read, Ok(None))
+}
+
+/// Whether a catch-up that found the day already in the bucket may mark the
+/// day done (LF-9 review): only when the summary row already says the copy
+/// was verified. A row that says otherwise, or none, cannot be repaired here
+/// (the bucket is never read back), so the day is left unmarked and reported
+/// rather than marked done with a summary row that disagrees with the
+/// bucket. Pure, O(1).
+#[must_use]
+pub const fn catch_up_repair_may_mark(row_uploaded: Option<bool>) -> bool {
+    matches!(row_uploaded, Some(true))
 }
 
 /// Whether a run builds the day's files afresh (LF-7 review finding 5). Never
@@ -535,6 +579,13 @@ pub fn daily_row_from_report_json(
 /// with the designated timestamp `timestamp` and no DEDUP key, and every
 /// later `DEDUP ENABLE` would fail (the LH-01 class). Returns whether `write`
 /// ran and succeeded. O(1).
+///
+/// LF-9 review (second pass): since LF-9 finding 6 the day's marker waits for
+/// this row, so a table that can never be ensured leaves every day
+/// unmarked: each boot copies the lookback days again and today's loop runs
+/// all its attempts (each copy is idempotent: verified files are reused, one
+/// HeadObject each), and each attempt is reported here. The files alone are
+/// no longer the record; the row is.
 pub async fn gated_row_write<E, EF, W, WF>(
     ensured: &AtomicBool,
     ensure: E,
@@ -556,8 +607,9 @@ where
             "db_row_not_ensured",
             day,
             attempt,
-            "the table could not be created or checked; the summary row is not written \
-             (the files and the copy remain the record)",
+            "the table could not be created or checked; the summary row is not written, \
+             so the day stays unmarked and is copied again (idempotent) at the next \
+             attempt and boot; its files stay on disk",
         );
         return false;
     }
@@ -648,9 +700,22 @@ impl ReportRun<'_> {
     /// Re-prices the Decision row of every order the report will compare
     /// ([`build::priced_signal_ids`]), at most [`RECHECK_MAX_ORDERS`] of them
     /// (LF-7 review finding 3: unplaced refusals, skips and runtime
-    /// rejections are never read and never use up the cap or the budget).
+    /// rejections are never compared and never use up the cap or the budget).
     /// `catch_up` skips the reads: the stored seconds of a past day are
     /// usually archived and gone. No read starts at or after `deadline`.
+    ///
+    /// LF-9 finding 3: the orders the chain held on one instrument share each
+    /// second's participation cap, earlier orders first, so the re-pricing
+    /// walks every HELD order of an instrument in signal order
+    /// ([`build::held_share_known`]) with one map of the volume taken per
+    /// second. A held order that is not compared but whose window overlaps a
+    /// later held order of the same instrument is read too (its share is
+    /// needed; at most [`RECHECK_MAX_ORDERS`] such reads). An order whose
+    /// window overlaps one whose share is unknown (finished unpriced by a
+    /// taint or a late price, or not read) reads
+    /// `recheck_unavailable:shared_volume_unknown`, and so does every later
+    /// overlapping one. Cold, once a day: O(rows log rows) plus one bounded
+    /// read per order read.
     async fn recheck_all(
         &self,
         rows: &[rows::EventRow],
@@ -659,47 +724,61 @@ impl ReportRun<'_> {
         deadline: tokio::time::Instant,
     ) -> Vec<(i64, Recheck)> {
         let url = self.exec_url();
-        let mut out = Vec::new();
-        let mut schedule = FillSchedule::with_capacity(FillSchedule::required_capacity(61, 0));
         let mut read_failures = 0u64;
-        let targets = off_worker(|| build::priced_signal_ids(rows));
+        let items = off_worker(|| {
+            let targets = build::priced_signal_ids(rows);
+            let held = build::held_share_known(rows);
+            recheck::walk_items(rows, &targets, &held)
+        });
+        // Phase 1: the reads (bounded, in walk order).
+        let mut got: std::collections::BTreeMap<i64, OrderSeconds> =
+            std::collections::BTreeMap::new();
         let mut targeted = 0usize;
-        for row in rows
-            .iter()
-            .filter(|r| r.event == "decision" && targets.contains(&r.signal_id))
-        {
-            targeted += 1;
-            let r = if targeted > RECHECK_MAX_ORDERS {
-                Recheck::not_run(RecheckKind::Skipped("order_cap"))
-            } else if tokio::time::Instant::now() >= deadline {
-                Recheck::not_run(RecheckKind::Skipped("wall_budget"))
-            } else if catch_up {
-                Recheck::not_run(RecheckKind::Unavailable("catch_up_rebuild"))
+        let mut helper_reads = 0usize;
+        for item in &items {
+            if !item.wants_seconds() && !item.is_target {
+                continue;
+            }
+            let sid = item.row.signal_id;
+            if item.is_target {
+                targeted += 1;
+                let not_run = if targeted > RECHECK_MAX_ORDERS {
+                    Some(RecheckKind::Skipped("order_cap"))
+                } else if tokio::time::Instant::now() >= deadline {
+                    Some(RecheckKind::Skipped("wall_budget"))
+                } else if catch_up {
+                    Some(RecheckKind::Unavailable("catch_up_rebuild"))
+                } else {
+                    None
+                };
+                if let Some(kind) = not_run {
+                    got.insert(sid, OrderSeconds::NotRun(Recheck::not_run(kind)));
+                    continue;
+                }
             } else {
-                match OrderInputs::from_decision(row) {
-                    None => Recheck::not_run(RecheckKind::Unavailable("no_pricing_inputs")),
-                    Some(inp) => match read_seconds(&url, &inp).await {
-                        Err(_) => {
-                            read_failures += 1;
-                            Recheck::not_run(RecheckKind::Unavailable("seconds_read_failed"))
-                        }
-                        Ok(all) => {
-                            let decision = all.iter().copied().find(|s| s.sec == inp.decision_sec);
-                            let mut seconds: Vec<SecondBar> = all
-                                .into_iter()
-                                .filter(|s| s.sec != inp.decision_sec)
-                                .collect();
-                            let need = FillSchedule::required_capacity(inp.max_fill_seconds, 0);
-                            if schedule.capacity() < need {
-                                schedule = FillSchedule::with_capacity(need);
-                            }
-                            recheck_order(&inp, decision, &mut seconds, &mut schedule)
-                        }
-                    },
+                // A held order not compared: read only for its share.
+                if catch_up
+                    || helper_reads >= RECHECK_MAX_ORDERS
+                    || tokio::time::Instant::now() >= deadline
+                {
+                    continue;
+                }
+                helper_reads += 1;
+            }
+            let Some(inp) = item.inputs.as_ref() else {
+                continue;
+            };
+            let read = match read_seconds(&url, inp).await {
+                Ok(all) => OrderSeconds::Seconds(all),
+                Err(_) => {
+                    read_failures += 1;
+                    OrderSeconds::ReadFailed
                 }
             };
-            out.push((row.signal_id, r));
+            got.insert(sid, read);
         }
+        // Phase 2: the shared walk (pure, off the runtime worker).
+        let out = off_worker(|| recheck::recheck_walk(&items, &mut got));
         if read_failures > 0 {
             report_failed(
                 "recheck",
@@ -712,8 +791,11 @@ impl ReportRun<'_> {
     }
 
     /// One report of `day`: build (unless a copy of the day already started,
-    /// or the folder is complete and this is a catch-up), write, the summary row (`s3_uploaded = false`),
-    /// copy, marker, the summary row again after a verified copy. Every step
+    /// or the folder is complete and this is a catch-up, or the catch-up of a
+    /// day with no local state finds it already reported and copied, LF-9
+    /// finding 7), write, the summary row (`s3_uploaded = false`), copy, the
+    /// summary row again after a verified copy, then the marker only once
+    /// that row is written (LF-9 finding 6). Every step
     /// is budgeted against `deadline` (LF-7 review findings 4, 7, 10), so the
     /// row and the counters are never left behind by a slow copy. `final_try`
     /// builds even when unsettled. Returns `true` when the day is done
@@ -739,6 +821,94 @@ impl ReportRun<'_> {
                 "a copy of this day already started but a file is missing; not rebuilt, \
                  so the bucket never holds two builds",
             );
+        }
+        // LF-9 finding 7: a catch-up of a day with no local state (a box
+        // rebuild or a wiped data folder) first asks the bucket (HeadObject
+        // only) and the summary table whether the day was already reported
+        // and copied; if so it repairs the local record (the marker) and
+        // never builds the day a second time. LF-9 review: a complete local
+        // folder not yet copied is asked about too (it may be a build made
+        // while the bucket could not be checked), and a probe that fails
+        // still builds a never-reported day locally, without the copy.
+        let mut copy_blocked = false;
+        if catch_up_probes_bucket(catch_up, started) {
+            match self.already_reported_and_copied(&day_s).await {
+                Err(e) => {
+                    let row = rows::read_row_uploaded(&self.exec_url(), &day_s).await;
+                    if let Err(re) = &row {
+                        // LF-9 review, findings 6 and 10: neither the bucket
+                        // nor the summary row could be read, so whether the
+                        // day was already reported is unknown; it is never
+                        // rebuilt over a row that may say green.
+                        report_failed(
+                            "summary_row_read",
+                            &day_s,
+                            attempt,
+                            &format!(
+                                "the bucket could not be checked ({e}) and the summary row \
+                                 could not be read ({re}); the day is neither rebuilt nor \
+                                 copied now"
+                            ),
+                        );
+                        return false;
+                    }
+                    if !probe_failure_may_build(complete, &row) {
+                        report_failed(
+                            "bucket_probe",
+                            &day_s,
+                            attempt,
+                            &format!(
+                                "the bucket could not be checked, so the day is neither \
+                                 rebuilt nor copied now: {e}"
+                            ),
+                        );
+                        return false;
+                    }
+                    report_failed(
+                        "bucket_probe",
+                        &day_s,
+                        attempt,
+                        &format!(
+                            "the bucket could not be checked; the day is built locally and \
+                             copied only once the bucket is checked: {e}"
+                        ),
+                    );
+                    copy_blocked = true;
+                }
+                Ok(Some((files, row))) => {
+                    if files < report_file_names(&day_s).len() {
+                        report_failed(
+                            "copied_day_without_local_files",
+                            &day_s,
+                            attempt,
+                            &format!(
+                                "the bucket holds {files} of the day's report files and no local \
+                                 copy exists; not rebuilt, so the bucket never holds two builds"
+                            ),
+                        );
+                    }
+                    if !catch_up_repair_may_mark(row) {
+                        report_failed(
+                            "copied_day_row_not_verified",
+                            &day_s,
+                            attempt,
+                            "the bucket holds the day's report files but its summary row does \
+                             not say the copy was verified; the day is left unmarked",
+                        );
+                        return false;
+                    }
+                    let marked = off_worker(|| {
+                        crate::daily_task_marker::try_write_daily_marker(LIVE_FILL_REPORT_TASK, day)
+                    });
+                    if let Err(e) = marked {
+                        report_failed("marker", &day_s, attempt, &e.to_string());
+                        return false;
+                    }
+                    info!(day = %day_s, files, "live fill report: the day was already reported and copied; local record repaired, not rebuilt");
+                    return true;
+                }
+                Ok(None) => {}
+            }
         }
         if rebuild_wanted(catch_up, complete, started) {
             // A past day's rows were applied long before; its report reads
@@ -813,9 +983,18 @@ impl ReportRun<'_> {
                 .await;
             report = Some(built);
         }
+        if copy_blocked {
+            // Built (or not) locally; the copy waits for a bucket check, so
+            // the day stays unmarked and a later catch-up or the old-day pass
+            // copies it once the bucket answers.
+            if let Some(r) = &report {
+                info!(uploaded = false, "{}", summary_plain(r));
+            }
+            return false;
+        }
         let uploaded = match tokio::time::timeout(
             copy_budget(left(deadline)),
-            self.copy_and_mark(day, &day_s, &dir, attempt),
+            self.copy_verified(&day_s, &dir, attempt),
         )
         .await
         {
@@ -841,36 +1020,127 @@ impl ReportRun<'_> {
                         .and_then(|body| daily_row_from_report_json(&body, now_ist_ns(), true))
                 }
             };
-            match row {
+            // LF-9 finding 6: copy, then the row, then the marker. The day is
+            // marked done only once its summary row says the copy is
+            // verified; a row that cannot be written leaves the day unmarked,
+            // so a later attempt or the next boot copies again (idempotent)
+            // and writes the row before marking.
+            let row_written = match row {
                 Some(row) => self.write_db_row(row, &day_s, attempt).await,
-                None => report_failed(
-                    "db_row_from_files",
-                    &day_s,
-                    attempt,
-                    "the copied report file could not be read back for its summary row",
-                ),
+                None => {
+                    report_failed(
+                        "db_row_from_files",
+                        &day_s,
+                        attempt,
+                        "the copied report file could not be read back for its summary row",
+                    );
+                    false
+                }
+            };
+            // LF-9 review (second pass): the row's own local record, beside
+            // the five copy records (which are written as each file is
+            // verified, before the row). The old-day scan treats a day as
+            // finished only with it, so a copied day whose row failed is
+            // revisited and its row rewritten from its report file.
+            let row_written = row_written && self.record_row_written(&dir, &day_s, attempt);
+            let marked = row_written && self.write_marker(day, &day_s, attempt);
+            if let Some(r) = &report {
+                info!(uploaded, marked, "{}", summary_plain(r));
             }
+            return marked || final_try;
         }
         if let Some(r) = &report {
             info!(uploaded, "{}", summary_plain(r));
         }
-        uploaded || final_try
+        final_try
+    }
+
+    /// Whether day `day_s` was already reported and copied (LF-9 finding 7):
+    /// `Some((files in the bucket, the summary row's copy flag))` when the
+    /// bucket holds any of its report files or the summary row says the copy
+    /// was verified, `None` when neither. HeadObject and one bounded summary read only; never a write.
+    ///
+    /// # Errors
+    /// No bucket, or a bucket probe that failed.
+    async fn already_reported_and_copied(
+        &self,
+        day_s: &str,
+    ) -> Result<Option<(usize, Option<bool>)>, String> {
+        let store = self
+            .load_store()
+            .await
+            .ok_or_else(|| "no cold bucket".to_owned())?;
+        let files = tokio::time::timeout(
+            Duration::from_secs(BUCKET_LOAD_TIMEOUT_SECS),
+            upload::day_files_in_bucket(&store, day_s),
+        )
+        .await
+        .map_err(|_| "bucket probe timed out".to_owned())??;
+        // A failed row read (LF-9 review, findings 6 and 10): with files in
+        // the bucket the day is reported with no verified row (never
+        // marked); with none, whether it was reported is unknown, so the
+        // caller's failure arm handles it (it reads the row again and never
+        // builds over a row it cannot read).
+        let row = match rows::read_row_uploaded(&self.exec_url(), day_s).await {
+            Ok(row) => row,
+            Err(e) if files == 0 => return Err(e),
+            Err(_) => None,
+        };
+        Ok(catch_up_repairs_instead(files, row).then_some((files, row)))
+    }
+
+    /// Loads the cold bucket, bounded. Cold.
+    async fn load_store(&self) -> Option<tickvault_storage::s3_cold::S3Cold> {
+        tokio::time::timeout(
+            Duration::from_secs(BUCKET_LOAD_TIMEOUT_SECS),
+            tickvault_storage::s3_cold::S3Cold::load(self.bucket),
+        )
+        .await
+        .ok()
+        .flatten()
+    }
+
+    /// Writes the day's row record (`upload::write_row_written`); `false`
+    /// (reported) when it fails, which leaves the day unmarked. Cold.
+    fn record_row_written(&self, dir: &Path, day_s: &str, attempt: usize) -> bool {
+        match off_worker(|| upload::write_row_written(dir, day_s)) {
+            Ok(()) => true,
+            Err(e) => {
+                report_failed("row_record", day_s, attempt, &e.to_string());
+                false
+            }
+        }
+    }
+
+    /// Writes the day's marker; `false` (reported) when it fails. Cold.
+    fn write_marker(&self, day: NaiveDate, day_s: &str, attempt: usize) -> bool {
+        match off_worker(|| {
+            crate::daily_task_marker::try_write_daily_marker(LIVE_FILL_REPORT_TASK, day)
+        }) {
+            Ok(_) => true,
+            Err(e) => {
+                report_failed("marker", day_s, attempt, &e.to_string());
+                false
+            }
+        }
     }
 
     /// Day folders older than the lookback that were never copied (LF-7
-    /// review round 3, finding 2): at most [`OLD_DAY_COPIES_PER_PASS`]
-    /// complete ones are copied (a copy-only catch-up, never a rebuild),
-    /// each only while a whole run stays outside the session and the stop
-    /// window; each incomplete one is reported once per process as LIVE-FILL-01
-    /// `stage="outside_lookback_incomplete"` naming the folder. A folder that
-    /// cannot be listed is reported as `stage="old_day_scan"`. Returns whether
-    /// a copy is still owed this pass (deferred for room or by the cap). Cold,
-    /// once per pass, O(folders) through `off_worker`.
+    /// review round 3, finding 2), or copied with their summary row never
+    /// written: complete ones are copied again (a copy-only catch-up, never a
+    /// rebuild), each only while a whole run stays outside the session and
+    /// the stop window; each incomplete one is reported once per process as
+    /// LIVE-FILL-01 `stage="outside_lookback_incomplete"` naming the folder.
+    /// A folder that cannot be listed is reported as `stage="old_day_scan"`.
+    /// See [`Self::walk_old_days`] for the order and the per-pass cap.
+    /// Returns whether a copy is still owed this pass (deferred for room or
+    /// by the cap). Cold, once per pass, O(folders) through `off_worker`.
     async fn copy_old_days(
         &self,
         today: NaiveDate,
         lookback: &[NaiveDate],
         reported_incomplete: &mut BTreeSet<NaiveDate>,
+        unfinished: &mut BTreeSet<NaiveDate>,
     ) -> bool {
         let root = Path::new(LIVE_FILL_LOGS_DIR);
         let found = match off_worker(|| {
@@ -887,7 +1157,52 @@ impl ReportRun<'_> {
                 return false;
             }
         };
-        let mut copied = 0;
+        Self::walk_old_days(
+            found,
+            reported_incomplete,
+            unfinished,
+            || leftovers_allowed(sod_of(now_ist_ns())),
+            |day, was_copied| async move {
+                let _done = bounded_run(self, day, 0, true, true).await;
+                let day_s = day.format("%Y-%m-%d").to_string();
+                let dir = root.join(&day_s);
+                off_worker(|| {
+                    let now_copied = upload::folder_copied(&dir, &day_s);
+                    now_copied && (!was_copied || upload::row_written(&dir))
+                })
+            },
+        )
+        .await
+    }
+
+    /// One pass over the old day folders `found` (never-copied ones first,
+    /// then copied ones missing only their row, oldest first within each).
+    /// `run(day, was_copied)` copies one and says whether it made PROGRESS
+    /// (finished, or copied when it was not).
+    ///
+    /// LF-9 hardening: only a run that made progress uses one of the pass's
+    /// [`OLD_DAY_COPIES_PER_PASS`] slots, and a folder run once by this
+    /// process with no progress (`unfinished`) is not run again by it: its
+    /// own run already reported why (its row cannot be written, or the
+    /// bucket holds its files with no verified row). Before, such folders
+    /// took every slot, oldest first, on every pass forever, and a newer
+    /// folder that was never copied waited behind them, its report on the
+    /// local disk only. A pass therefore runs at most one bounded run per
+    /// folder, each started only while `allowed()` (a whole run fits outside
+    /// the session and the stop window). Returns whether a copy is still
+    /// owed this pass. Cold, O(folders).
+    async fn walk_old_days<R, F>(
+        found: Vec<upload::UnreportedDay>,
+        reported_incomplete: &mut BTreeSet<NaiveDate>,
+        unfinished: &mut BTreeSet<NaiveDate>,
+        mut allowed: impl FnMut() -> bool,
+        mut run: R,
+    ) -> bool
+    where
+        R: FnMut(NaiveDate, bool) -> F,
+        F: std::future::Future<Output = bool>,
+    {
+        let mut progressed = 0;
         for old in found {
             let day_s = old.day.format("%Y-%m-%d").to_string();
             if !old.complete {
@@ -903,26 +1218,29 @@ impl ReportRun<'_> {
                 }
                 continue;
             }
-            if copied >= OLD_DAY_COPIES_PER_PASS || !leftovers_allowed(sod_of(now_ist_ns())) {
+            if unfinished.contains(&old.day) {
+                continue;
+            }
+            if progressed >= OLD_DAY_COPIES_PER_PASS || !allowed() {
                 info!(day = %day_s, "live fill report: old uncopied day deferred to a later pass");
                 return true;
             }
-            warn!(day = %day_s, "live fill report: copying a day older than the lookback that was never copied");
-            copied += 1;
-            let _done = bounded_run(self, old.day, 0, true, true).await;
+            warn!(day = %day_s, copied = old.copied, "live fill report: copying a day older than the lookback that is not finished");
+            if run(old.day, old.copied).await {
+                progressed += 1;
+            } else {
+                unfinished.insert(old.day);
+                info!(day = %day_s, "live fill report: old day made no progress; not retried by this process");
+            }
         }
         false
     }
 
-    /// Copies the day's files and writes the marker once all five are
-    /// verified. Returns whether they are.
-    async fn copy_and_mark(&self, day: NaiveDate, day_s: &str, dir: &Path, attempt: usize) -> bool {
-        let loaded = tokio::time::timeout(
-            Duration::from_secs(BUCKET_LOAD_TIMEOUT_SECS),
-            tickvault_storage::s3_cold::S3Cold::load(self.bucket),
-        )
-        .await;
-        let Ok(Some(store)) = loaded else {
+    /// Copies the day's files; whether all five are verified in the bucket.
+    /// The marker is written by the caller only after the summary row (LF-9
+    /// finding 6).
+    async fn copy_verified(&self, day_s: &str, dir: &Path, attempt: usize) -> bool {
+        let Some(store) = self.load_store().await else {
             metrics::counter!(UPLOAD_COUNTER, "outcome" => "no_bucket").increment(1);
             report_failed(
                 "no_bucket",
@@ -958,24 +1276,14 @@ impl ReportRun<'_> {
             return false;
         }
         metrics::counter!(UPLOAD_COUNTER, "outcome" => "verified").increment(1);
-        match off_worker(|| {
-            crate::daily_task_marker::try_write_daily_marker(LIVE_FILL_REPORT_TASK, day)
-        }) {
-            Ok(_) => true,
-            Err(e) => {
-                report_failed("marker", day_s, attempt, &e.to_string());
-                // The copies are verified; a missing marker only repeats the
-                // (idempotent) copy at the next boot.
-                true
-            }
-        }
+        true
     }
 
     /// One summary row, gated on the table being ensured, at most
     /// [`DB_ROW_TRIES`] tries [`DB_ROW_RETRY_SPACING_SECS`] apart (no sleep
     /// after the last). The designated timestamp is the day, so this row
     /// upserts any earlier row of the same day.
-    async fn write_db_row(&self, row: LiveFillReportDailyRow, day: &str, attempt: usize) {
+    async fn write_db_row(&self, row: LiveFillReportDailyRow, day: &str, attempt: usize) -> bool {
         let questdb = self.questdb;
         let ensure = || async move {
             tokio::time::timeout(
@@ -1003,7 +1311,7 @@ impl ReportRun<'_> {
             report_failed("db_row", day, attempt, &last);
             false
         };
-        let _written = gated_row_write(&self.ensured, ensure, write, day, attempt).await;
+        gated_row_write(&self.ensured, ensure, write, day, attempt).await
     }
 }
 
@@ -1113,6 +1421,9 @@ pub fn spawn_live_fill_report(
         // Incomplete old folders already reported by this process (one line
         // per folder per process). Bounded by the folder count.
         let mut reported_incomplete = BTreeSet::new();
+        // Old complete folders this process ran with no progress (LF-9
+        // hardening): not run again by it. Bounded by the folder count.
+        let mut unfinished_old = BTreeSet::new();
         loop {
             let now = now_ist_ns();
             if let Some(today) = ist_date_of(now).filter(|d| calendar.is_trading_day(*d)) {
@@ -1160,7 +1471,12 @@ pub fn spawn_live_fill_report(
                 if !deferred {
                     let lookback = lookback_days(today, |d| calendar.is_trading_day(d));
                     deferred = run
-                        .copy_old_days(today, &lookback, &mut reported_incomplete)
+                        .copy_old_days(
+                            today,
+                            &lookback,
+                            &mut reported_incomplete,
+                            &mut unfinished_old,
+                        )
                         .await;
                 }
                 // LF-7 review round 3, finding 3: a start or an end inside the
@@ -1480,10 +1796,10 @@ mod tests {
         let copy_old = &MOD_SRC[MOD_SRC
             .find("    async fn copy_old_days(")
             .expect("copy_old_days")..];
-        let copy_old = &copy_old[..copy_old.find("    async fn copy_and_mark(").expect("end")];
+        let copy_old = &copy_old[..copy_old.find("    async fn copy_verified(").expect("end")];
         assert!(copy_old.contains("upload::unreported_day_folders("));
         // Copy only, never a rebuild: a catch-up run with the folder complete.
-        assert!(copy_old.contains("bounded_run(self, old.day, 0, true, true)"));
+        assert!(copy_old.contains("bounded_run(self, day, 0, true, true)"));
         assert!(copy_old.contains("\"outside_lookback_incomplete\""));
         assert!(copy_old.contains("OLD_DAY_COPIES_PER_PASS"));
     }
@@ -1684,6 +2000,156 @@ mod tests {
         assert!(spawn.contains("AtomicBool::new(ensured)"));
     }
 
+    /// LF-9 finding 6: the day's marker is written only after the summary
+    /// row that says the copy is verified (copy, row, marker), and only when
+    /// that row was written: a row that fails leaves the day unmarked, so a
+    /// later attempt or the next boot copies again (idempotent) and writes
+    /// it. The copy itself writes no marker.
+    #[test]
+    fn test_regression_marker_only_after_the_row_after_a_verified_copy() {
+        let run_day = &MOD_SRC[MOD_SRC.find("    async fn run_day(").expect("run_day")..];
+        let run_day = &run_day[..run_day
+            .find("    async fn already_reported_and_copied(")
+            .expect("end")];
+        let copy = run_day.find("self.copy_verified(").expect("copy");
+        let row = run_day
+            .find("daily_row(r, now_ist_ns(), true)")
+            .expect("row after copy");
+        let record = run_day
+            .find("let row_written = row_written && self.record_row_written(")
+            .expect("the row record gated on the row");
+        let marker = run_day
+            .find("let marked = row_written && self.write_marker(")
+            .expect("marker gated on the row");
+        assert!(copy < row && row < marker);
+        assert!(
+            row < record && record < marker,
+            "row, its record, then the marker"
+        );
+        let copy_fn = &MOD_SRC[MOD_SRC
+            .find("    async fn copy_verified(")
+            .expect("copy fn")..];
+        let copy_fn = &copy_fn[..copy_fn.find("    async fn write_db_row(").expect("end")];
+        assert!(
+            !copy_fn.contains("try_write_daily_marker"),
+            "the copy writes no marker"
+        );
+        assert!(run_day.contains("return marked || final_try;"));
+    }
+
+    /// LF-9 finding 7: a catch-up of a day with no local state asks the
+    /// bucket and the summary row first, and repairs (never rebuilds) a day
+    /// already reported and copied.
+    #[test]
+    fn test_regression_catch_up_never_rebuilds_a_day_already_copied() {
+        assert!(catch_up_repairs_instead(5, None), "files in the bucket");
+        assert!(catch_up_repairs_instead(1, Some(false)), "a part copy");
+        assert!(
+            catch_up_repairs_instead(0, Some(true)),
+            "the row says copied"
+        );
+        assert!(!catch_up_repairs_instead(0, Some(false)));
+        assert!(!catch_up_repairs_instead(0, None), "never copied: rebuild");
+        let run_day = &MOD_SRC[MOD_SRC.find("    async fn run_day(").expect("run_day")..];
+        let probe = run_day
+            .find("if catch_up_probes_bucket(catch_up, started) {")
+            .expect("the probe for a day whose copy never started");
+        let ask = run_day
+            .find("self.already_reported_and_copied(&day_s)")
+            .expect("asks the bucket and the row");
+        let rebuild = run_day
+            .find("if rebuild_wanted(catch_up, complete, started) {")
+            .expect("rebuild");
+        assert!(probe < ask && ask < rebuild);
+    }
+
+    /// LF-9 review: (1) a catch-up whose copy never started asks the bucket
+    /// even with a complete local folder; a probe that fails still builds a
+    /// never-reported day locally (files and a `s3_uploaded = false` row) and
+    /// never copies or marks it, so a later catch-up or the old-day pass
+    /// finishes it once the bucket answers; (2) a day found in the bucket is
+    /// marked done only when its summary row already says the copy was
+    /// verified.
+    #[test]
+    fn test_regression_probe_failure_builds_locally_and_repair_needs_a_verified_row() {
+        assert!(catch_up_probes_bucket(true, false));
+        assert!(!catch_up_probes_bucket(true, true), "a started copy");
+        assert!(!catch_up_probes_bucket(false, false), "today's run");
+        assert!(catch_up_repair_may_mark(Some(true)));
+        assert!(
+            !catch_up_repair_may_mark(Some(false)),
+            "row says not copied"
+        );
+        assert!(!catch_up_repair_may_mark(None), "no row");
+        let run_day = &MOD_SRC[MOD_SRC.find("    async fn run_day(").expect("run_day")..];
+        let run_day = &run_day[..run_day
+            .find("    async fn already_reported_and_copied(")
+            .expect("end")];
+        // (1) A probe error does not return before the build unless the day
+        // is complete or has a row; it blocks the copy instead.
+        let err = run_day
+            .find("                Err(e) => {")
+            .expect("probe error arm");
+        let err_arm = &run_day[err..run_day.find("Ok(Some((files, row))) =>").expect("repair")];
+        assert!(err_arm.contains("if !probe_failure_may_build(complete, &row) {"));
+        assert!(err_arm.contains("copy_blocked = true;"));
+        let build = run_day
+            .find("if rebuild_wanted(catch_up, complete, started) {")
+            .expect("build");
+        let blocked = run_day.find("if copy_blocked {").expect("copy gate");
+        let copy = run_day.find("self.copy_verified(").expect("copy");
+        assert!(err < build && build < blocked && blocked < copy);
+        let gate = &run_day[blocked..copy];
+        assert!(gate.contains("return false;"), "no copy, no marker");
+        assert!(!gate.contains("write_marker"));
+        // (2) The repair arm checks the row before the marker.
+        let repair = &run_day[run_day.find("Ok(Some((files, row))) =>").expect("repair")..];
+        let check = repair
+            .find("if !catch_up_repair_may_mark(row) {")
+            .expect("row check");
+        let mark = repair.find("try_write_daily_marker").expect("marker");
+        assert!(check < mark);
+    }
+
+    /// LF-9 review, findings 6 and 10: when the bucket probe fails, a day is
+    /// built locally only when its summary row read SUCCEEDED and found no
+    /// row. A failed row read (a timeout, a bad status, an unreadable body)
+    /// used to read as "no row", so a day already reported green and copied
+    /// was rebuilt Amber and its row overwritten with `s3_uploaded = false`.
+    /// The failure arm now returns, reported as `summary_row_read`, before
+    /// any build or row write.
+    #[test]
+    fn test_regression_a_failed_row_read_never_builds_probe_failure_may_build() {
+        assert!(probe_failure_may_build(false, &Ok(None)), "never reported");
+        assert!(!probe_failure_may_build(true, &Ok(None)), "complete folder");
+        assert!(!probe_failure_may_build(false, &Ok(Some(true))), "a row");
+        assert!(!probe_failure_may_build(false, &Ok(Some(false))), "a row");
+        assert!(
+            !probe_failure_may_build(false, &Err("timed out".to_owned())),
+            "a failed read is not no row"
+        );
+        let run_day = &MOD_SRC[MOD_SRC.find("    async fn run_day(").expect("run_day")..];
+        let err = run_day
+            .find("                Err(e) => {")
+            .expect("probe error arm");
+        let err_arm = &run_day[err..run_day.find("Ok(Some((files, row))) =>").expect("repair")];
+        let read_fail = err_arm
+            .find("if let Err(re) = &row {")
+            .expect("failed read handled");
+        let returns = err_arm[read_fail..].find("return false;").expect("returns") + read_fail;
+        let build = run_day
+            .find("if rebuild_wanted(catch_up, complete, started) {")
+            .expect("build");
+        assert!(err + returns < build, "returns before any build");
+        assert!(err_arm[read_fail..returns].contains("\"summary_row_read\""));
+        // The bucket probe itself: a failed row read with no file in the
+        // bucket is an error (the failure arm decides), never "no row".
+        let probe = &MOD_SRC[MOD_SRC
+            .find("    async fn already_reported_and_copied(")
+            .expect("probe")..];
+        assert!(probe.contains("Err(e) if files == 0 => return Err(e),"));
+    }
+
     /// LF-7 review finding 5: once a copy of the day started, no attempt
     /// (today's retry, a same-day restart's late attempt, or a catch-up)
     /// rebuilds the files; only a day never copied is built afresh.
@@ -1716,6 +2182,79 @@ mod tests {
             qty: 500,
             ..rows::EventRow::default()
         }
+    }
+
+    /// LF-9 finding 3: the chain held two orders on one instrument with
+    /// overlapping windows; the first was refused by a taint after it had
+    /// taken part of a shared second, so the second's share is unknown and it
+    /// reads `shared_volume_unknown` (never a read, never a guessed fill). A
+    /// third order on another instrument is unaffected (here it reads
+    /// `seconds_read_failed`: the database is unreachable).
+    #[tokio::test]
+    async fn test_recheck_all_marks_an_order_sharing_with_a_tainted_one_unknown_held_share_known() {
+        let decision = |sid: i64, sec_id: i64, end_s: i64| {
+            let mut d = event(sid, 0, "decision");
+            d.security_id = sec_id;
+            d.segment = "NSE_FNO".to_owned();
+            d.qty = 100;
+            d.candle_end_ns = Some(end_s * 1_000_000_000);
+            d.ltp_paise = Some(10_000);
+            d.limit_paise = Some(10_100);
+            d.tick_paise = Some(5);
+            d.lot_size = Some(1);
+            d.participation_bps = Some(2_500);
+            d.max_fill_seconds = Some(60);
+            d
+        };
+        let t0 = 1_794_441_600 + 36_000;
+        let mut rows = vec![
+            decision(1, 2885, t0),
+            event(1, 1, "built"),
+            decision(2, 2885, t0 + 10),
+            event(2, 1, "built"),
+            event(2, 2, "sent"),
+            event(2, 3, "cancel"),
+            decision(3, 7, t0),
+            event(3, 1, "built"),
+            event(3, 2, "sent"),
+            event(3, 3, "cancel"),
+        ];
+        let mut tainted = event(1, 2, "reject");
+        tainted.reason = Some("tick_dropped".to_owned());
+        rows.push(tainted);
+        let known = build::held_share_known(&rows);
+        assert_eq!(known.get(&1), Some(&false), "finished unpriced");
+        assert_eq!(known.get(&2), Some(&true));
+        let questdb = QuestDbConfig {
+            host: "127.0.0.1".to_owned(),
+            http_port: 1,
+            pg_port: 1,
+            ilp_port: 1,
+        };
+        let run = ReportRun {
+            questdb: &questdb,
+            bucket: "tv-test-cold",
+            process_start_ist_ns: 0,
+            ensured: AtomicBool::new(false),
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let mut out = run.recheck_all(&rows, false, "2026-11-12", deadline).await;
+        out.sort_by_key(|(sid, _)| *sid);
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert_eq!(
+            out[0],
+            (
+                2,
+                Recheck::not_run(RecheckKind::Unavailable("shared_volume_unknown"))
+            )
+        );
+        assert_eq!(
+            out[1],
+            (
+                3,
+                Recheck::not_run(RecheckKind::Unavailable("seconds_read_failed"))
+            )
+        );
     }
 
     /// LF-7 review finding 3: the 500-order cap counts only the orders the
@@ -1766,5 +2305,113 @@ mod tests {
             assert!((1_001..=1_003).contains(sid));
             assert_eq!(r.kind, RecheckKind::Unavailable("catch_up_rebuild"));
         }
+    }
+
+    /// LF-9 hardening: old day folders that cannot finish never starve a
+    /// newer one that was never copied. Four complete folders older than the
+    /// lookback: the three oldest are stuck (case 1: copied, their summary
+    /// row can never be written; case 2: never copied locally, the bucket
+    /// already holds their files with no verified row), the newest is complete
+    /// and was never copied. The newest is copied in the FIRST pass, and a
+    /// second pass of the same process does not run the stuck ones again.
+    /// Before, the three oldest took every slot of every pass, oldest first,
+    /// and the newest was never copied.
+    #[tokio::test]
+    async fn test_regression_stuck_old_days_never_starve_a_never_copied_one() {
+        for stuck_copied in [true, false] {
+            let base = std::env::temp_dir().join(format!(
+                "tv_lfr_old_{}_{}_{stuck_copied}",
+                std::process::id(),
+                now_ist_ns()
+            ));
+            let days = ["2026-10-01", "2026-10-02", "2026-10-05", "2026-10-06"];
+            for (i, d) in days.iter().enumerate() {
+                let dir = upload::day_dir(&base, d);
+                std::fs::create_dir_all(upload::markers_dir(&dir)).expect("dirs");
+                for n in report_file_names(d) {
+                    std::fs::write(dir.join(&n), b"x").expect("file");
+                    if i < 3 && stuck_copied {
+                        std::fs::write(upload::markers_dir(&dir).join(&n), b"x").expect("rec");
+                    }
+                }
+            }
+            let today = NaiveDate::from_ymd_opt(2026, 11, 13).expect("day");
+            let newest = NaiveDate::from_ymd_opt(2026, 10, 6).expect("day");
+            let found = upload::unreported_day_folders(&base, today, |_| false).expect("scan");
+            assert_eq!(found.len(), 4);
+            let mut reported = BTreeSet::new();
+            let mut unfinished = BTreeSet::new();
+            let ran = std::cell::RefCell::new(Vec::new());
+            let run = |day: NaiveDate, _copied: bool| {
+                ran.borrow_mut().push(day);
+                std::future::ready(day == newest)
+            };
+            let owed = ReportRun::walk_old_days(
+                found.clone(),
+                &mut reported,
+                &mut unfinished,
+                || true,
+                run,
+            )
+            .await;
+            assert!(
+                ran.borrow().contains(&newest),
+                "stuck_copied={stuck_copied}: the newest is copied in one pass: {:?}",
+                ran.borrow()
+            );
+            assert!(!owed);
+            assert_eq!(unfinished.len(), 3);
+            // A second pass of the process runs none of the stuck ones again.
+            ran.borrow_mut().clear();
+            let rest: Vec<_> = found.into_iter().filter(|u| u.day != newest).collect();
+            let run = |day: NaiveDate, _copied: bool| {
+                ran.borrow_mut().push(day);
+                std::future::ready(false)
+            };
+            let owed =
+                ReportRun::walk_old_days(rest, &mut reported, &mut unfinished, || true, run).await;
+            assert!(!owed);
+            assert!(ran.borrow().is_empty(), "{:?}", ran.borrow());
+            std::fs::remove_dir_all(&base).ok();
+        }
+    }
+
+    /// The per-pass cap counts only runs that made progress, and a pass with
+    /// no room left defers the rest.
+    #[tokio::test]
+    async fn test_walk_old_days_caps_progress_and_defers_without_room() {
+        let day = |d: u32| NaiveDate::from_ymd_opt(2026, 10, d).expect("day");
+        let found: Vec<upload::UnreportedDay> = (1..=5)
+            .map(|d| upload::UnreportedDay {
+                day: day(d),
+                complete: true,
+                copied: false,
+            })
+            .collect();
+        let mut reported = BTreeSet::new();
+        let mut unfinished = BTreeSet::new();
+        let mut ran = 0usize;
+        let owed = ReportRun::walk_old_days(
+            found.clone(),
+            &mut reported,
+            &mut unfinished,
+            || true,
+            |_, _| {
+                ran += 1;
+                std::future::ready(true)
+            },
+        )
+        .await;
+        assert!(owed, "deferred by the cap");
+        assert_eq!(ran, OLD_DAY_COPIES_PER_PASS);
+        let owed = ReportRun::walk_old_days(
+            found,
+            &mut reported,
+            &mut unfinished,
+            || false,
+            |_, _| std::future::ready(true),
+        )
+        .await;
+        assert!(owed, "deferred for room");
     }
 }

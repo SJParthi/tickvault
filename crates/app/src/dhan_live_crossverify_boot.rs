@@ -149,6 +149,12 @@ pub const XVERIFY_PERSIST_ERRORS_COUNTER: &str = "tv_dhan_feed_xverify_persist_e
 /// `xverify_failed` (`reason = "not_persisted"`).
 pub const XVERIFY_PERSIST_DEADLINE_STOPS_COUNTER: &str =
     "tv_dhan_xverify_persist_deadline_stops_total";
+/// B1 review 4: audit persists skipped because the cross-verify tables were
+/// not keyed yet, by `pass` (`spot`, `options`). A deferral, not a loss: the
+/// attempt is retried and writes no marker. Local `/metrics` only: no EMF
+/// name, filter or alarm reads it.
+pub const XVERIFY_PERSIST_UNKEYED_SKIPS_COUNTER: &str =
+    "tv_dhan_xverify_persist_unkeyed_skips_total";
 /// Subscribed instruments the comparator cannot target (F&O etc.).
 pub const XVERIFY_UNVERIFIABLE_COUNTER: &str = "tv_dhan_xverify_targets_unverifiable_total";
 
@@ -764,6 +770,14 @@ pub struct PersistOutcome {
     /// Rows already buffered when the persist stopped at the deadline,
     /// abandoned on purpose (`abandon_pending`), never counted as discarded.
     pub rows_abandoned_at_deadline: usize,
+    /// B1 review 4: the cross-verify tables were not keyed, so the persist
+    /// appended and flushed nothing. A deferral, never a lost row: the
+    /// attempt reads `NotPersisted` (no marker, retried) and no §2.10
+    /// `audit_rows` counter moves. `final_flush_ok` is then `false`.
+    pub tables_not_keyed: bool,
+    /// Rows the persist did not write because the tables were not keyed (the
+    /// daily row included).
+    pub rows_not_written_unkeyed: usize,
 }
 
 /// The persist half of an attempt's verdict. `NotPersisted` when the final
@@ -2840,6 +2854,7 @@ async fn run_once(
                 vacuous = c.is_vacuous(),
                 "Dhan 1-minute cross-verification finished"
             );
+            ensure_xverify_tables_before(&deps.questdb, deadline).await;
             let complete = run_is_complete(
                 report.budget_elapsed,
                 report.live_truncated,
@@ -3136,6 +3151,30 @@ enum PersistScope {
     TapeOnly,
 }
 
+/// B1 (2026-11-13): when the boot's ensure of the three cross-verify tables
+/// was refused, re-runs it before this attempt persists, bounded by
+/// `deadline`. The writer refuses to post until the tables are keyed (a row
+/// reaching a missing table would make QuestDB create it in a shape no ensure
+/// can repair), so a refusal here leaves the attempt unpersisted and retried.
+/// One Acquire load when keyed (the normal case).
+async fn ensure_xverify_tables_before(questdb: &QuestDbConfig, deadline: tokio::time::Instant) {
+    use tickvault_storage::dhan_live_crossverify_persistence as xp;
+    if xp::xverify_tables_keyed() {
+        return;
+    }
+    let keyed = tokio::time::timeout_at(deadline, xp::ensure_dhan_live_crossverify_tables(questdb))
+        .await
+        .unwrap_or(false);
+    if !keyed {
+        warn!(
+            code = ErrorCode::DhanLiveXverify01RunDegraded.code_str(),
+            source = "xverify_tables_not_keyed",
+            "Dhan 1-minute cross-verification tables are still not created with their \
+             keys; this attempt's rows are not written and the attempt is retried"
+        );
+    }
+}
+
 /// Persists the run through the production writer, in batches of
 /// [`PERSIST_BATCH_ROWS`], stopping at `deadline`. See [`persist_report_into`].
 fn persist_report(
@@ -3186,6 +3225,20 @@ fn persist_report_into(
 ) -> PersistOutcome {
     let c = &report.comparison;
     let mut out = PersistOutcome::default();
+    // B1 review 4: with the tables not keyed every flush posts nothing and
+    // returns `Err`, which the code below would count as discarded rows and a
+    // failed final flush (a §2.10 `audit_rows` page per attempt). It is a
+    // deferral: append nothing, flush nothing, count the rows locally only.
+    if !writer.tables_keyed() {
+        let full = rows.scope == PersistScope::Full;
+        let findings = if full { c.findings.len() } else { 0 };
+        out.tables_not_keyed = true;
+        out.final_flush_ok = false;
+        out.rows_not_written_unkeyed = findings
+            .saturating_add(report.rest_tape.len())
+            .saturating_add(usize::from(full));
+        return finish_persist(report, out, 0, None, rows.scope);
+    }
     let mut batch_errors = 0_usize;
     // Counts the rows a flush took with it: on `Err` they were discarded; on
     // `Ok` with an empty buffer they were ACKed. An `Ok` that left rows
@@ -3325,6 +3378,18 @@ fn finish_persist(
 ) -> PersistOutcome {
     let c = &report.comparison;
     metrics::counter!(XVERIFY_PERSIST_ROWS_COUNTER).increment(out.rows_flushed as u64);
+    if out.tables_not_keyed {
+        // B1 review 4: local counters only. Never `XVERIFY_PERSIST_ERRORS_COUNTER`
+        // nor the writer's discard counter (both §2.10 `audit_rows` members):
+        // nothing was sent, the rows are recomputed by the next attempt, and
+        // the coded warn in `ensure_xverify_tables_before` is the signal.
+        metrics::counter!(
+            tickvault_storage::dhan_live_crossverify_persistence::DHAN_LIVE_XVERIFY_AUDIT_ROWS_ABANDONED_COUNTER
+        )
+        .increment(out.rows_not_written_unkeyed as u64);
+        metrics::counter!(XVERIFY_PERSIST_UNKEYED_SKIPS_COUNTER, "pass" => "spot").increment(1);
+        return out;
+    }
     if out.deadline_reached {
         // §12.15.8 (51b review): a deliberate stop counts only locally. It
         // never touches `XVERIFY_PERSIST_ERRORS_COUNTER` or the writer's
@@ -3645,6 +3710,7 @@ async fn run_option_pass(
     match result {
         Ok(report) => {
             let c = &report.comparison;
+            ensure_xverify_tables_before(&deps.questdb, deadline).await;
             let persisted_ok = persist_option_findings(&deps.questdb, &report, deadline);
             let label =
                 option_pass_outcome(c.is_vacuous(), report.budget_elapsed, report.rest_failures);
@@ -3736,6 +3802,9 @@ enum OptionPersist {
     Failed,
     /// The persist stopped before a flush it could not end by the deadline.
     StoppedAtDeadline,
+    /// B1 review 4: the tables were not keyed, so nothing was appended or
+    /// flushed (a deferral, counted locally only).
+    TablesNotKeyed,
 }
 
 /// The body of [`persist_option_findings`], with the writer and the clock
@@ -3748,6 +3817,17 @@ fn persist_option_findings_into(
     mut now: impl FnMut() -> tokio::time::Instant,
 ) -> OptionPersist {
     let c = &report.comparison;
+    // B1 review 4: as in `persist_report_into`, an un-keyed writer flushes
+    // nothing; skip before any append so no refused flush reaches
+    // `XVERIFY_PERSIST_ERRORS_COUNTER` (a §2.10 `audit_rows` member).
+    if !writer.tables_keyed() {
+        metrics::counter!(
+            tickvault_storage::dhan_live_crossverify_persistence::DHAN_LIVE_XVERIFY_AUDIT_ROWS_ABANDONED_COUNTER
+        )
+        .increment((c.findings.len() as u64).saturating_add(report.rest_tape.len() as u64));
+        metrics::counter!(XVERIFY_PERSIST_UNKEYED_SKIPS_COUNTER, "pass" => "options").increment(1);
+        return OptionPersist::TablesNotKeyed;
+    }
     let mut row_errors = 0_usize;
     let mut batch_errors = 0_usize;
     let mut flush_if_full = |w: &mut DhanLiveXverifyAuditWriter| {
@@ -3884,6 +3964,34 @@ mod tests {
     /// before its persist, and stamps that reading on its daily row and on
     /// every cell; `run_complete` on the row is the same `run_is_complete`
     /// value the marker decision uses. The option pass stamps its cells too.
+    /// Regression, B1 (2026-11-13): every attempt re-runs the cross-verify
+    /// DDL (when the boot's ensure was refused) BEFORE it persists, on both
+    /// the spot and the option pass, and the helper asks the keyed verdict.
+    #[test]
+    fn test_regression_each_attempt_ensures_the_tables_before_persisting() {
+        let prod = prod_src();
+        for (pass, persist) in [
+            (
+                "async fn run_once(",
+                "persist_report(&deps.questdb, &report, rows, deadline)",
+            ),
+            (
+                "async fn run_option_pass(",
+                "persist_option_findings(&deps.questdb",
+            ),
+        ] {
+            let body = fn_body(prod, pass);
+            let ensure = body
+                .find("ensure_xverify_tables_before(&deps.questdb, deadline).await")
+                .unwrap_or_else(|| panic!("{pass} must ensure the tables"));
+            let write = body.find(persist).expect("the persist call");
+            assert!(ensure < write, "{pass}: ensure, then persist");
+        }
+        let helper = fn_body(prod, "async fn ensure_xverify_tables_before(");
+        assert!(helper.contains("xverify_tables_keyed()"));
+        assert!(helper.contains("ensure_dhan_live_crossverify_tables(questdb)"));
+    }
+
     #[test]
     fn test_every_persisted_row_carries_one_attempt_stamp_and_the_run_complete_flag() {
         let prod = prod_src();
@@ -4343,6 +4451,8 @@ mod tests {
                 deadline_reached: false,
                 rows_not_written_at_deadline: 0,
                 rows_abandoned_at_deadline: 0,
+                tables_not_keyed: false,
+                rows_not_written_unkeyed: 0,
             };
             let lost = rows_discarded > 0 || cell_append_errors > 0 || tape_append_errors > 0;
             let expected = if !final_flush_ok || !daily_appended {
@@ -4444,6 +4554,50 @@ mod tests {
             live_truncated: false,
             rest_tape: (0..tape).map(|i| tape_row(to_i64(i))).collect(),
         }
+    }
+
+    /// Regression, B1 review 4: with the cross-verify tables not keyed, both
+    /// passes append and flush nothing, the spot attempt reads
+    /// `NotPersisted` (no marker, retried), and the §2.10 `audit_rows`
+    /// counters (`XVERIFY_PERSIST_ERRORS_COUNTER` and the writer's discard
+    /// counter) are never registered. Before the fix, the final flush's
+    /// refusal took `finish_persist`'s error arm and paged per attempt.
+    #[test]
+    fn test_regression_unkeyed_tables_skip_the_persist_and_never_page() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let report = report_with(5, 3);
+        let t0 = tokio::time::Instant::now();
+        let far = t0 + Duration::from_secs(86_400);
+        let (spot, options) = metrics::with_local_recorder(&recorder, || {
+            let mut writer = DhanLiveXverifyAuditWriter::for_test_unkeyed();
+            let spot = persist_report_into(&mut writer, &report, test_rows(), 2, far, || t0);
+            assert_eq!(writer.pending(), 0, "nothing appended");
+            let mut writer = DhanLiveXverifyAuditWriter::for_test_unkeyed();
+            let options =
+                persist_option_findings_into(&mut writer, &report, TEST_ATTEMPT_AT, far, || t0);
+            assert_eq!(writer.pending(), 0, "nothing appended");
+            (spot, options)
+        });
+        assert!(spot.tables_not_keyed, "{spot:?}");
+        assert_eq!(spot.rows_not_written_unkeyed, 5 + 3 + 1, "{spot:?}");
+        assert_eq!(spot.rows_discarded, 0, "{spot:?}");
+        assert!(!spot.deadline_reached);
+        assert_eq!(persist_verdict(&spot), Err(AttemptFailure::NotPersisted));
+        assert_eq!(options, OptionPersist::TablesNotKeyed);
+        let rendered = handle.render();
+        assert!(
+            !rendered.contains(XVERIFY_PERSIST_ERRORS_COUNTER),
+            "the paging persist-errors counter must not move:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("tv_dhan_live_xverify_audit_rows_discarded_total"),
+            "the paging discard counter must not move:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(XVERIFY_PERSIST_UNKEYED_SKIPS_COUNTER),
+            "{rendered}"
+        );
     }
 
     /// §12.15.8: with the deadline already passed, no row is appended and no

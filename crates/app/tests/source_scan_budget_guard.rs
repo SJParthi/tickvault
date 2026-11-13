@@ -38,6 +38,10 @@ const BUDGET: &[(&str, usize)] = &[
     // ensure is refused (the same can-not-be-staged refusal as J3). Paired
     // behaviour tests: `market_depth_book_ensure_reads_not_keyed_when_unreachable`,
     // `ensure_until_keyed_returns_once_every_statement_is_accepted`.
+    // 2026-11-13 (B1): the arming order of the live write gate is a behaviour
+    // test in its own binary (`crates/app/tests/live_write_gate_boot.rs`,
+    // `test_boot_live_ddl_arms_the_write_gate_before_its_first_ensure`), not a
+    // source scan, so this row stays at 7.
     ("candle_ddl_boot.rs", 7),
     // 2026-11-12 (plan item LF-6a): one wiring scan pinning that the live
     // clock poll loop feeds the 1 ms page episode and the probe publishes the
@@ -228,6 +232,12 @@ const BUDGET: &[(&str, usize)] = &[
     ("oms_wiring.rs", 1),
     ("order_observability.rs", 1),
     ("order_runtime.rs", 3),
+    // 2026-11-13 (LF-9 review round 2, finding 11): one wiring scan pinning
+    // that the runtime's live-fill arm republishes only inside
+    // `if changes_orders {` (the arm sits inside the runtime's select loop,
+    // which a unit test cannot drive alone). Paired behaviour test:
+    // `test_handle_live_fill_cmd_asks_for_the_republish_only_after_an_execute`.
+    ("order_runtime_live_fill.rs", 1),
     ("subsystem_memory.rs", 1),
     ("tf_consistency_boot.rs", 1),
     // 2026-10-26 (audit K4): 1 wiring scan, main spawns the daily tick

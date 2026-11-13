@@ -17,9 +17,11 @@
 //!   ever shows, and Dhan does not replay the downtime. Read with
 //!   [`main_feed_socket_loss_state`]: the low 32 bits are the mask of main-feed
 //!   slots down now (by global connection index), the high 32 bits count every
-//!   change of that mask. The tap counts a loss on every change and, while
-//!   the mask is not 0, once per second of receipt time, so the chain's
-//!   untrusted stretch runs without a hole from the close to the redial.
+//!   change of that mask. The tap counts one loss on every change, never once
+//!   per second while a slot stays down (LF-9 finding 11: a parked slot used
+//!   to taint every instrument for the rest of the day). The chain taints the
+//!   stretch around each change, which covers every bar of a down socket's
+//!   instrument that holds the close or the redial.
 //!
 //! # Complexity
 //!

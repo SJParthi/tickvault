@@ -401,6 +401,14 @@ fn run_stream(class: Class, seed: u64, d: &mut Digest) {
             .replace(", fresh_first: true", "")
             .replace(", older_trade: false", "")
             .replace(", older_trade: true", "");
+        // 2026-11-13 (LF-9): six more informational fields the live paper
+        // fill chain reads (`volume_delta`, `first_bucket_volume_delta`,
+        // `cumulative_restarted`, `stale_packet`, `seeded`, `gap_reseed`).
+        // None feeds a bar, so they are left out the same way; every sealed
+        // bar, amendment and pre-existing verdict is still pinned bit for bit
+        // by the ORIGINAL goldens. They are pinned by the chain's own tests
+        // (`test_regression_chain_bar_volume_equals_the_fold_bar_volume`).
+        let stats_text = strip_lf9_fields(&stats_text);
         d.text(&stats_text);
     }
 
@@ -534,5 +542,42 @@ fn the_streams_reach_every_fold_outcome() {
     assert!(
         every.iter().all(|&n| n > 0),
         "an outcome is never reached: {total:?}"
+    );
+}
+
+/// Removes the LF-9 informational `ConsumeStats` fields from its `Debug`
+/// text (`, name: value` up to the next `,` or `}`), so the golden digests
+/// recorded before LF-9 still pin every pre-existing field.
+fn strip_lf9_fields(text: &str) -> String {
+    const LF9_FIELDS: [&str; 6] = [
+        "volume_delta",
+        "first_bucket_volume_delta",
+        "cumulative_restarted",
+        "stale_packet",
+        "seeded",
+        "gap_reseed",
+    ];
+    let mut out = text.to_owned();
+    for name in LF9_FIELDS {
+        let needle = format!(", {name}: ");
+        if let Some(start) = out.find(&needle) {
+            let rest = &out[start + needle.len()..];
+            let end = rest
+                .find([',', '}'])
+                .map_or(out.len(), |i| start + needle.len() + i);
+            out.replace_range(start..end, "");
+        }
+    }
+    out
+}
+
+#[test]
+fn strip_lf9_fields_removes_only_the_named_fields() {
+    let s = "ConsumeStats { older_trade: true, volume_delta: 40, first_bucket_volume_delta: 0, \
+             cumulative_restarted: false, stale_packet: true, seeded: false, gap_reseed: true, \
+             replay_partial_suppressed: 2 }";
+    assert_eq!(
+        strip_lf9_fields(s),
+        "ConsumeStats { older_trade: true, replay_partial_suppressed: 2 }"
     );
 }

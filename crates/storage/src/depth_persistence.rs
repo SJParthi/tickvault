@@ -578,10 +578,10 @@ pub fn market_depth_book_ensure_statements() -> Vec<String> {
 /// One row of QuestDB's `table_columns(..)` answer: what the boot needs to
 /// know about a column before it asks for the `market_depth_book` DEDUP key.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct TableColumn {
-    name: String,
-    ty: String,
-    designated: bool,
+pub(crate) struct TableColumn {
+    pub(crate) name: String,
+    pub(crate) ty: String,
+    pub(crate) designated: bool,
 }
 
 /// Why an existing `market_depth_book` cannot take its DEDUP key (live audit
@@ -991,7 +991,7 @@ async fn self_heal_empty_market_depth_book(
 /// column NAME (`column`, `type`, `designated`), so an added or reordered
 /// result column does not break it. `None` for anything it cannot read (an
 /// error body, a missing column): the check then refuses nothing.
-fn parse_table_columns_answer(body: &str) -> Option<Vec<TableColumn>> {
+pub(crate) fn parse_table_columns_answer(body: &str) -> Option<Vec<TableColumn>> {
     let answer: serde_json::Value = serde_json::from_str(body).ok()?;
     let header = answer.get("columns")?.as_array()?;
     let index_of = |wanted: &str| {
@@ -1405,6 +1405,12 @@ async fn run_depth_ddl(questdb_config: &QuestDbConfig, table: &str, statements: 
         }
     };
     let mut every_statement_accepted = true;
+    // B1 review: the gates need only the key-bearing statements (see
+    // `ilp_table_gate::ddl_is_key_bearing`); the table is marked keyed below
+    // when those were all accepted, whatever the column self-heals answered.
+    let mut key_statements_accepted = true;
+    // B1 review 2: a key statement QuestDB answered with a refusal.
+    let mut key_refused_by_server = false;
     for ddl in statements {
         match client
             .get(&base_url)
@@ -1429,6 +1435,8 @@ async fn run_depth_ddl(questdb_config: &QuestDbConfig, table: &str, statements: 
                      missing, which makes the two depth pools overwrite each other"
                 );
                 every_statement_accepted = false;
+                key_statements_accepted &= !crate::ilp_table_gate::ddl_is_key_bearing(ddl);
+                key_refused_by_server |= crate::ilp_table_gate::ddl_is_key_bearing(ddl);
             }
             Err(err) => {
                 metrics::counter!("tv_depth_persist_errors_total", "stage" => "ensure_ddl")
@@ -1442,8 +1450,23 @@ async fn run_depth_ddl(questdb_config: &QuestDbConfig, table: &str, statements: 
                     "depth table DDL request failed"
                 );
                 every_statement_accepted = false;
+                key_statements_accepted &= !crate::ilp_table_gate::ddl_is_key_bearing(ddl);
             }
         }
+    }
+    if key_statements_accepted
+        && let Some(gated) = crate::ilp_table_gate::GatedTable::from_measurement(table.as_bytes())
+    {
+        crate::ilp_table_gate::mark_table_keyed(gated);
+    }
+    // B1 review 2: name a `market_depth` QuestDB created itself (it can never
+    // be keyed). `market_depth_book` has its own shape probe (PR DP-5).
+    if !key_statements_accepted && key_refused_by_server && table == MARKET_DEPTH_TABLE {
+        crate::ilp_table_gate::diagnose_refused_key(
+            questdb_config,
+            crate::ilp_table_gate::GatedTable::MarketDepth,
+        )
+        .await;
     }
     every_statement_accepted
 }
@@ -2126,6 +2149,10 @@ pub struct DepthWriter {
     /// commits land in old depth hours an archiver may be copying and
     /// dropping; set by [`Self::hold_archive_quiesce_on_pin_cut`].
     pin_cut_quiesce: Option<&'static crate::archive_quiesce::ArchiveQuiesce>,
+    /// B1 (2026-11-13): whether a batch may be posted now, given its table.
+    /// Always [`crate::ilp_table_gate::live_tables_writable`] outside this
+    /// module's tests. One call per flush, never per row.
+    table_gate: fn(&[crate::ilp_table_gate::GatedTable]) -> bool,
 }
 
 /// A unique temp spill directory, so a test writer never touches
@@ -2331,6 +2358,7 @@ impl DepthWriter {
                     spare_staged: None,
                     spare_staged_tx: None,
                     pin_cut_quiesce: None,
+                    table_gate: crate::ilp_table_gate::live_tables_writable,
                 }
             }
             Err(err) => {
@@ -2368,6 +2396,7 @@ impl DepthWriter {
                     spare_staged: None,
                     spare_staged_tx: None,
                     pin_cut_quiesce: None,
+                    table_gate: crate::ilp_table_gate::live_tables_writable,
                 }
             }
         }
@@ -2411,7 +2440,38 @@ impl DepthWriter {
             spare_staged: None,
             spare_staged_tx: None,
             pin_cut_quiesce: None,
+            table_gate: crate::ilp_table_gate::live_tables_writable,
         }
+    }
+
+    /// The gated table this writer's layout posts into (B1). O(1).
+    #[must_use]
+    pub const fn gated_tables(&self) -> &'static [crate::ilp_table_gate::GatedTable] {
+        match self.layout {
+            DepthLayout::Levels => &[crate::ilp_table_gate::GatedTable::MarketDepth],
+            DepthLayout::Book => &[crate::ilp_table_gate::GatedTable::MarketDepthBook],
+        }
+    }
+
+    /// Whether this writer may post now: its table is keyed in this process,
+    /// or the live gate was never armed (B1). One call per flush on the live
+    /// path; the after-close pass also reads it once a round, so a shut gate
+    /// carries its buckets instead of spilling the same rows every round (B1
+    /// review). O(1).
+    #[must_use]
+    pub fn table_keyed(&self) -> bool {
+        (self.table_gate)(self.gated_tables())
+    }
+
+    /// Test-only: replaces the live table gate (B1).
+    #[cfg(test)]
+    #[must_use]
+    fn with_table_gate_for_test(
+        mut self,
+        gate: fn(&[crate::ilp_table_gate::GatedTable]) -> bool,
+    ) -> Self {
+        self.table_gate = gate;
+        self
     }
 
     /// Test constructor for an array-row writer: disconnected, its buffer
@@ -3350,6 +3410,8 @@ impl DepthWriter {
             staged_return: Some(staged_tx.clone()), // APPROVED: channel sender cloned once per process at the offload split
             scratch: Buffer::new(DepthLayout::Book.protocol()),
             counters: DepthSinkCounters::new(self.feed),
+            table_gate: self.table_gate,
+            gate_tables: self.gated_tables(),
         };
         self.offload = Some(tx);
         self.spare_buffers = Some(spare_rx);
@@ -3755,6 +3817,13 @@ impl DepthWriter {
                 self.buffer.clear();
                 return Ok(());
             }
+        }
+        // B1 (2026-11-13): never post into a table this process has not
+        // keyed; the rows take the rescue (WAL deferral or the spill).
+        if self.sender.is_some() && !self.table_keyed() {
+            crate::ilp_table_gate::note_live_batch_held("market_depth");
+            let dropped = self.discard_pending();
+            anyhow::bail!("market_depth: table not keyed yet; {dropped} row(s) rescued");
         }
         let Some(sender) = self.sender.as_mut() else {
             let rescued_before = self.rescued;
@@ -4501,6 +4570,10 @@ pub struct DepthWriterSink {
     scratch: Buffer,
     /// Rescue-arm counter handles, resolved once at the split (item 44g).
     counters: DepthSinkCounters,
+    /// The producer's live table gate and its layout's table, copied at the
+    /// split (B1).
+    table_gate: fn(&[crate::ilp_table_gate::GatedTable]) -> bool,
+    gate_tables: &'static [crate::ilp_table_gate::GatedTable],
 }
 
 /// Flush-path counter handles for the depth PRODUCER half, resolved once per
@@ -4718,6 +4791,13 @@ impl DepthWriterSink {
 
     fn write_inner(&mut self, batch: &mut DepthFlushBatch) -> usize {
         if batch.rows == 0 {
+            return 0;
+        }
+        // B1 (2026-11-13): never post into a table this process has not keyed
+        // (QuestDB would create it in a shape that can never take the key).
+        if self.sender.is_some() && !(self.table_gate)(self.gate_tables) {
+            crate::ilp_table_gate::note_live_batch_held("market_depth");
+            self.rescue(batch, "table not keyed yet (boot DDL refused)");
             return 0;
         }
         let Some(sender) = self.sender.as_mut() else {
@@ -6560,6 +6640,74 @@ mod tests {
             min_seq: 0,
             max_seq: 0,
             unbacked: false,
+        }
+    }
+
+    /// B1 review: `table_keyed` reads the gate for this writer's OWN table
+    /// (level rows: `market_depth`; book rows: `market_depth_book`).
+    #[test]
+    fn test_table_keyed_reads_the_gate_for_the_writers_own_table() {
+        let only_book: fn(&[crate::ilp_table_gate::GatedTable]) -> bool =
+            |t| t == [crate::ilp_table_gate::GatedTable::MarketDepthBook];
+        let levels = DepthWriter::for_test(Feed::Dhan).with_table_gate_for_test(only_book);
+        assert!(!levels.table_keyed());
+        let book = DepthWriter::for_test_book(Feed::Dhan).with_table_gate_for_test(only_book);
+        assert!(book.table_keyed());
+        let shut = DepthWriter::for_test_book(Feed::Dhan).with_table_gate_for_test(|_| false);
+        assert!(!shut.table_keyed());
+    }
+
+    /// Regression, B1 (2026-11-13): with `market_depth` not keyed, the live
+    /// depth writer thread must NOT post (QuestDB would create the table in a
+    /// shape that can never take the DEDUP key); the batch is rescued to the
+    /// spill. The open-gate half proves the server would have been reached.
+    #[test]
+    fn test_regression_depth_sink_never_posts_into_an_unkeyed_table() {
+        use std::io::{Read, Write};
+        for (gate_open, expect_hits) in [(false, 0_usize), (true, 1)] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            let port = listener.local_addr().expect("addr").port();
+            let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let seen = std::sync::Arc::clone(&hits);
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { continue };
+                    seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let mut buf = [0u8; 65_536];
+                    let _ = stream.read(&mut buf);
+                    let _ =
+                        stream.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n");
+                }
+            });
+            let cfg = QuestDbConfig {
+                host: "127.0.0.1".to_string(),
+                http_port: port,
+                pg_port: 1,
+                ilp_port: 1,
+            };
+            let gate: fn(&[crate::ilp_table_gate::GatedTable]) -> bool =
+                if gate_open { |_| true } else { |_| false };
+            let w = DepthWriter::new(&cfg, Feed::Dhan).with_table_gate_for_test(gate);
+            let (mut w, mut sink, rx) = w.split_for_offload();
+            let dir = temp_depth_spill_dir();
+            sink.spill_dir = dir.clone();
+            sink.spill_min_free_headroom = 0;
+            w.append_row(&row()).expect("append");
+            w.flush().expect("hand off");
+            let mut batch = rx.try_recv().expect("batch queued");
+            let landed = sink.write(&mut batch);
+            assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), expect_hits);
+            if gate_open {
+                assert_eq!(landed, 1, "an open gate posts");
+            } else {
+                assert_eq!(landed, 0, "a shut gate lands nothing");
+                let spilled = std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0);
+                assert!(
+                    spilled >= 1,
+                    "the rows are rescued to the spill, not dropped"
+                );
+            }
+            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 

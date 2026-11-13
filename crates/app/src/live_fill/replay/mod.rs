@@ -603,15 +603,19 @@ fn run(a: &ReplayArgs) -> Result<i32, Failure> {
             .map_err(|e| bad(format!("backup history {}: {e}", p.display())))?
             .and_then(|h| crate::main_feed_backup::ReplayBackup::new(&h)),
     };
+    let day_start_ist_ns =
+        crate::live_fill_report::build::rows_day_start(&day_text).ok_or_else(|| bad("bad day"))?;
     let setup = ChainSetup {
         recipe: replay_recipe(&frames, &universe),
         snapshot: None,
         engine_frames_secs: frames.clone(),
         universe,
         contracts,
+        // The replayed day: the setup is built for it.
+        trading_day: day_start_ist_ns
+            .div_euclid(1_000_000_000)
+            .div_euclid(86_400),
     };
-    let day_start_ist_ns =
-        crate::live_fill_report::build::rows_day_start(&day_text).ok_or_else(|| bad("bad day"))?;
     let pass_ns = i64::try_from(a.pass_us)
         .unwrap_or(1_000)
         .saturating_mul(1_000);

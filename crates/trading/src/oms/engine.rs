@@ -551,7 +551,17 @@ impl OrderManagementSystem {
             // record); without this the CB stays stuck HalfOpen after the halt is
             // cleared and every later order is refused with CircuitBreakerOpen.
             self.circuit_breaker.reset();
-            self.order_budget.reset_daily();
+            // 2026-11-13 (audit B2 finding 9): the order budget is NOT reset here.
+            // Clearing a halt mid-day used to zero the 250/min, 1000/hr and
+            // 7000/day counters on top of what was already sent today. Nothing
+            // resets the budget now (`reset_daily` does not either): the minute
+            // and hour tiers roll by time and the day tier at 00:00 IST. Orders
+            // refused while halted spent nothing: every local refusal after
+            // `try_consume` gives the budget back (B2 review, 2026-11-13),
+            // including a failed token fetch and the STOP-ALL latch before the
+            // first send (round 4). Still counted: a token fetch that fails on
+            // the auth retry pass, and a STOP-ALL abort at a later DH-904 ladder
+            // rung, since an earlier request of that call was sent.
         }
     }
 
@@ -578,7 +588,26 @@ impl OrderManagementSystem {
 
     /// O(1) live-order gate: halt check + readiness evaluation. Place + Modify
     /// ONLY (Cancel is exempt — exposure-reducing). First failure wins.
+    ///
+    /// Every caller runs it AFTER `circuit_breaker.check()`, which takes the
+    /// single HalfOpen probe. A refusal here sends nothing, so it records no
+    /// success or failure on the breaker; the probe is therefore given back
+    /// (audit B2, 2026-11-13), otherwise every later order on every path was
+    /// refused with CircuitBreakerOpen until the 16:00 daily reset.
     fn check_live_order_gates(
+        &mut self,
+        endpoint: OrderEndpoint,
+        correlation_id: &str,
+    ) -> Result<(), OmsError> {
+        let verdict = self.evaluate_live_order_gates(endpoint, correlation_id);
+        if verdict.is_err() {
+            self.release_unsent_order();
+        }
+        verdict
+    }
+
+    /// The halt and readiness checks behind [`Self::check_live_order_gates`].
+    fn evaluate_live_order_gates(
         &mut self,
         endpoint: OrderEndpoint,
         correlation_id: &str,
@@ -636,7 +665,33 @@ impl OrderManagementSystem {
         Err(OmsError::OrderReadinessRefused { reason })
     }
 
-    /// Apply the engine-layer policy for a surfaced order error. The wrapper
+    /// Apply the engine-layer policy for a surfaced order error, then settle
+    /// the circuit breaker's HalfOpen probe. A class the breaker does not
+    /// count (halt, rate, refresh classes, R19) records no outcome, so when
+    /// the call ends on such an answer (any action but `Retry`) the probe the
+    /// call took is given back (audit B2 follow-up, 2026-11-13). Before, an
+    /// HTTP 429, a DH-904 ladder exhaustion, an 805 or a failed 807/808/809
+    /// refresh answering the probe left the flag set and every later order
+    /// was refused until the 16:00 daily reset. A `Retry` keeps the probe:
+    /// the retried request settles it. O(1) on top of the policy.
+    async fn apply_engine_error_policy(
+        &mut self,
+        err: &OmsError,
+        endpoint: OrderEndpoint,
+        auth_retry_used: &mut bool,
+    ) -> EngineAction {
+        let action = self
+            .decide_engine_action(err, endpoint, auth_retry_used)
+            .await;
+        let counted = error_taxonomy::classify_oms_error(err)
+            .is_none_or(error_taxonomy::trips_circuit_breaker);
+        if !counted && !matches!(action, EngineAction::Retry) {
+            self.circuit_breaker.release_probe();
+        }
+        action
+    }
+
+    /// The engine-layer policy for a surfaced order error. The wrapper
     /// (`*_with_policy`) already ran the DH-904 ladder + 805 latch + Cancel
     /// single-retry; this layer owns the auth rotate-retry-once, the halt latch,
     /// the 806 readiness-poison, and the circuit-breaker decision (R19). Returns
@@ -650,7 +705,7 @@ impl OrderManagementSystem {
     // Genuinely ambiguous outcomes (908/909/800/5xx/transport) are NEVER retried
     // here (Place/Modify NeverRetry); the correlation-probe adopt-or-flag
     // (flagged follow-up) is the real net for those.
-    async fn apply_engine_error_policy(
+    async fn decide_engine_action(
         &mut self,
         err: &OmsError,
         endpoint: OrderEndpoint,
@@ -746,14 +801,7 @@ impl OrderManagementSystem {
             OrderErrorPolicy::StopAllCooldown => {
                 // C2: fire the operator alert ONCE per stop-all episode, not on
                 // every throttled call during the 60s window.
-                if !self.stop_all_alert_latched {
-                    self.stop_all_alert_latched = true;
-                    self.fire_alert(OmsAlert::OrderApiStopAll {
-                        cooldown_secs: DATA_805_STOP_ALL_COOLDOWN_SECS,
-                    });
-                } else {
-                    debug!("DATA-805 stop-all alert already fired this episode");
-                }
+                self.note_stop_all_episode();
                 EngineAction::PassThroughSilent
             }
             // NeverRetry / CheckParamsNoRetry / LogAndAlert / CancelSingleRetry
@@ -805,6 +853,7 @@ impl OrderManagementSystem {
         self.order_budget.try_consume(now_epoch_s())?;
 
         if let Err(err) = self.rate_limiter.check() {
+            self.order_budget.give_back(); // B2 review: nothing sent
             self.fire_alert(OmsAlert::RateLimitExhausted {
                 limit_type: "per_second".to_string(),
             });
@@ -813,6 +862,7 @@ impl OrderManagementSystem {
 
         // Step 2: Circuit breaker check
         if let Err(err) = self.circuit_breaker.check() {
+            self.order_budget.give_back(); // B2 review: nothing sent
             self.fire_alert(OmsAlert::CircuitBreakerOpened {
                 consecutive_failures: u64::from(self.circuit_breaker.failure_count()),
             });
@@ -912,6 +962,7 @@ impl OrderManagementSystem {
                      re-arm (sentinel 2099-12-31; a dated operator quote + \
                      constant edit are required to go live)"
                 );
+                self.release_unsent_order(); // audit B2: nothing sent
                 return Err(OmsError::SandboxEnforcement);
             }
         }
@@ -944,9 +995,13 @@ impl OrderManagementSystem {
 
         // Step 5: Call Dhan REST API through the STOP-ALL latch + DH-904 ladder,
         // with an at-most-once auth rotate-retry at the engine layer.
+        self.refuse_unsent_inside_stop_all()?;
         let mut auth_retry_used = false;
         let response = loop {
-            let access_token = self.token_provider.get_access_token()?;
+            let access_token = self.probe_back_on_token_err(
+                self.token_provider.get_access_token(),
+                !auth_retry_used,
+            )?;
             match self
                 .api_client
                 .place_order_with_policy(access_token.expose_secret(), &dhan_request)
@@ -1079,8 +1134,7 @@ impl OrderManagementSystem {
 
         self.order_budget.try_consume(now_epoch_s())?;
 
-        self.rate_limiter.check()?;
-        self.circuit_breaker.check()?;
+        self.rate_and_circuit_or_give_back()?;
 
         // ---- DRY-RUN: update local state only, no HTTP ----
         if self.dry_run {
@@ -1099,6 +1153,10 @@ impl OrderManagementSystem {
 
         // Step 3a (Cluster F): live-order readiness gate (fail-closed). Runs
         // BEFORE the token fetch. Cancel is exempt; Modify is NOT.
+        // 2026-11-13 (audit B2 follow-up): the sandbox sentinel first, the
+        // same one place_order and every exit arm run. Before, a plain modify
+        // skipped it and could reach Dhan while every place was still blocked.
+        self.refuse_inside_sandbox()?;
         self.check_live_order_gates(OrderEndpoint::Modify, order_id)?;
 
         // ---- LIVE MODE ----
@@ -1118,9 +1176,13 @@ impl OrderManagementSystem {
 
         // STOP-ALL latch + DH-904 ladder in the client wrapper; auth
         // rotate-retry-once + halt latch + circuit-breaker decision here.
+        self.refuse_unsent_inside_stop_all()?;
         let mut auth_retry_used = false;
         loop {
-            let access_token = self.token_provider.get_access_token()?;
+            let access_token = self.probe_back_on_token_err(
+                self.token_provider.get_access_token(),
+                !auth_retry_used,
+            )?;
             match self
                 .api_client
                 .modify_order_with_policy(access_token.expose_secret(), order_id, &dhan_request)
@@ -1190,8 +1252,7 @@ impl OrderManagementSystem {
 
         self.order_budget.try_consume(now_epoch_s())?;
 
-        self.rate_limiter.check()?;
-        self.circuit_breaker.check()?;
+        self.rate_and_circuit_or_give_back()?;
 
         // ---- DRY-RUN: simulate cancel locally ----
         if self.dry_run {
@@ -1208,9 +1269,13 @@ impl OrderManagementSystem {
         // It must always be attempted so the operator can flatten during a halt.
         // STOP-ALL latch + DH-904 ladder + cancel single-retry in the client
         // wrapper; auth rotate-retry-once + circuit-breaker decision here.
+        self.refuse_unsent_inside_stop_all()?;
         let mut auth_retry_used = false;
         loop {
-            let access_token = self.token_provider.get_access_token()?;
+            let access_token = self.probe_back_on_token_err(
+                self.token_provider.get_access_token(),
+                !auth_retry_used,
+            )?;
             match self
                 .api_client
                 .cancel_order_with_policy(access_token.expose_secret(), order_id)
@@ -1812,6 +1877,12 @@ impl OrderManagementSystem {
         self.total_updates = 0;
         self.paper_order_counter = 0;
         self.circuit_breaker.reset();
+        // 2026-11-13 (audit B2 finding 9, then its follow-up): the order
+        // budget is NOT cleared here. Its day tier is the IST calendar date
+        // and opens a new window at 00:00 IST by itself; clearing it at this
+        // 16:00 reset let a day's 7,000 be spent twice inside one IST date.
+        // The minute and hour tiers roll by time, so a burst across the
+        // reset never exceeds the broker's 250/min or 1,000/hr.
         // Cluster F (R8): the order-path halt latch is INTENTIONALLY NOT cleared
         // here. A broker account-class halt (DH-902/903/…) persists across the
         // daily reset until a deliberate operator `clear_order_halt()`.
@@ -2005,7 +2076,12 @@ impl OrderManagementSystem {
         }
 
         // LIVE-EXIT-ARM
-        let access_token = self.token_provider.get_access_token()?;
+        // 2026-11-13 (audit B2 finding 8): the same live gates place_order runs
+        // (sandbox sentinel, then halt latch and readiness), before any token
+        // fetch or network call. The dry-run branch above still returns first.
+        self.check_live_exit_gates(OrderEndpoint::Place, &correlation_id)?;
+        let access_token =
+            self.probe_back_on_token_err(self.token_provider.get_access_token(), true)?;
 
         let dhan_request = DhanPlaceSuperOrderRequest {
             dhan_client_id: self.client_id.clone(),
@@ -2035,9 +2111,7 @@ impl OrderManagementSystem {
             }
             Err(err) => {
                 // 429/DH-904 never trips the breaker (API healthy, throttled).
-                if !matches!(err, OmsError::DhanRateLimited) {
-                    self.circuit_breaker.record_failure();
-                }
+                self.record_exit_api_failure(&err);
                 // M1 (refuter round 1, 2026-07-14): the alert reason is a
                 // future sink payload — sanitized like every log rendering.
                 self.fire_alert(OmsAlert::OrderRejected {
@@ -2318,7 +2392,12 @@ impl OrderManagementSystem {
         }
 
         // LIVE-EXIT-ARM
-        let access_token = self.token_provider.get_access_token()?;
+        // 2026-11-13 (audit B2): a leg modify changes price and quantity, so it
+        // takes the same live gates as `modify_order` (sandbox sentinel, then
+        // halt latch and readiness) before any token fetch. Cancels stay exempt.
+        self.check_live_exit_gates(OrderEndpoint::Modify, order_id)?;
+        let access_token =
+            self.probe_back_on_token_err(self.token_provider.get_access_token(), true)?;
         let dhan_request = build_super_modify_request(&self.client_id, order_id, &modify);
 
         let accepted_unparsed = match self
@@ -2332,9 +2411,7 @@ impl OrderManagementSystem {
                 resp.order_status == SUPER_ORDER_STATUS_ACCEPTED_UNPARSED_BODY
             }
             Err(err) => {
-                if !matches!(err, OmsError::DhanRateLimited) {
-                    self.circuit_breaker.record_failure();
-                }
+                self.record_exit_api_failure(&err);
                 error!(
                     code = ErrorCode::ExitOrder01ExecutionDegraded.code_str(),
                     order_id = %order_id,
@@ -2456,7 +2533,8 @@ impl OrderManagementSystem {
         }
 
         // LIVE-EXIT-ARM
-        let access_token = self.token_provider.get_access_token()?;
+        let access_token =
+            self.probe_back_on_token_err(self.token_provider.get_access_token(), true)?;
 
         match self
             .api_client
@@ -2468,9 +2546,7 @@ impl OrderManagementSystem {
                 self.record_api_success_and_alert_recovery();
             }
             Err(err) => {
-                if !matches!(err, OmsError::DhanRateLimited) {
-                    self.circuit_breaker.record_failure();
-                }
+                self.record_exit_api_failure(&err);
                 error!(
                     code = ErrorCode::ExitOrder01ExecutionDegraded.code_str(),
                     order_id = %order_id,
@@ -2585,7 +2661,12 @@ impl OrderManagementSystem {
         }
 
         // LIVE-EXIT-ARM
-        let access_token = self.token_provider.get_access_token()?;
+        // 2026-11-13 (audit B2 finding 8): the same live gates place_order runs
+        // (sandbox sentinel, then halt latch and readiness), before any token
+        // fetch or network call. The dry-run branch above still returns first.
+        self.check_live_exit_gates(OrderEndpoint::Place, &correlation_id)?;
+        let access_token =
+            self.probe_back_on_token_err(self.token_provider.get_access_token(), true)?;
         let dhan_request = build_forever_request(&self.client_id, &correlation_id, &request);
 
         let response = match self
@@ -2598,9 +2679,7 @@ impl OrderManagementSystem {
                 resp
             }
             Err(err) => {
-                if !matches!(err, OmsError::DhanRateLimited) {
-                    self.circuit_breaker.record_failure();
-                }
+                self.record_exit_api_failure(&err);
                 // M1 (refuter round 1, 2026-07-14): sanitized alert reason.
                 self.fire_alert(OmsAlert::OrderRejected {
                     correlation_id: correlation_id.clone(),
@@ -2754,6 +2833,10 @@ impl OrderManagementSystem {
         }
 
         // LIVE-EXIT-ARM
+        // 2026-11-13 (audit B2 finding 8): the same live gates place_order runs
+        // (sandbox sentinel, then halt latch and readiness), before any token
+        // fetch or network call. The dry-run branch above still returns first.
+        self.check_live_exit_gates(OrderEndpoint::Place, &correlation_id)?;
         // The escape hatch actually engaged — strategy doctrine caps the
         // per-signal quantity at the freeze limit, so this is warn-worthy.
         warn!(
@@ -2763,7 +2846,8 @@ impl OrderManagementSystem {
             "order exceeds freeze limit — routing through /orders/slicing (escape hatch)"
         );
 
-        let access_token = self.token_provider.get_access_token()?;
+        let access_token =
+            self.probe_back_on_token_err(self.token_provider.get_access_token(), true)?;
         let dhan_request = DhanPlaceOrderRequest {
             dhan_client_id: self.client_id.clone(),
             transaction_type: request.transaction_type.as_str().to_owned(),
@@ -2790,9 +2874,7 @@ impl OrderManagementSystem {
                 resp
             }
             Err(err) => {
-                if !matches!(err, OmsError::DhanRateLimited) {
-                    self.circuit_breaker.record_failure();
-                }
+                self.record_exit_api_failure(&err);
                 // M1 (refuter round 1, 2026-07-14): sanitized alert reason.
                 self.fire_alert(OmsAlert::OrderRejected {
                     correlation_id: correlation_id.clone(),
@@ -2978,7 +3060,10 @@ impl OrderManagementSystem {
         // Step 1: the probe consumes the shared GCRA — dry-run included.
         self.check_order_book_capacity()?;
         self.order_budget.try_consume(now_epoch_s())?;
-        self.rate_limiter.check()?;
+        if let Err(err) = self.rate_limiter.check() {
+            self.order_budget.give_back(); // B2 review: nothing sent
+            return Err(err);
+        }
 
         // ---- DRY-RUN: tracked paper order ⇒ deterministic verdict, no HTTP ----
         if self.dry_run {
@@ -2988,7 +3073,7 @@ impl OrderManagementSystem {
         }
 
         // LIVE-EXIT-ARM
-        let access_token = self.token_provider.get_access_token()?;
+        let access_token = self.budget_back_on_token_err(self.token_provider.get_access_token())?;
 
         let verdict = if is_super {
             // ONE batched list GET serves ALL tracked supers (no per-ID
@@ -3117,16 +3202,92 @@ impl OrderManagementSystem {
         self.order_budget.try_consume(now_epoch_s())?;
 
         if let Err(err) = self.rate_limiter.check() {
+            self.order_budget.give_back(); // B2 review: nothing sent
             self.fire_alert(OmsAlert::RateLimitExhausted {
                 limit_type: "per_second".to_string(),
             });
             return Err(err);
         }
         if let Err(err) = self.circuit_breaker.check() {
+            self.order_budget.give_back(); // B2 review: nothing sent
             self.fire_alert(OmsAlert::CircuitBreakerOpened {
                 consecutive_failures: u64::from(self.circuit_breaker.failure_count()),
             });
             return Err(err);
+        }
+        Ok(())
+    }
+
+    /// A live order refused by a local gate AFTER the budget and the circuit
+    /// breaker admitted it: nothing was sent, so give back the HalfOpen probe
+    /// (audit B2) and the one order of budget the caller spent (B2 review,
+    /// 2026-11-13). Without the budget half, refusals during a halt used up
+    /// the hour tier and, once the halt was cleared, every place, modify and
+    /// cancel was refused until the hour rolled. O(1).
+    fn release_unsent_order(&mut self) {
+        self.circuit_breaker.release_probe();
+        self.order_budget.give_back();
+    }
+
+    /// The per-second limiter and the circuit breaker for the arms that run
+    /// them without alerts (`modify_order`, `cancel_order`). A refusal sends
+    /// nothing, so it gives back the one order of budget the caller spent
+    /// just before (B2 review, 2026-11-13). O(1).
+    fn rate_and_circuit_or_give_back(&mut self) -> Result<(), OmsError> {
+        let verdict = self
+            .rate_limiter
+            .check()
+            .and_then(|()| self.circuit_breaker.check());
+        if verdict.is_err() {
+            self.order_budget.give_back();
+        }
+        verdict
+    }
+
+    /// The live-arm gates `place_order` and `modify_order` run, for every exit
+    /// method that sends a NEW order (super, forever/OCO, sliced: `Place`) or
+    /// changes one (super-order leg modify: `Modify`). Added 2026-11-13 (audit
+    /// B2 finding 8): those arms ran only `check_order_gates` (book, budget,
+    /// rate, circuit) and skipped the sandbox sentinel and the halt and
+    /// readiness gate, so with `dry_run` removed they could reach Dhan while
+    /// `place_order` was still blocked. Call it after the dry-run branch and
+    /// before the token fetch. Only adds refusals; cancels stay exempt. A
+    /// refusal gives back the circuit breaker's HalfOpen probe (nothing was
+    /// sent, see [`Self::check_live_order_gates`]).
+    fn check_live_exit_gates(
+        &mut self,
+        endpoint: OrderEndpoint,
+        correlation_id: &str,
+    ) -> Result<(), OmsError> {
+        self.refuse_inside_sandbox()?;
+        self.check_live_order_gates(endpoint, correlation_id)
+    }
+
+    /// The sandbox sentinel shared by every live arm that is not
+    /// `place_order` (which keeps its own copy in its body, pinned by the
+    /// sandbox guard): the exit arms through [`Self::check_live_exit_gates`]
+    /// and, since the B2 follow-up (2026-11-13), `modify_order`, which before
+    /// ran halt and readiness only and could reach Dhan while every place was
+    /// still blocked. A refusal gives back the HalfOpen probe (nothing was
+    /// sent). Compiled out of test builds only, like place_order's copy.
+    #[cfg_attr(test, allow(clippy::unused_self, clippy::unnecessary_wraps))]
+    fn refuse_inside_sandbox(&mut self) -> Result<(), OmsError> {
+        #[cfg(not(test))]
+        {
+            use tickvault_common::constants::SANDBOX_DEADLINE_EPOCH_SECS;
+            let now_secs = chrono::Utc::now().timestamp();
+            if now_secs < SANDBOX_DEADLINE_EPOCH_SECS {
+                metrics::counter!("tv_sandbox_gate_blocks_total").increment(1);
+                error!(
+                    code = ErrorCode::OmsGapDryRunSafety.code_str(),
+                    source = "sandbox_enforcement",
+                    "SANDBOX ENFORCEMENT: live orders blocked pending explicit \
+                     re-arm (sentinel 2099-12-31; a dated operator quote + \
+                     constant edit are required to go live)"
+                );
+                self.release_unsent_order();
+                return Err(OmsError::SandboxEnforcement);
+            }
         }
         Ok(())
     }
@@ -3143,6 +3304,98 @@ impl OrderManagementSystem {
         self.circuit_breaker.record_success();
         if self.circuit_breaker.was_previously_open(prev_failures) {
             self.fire_alert(OmsAlert::CircuitBreakerClosed);
+        }
+    }
+
+    /// Records one failed live exit-arm API call on the circuit breaker. A
+    /// throttled answer (HTTP 429 / DH-904) never trips the breaker, because
+    /// the API is healthy; it records nothing, so it gives back the HalfOpen
+    /// probe the call took instead (audit B2 follow-up, 2026-11-13). Before,
+    /// a 429 answering the probe left the probe flag set with no outcome and
+    /// every later order was refused until the 16:00 daily reset. O(1).
+    fn record_exit_api_failure(&self, err: &OmsError) {
+        if matches!(err, OmsError::DhanRateLimited) {
+            self.circuit_breaker.release_probe();
+        } else {
+            self.circuit_breaker.record_failure();
+        }
+    }
+
+    /// Wraps the token fetch of every live arm that ran
+    /// `circuit_breaker.check()` first (the provider call goes in as the
+    /// argument).
+    /// A failed fetch (no token, expired token) sends nothing and records no
+    /// success or failure, so it gives back the HalfOpen probe that check
+    /// took (audit B2 follow-up, 2026-11-13). The fetch stays spelled out at
+    /// each call site, where the exit-order lockout guard looks for it.
+    /// `reconcile` and `verify_order_execution` never take the probe and
+    /// fetch the token directly. O(1).
+    ///
+    /// 2026-11-13 (B2 review round 4): when `nothing_sent` is true it also
+    /// gives back the one order of budget the call spent, because no request
+    /// left the process. Before, a missing or expired token kept the budget
+    /// spent, so retries while the token was gone could fill the hour tier
+    /// and then lock out every place, modify and cancel for up to an hour.
+    /// The exit arms send nothing before the fetch and pass `true`. The
+    /// place, modify and cancel loops pass `!auth_retry_used`: after an auth
+    /// rotate-retry the first request was sent and stays counted.
+    fn probe_back_on_token_err(
+        &mut self,
+        token: Result<SecretString, OmsError>,
+        nothing_sent: bool,
+    ) -> Result<SecretString, OmsError> {
+        if token.is_err() {
+            self.circuit_breaker.release_probe();
+            if nothing_sent {
+                self.order_budget.give_back();
+            }
+        }
+        token
+    }
+
+    /// The token fetch of `verify_order_execution`, which spends one order of
+    /// budget but takes no breaker probe: a failed fetch sent nothing, so it
+    /// gives the budget back (B2 review round 4, 2026-11-13). O(1).
+    fn budget_back_on_token_err(
+        &mut self,
+        token: Result<SecretString, OmsError>,
+    ) -> Result<SecretString, OmsError> {
+        if token.is_err() {
+            self.order_budget.give_back();
+        }
+        token
+    }
+
+    /// The DATA-805 STOP-ALL latch, checked once before the first send of
+    /// `place_order`, `modify_order` and `cancel_order` (B2 review round 4,
+    /// 2026-11-13). While the latch holds, the wrapper would refuse at its
+    /// first rung with nothing sent, but the engine cannot tell that refusal
+    /// from a later-rung abort (earlier rungs were sent), so the budget stayed
+    /// spent. Checked here, the refusal is known to be unsent: it gives back
+    /// the HalfOpen probe and the order's budget, and raises the stop-all
+    /// alert once per episode exactly as the policy arm does. A latch engaged
+    /// after this check (only by this call's own ladder, the latch belongs to
+    /// this engine's client) keeps the budget spent, which counts more,
+    /// never less. O(1).
+    fn refuse_unsent_inside_stop_all(&mut self) -> Result<(), OmsError> {
+        if let Err(err) = self.api_client.check_stop_all_latch() {
+            self.note_stop_all_episode();
+            self.release_unsent_order();
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    /// The once-per-episode DATA-805 stop-all alert (C2), shared by the
+    /// policy arm and [`Self::refuse_unsent_inside_stop_all`]. O(1).
+    fn note_stop_all_episode(&mut self) {
+        if !self.stop_all_alert_latched {
+            self.stop_all_alert_latched = true;
+            self.fire_alert(OmsAlert::OrderApiStopAll {
+                cooldown_secs: DATA_805_STOP_ALL_COOLDOWN_SECS,
+            });
+        } else {
+            debug!("DATA-805 stop-all alert already fired this episode");
         }
     }
 
@@ -7984,6 +8237,7 @@ mod tests {
         let (base_url, handle) = start_oms_mock(200, body).await;
 
         let mut oms = make_live_oms(&base_url);
+        install_ready(&mut oms);
         let placement = oms
             .place_super_order(make_super_request(), 1_800)
             .await
@@ -8010,6 +8264,7 @@ mod tests {
         let (base_url, handle) = start_oms_mock(400, body).await;
 
         let mut oms = make_live_oms(&base_url);
+        install_ready(&mut oms);
         let result = oms.place_super_order(make_super_request(), 1_800).await;
         assert!(result.is_err());
         assert_eq!(oms.circuit_breaker.failure_count(), 1);
@@ -8022,6 +8277,7 @@ mod tests {
         let (base_url, handle) = start_oms_mock(429, body).await;
 
         let mut oms = make_live_oms(&base_url);
+        install_ready(&mut oms);
         let result = oms.place_super_order(make_super_request(), 1_800).await;
         assert!(matches!(result.unwrap_err(), OmsError::DhanRateLimited));
         assert_eq!(oms.circuit_breaker.failure_count(), 0);
@@ -8164,6 +8420,7 @@ mod tests {
             start_multi_mock(vec![(200, place_body), (200, modify_body)]).await;
 
         let mut oms = make_live_oms(&base_url);
+        install_ready(&mut oms);
         oms.place_super_order(make_super_request(), 1_800)
             .await
             .unwrap();
@@ -8325,6 +8582,7 @@ mod tests {
             start_multi_mock(vec![(200, place_body), (200, cancel_body)]).await;
 
         let mut oms = make_live_oms(&base_url);
+        install_ready(&mut oms);
         oms.place_super_order(make_super_request(), 1_800)
             .await
             .unwrap();
@@ -8372,6 +8630,7 @@ mod tests {
         let (base_url, handle) = start_oms_mock(200, body).await;
 
         let mut oms = make_live_oms(&base_url);
+        install_ready(&mut oms);
         let order_id = oms.place_forever_oco(make_forever_request()).await.unwrap();
 
         assert_eq!(order_id, "FO-1");
@@ -8462,6 +8721,7 @@ mod tests {
         let (base_url, handle) = start_oms_mock(200, body).await;
 
         let mut oms = make_live_oms(&base_url);
+        install_ready(&mut oms);
         let mut request = make_place_request();
         request.quantity = 250;
 
@@ -8495,6 +8755,7 @@ mod tests {
         let (base_url, handle) = start_oms_mock(200, body).await;
 
         let mut oms = make_live_oms(&base_url);
+        install_ready(&mut oms);
         let mut request = make_place_request();
         request.quantity = 250;
 
@@ -8559,6 +8820,7 @@ mod tests {
         let (base_url, handle) = start_multi_mock(vec![(200, pending), (200, traded)]).await;
 
         let mut oms = make_live_oms(&base_url);
+        install_ready(&mut oms);
         insert_tracked_order(&mut oms, "D-1", OrderStatus::Pending, 50);
 
         let first = oms.verify_order_execution("D-1", 1, 30).await.unwrap();
@@ -8587,6 +8849,7 @@ mod tests {
         let (base_url, handle) = start_oms_mock(200, body).await;
 
         let mut oms = make_live_oms(&base_url);
+        install_ready(&mut oms);
         insert_tracked_order(&mut oms, "D-1", OrderStatus::Pending, 50);
 
         let verdict = oms.verify_order_execution("D-1", 30, 30).await.unwrap();
@@ -8603,6 +8866,7 @@ mod tests {
         let (base_url, handle) = start_oms_mock(200, body).await;
 
         let mut oms = make_live_oms(&base_url);
+        install_ready(&mut oms);
         insert_tracked_order(&mut oms, "D-1", OrderStatus::Pending, 50);
 
         let verdict = oms.verify_order_execution("D-1", 5, 30).await.unwrap();
@@ -8622,6 +8886,7 @@ mod tests {
         let (base_url, handle) = start_oms_mock(200, body).await;
 
         let mut oms = make_live_oms(&base_url);
+        install_ready(&mut oms);
         insert_tracked_order(&mut oms, "D-1", OrderStatus::Pending, 50);
 
         let verdict = oms.verify_order_execution("D-1", 30, 30).await.unwrap();
@@ -8646,6 +8911,7 @@ mod tests {
         let (base_url, handle) = start_oms_mock(200, body).await;
 
         let mut oms = make_live_oms(&base_url);
+        install_ready(&mut oms);
         insert_tracked_order(&mut oms, "D-1", OrderStatus::Pending, 50);
 
         let verdict = oms.verify_order_execution("D-1", 5, 30).await.unwrap();
@@ -8664,6 +8930,7 @@ mod tests {
         let (base_url, handle) = start_oms_mock(429, body).await;
 
         let mut oms = make_live_oms(&base_url);
+        install_ready(&mut oms);
         insert_tracked_order(&mut oms, "D-1", OrderStatus::Pending, 50);
 
         let result = oms.verify_order_execution("D-1", 5, 30).await;
@@ -8679,6 +8946,7 @@ mod tests {
         let (base_url, handle) = start_oms_mock(200, body).await;
 
         let mut oms = make_live_oms(&base_url);
+        install_ready(&mut oms);
         insert_tracked_super(&mut oms, "SO-9", "PENDING", 75);
         insert_tracked_order(&mut oms, "SO-9", OrderStatus::Pending, 75);
 
@@ -8704,6 +8972,7 @@ mod tests {
         let (base_url, handle) = start_oms_mock(200, body).await;
 
         let mut oms = make_live_oms(&base_url);
+        install_ready(&mut oms);
         insert_tracked_super(&mut oms, "SO-9", "TRADED", 75);
         insert_tracked_order(&mut oms, "SO-9", OrderStatus::PartTraded, 75);
 
@@ -8732,6 +9001,7 @@ mod tests {
         let (base_url, handle) = start_oms_mock(200, body).await;
 
         let mut oms = make_live_oms(&base_url);
+        install_ready(&mut oms);
         insert_tracked_super(&mut oms, "SO-9", "PENDING", 75);
         insert_tracked_order(&mut oms, "SO-9", OrderStatus::Pending, 75);
 
@@ -8758,6 +9028,7 @@ mod tests {
         let (base_url, handle) = start_oms_mock(200, body).await;
 
         let mut oms = make_live_oms(&base_url);
+        install_ready(&mut oms);
         insert_tracked_super(&mut oms, "SO-9", "PENDING", 75);
         insert_tracked_order(&mut oms, "SO-9", OrderStatus::Pending, 75);
 
@@ -8786,6 +9057,7 @@ mod tests {
         let (base_url, handle) = start_oms_mock(200, body).await;
 
         let mut oms = make_live_oms(&base_url);
+        install_ready(&mut oms);
         insert_tracked_order(&mut oms, "D-1", OrderStatus::Pending, 50);
 
         let verdict = oms.verify_order_execution("D-1", 30, 30).await.unwrap();
@@ -8808,6 +9080,7 @@ mod tests {
         let (base_url, handle) = start_oms_mock(200, body).await;
 
         let mut oms = make_live_oms(&base_url);
+        install_ready(&mut oms);
         insert_tracked_order(&mut oms, "D-1", OrderStatus::Pending, 50);
 
         let verdict = oms.verify_order_execution("D-1", 5, 30).await.unwrap();
@@ -8993,6 +9266,7 @@ mod tests {
         let body = r#"{"orderId":"SO/../1","orderStatus":"PENDING","legDetails":[]}"#;
         let (base_url, handle) = start_oms_mock(200, body).await;
         let mut oms = make_live_oms(&base_url);
+        install_ready(&mut oms);
         let result = oms.place_super_order(make_super_request(), 1_800).await;
         assert!(matches!(result, Err(OmsError::DhanApiError { .. })));
         assert_eq!(oms.total_placed(), 0);
@@ -9003,6 +9277,7 @@ mod tests {
         let body = r#"[{"orderId":"S-1","orderStatus":"TRANSIT"},{"orderId":"S 2","orderStatus":"TRANSIT"}]"#;
         let (base_url, handle) = start_oms_mock(200, body).await;
         let mut oms = make_live_oms(&base_url);
+        install_ready(&mut oms);
         let mut request = make_place_request();
         request.quantity = 250;
         let result = oms.place_order_sliced(request, 100).await;
@@ -9014,6 +9289,7 @@ mod tests {
         let body = r#"{"orderId":"FO\n1","orderStatus":"CONFIRM"}"#;
         let (base_url, handle) = start_oms_mock(200, body).await;
         let mut oms = make_live_oms(&base_url);
+        install_ready(&mut oms);
         let result = oms.place_forever_oco(make_forever_request()).await;
         assert!(matches!(result, Err(OmsError::DhanApiError { .. })));
         assert!(oms.all_orders().is_empty());
@@ -9031,6 +9307,7 @@ mod tests {
             start_multi_mock(vec![(200, place_body), (200, cancel_body)]).await;
 
         let mut oms = make_live_oms(&base_url);
+        install_ready(&mut oms);
         oms.place_super_order(make_super_request(), 1_800)
             .await
             .unwrap();
@@ -9058,6 +9335,7 @@ mod tests {
             start_multi_mock(vec![(200, place_body), (200, modify_body)]).await;
 
         let mut oms = make_live_oms(&base_url);
+        install_ready(&mut oms);
         oms.place_super_order(make_super_request(), 1_800)
             .await
             .unwrap();
@@ -9136,6 +9414,7 @@ mod tests {
         let (base_url, handle) = start_oms_mock(200, body).await;
 
         let mut oms = make_live_oms(&base_url);
+        install_ready(&mut oms);
         insert_tracked_super(&mut oms, "SO-9", "PENDING", 75);
         insert_tracked_order(&mut oms, "SO-9", OrderStatus::Pending, 75);
 
@@ -9165,6 +9444,7 @@ mod tests {
         let (base_url, handle) = start_oms_mock(200, &body).await;
 
         let mut oms = make_live_oms(&base_url);
+        install_ready(&mut oms);
         let mut request = make_place_request();
         request.quantity = 250;
 
@@ -9322,4 +9602,7 @@ mod tests {
     fn the_order_ceiling_agrees_with_every_other_per_entity_ceiling() {
         assert_eq!(OrderManagementSystem::MAX_TRACKED_ORDERS, 25_000);
     }
+
+    // Audit B2 (2026-11-13) tests live in `engine/tests/b2_tests.rs` (size pin).
+    mod b2_tests;
 }

@@ -244,6 +244,21 @@ const REVIEWED_WARN_SITES: &[(&str, &str, &str)] = &[
     ),
     // ---- storage ----
     (
+        "crates/storage/src/tick_spill_replay.rs",
+        "could not be moved to their own held file",
+        "B1 review 4 (2026-11-13): a retry, not a loss; the spill file is kept intact, nothing from the chunk is posted or advanced past, and the next round tries the move again",
+    ),
+    (
+        "crates/storage/src/ws_frame_spill/replay_retry.rs",
+        "replay read-failure book could not be written",
+        "B1 review 2 (2026-11-13): a lost count, not lost data; the in-memory count still bounds this process, so a missing book only means more replay retries (keeps more), never a dropped frame",
+    ),
+    (
+        "crates/storage/src/ilp_table_gate.rs",
+        "a live writer is not posting: its table has not been created",
+        "B1 (2026-11-13): a hold, not a loss, logged once per process; each held batch takes the writer's existing rescue (spill file or WAL deferral), whose own per-batch line carries the error code, and replays once the DDL re-run keys the table",
+    ),
+    (
         "crates/storage/src/fresh_start_reset.rs",
         "its first-boot marker could not be read",
         "2026-10-29: a READ, not a write: nothing is persisted or lost. Coded TICK-SPILL-01 (source market_data_floor_no_marker), once per boot; the boot keeps any floor file an earlier boot wrote, and without one the replays bring back more rows (never fewer)",

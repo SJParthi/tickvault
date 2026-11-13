@@ -80,12 +80,12 @@ use tickvault_trading::candles::{MultiTfAggregator, TfIndex};
 
 use super::source::{FrameTick, walk_frame};
 use crate::dhan_feed_stack::fold_verdict::{FoldVerdict, fold_verdict};
-use crate::dhan_feed_stack::live_fill_tap::TapTick;
+use crate::dhan_feed_stack::live_fill_tap::{TapTick, TapVolume};
 use crate::live_fill::chain::{
     ChainError, ChainOutput, ChainParams, ChainSetup, LiveFillChain, PaperCmd, PaperExecution,
 };
 use crate::live_fill::paper_rows::{
-    PaperOutcome, clamp_exit, execution_rows, reject_row, remainder_reason,
+    PaperOutcome, clamp_exit, execution_rows, position_report, reject_row, remainder_reason,
 };
 use crate::live_fill::replay::scripted::ScriptedIntents;
 
@@ -556,6 +556,7 @@ impl ReplayDriver {
                     self.drop_seq,
                     new_trade,
                     older_trade,
+                    TapVolume::from_stats(&stats),
                 );
                 if let Some(chain) = self.chain.as_mut() {
                     chain.on_tap(&tap);
@@ -634,6 +635,7 @@ impl ReplayDriver {
     /// module docs of `live_fill::replay`).
     fn execute(&mut self, x: &PaperExecution, ts: i64) {
         self.stats.executions = self.stats.executions.saturating_add(1);
+        let sent = x;
         let mut seq = x.next_seq;
         let key = (x.security_id, x.segment.binary_code());
         let held = self.held_lots.get(&key).copied().unwrap_or(0);
@@ -646,6 +648,7 @@ impl ReplayDriver {
                     "exit_without_position".to_owned(),
                     &mut seq,
                 ));
+                self.report_position(sent, held);
                 return;
             };
             clamped = c;
@@ -670,6 +673,16 @@ impl ReplayDriver {
         };
         let slot = self.held_lots.entry(key).or_insert(0);
         *slot = slot.saturating_add(signed);
+        let now_held = *slot;
+        self.report_position(sent, now_held);
+    }
+
+    /// Hands the chain what the emulated paper book holds once `sent` is
+    /// booked or refused, as the live runtime does (LF-9 finding 2). O(1).
+    fn report_position(&mut self, sent: &PaperExecution, held_lots: i32) {
+        if let Some(chain) = self.chain.as_mut() {
+            chain.on_position_report(&position_report(sent, held_lots));
+        }
     }
 
     /// Runs the grid to its end (held orders reach their fill window's end),
