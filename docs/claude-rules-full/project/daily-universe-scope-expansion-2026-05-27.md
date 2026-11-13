@@ -2022,6 +2022,52 @@ made in memory in under 1 µs; sending an order to the broker cannot (a network
 round trip, milliseconds), and neither can writing to disk or the database. Those
 stay off the decision path.
 
+### §28.6 — SPEED-ONLY LIFT: the paper fill chain thread wakes on a tick instead of napping (operator-approved 2026-11-13)
+
+**The operator authorization (2026-11-13).** Asked on a decision card: *"The
+paper-trading decision thread naps 1 ms (5 ms after a quiet spell) whenever no
+tick is waiting, so a tick arriving during a nap waits up to 1–5 ms. Replace the
+nap with an instant wake-up? Speed only, the strategy logic is untouched, but
+this code sits under the brutex strategy lock so it needs your OK."*, the owner
+tapped **"Yes, instant wake (Recommended)"**, whose text read: *"About 1 ms
+faster per tick on average. No logic change; old-vs-new identical-output test;
+no extra CPU core used."*
+
+**What this lift allows, and only this.** In `crates/app/src/live_fill/` (the
+`tv-live-fill` thread) and `crates/app/src/dhan_feed_stack/live_fill_tap.rs`
+(its producer on the frame drain): the thread's idle `sleep` becomes a park
+that the tap's producer ends once per frame that queued a tick (one `SeqCst`
+load per such frame while the thread is awake, at most one unpark per frame,
+no allocation). The old nap length stays as the park's upper bound, so a pass
+driven by the clock or a position report is never later than before. Ships
+with a test that drives the same scripted tick stream through the loop with
+the old sleep and the new park and requires identical chain outputs for the
+same pass times, the ticks queued by a second thread so the park must be
+ended by the tap's real unpark (counted).
+
+**Honest cost (corrected 2026-11-13 review).** The idle-to-busy edge is not
+rare: the thread drains a frame in microseconds and parks before the next,
+so while the tap is armed the frame drain pays about one futex wake per
+frame, never more: the tap records a queued tick and wakes the thread once,
+after the frame walk (`LiveFillTap::flush_wake`; before the 2026-11-13
+review `offer` woke per tick, and a thread that caught up mid-frame was woken
+again per tick),
+measured 8.2 to 8.7 µs per edge on the x86 dev container (the
+`live_fill/wake_edge` bench, unbudgeted, 2026-11-13), not yet on the box,
+and the woken thread can preempt the drain on a 2-core host. The wake runs
+after the frame's stage timings, so its cost is not counted in the
+`drain_main_frame`, `drain_main_tick` or `receipt_to_fold` stages (PR C
+review, 2026-11-13; the first placement timed it as fold work). It IS counted
+in `drain_frame_post` (audit B3, merged the same day), which times the
+drain's work after the fold, so the cost shows there. Reachability today: none (the tap is armed
+only when an approved strategy engine exists).
+`[live_fill] enabled` stays `false` by default.
+
+**REJECT:** any change to what the chain, its fill model or an engine decides;
+a spin or busy-wait that keeps a core busy (the card said "no extra CPU core
+used"); an unpark per tick instead of per idle-to-busy edge; an allocation or
+lock on the drain's offer path; reusing this lift for any other change.
+
 ## §31.1 — Constituent → Dhan `security_id` mapping contract (LOCKED 2026-06-06)
 
 > **Authority for Sub-PR #4.** This is the precise, fail-closed mapping the

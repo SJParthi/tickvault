@@ -151,8 +151,9 @@ fn micros_since(t: Instant) -> i64 {
 }
 
 /// Drives a rustls client handshake over `stream` until it finishes (or the
-/// socket fails). Sends nothing but TLS handshake records.
-async fn drive_tls_handshake(
+/// socket fails). Sends nothing but TLS handshake records. Also used by the
+/// order host pre-warm (`order_prewarm`, no-rest rule §12.16).
+pub(crate) async fn drive_tls_handshake(
     stream: &mut TcpStream,
     conn: &mut rustls::ClientConnection,
 ) -> Result<(), ()> {

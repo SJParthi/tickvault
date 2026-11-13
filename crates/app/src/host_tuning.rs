@@ -13,7 +13,8 @@
 //!    verdict to `/opt/tickvault/net-tuning.status`, exit 1 when anything is
 //!    missing or below target. Reports, never halts the box.
 //! 3. `apply` (was `deploy/aws/host-tuning/apply-host-tuning.sh`): transparent
-//!    hugepages to `madvise`, the clock-discipline check, NIC IRQ steering, and
+//!    hugepages to `madvise`, the clock-discipline check, NIC IRQ steering, the
+//!    one-day NIC receive-coalescing trial (`host_tuning/nic_rx.rs`, 2026-11-13), and
 //!    the two systemd drop-ins that keep the app's CPU and memory limits
 //!    satisfiable on a smaller host. Always exits 0.
 //!
@@ -39,6 +40,8 @@ use std::io::Write as _;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
+
+mod nic_rx;
 
 /// The CLI word that selects this module: `tickvault host-tuning <action>`.
 pub const HOST_TUNING_SUBCOMMAND: &str = "host-tuning";
@@ -335,6 +338,7 @@ fn run_apply() -> i32 {
     apply_thp();
     check_clock();
     steer_nic_irqs();
+    nic_rx::apply_nic_rx_coalesce(default_route_nic().as_deref(), &emit);
     guard_app_cpus();
     guard_app_memory();
     emit(&apply_questdb_host_env(false));
@@ -707,6 +711,13 @@ fn default_route_iface(route_table: &str) -> Option<String> {
     })
 }
 
+/// The default-route interface of this host, `None` when unreadable.
+fn default_route_nic() -> Option<String> {
+    std::fs::read_to_string("/proc/net/route")
+        .ok()
+        .and_then(|t| default_route_iface(&t))
+}
+
 /// IRQ numbers whose `/proc/interrupts` line names `nic` (ENA names its
 /// vectors after the interface, so every queue vector is caught).
 fn nic_irqs(interrupts: &str, nic: &str) -> Vec<u32> {
@@ -742,10 +753,7 @@ fn steer_nic_irqs() {
         emit("host-tuning: irqbalance not running — static IRQ affinity will stick");
     }
 
-    let nic = std::fs::read_to_string("/proc/net/route")
-        .ok()
-        .and_then(|t| default_route_iface(&t));
-    let Some(nic) = nic else {
+    let Some(nic) = default_route_nic() else {
         emit(
             "host-tuning: WARNING could not resolve the default-route interface — NIC IRQs NOT steered",
         );

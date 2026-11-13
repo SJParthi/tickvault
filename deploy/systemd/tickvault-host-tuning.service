@@ -57,6 +57,32 @@ EnvironmentFile=-/etc/tickvault/host-tuning.env
 # never during a session. Review with the 16:15 IST verdict; delete this line
 # to switch off (the next boot restores the operator's previous values).
 Environment=TV_QDB_CORE_ISOLATION=1
+# NIC RECEIVE COALESCING OFF FOR ONE MEASURED DAY (owner card, Fri 13 Nov 2026:
+# "Yes, measure 1 day (Recommended)" — "About 0–20 µs per packet faster,
+# slightly more CPU. Applied outside market hours; easy to undo."). While
+# today (IST) is on or before TV_NIC_RX_COALESCE_UNTIL, `host-tuning apply`
+# sets the default-route NIC to rx-usecs 0 / adaptive-rx off through the
+# ethtool ioctl (no shell), after saving the values it found to
+# /opt/tickvault/nic-coalesce.before. The first run after that date puts the
+# saved values back and deletes the file (an EC2 stop/start also resets the
+# driver). This unit runs at every boot and on every deploy (an emergency
+# deploy can override the 09:00-15:45 IST deploy block), so the code itself
+# never STARTS the trial between 09:00 and 15:45 IST: such a run logs "not
+# touched" and the next run outside that window applies it. UNDO: set
+# TV_NIC_RX_COALESCE=keep in /etc/tickvault/host-tuning.env, which wins over
+# these lines and is read at each start, then `systemctl restart
+# tickvault-host-tuning`. Only the env-file route survives a deploy: every
+# deploy copies this unit from the repo over the box copy, reloads systemd and
+# restarts the unit, and deleting these two lines does not undo it either,
+# because the code's own defaults are also `off` and the same date. A quicker
+# undo that lasts only until the next deploy: change `off` to `keep` on the
+# next line, then `systemctl daemon-reload && systemctl restart
+# tickvault-host-tuning` (without the daemon-reload systemd keeps the cached
+# unit and the restart re-applies the trial). Move the date if the deploy
+# slips past Mon 16 Nov. How to read the day:
+# docs/runbooks/hot-path-capacity-proof.md "NIC coalescing trial".
+Environment=TV_NIC_RX_COALESCE=off
+Environment=TV_NIC_RX_COALESCE_UNTIL=2026-11-16
 
 WorkingDirectory=/opt/tickvault
 

@@ -83,6 +83,9 @@ Examples:
 | `TEMPLATE.md` | — | Reusable template |
 | `2026-04-15-ticket-5519522-still-failing.md` | #5519522 | Initial escalation after both fixes applied |
 | `2026-04-15-reply-to-trishul.md` | #5519522 | Reply to Trishul with today's 4 precise ATM contracts |
+| `2026-11-13-feed-latency-and-zone.md` | NOT READY TO SEND: draft, packet samples and our zone ID still placeholders | Live Market Feed delivery delay, AWS region / zone of the feed and order servers, faster feed options |
+
+(The rows above are not a complete list; `ls docs/dhan-support/` is.)
 
 ## Source of the precise labels
 

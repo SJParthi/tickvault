@@ -102,7 +102,7 @@ use tickvault_trading::oms::{
 };
 use tickvault_trading::risk::engine::{RiskAlertSink, RiskEngine};
 
-use crate::oms_wiring::{TokenHandleBridge, build_oms_http_client};
+use crate::oms_wiring::TokenHandleBridge;
 
 // ---------------------------------------------------------------------------
 // Constants (module-scoped, named per rust-code.md "no hardcoded values")
@@ -1345,7 +1345,14 @@ async fn run_order_runtime(
     // subsides. Never a panic/abort for a dry-run client that issues no
     // HTTP (the pre-fix `.unwrap_or_default()` aborted the WHOLE process,
     // REST capture legs included, under `panic = "abort"`).
-    let Ok(http_client) = build_oms_http_client() else {
+    // No-rest rule §12.16 (default OFF): with the order-host pre-warm on, the
+    // client shares its TLS session store with the 09:14 pre-warm.
+    let built = crate::order_prewarm::order_runtime_http_client(
+        config.order_runtime.prewarm_order_connection,
+        &config.dhan.rest_api_base_url,
+        Arc::clone(&ctx.calendar),
+    );
+    let Ok(http_client) = built else {
         return;
     };
     let api_client = OrderApiClient::new(

@@ -392,8 +392,9 @@ pub const HONEST_LIMITS: [&str; 9] = [
      decision as one live would have made.",
     "Frame order is the WAL's write order, which can differ from the live drain's order by up \
      to about a second (the reorder slack between sockets).",
-    "Decision times are on the replay's pass grid (1 ms by default); the live thread naps 1 ms, \
-     or 5 ms after 50 idle passes, so live can decide up to about 5 ms later. --compare shows it.",
+    "Decision times are on the replay's pass grid (1 ms by default); the live thread wakes on \
+     each new tick and otherwise passes at least every 1 ms, or 5 ms after 50 idle passes, so \
+     a decision only the clock releases can land up to about 5 ms later live. --compare shows it.",
     "No risk check and no order gates: the risk engine's pre-trade check and the OMS rate, \
      budget and circuit gates are skipped, so an order the runtime would refuse shows as \
      placed and filled.",

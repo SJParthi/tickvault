@@ -53,12 +53,30 @@
 //! built on the stack and one `try_send` into a crossbeam array slot; no
 //! allocation, no lock, no log, no metric macro. The receiver busy-polls
 //! ([`FrameRingReceiver::set_busy_polling`] is set before the sender is handed
-//! out), so `try_send` never calls `notify_one`. DHAT-gated by
-//! `crates/app/tests/dhat_live_fill.rs`. [`LiveFillTap::publish_dropped`] runs
-//! on the drain's 30 s silence arm: one counter add.
+//! out), so `try_send` never calls `notify_one`. Since 2026-11-13 (§28.6) a
+//! queued tick also sets one plain `bool` (`wake_pending`), and the frame
+//! drain calls [`LiveFillTap::flush_wake`] ONCE after the whole frame walk
+//! (`LiveIngest::flush_live_fill_wake`, after `drain_main_feed_frame` returns
+//! and after the frame's stage timings, so the wake is never timed as fold
+//! work in `drain_main_frame`, `drain_main_tick` or `receipt_to_fold`): one
+//! `SeqCst` load while the chain thread is awake, one swap and
+//! one `unpark` on its idle-to-busy edge. So at most ONE wake per frame,
+//! whatever the frame holds: before the 2026-11-13 review `offer` woke per
+//! queued tick, and a thread that caught up and parked mid-frame was woken
+//! again by the next offer, which on a 2-core host could preempt the drain
+//! once per tick (`test_flush_wake_costs_at_most_one_unpark_per_frame_while_the_consumer_reparks`).
+//! The edge is NOT rare: about one futex wake syscall per frame while the tap
+//! is armed (MEASURED 8.2 to 8.7 µs per edge on the x86 dev container,
+//! `live_fill/wake_edge`, 2026-11-13; not measured on the box). Cost of the
+//! deferral: the chain sees a frame's ticks after the walk ends, a few µs
+//! against the old 1 to 5 ms nap. The thread may not spin to avoid it (§28.6
+//! REJECT). DHAT-gated by `crates/app/tests/dhat_live_fill.rs`.
+//! [`LiveFillTap::publish_dropped`] runs on the drain's 30 s silence arm: one
+//! counter add.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::thread::Thread;
 
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::tick_types::{MarketDepthLevel, ParsedTick};
@@ -251,14 +269,154 @@ pub struct LiveFillTap {
     /// The chain thread is gone (its receiver dropped, e.g. a refused day
     /// roll): every later offer returns at once, doing no work.
     closed: bool,
+    /// The chain thread's wake (§28.6): woken once per frame, by
+    /// [`Self::flush_wake`], when the frame queued a tick. `None` in tests
+    /// that drive the ring by hand.
+    wake: Option<Arc<ChainWake>>,
+    /// A tick was queued since the last [`Self::flush_wake`].
+    wake_pending: bool,
 }
 
-/// The tap's link from the boot to the frame drain: the ring's sender and the
-/// shared loss total the chain thread reads out of band.
+/// The tap's link from the boot to the frame drain: the ring's sender, the
+/// shared loss total the chain thread reads out of band, and the chain
+/// thread's wake (§28.6).
 #[derive(Debug)]
 pub struct TapLink {
     pub tx: FrameRingSender<TapTick>,
     pub loss: Arc<AtomicU64>,
+    pub wake: Arc<ChainWake>,
+}
+
+/// The chain thread's park/unpark handshake with the tap (owner card
+/// 2026-11-13, "Yes, instant wake (Recommended)", rule file §28.6). The
+/// thread parks instead of napping when both its rings are empty; the tap
+/// unparks it when it queues a tick.
+///
+/// # Why no tick is stranded
+///
+/// The tap pushes (crossbeam's tail compare-and-swap, `SeqCst`), then loads
+/// `parked` (`SeqCst`). The thread stores `parked = true` (`SeqCst`), then
+/// checks its rings (crossbeam-channel 0.5.17 `is_empty`: two `SeqCst`
+/// loads) and parks only when both are empty. In the single total order of
+/// `SeqCst` operations either the tap's load comes after the thread's store
+/// (it sees the flag and unparks), or its push comes before the thread's
+/// check (the thread sees the tick and does not park). An unpark that lands
+/// before the park makes the park return at once. Same reasoning as
+/// `FrameRingReceiver::set_busy_polling`. The park is bounded by the old nap,
+/// so a missed wake can only cost what the old nap cost.
+///
+/// # Cost on the frame drain
+///
+/// While the thread is awake: one `SeqCst` load per queued tick (a plain load
+/// on x86, `ldar` on ARM; not `Relaxed`, which would let the load pass the
+/// push on ARM and lose a wake). On the idle-to-busy edge only: one swap and
+/// one `unpark` (a futex wake when the thread is asleep). No allocation, no
+/// lock. O(1). The tap calls [`Self::wake`] once per frame, after the frame
+/// walk ([`LiveFillTap::flush_wake`]), never per tick, so the drain makes at
+/// most one futex wake per frame while the tap is armed; see the module docs
+/// and the `live_fill/wake_edge` bench.
+#[derive(Debug, Default)]
+pub struct ChainWake {
+    parked: AtomicBool,
+    thread: OnceLock<Thread>,
+    /// Unparks issued (tests count wakes per edge).
+    #[cfg(test)]
+    unparks: AtomicU64,
+    /// Waits that found the rings empty and called `park_timeout` (tests:
+    /// a producer that queues only after this moved meets a real park).
+    #[cfg(test)]
+    parks_entered: AtomicU64,
+    /// Test-only stall between declaring parked and the ring check, in ns.
+    #[cfg(test)]
+    check_stall_ns: AtomicU64,
+}
+
+impl ChainWake {
+    /// A wake with no thread registered yet. Cold.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Registers the calling thread as the one to unpark. Once; a later call
+    /// is ignored. Cold (thread start).
+    pub fn register_current_thread(&self) {
+        // A second registration keeps the first thread: `Err` is that case.
+        if self.thread.set(std::thread::current()).is_err() {
+            tracing::debug!("live paper fill chain: wake already registered");
+        }
+    }
+
+    /// The tap's half, after a frame queued a tick: unparks the thread only
+    /// on the edge where it declared itself parked. O(1).
+    #[inline]
+    pub fn wake(&self) {
+        if self.parked.load(Ordering::SeqCst) && self.parked.swap(false, Ordering::AcqRel) {
+            self.unpark_cold();
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn unpark_cold(&self) {
+        #[cfg(test)]
+        self.unparks.fetch_add(1, Ordering::Relaxed);
+        if let Some(t) = self.thread.get() {
+            t.unpark();
+        }
+    }
+
+    /// The thread's half: declares itself parked, re-checks `empty`, and
+    /// parks for at most `bound` while it is still true. Returns `true` when
+    /// the tap ended the wait (it cleared the flag), `false` when the bound
+    /// ran out or nothing was empty. O(1).
+    pub fn park_unless(&self, empty: impl Fn() -> bool, bound: std::time::Duration) -> bool {
+        self.parked.store(true, Ordering::SeqCst);
+        #[cfg(test)]
+        std::thread::sleep(std::time::Duration::from_nanos(
+            self.check_stall_ns.load(Ordering::SeqCst),
+        ));
+        if empty() {
+            #[cfg(test)]
+            self.parks_entered.fetch_add(1, Ordering::SeqCst);
+            std::thread::park_timeout(bound);
+        }
+        // Already `false` means the tap cleared it: it saw the thread parked.
+        !self.parked.swap(false, Ordering::Relaxed)
+    }
+
+    /// Whether the thread has declared itself parked (the next queued tick
+    /// pays the unpark). One `SeqCst` load. For tests and the wake-edge
+    /// bench; O(1).
+    #[must_use]
+    pub fn is_parked(&self) -> bool {
+        self.parked.load(Ordering::SeqCst)
+    }
+
+    /// Waits that entered `park_timeout` so far (tests). O(1).
+    #[cfg(test)]
+    #[must_use]
+    // TEST-EXEMPT: test-only probe read by the park and wake tests in live_fill/wake_tests.rs.
+    pub fn parks_entered(&self) -> u64 {
+        self.parks_entered.load(Ordering::SeqCst)
+    }
+
+    /// Makes every later `park_unless` stall `d` between declaring itself
+    /// parked and checking the rings (tests: a consumer the scheduler took
+    /// off its core at the worst moment). O(1).
+    #[cfg(test)]
+    // TEST-EXEMPT: test-only fault injection used by the wake gate in live_fill/wake_tests.rs.
+    pub fn set_check_stall(&self, d: std::time::Duration) {
+        let ns = u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
+        self.check_stall_ns.store(ns, Ordering::SeqCst);
+    }
+
+    /// Unparks issued so far (tests). O(1).
+    #[cfg(test)]
+    #[must_use]
+    pub fn unparks(&self) -> u64 {
+        self.unparks.load(Ordering::Relaxed)
+    }
 }
 
 /// No socket loss (tests that do not exercise it). O(1).
@@ -303,7 +461,26 @@ impl LiveFillTap {
             loss_out: None,
             loss_published: 0,
             closed: false,
+            wake: None,
+            wake_pending: false,
         }
+    }
+
+    /// The production tap for a boot's [`TapLink`]: [`Self::new`] with the
+    /// link's loss total and the chain thread's wake. Cold.
+    #[must_use]
+    pub fn from_link(link: TapLink) -> Self {
+        Self::new(link.tx)
+            .with_loss_out(link.loss)
+            .with_wake(link.wake)
+    }
+
+    /// Wakes `wake`'s thread, once per frame that queued a tick, while it
+    /// sleeps (builder, §28.6). Cold.
+    #[must_use]
+    pub fn with_wake(mut self, wake: Arc<ChainWake>) -> Self {
+        self.wake = Some(wake);
+        self
     }
 
     /// Publishes the running loss total to `loss` for the chain thread
@@ -350,6 +527,9 @@ impl LiveFillTap {
         match self.tx.try_send(t) {
             Ok(()) => {
                 self.publish_loss();
+                // The wake waits for the frame's end (`flush_wake`), so a
+                // thread that catches up mid-frame is not woken per tick.
+                self.wake_pending = true;
                 true
             }
             Err(FrameRingTrySendError::Full(_)) => {
@@ -360,6 +540,22 @@ impl LiveFillTap {
             Err(FrameRingTrySendError::Closed(_)) => {
                 self.on_closed();
                 false
+            }
+        }
+    }
+
+    /// Wakes the chain thread when a tick was queued since the last call.
+    /// Called ONCE per frame, after the frame walk, so a frame costs at most
+    /// one [`ChainWake::wake`] (one unpark on the idle-to-busy edge) however
+    /// many ticks it queued. No tick is stranded: every push precedes this
+    /// `SeqCst` load in program order (see [`ChainWake`]). O(1): one branch
+    /// when nothing was queued.
+    #[inline]
+    pub fn flush_wake(&mut self) {
+        if self.wake_pending {
+            self.wake_pending = false;
+            if let Some(w) = self.wake.as_deref() {
+                w.wake();
             }
         }
     }
@@ -729,6 +925,258 @@ mod tests {
             p.received_at_nanos = utc(t0_ist + k, 0);
             assert!(quiet.offer(&p, None, true, false, TapVolume::default()));
             assert_eq!(rx.try_recv().map(|t| t.drop_seq), Some(0));
+        }
+    }
+
+    // ---------------- §28.6: the chain thread's instant wake ----------------
+
+    /// A thread parked on an empty ring wakes as soon as the frame that
+    /// queued a tick ends (`flush_wake`), not when its bound runs out.
+    /// Without the wake in `flush_wake` the park lasts the full 10 s bound.
+    #[test]
+    fn test_tap_offer_wakes_a_parked_chain_thread_at_once_with_wake_from_link() {
+        let (tx, rx) = live_fill_tap_ring(8);
+        let wake = Arc::new(ChainWake::new());
+        let link = TapLink {
+            tx,
+            loss: Arc::new(AtomicU64::new(0)),
+            wake: Arc::clone(&wake),
+        };
+        let mut tap = LiveFillTap::from_link(link);
+        let w = Arc::clone(&wake);
+        let consumer = std::thread::spawn(move || {
+            w.register_current_thread();
+            let t0 = std::time::Instant::now();
+            let woke = w.park_unless(|| rx.is_empty(), std::time::Duration::from_secs(10));
+            (woke, t0.elapsed(), rx.len())
+        });
+        // Wait until the consumer has declared itself parked.
+        while !wake.parked.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let p = parsed(1, 10.0, 100, 1);
+        assert!(tap.offer(&p, None, true, false, TapVolume::default()));
+        tap.flush_wake();
+        let (woke, waited, queued) = consumer.join().expect("consumer");
+        assert!(woke, "the tap ended the park");
+        assert!(
+            waited < std::time::Duration::from_secs(2),
+            "woken at once, not at the 10 s bound: waited {waited:?}"
+        );
+        assert_eq!(queued, 1, "the wake took nothing off the ring");
+        assert_eq!(wake.unparks(), 1);
+    }
+
+    /// At most one unpark per idle-to-busy edge: a burst of ticks while the
+    /// thread is parked unparks once, and ticks while it is awake unpark
+    /// never. Fails if `wake` unparks on every tick.
+    #[test]
+    fn test_wake_unparks_once_per_idle_to_busy_edge_with_wake_none_while_awake() {
+        let (tx, mut rx) = live_fill_tap_ring(4_096);
+        let wake = Arc::new(ChainWake::new());
+        wake.register_current_thread();
+        let mut tap = LiveFillTap::with_shed_source(tx, || 0).with_wake(Arc::clone(&wake));
+        let p = parsed(1, 10.0, 100, 1);
+        // Awake: nothing to unpark.
+        for _ in 0..1_000 {
+            assert!(tap.offer(&p, None, true, false, TapVolume::default()));
+        }
+        assert_eq!(wake.unparks(), 0, "no unpark while the thread is awake");
+        while rx.try_recv().is_some() {}
+        tap.flush_wake();
+        assert_eq!(wake.unparks(), 0, "no unpark while the thread is awake");
+        // Declared parked: a frame of 1,000 ticks unparks once, at its end.
+        wake.parked.store(true, Ordering::SeqCst);
+        for _ in 0..1_000 {
+            assert!(tap.offer(&p, None, true, false, TapVolume::default()));
+        }
+        assert_eq!(wake.unparks(), 0, "no wake inside the frame walk");
+        tap.flush_wake();
+        tap.flush_wake();
+        assert_eq!(wake.unparks(), 1, "one unpark for the edge");
+        assert!(!wake.parked.load(Ordering::SeqCst), "the tap cleared it");
+        // The token it left makes a later park return at once (no tick lost
+        // to a wake that arrived before the park).
+        let t0 = std::time::Instant::now();
+        assert!(!wake.park_unless(|| true, std::time::Duration::from_secs(10)));
+        assert!(t0.elapsed() < std::time::Duration::from_secs(2));
+        // A full ring queues nothing and unparks nothing.
+        let (full_tx, _full_rx) = live_fill_tap_ring(1);
+        let mut full = LiveFillTap::with_shed_source(full_tx, || 0).with_wake(Arc::clone(&wake));
+        assert!(full.offer(&p, None, true, false, TapVolume::default()));
+        full.flush_wake();
+        wake.parked.store(true, Ordering::SeqCst);
+        assert!(!full.offer(&p, None, true, false, TapVolume::default()));
+        full.flush_wake();
+        assert_eq!(wake.unparks(), 1, "a refused tick wakes nobody");
+    }
+
+    /// `park_unless` does not park when the ring is not empty, and reports a
+    /// bound that ran out as not woken.
+    #[test]
+    fn test_park_unless_skips_the_park_when_work_is_queued_register_current_thread_and_new() {
+        let wake = ChainWake::new();
+        wake.register_current_thread();
+        let t0 = std::time::Instant::now();
+        assert!(!wake.park_unless(|| false, std::time::Duration::from_secs(10)));
+        assert!(t0.elapsed() < std::time::Duration::from_secs(2));
+        assert!(!wake.park_unless(|| true, std::time::Duration::from_millis(5)));
+        assert!(!wake.parked.load(Ordering::SeqCst), "never left set");
+    }
+
+    /// Steady state with frames spaced apart (the shape of the live drain):
+    /// the chain thread drains each frame and parks again before the next,
+    /// so the tap pays about one unpark per frame and never more. Pins
+    /// the cost the module docs state (§28.6 review: the edge is per frame,
+    /// not rare). `is_parked` reports the declared park.
+    #[test]
+    fn test_steady_state_costs_one_unpark_per_frame_is_parked() {
+        const FRAMES: u64 = 100;
+        const PER_FRAME: u64 = 8;
+        let (tx, mut rx) = live_fill_tap_ring(4_096);
+        let wake = Arc::new(ChainWake::new());
+        let mut tap = LiveFillTap::with_shed_source(tx, || 0).with_wake(Arc::clone(&wake));
+        let w = Arc::clone(&wake);
+        let consumer = std::thread::spawn(move || {
+            w.register_current_thread();
+            let mut got = 0u64;
+            while got < FRAMES * PER_FRAME {
+                while rx.try_recv().is_some() {
+                    got += 1;
+                }
+                if got < FRAMES * PER_FRAME {
+                    w.park_unless(|| rx.is_empty(), std::time::Duration::from_secs(10));
+                }
+            }
+        });
+        let p = parsed(1, 10.0, 100, 1);
+        for _ in 0..FRAMES {
+            // The next frame arrives after the thread has drained and parked.
+            let t0 = std::time::Instant::now();
+            while !wake.is_parked() && t0.elapsed() < std::time::Duration::from_millis(200) {
+                std::thread::yield_now();
+            }
+            for _ in 0..PER_FRAME {
+                assert!(tap.offer(&p, None, true, false, TapVolume::default()));
+            }
+            tap.flush_wake();
+        }
+        consumer.join().expect("consumer");
+        let unparks = wake.unparks();
+        // One wake per frame at most, whatever the thread does mid-frame.
+        assert!(
+            unparks <= FRAMES,
+            "at most one unpark per frame, got {unparks} for {FRAMES} frames"
+        );
+        assert!(
+            unparks >= FRAMES / 2,
+            "a frame arriving at a parked thread pays the unpark: got {unparks} for {FRAMES} frames"
+        );
+    }
+
+    /// One frame whose walk is slow enough for the chain thread to catch up
+    /// and park again between two of its ticks (the 2-core preemption shape
+    /// of the 2026-11-13 review) still costs at most ONE unpark: the wake
+    /// waits for the frame's end. Before the fix `offer` woke per queued
+    /// tick, so this consumer was unparked once per tick.
+    #[test]
+    fn test_flush_wake_costs_at_most_one_unpark_per_frame_while_the_consumer_reparks() {
+        const FRAMES: u64 = 6;
+        const PER_FRAME: u64 = 12;
+        let (tx, mut rx) = live_fill_tap_ring(4_096);
+        let wake = Arc::new(ChainWake::new());
+        let mut tap = LiveFillTap::with_shed_source(tx, || 0).with_wake(Arc::clone(&wake));
+        let w = Arc::clone(&wake);
+        let consumer = std::thread::spawn(move || {
+            w.register_current_thread();
+            let mut got = 0u64;
+            while got < FRAMES * PER_FRAME {
+                while rx.try_recv().is_some() {
+                    got += 1;
+                }
+                if got < FRAMES * PER_FRAME {
+                    w.park_unless(|| rx.is_empty(), std::time::Duration::from_secs(10));
+                }
+            }
+        });
+        let p = parsed(1, 10.0, 100, 1);
+        let settle = |wake: &ChainWake| {
+            let t0 = std::time::Instant::now();
+            while !wake.is_parked() && t0.elapsed() < std::time::Duration::from_millis(500) {
+                std::thread::yield_now();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        };
+        for _ in 0..FRAMES {
+            settle(&wake);
+            for _ in 0..PER_FRAME {
+                assert!(tap.offer(&p, None, true, false, TapVolume::default()));
+                // A slow walk: the thread, if woken, drains and re-parks here.
+                settle(&wake);
+            }
+            tap.flush_wake();
+        }
+        consumer.join().expect("consumer");
+        let unparks = wake.unparks();
+        assert!(
+            unparks <= FRAMES,
+            "at most one unpark per frame: got {unparks} for {FRAMES} frames of {PER_FRAME} ticks"
+        );
+        assert!(unparks >= 1, "the frame end woke the parked thread");
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(12))]
+        /// No tick is ever stranded by the park: a consumer parked with a
+        /// 30 s bound takes every tick of a producer sending with random
+        /// gaps, and the whole case ends long before that bound could have
+        /// been the thing that woke it.
+        #[test]
+        fn proptest_park_never_strands_a_tick(
+            gaps in proptest::collection::vec(0u32..400, 200..4_000),
+        ) {
+            let total = gaps.len() as u64;
+            let (tx, mut rx) = live_fill_tap_ring(64);
+            let wake = Arc::new(ChainWake::new());
+            let mut tap = LiveFillTap::with_shed_source(tx, || 0).with_wake(Arc::clone(&wake));
+            let w = Arc::clone(&wake);
+            let consumer = std::thread::spawn(move || {
+                w.register_current_thread();
+                let (mut got, mut woken) = (0u64, 0u64);
+                while got < total {
+                    while rx.try_recv().is_some() {
+                        got += 1;
+                    }
+                    if got < total
+                        && w.park_unless(|| rx.is_empty(), std::time::Duration::from_secs(30))
+                    {
+                        woken += 1;
+                    }
+                }
+                woken
+            });
+            let t0 = std::time::Instant::now();
+            let p = parsed(1, 10.0, 100, 1);
+            for g in &gaps {
+                while !tap.offer(&p, None, true, false, TapVolume::default()) {
+                    tap.flush_wake();
+                    std::thread::yield_now();
+                }
+                tap.flush_wake();
+                match g % 4 {
+                    0 => {}
+                    1 => std::thread::yield_now(),
+                    2 => std::hint::spin_loop(),
+                    _ => std::thread::sleep(std::time::Duration::from_micros(u64::from(*g))),
+                }
+            }
+            let woken = consumer.join().expect("consumer");
+            proptest::prop_assert!(
+                t0.elapsed() < std::time::Duration::from_secs(20),
+                "a tick waited for the 30 s bound: a lost wake"
+            );
+            proptest::prop_assert!(woken > 0, "the tap, not a timeout, woke the consumer");
         }
     }
 }

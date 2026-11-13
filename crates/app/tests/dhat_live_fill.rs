@@ -4,6 +4,11 @@
 //! * (A) `LiveFillTap::offer`, the drain's half: accepted and ring-full arms,
 //!   each with its upstream-shed load (one relaxed atomic), 0 blocks over
 //!   20,000 calls.
+//! * (A2, 2026-11-13, §28.6) the same offer, each followed by the frame's
+//!   `flush_wake`, with a `ChainWake` armed and its consumer thread parking
+//!   between ticks, so each one-tick frame takes the idle-to-busy edge
+//!   (swap + unpark): 0 blocks over 2,000 calls, and the
+//!   consumer must have been woken by the tap (non-vacuity).
 //! * (B) the frame drain with the tap ARMED: the same 10,000-tick workload as
 //!   `dhat_live_ingest_seam::frame_drain_seam_does_not_allocate_per_tick`,
 //!   held to that test's 256-block ceiling (the drain's own row-buffer growth,
@@ -43,7 +48,9 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
 use std::collections::HashMap;
 
 use tickvault_app::dhan_feed_stack::live_fill_tap::TapTick;
-use tickvault_app::dhan_feed_stack::live_fill_tap::{LiveFillTap, TapVolume, live_fill_tap_ring};
+use tickvault_app::dhan_feed_stack::live_fill_tap::{
+    ChainWake, LiveFillTap, TapVolume, live_fill_tap_ring,
+};
 use tickvault_app::dhan_feed_stack::{LiveIngest, counters, drain_main_feed_frame};
 use tickvault_app::live_fill::chain::REASON_LATE_FILL_PRICE;
 use tickvault_app::live_fill::chain::{
@@ -73,6 +80,16 @@ const DAY: i64 = 1_779_321_600;
 /// (its Decision / Built / Reject rows or Execute: owned text fields and
 /// boxes). Per order, never per tick.
 const ORDER_STEP_MAX_BLOCKS: u64 = 32;
+/// (A2) profiled offers, each made after the consumer declared itself parked.
+const A2_EDGE_OFFERS: u64 = 2_000;
+
+/// (A2) non-vacuity: the profiled offers (counted from a snapshot taken after
+/// the warm-up offer, so its wake cannot stand in) took the swap + unpark
+/// edge at least 95% of the time (an offer can miss only when the consumer's
+/// 50 ms park bound ran out in the instant between the wait and the offer).
+fn a2_edges_taken_enough(edges: u64) -> bool {
+    edges >= A2_EDGE_OFFERS - A2_EDGE_OFFERS / 20
+}
 
 fn quote_packet(security_id: u32, ltp: f32, ltt: u32) -> Vec<u8> {
     let mut buf = vec![0u8; 50];
@@ -380,6 +397,42 @@ fn dhat_live_fill_tap_drain_and_chain_per_tick_paths_allocate_nothing() {
     assert_eq!(chain.counters().intents, 0, "a flat price asks for nothing");
 
     let marked_before = chain.counters().volume_unknown_marked;
+    // The A2 check bites: one wake (the warm-up's) is not enough.
+    assert!(!a2_edges_taken_enough(1) && a2_edges_taken_enough(A2_EDGE_OFFERS));
+    // (A2) fixture, §28.6: a wake-armed tap whose consumer thread parks
+    // between ticks, so offers take both the awake path and the idle-to-busy
+    // edge (swap + unpark). Thread spawned and registered before the profiler.
+    let (wake_tx, mut wake_rx) = live_fill_tap_ring(4_096);
+    let chain_wake = std::sync::Arc::new(ChainWake::new());
+    let mut wake_tap = LiveFillTap::new(wake_tx).with_wake(std::sync::Arc::clone(&chain_wake));
+    let wake_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let woken = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let consumer = {
+        let (w, stop, woken, ready) = (
+            std::sync::Arc::clone(&chain_wake),
+            std::sync::Arc::clone(&wake_stop),
+            std::sync::Arc::clone(&woken),
+            std::sync::Arc::clone(&ready),
+        );
+        std::thread::spawn(move || {
+            w.register_current_thread();
+            ready.store(true, std::sync::atomic::Ordering::SeqCst);
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                while wake_rx.try_recv().is_some() {}
+                if w.park_unless(|| wake_rx.is_empty(), std::time::Duration::from_millis(50)) {
+                    woken.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        })
+    };
+    while !ready.load(std::sync::atomic::Ordering::SeqCst) {
+        std::thread::yield_now();
+    }
+    assert!(wake_tap.offer(&parsed, None, true, false, TapVolume::default()));
+    wake_tap.flush_wake();
+    std::thread::sleep(std::time::Duration::from_millis(5));
+
     let _profiler = dhat::Profiler::builder().testing().build();
 
     // ---------------- (A) the tap ----------------
@@ -411,6 +464,52 @@ fn dhat_live_fill_tap_drain_and_chain_per_tick_paths_allocate_nothing() {
         (a_bytes, a_blocks),
         (0, 0),
         "LiveFillTap::offer allocated {a_bytes} bytes / {a_blocks} blocks over 20,000 calls"
+    );
+
+    // ---------------- (A2) the tap waking a parked chain thread ----------------
+    // Snapshot first: the warm-up offer above (before the profiler) may
+    // already have counted a wake, which must not stand in for the profiled
+    // offers' edges.
+    let woken_before = woken.load(std::sync::atomic::Ordering::SeqCst);
+    let (a2_bytes, a2_blocks) = dhat_support::measure_with_phantom_retry(
+        0,
+        0,
+        || {},
+        || {
+            for _ in 0..A2_EDGE_OFFERS {
+                // Wait until the consumer has drained and declared itself
+                // parked, so this offer takes the swap + unpark edge (bounded:
+                // a stalled consumer only lowers the count checked below).
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while !chain_wake.is_parked() && std::time::Instant::now() < deadline {
+                    std::thread::yield_now();
+                }
+                std::hint::black_box(wake_tap.offer(
+                    &parsed,
+                    None,
+                    true,
+                    false,
+                    TapVolume::default(),
+                ));
+                // One tick per frame: the frame's end takes the edge.
+                wake_tap.flush_wake();
+            }
+        },
+    );
+    wake_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    chain_wake.wake();
+    let _ = consumer.join();
+    let edges = woken.load(std::sync::atomic::Ordering::SeqCst) - woken_before;
+    assert!(
+        a2_edges_taken_enough(edges),
+        "non-vacuity: only {edges} of the {A2_EDGE_OFFERS} profiled offers unparked the \
+         parked consumer; the A2 gate must measure the idle-to-busy edge it names"
+    );
+    assert_eq!(
+        (a2_bytes, a2_blocks),
+        (0, 0),
+        "LiveFillTap::offer with a ChainWake allocated {a2_bytes} bytes / {a2_blocks} blocks \
+         over 2,000 calls taking the idle-to-busy edge"
     );
 
     // ---------------- (B) the drain with the tap armed ----------------
