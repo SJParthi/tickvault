@@ -595,6 +595,13 @@ pub struct OrderRuntimeConfig {
     /// Validation range: [256, 65536].
     #[serde(default = "default_order_runtime_mark_channel_capacity")]
     pub mark_channel_capacity: usize,
+    /// Connect-only TLS pre-warm of the order REST host at 09:14 IST on
+    /// trading days (owner card 2026-11-13, `no-rest-except-live-feed`
+    /// §12.16). Sends no HTTP request; keeps the TLS session ticket for the
+    /// first order. Default OFF; never a substitute for the OMS `dry_run`
+    /// hardcode.
+    #[serde(default)]
+    pub prewarm_order_connection: bool,
 }
 
 fn default_order_runtime_paper_fill() -> bool {
@@ -624,6 +631,7 @@ impl Default for OrderRuntimeConfig {
             self_test: default_order_runtime_self_test(),
             reconcile_interval_secs: default_order_runtime_reconcile_interval_secs(),
             mark_channel_capacity: default_order_runtime_mark_channel_capacity(),
+            prewarm_order_connection: false,
         }
     }
 }
@@ -5977,6 +5985,42 @@ mod tests {
     /// an older TOML all deserialize to disabled with the pinned field
     /// defaults (paper_fill/self_test ON, 300s reconcile, 8192 marks);
     /// explicit values round-trip.
+    /// The order-host TLS pre-warm (no-rest rule §12.16) is OFF by default:
+    /// the `Default` impl, an `[order_runtime]` section without the key, and
+    /// the tracked `config/base.toml` all read false.
+    #[test]
+    fn test_order_runtime_prewarm_defaults_off() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+
+        assert!(!OrderRuntimeConfig::default().prewarm_order_connection);
+        #[derive(Deserialize)]
+        struct Wrapper {
+            order_runtime: OrderRuntimeConfig,
+        }
+        let absent: Wrapper = Figment::new()
+            .merge(Toml::string("[order_runtime]\nenabled = true\n"))
+            .extract()
+            .expect("a section without the key must parse");
+        assert!(!absent.order_runtime.prewarm_order_connection);
+        let set: Wrapper = Figment::new()
+            .merge(Toml::string(
+                "[order_runtime]\nprewarm_order_connection = true\n",
+            ))
+            .extract()
+            .expect("an explicit key must parse");
+        assert!(set.order_runtime.prewarm_order_connection);
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/base.toml");
+        let tracked: Wrapper = Figment::new()
+            .merge(Toml::file(base))
+            .extract()
+            .expect("config/base.toml must carry [order_runtime]");
+        assert!(
+            !tracked.order_runtime.prewarm_order_connection,
+            "config/base.toml must keep the order pre-warm OFF (no-rest rule §12.16)"
+        );
+    }
+
     #[test]
     fn test_order_runtime_config_defaults_off() {
         use figment::Figment;

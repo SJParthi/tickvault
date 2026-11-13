@@ -2762,3 +2762,37 @@ The record correction also makes persisted completeness explicit: legacy files w
 Calendar scope remains the existing normal-day09:15–15:40 comparison window and regular trading-day predicate. This recovery does not claim Muhurat verification, change schedules/defaults or restore per-minute REST feeds. The supervisor additionally rechecks the actual16:24 wall-clock bound after its bounded re-sleeps, so repeated backward clock changes cannot page early. All exact-candidate execution and deployment results remain pending.
 
 The new supervisor and the worker can reach the final page together. A shared cold-path process lock now covers their actual paged-marker read, report and marker write. When persistence succeeds, the second caller observes the marker and does not page again. A failed marker write retains the existing loud retry behavior; it does not install an in-memory suppression flag. The lock is acquired within the existing off-worker boundary, but the caller can still wait on disk. This is not a cross-process transaction or a guarantee against lost markers, read/write errors, process crashes or repeated pages after persistence failure. The existing single-instance boundary and persisted marker retain their separate roles.
+
+## §12.16 — 2026-11-13: order host TLS pre-warm, connect-only, default OFF
+
+### §12.16.0 The verbatim owner decision (AskUserQuestion card, 2026-11-13)
+
+> Q: "Orders are paper-only today. For when real orders start: open the connection to Dhan's order server at 9:14 AM, before the first order, so it doesn't pay a 13–22 ms handshake? Connect-only, no request sent."
+> A: "Yes, connect-only (Recommended)" — "Saves 13–22 ms on the first order of the day. Sends no order and no request; the order safety locks stay."
+
+### §12.16.1 What it is (LOCKED)
+
+| Aspect | Locked value |
+|---|---|
+| Switch | `[order_runtime] prewarm_order_connection`, `#[serde(default)]` false; `config/base.toml` carries `false` |
+| When | once per IST day per process, on a trading day (`TradingCalendar::is_trading_day_today`), at 09:14 IST, or at once after a later boot before 15:30 IST; never after 15:30, never on a weekend or holiday. A process restarted the same day (a crash, a systemd restart, or an emergency deploy that overrides the 09:00 to 15:45 IST deploy block) runs it once more, on purpose: its TLS session store starts empty, so without the second handshake its first order would do a full one. Nothing is persisted across processes (2026-11-13 review note: "once a day" in the summary stub means once a day per process, as §12.16.3 says) |
+| What it sends | DNS lookup, one TCP connect to the REST API host on port 443, the TLS handshake, then one `close_notify` alert. **No HTTP byte and no application data inside the encryption**: the code never calls the TLS connection's plaintext writer. (With TLS 1.3 the client's encrypted Finished and its `close_notify` travel in records whose OUTER type is 23, application data; that is the record layer, not data, so a packet capture shows two such records per run. Corrected 2026-11-13 review: this row first said "no TLS application-data record", which no TLS 1.3 handshake can meet.) Pinned by `test_prewarm_once_full_handshake_sends_no_application_data` (a local server with a key generated at run time completes the handshake and counts the decrypted bytes: 0) |
+| What it keeps | the server's TLS session ticket and key-group hint, in a session store shared with the order HTTP client (one base TLS config, cloned for both, so the certificate verifier is the same `Arc` and rustls accepts the ticket) |
+| Order client | only with the switch on, the order HTTP client is built over that shared TLS config (the live sockets' native root store, ALPN `h2`, `http/1.1`); with the switch off it is built exactly as before |
+| Logs | one `info!` per run (TCP µs, TLS µs, tickets stored); a failed run is a coded `warn!` `NET-RTT-01` `source = "order_prewarm"`. No new code, metric, alarm, filter, EMF name or page |
+
+### §12.16.2 Honest limits
+
+- **It does not deliver the card's 13–22 ms.** reqwest 0.13 has no public way to open a pooled connection without sending a request (its connector returns a `Conn` for an `Unnameable` URI outside code cannot build; hyper-util's pool only keeps connections a request opened), so the first order still opens its own TCP connection (about 3.5 ms) and does a TLS handshake. What the stored ticket saves is the certificate transfer and check and the server's signature (a resumed TLS 1.3 handshake is still one round trip), plus a HelloRetry round trip when the server prefers another key group. Expected saving: low single-digit ms (Assumed, not measured). Reusing a real connection needs one HTTP request, which this section does not authorize.
+- DNS is warm only if the box's resolver caches (Unknown). Tickets expire or rotate on Dhan's schedule (Unknown), so an order hours after 09:14 can still get a full handshake, which is no worse than without the pre-warm.
+- With the switch on, the order client verifies certificates against the native root store (the live sockets' verifier) instead of reqwest's platform verifier; Assumed equivalent on Linux.
+- A local test proves the ticket path against a local server with a key generated at run time (nothing committed; `test_prewarm_once_full_handshake_sends_no_application_data`), not against Dhan's host; only the box's `tickets_stored` log line shows Dhan's server sends one. A proxy in the environment would route orders through it while the pre-warm connects direct, so the ticket would not help. Muhurat sessions are not covered.
+
+### §12.16.3 What a PR that violates §12.16 looks like (REJECT)
+
+- Sends any HTTP request, any application data inside the encryption (anything written through the TLS plaintext writer), or TLS 0-RTT early data from the pre-warm. (The TLS 1.3 Finished and `close_notify` records, outer type 23, are the handshake and the close, not application data.)
+- Places, modifies or cancels an order, or calls any Dhan REST endpoint, under cover of the pre-warm.
+- Defaults `prewarm_order_connection` to true, or sets it true in tracked config, without a fresh dated owner quote here first.
+- Uses the pre-warm in place of, or to weaken, the OMS `dry_run` hardcode or the exit-order lockout.
+- Runs the pre-warm on a non-trading day, after 15:30 IST, or more than once a day per process.
+- Adds a page, alarm, metric filter or EMF name for it.

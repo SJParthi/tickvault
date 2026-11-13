@@ -890,3 +890,185 @@ fn holiday_gate_window_start_matches_the_readiness_lambdas_floor() {
         (8 * 60 + 25) * 60
     );
 }
+
+/// (2026-11-13, owner card "Yes, measure 1 day (Recommended)".) The NIC
+/// receive-coalescing trial is switched by two lines of the unit and must stay
+/// bounded: the unit names the switch AND an end date, the code's defaults
+/// match them (so a box whose unit lost the lines runs the same bounded trial,
+/// never an unbounded one), and `apply` actually runs the step. Paired
+/// behaviour tests: `host_tuning::nic_rx::tests` (save-first, restore, skip
+/// paths) and `network::nic_coalesce::tests` (struct layout, date bound).
+#[test]
+fn nic_rx_coalesce_trial_is_wired_and_bounded() {
+    let unit = read(UNIT);
+    let code = read("crates/app/src/host_tuning/nic_rx.rs");
+    let line_value = |prefix: &str| -> String {
+        unit.lines()
+            .find_map(|l| l.trim().strip_prefix(prefix))
+            .unwrap_or_else(|| panic!("{UNIT} must carry `{prefix}…`"))
+            .trim()
+            .to_string()
+    };
+    let switch = line_value("Environment=TV_NIC_RX_COALESCE=");
+    let until = line_value("Environment=TV_NIC_RX_COALESCE_UNTIL=");
+    assert!(
+        switch == "off" || switch == "keep",
+        "the switch is `off` (trial) or `keep` (undo), got {switch:?}"
+    );
+    assert!(
+        chrono::NaiveDate::parse_from_str(&until, "%Y-%m-%d").is_ok(),
+        "the trial end date must be a valid YYYY-MM-DD date, got {until:?}; \
+         an unreadable date silently ends the trial"
+    );
+    assert!(
+        code.contains(&format!(
+            "pub const NIC_RX_COALESCE_UNTIL_DEFAULT: &str = \"{until}\";"
+        )),
+        "the code's default end date must equal the unit's ({until})"
+    );
+    assert!(
+        code.contains("pub const NIC_RX_COALESCE_SWITCH_DEFAULT: &str = \"off\";"),
+        "the code's default switch is the owner card's `off` (trial on)"
+    );
+    let apply = read("crates/app/src/host_tuning.rs");
+    let body = apply
+        .split("fn run_apply() -> i32 {")
+        .nth(1)
+        .and_then(|rest| rest.split("\n}\n").next())
+        .unwrap_or_else(|| panic!("host_tuning.rs must define run_apply"));
+    assert!(
+        body.contains("nic_rx::apply_nic_rx_coalesce("),
+        "run_apply must run the NIC receive-coalescing step"
+    );
+}
+
+/// One file's text as prose: comment markers (`#`, `//!`) dropped and line
+/// breaks folded, so a phrase wrapped across comment lines still matches.
+fn prose(rel: &str) -> String {
+    read(rel)
+        .lines()
+        .map(|l| {
+            let t = l.trim();
+            t.strip_prefix("//!")
+                .or_else(|| t.strip_prefix('#'))
+                .unwrap_or(t)
+                .trim()
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// (PR C review.) Every NIC trial undo that edits the UNIT must reload systemd
+/// before the restart: without `daemon-reload` systemd keeps the cached unit,
+/// only warns that the file changed, and the restart applies the trial again.
+/// (The env-file route needs no reload: `EnvironmentFile` is read at each
+/// start.) The anchor is the unit-edit step in each of the three places that
+/// tell an operator how to undo; the check is that `daemon-reload` comes
+/// between it and the next restart of the tuning unit.
+#[test]
+fn nic_rx_coalesce_unit_edit_undo_reloads_systemd_before_the_restart() {
+    for (rel, anchor) in [
+        (UNIT, "change `off` to `keep` on the next line"),
+        (
+            "crates/app/src/host_tuning/nic_rx.rs",
+            "`TV_NIC_RX_COALESCE=keep` in the unit",
+        ),
+        (
+            "docs/runbooks/hot-path-capacity-proof.md",
+            "to `keep` in the unit",
+        ),
+    ] {
+        let text = prose(rel);
+        let at = text
+            .find(anchor)
+            .unwrap_or_else(|| panic!("{rel}: the unit-edit undo step `{anchor}` is gone"));
+        let rest = &text[at..];
+        let restart = rest
+            .find("restart tickvault-host-tuning")
+            .unwrap_or_else(|| panic!("{rel}: the undo names no restart of the tuning unit"));
+        assert!(
+            rest[..restart].contains("daemon-reload"),
+            "{rel}: the unit-edit undo must run `systemctl daemon-reload` before \
+             `systemctl restart tickvault-host-tuning`, or the edit is not loaded"
+        );
+    }
+}
+
+/// (PR C review.) Every deploy copies the repo unit over the box copy, reloads
+/// systemd and restarts `tickvault-host-tuning`, and the code's own defaults
+/// are the trial (`off`, same date), so neither a unit edit nor deleting the
+/// two lines outlasts the next deploy. Each of the three places that tell an
+/// operator how to undo the trial must lead with the env-file route and say
+/// that it is the only one that survives a deploy. Each file is read from the
+/// start of its NIC undo text (`anchor`), so an earlier, unrelated mention of
+/// the env file (the unit's `EnvironmentFile=` line) cannot satisfy it.
+fn undo_order_holds(rel: &str, text: &str, anchor: &str) -> Result<(), String> {
+    let at = text
+        .find(anchor)
+        .ok_or_else(|| format!("{rel}: the NIC undo text `{anchor}` is gone"))?;
+    let text = &text[at..];
+    let survives = text
+        .find("Only the env-file route survives a deploy")
+        .ok_or_else(|| {
+            format!(
+                "{rel}: the undo text must say that only the env-file route \
+                 survives a deploy (a deploy copies the unit back with `off`)"
+            )
+        })?;
+    let env_file = text
+        .find("/etc/tickvault/host-tuning.env")
+        .ok_or_else(|| format!("{rel}: the NIC undo text must name the env file"))?;
+    let unit_edit = text
+        .find("lasts only until the next deploy")
+        .ok_or_else(|| {
+            format!("{rel}: a unit-edit undo must be marked as lasting only until the next deploy")
+        })?;
+    if !(env_file < survives && survives < unit_edit) {
+        return Err(format!(
+            "{rel}: the env-file undo comes first, then the deploy warning, then the \
+             unit-edit undo that lasts only until the next deploy"
+        ));
+    }
+    if !text.contains("does not undo it either") {
+        return Err(format!(
+            "{rel}: say that deleting the unit lines is not an undo (the code defaults are `off`)"
+        ));
+    }
+    Ok(())
+}
+
+/// The three undo texts and where each one's NIC undo starts.
+const NIC_UNDO_ANCHORS: [(&str, &str); 3] = [
+    (UNIT, "NIC RECEIVE COALESCING OFF FOR ONE MEASURED DAY"),
+    ("crates/app/src/host_tuning/nic_rx.rs", "Undo is one line"),
+    ("docs/runbooks/hot-path-capacity-proof.md", "Undo early"),
+];
+
+#[test]
+fn nic_rx_coalesce_undo_text_names_the_env_file_as_the_one_that_survives_a_deploy() {
+    for (rel, anchor) in NIC_UNDO_ANCHORS {
+        if let Err(e) = undo_order_holds(rel, &prose(rel), anchor) {
+            panic!("{e}");
+        }
+    }
+}
+
+/// Bite test: an env file named only BEFORE the NIC block (the unit's own
+/// `EnvironmentFile=` line) does not satisfy the check; before the fix the
+/// first mention in the whole file was used, so this passed.
+#[test]
+fn nic_undo_order_check_ignores_an_env_file_named_before_the_nic_block() {
+    let early = "EnvironmentFile=-/etc/tickvault/host-tuning.env NIC RECEIVE COALESCING OFF \
+                 FOR ONE MEASURED DAY UNDO: change `off` to `keep`. Only the env-file route \
+                 survives a deploy, and deleting these lines does not undo it either. A \
+                 quicker undo that lasts only until the next deploy: edit the unit.";
+    assert!(undo_order_holds("unit", early, NIC_UNDO_ANCHORS[0].1).is_err());
+    let good = "EnvironmentFile=-/etc/tickvault/host-tuning.env NIC RECEIVE COALESCING OFF \
+                FOR ONE MEASURED DAY UNDO: set keep in /etc/tickvault/host-tuning.env. Only \
+                the env-file route survives a deploy, and deleting these lines does not undo \
+                it either. A quicker undo that lasts only until the next deploy: edit it.";
+    assert!(undo_order_holds("unit", good, NIC_UNDO_ANCHORS[0].1).is_ok());
+}

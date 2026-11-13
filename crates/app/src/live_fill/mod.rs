@@ -31,8 +31,12 @@
 //! out of band (one relaxed load), then runs one pass (bounded by the newest
 //! receipt read when the cap left ticks queued), then
 //! sends what the pass produced with `try_send` (a full channel is counted and
-//! logged, never waited on), and sleeps 1 ms (5 ms after 50 idle passes) when
-//! no tick came. Per-tick and per-pass costs are in [`chain`].
+//! logged, never waited on). When no tick came it parks until the tap queues
+//! one (the tap unparks it on that idle-to-busy edge, §28.6, owner card
+//! 2026-11-13) or for at most 1 ms (5 ms after 50 idle passes), the nap it
+//! slept before; position reports and clock-driven releases do not wake it,
+//! so they wait at most that bound, as before. Per-tick and per-pass costs
+//! are in [`chain`].
 
 pub mod chain;
 pub mod fill_window;
@@ -60,7 +64,7 @@ use tickvault_trading::brutex_host::recipe::{ParamSnapshot, Recipe};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
-use crate::dhan_feed_stack::live_fill_tap::{TapLink, TapTick, live_fill_tap_ring};
+use crate::dhan_feed_stack::live_fill_tap::{ChainWake, TapLink, TapTick, live_fill_tap_ring};
 use chain::{ChainOutput, ChainParams, ChainSetup, LiveFillChain, PaperCmd, PositionReport};
 use taint::TaintReason;
 
@@ -95,7 +99,8 @@ pub const LATE_FILL_TICKS_KEY: &str = "late_fill_ticks";
 /// Ticks one pass takes from the ring at most.
 pub const MAX_TICKS_PER_PASS: usize = 4_096;
 const IDLE_PASSES_BEFORE_SLOW_SLEEP: u32 = 50;
-/// Idle sleep while ticks are recent, and after 50 idle passes, ms.
+/// Upper bound of the idle park while ticks are recent, and after 50 idle
+/// passes, ms (the old nap, §28.6).
 const IDLE_SLEEP_MS: u64 = 1;
 const SLOW_IDLE_SLEEP_MS: u64 = 5;
 /// How often the thread publishes its counters, seconds.
@@ -338,6 +343,7 @@ pub fn start_chain<E: StrategyEngine + Send + 'static>(
     let chain = LiveFillChain::new(engine, setup, params, now_ist_ns)?;
     let (tap_tx, tap_rx) = live_fill_tap_ring(config.tap_capacity);
     let tap_loss = Arc::new(AtomicU64::new(0));
+    let wake = Arc::new(ChainWake::new());
     let (cmd_tx, cmd_rx) = frame_ring::<PaperCmd>(config.event_channel_capacity.max(1));
     // Every Execute in flight gets one report: the command channel, the
     // runtime's exit retry queue and one pass of finished orders bound them.
@@ -347,6 +353,7 @@ pub fn start_chain<E: StrategyEngine + Send + 'static>(
     *TAP_SLOT.lock().unwrap_or_else(PoisonError::into_inner) = Some(TapLink {
         tx: tap_tx,
         loss: Arc::clone(&tap_loss),
+        wake: Arc::clone(&wake),
     });
     *PAPER_SLOT.lock().unwrap_or_else(PoisonError::into_inner) = Some(PaperLink {
         cmds: cmd_rx,
@@ -356,7 +363,13 @@ pub fn start_chain<E: StrategyEngine + Send + 'static>(
     std::thread::Builder::new()
         .name("tv-live-fill".to_owned())
         .spawn(move || {
-            run_live_fill_thread(chain, tap_rx, pos_rx, &tap_loss, cmd_tx, events_tx);
+            let ends = LoopEnds {
+                tap_rx,
+                pos_rx,
+                cmd_tx,
+                events_tx,
+            };
+            run_live_fill_thread(chain, ends, &tap_loss, wake);
         })?;
     Ok(())
 }
@@ -596,32 +609,101 @@ fn pass_step<E: StrategyEngine>(
     Ok(())
 }
 
-/// The `tv-live-fill` loop (see the module docs). Runs until the process
-/// exits or a day roll cannot reconfigure the chain.
-fn run_live_fill_thread<E: StrategyEngine>(
-    mut chain: LiveFillChain<E>,
-    mut tap_rx: FrameRingReceiver<TapTick>,
-    mut pos_rx: FrameRingReceiver<PositionReport>,
-    tap_loss: &AtomicU64,
+/// How the thread waits after a pass that took no tick (§28.6). The bound is
+/// the old nap: a pass driven by the clock or a position report (neither
+/// wakes the thread) is never later than before.
+trait IdleWait {
+    fn idle(
+        &self,
+        tap_rx: &FrameRingReceiver<TapTick>,
+        pos_rx: &FrameRingReceiver<PositionReport>,
+        bound: Duration,
+    );
+}
+
+/// The production wait (owner card 2026-11-13, "Yes, instant wake
+/// (Recommended)"): park until the tap queues a tick, or the bound. O(1).
+struct ParkWait(Arc<ChainWake>);
+
+impl IdleWait for ParkWait {
+    fn idle(
+        &self,
+        tap_rx: &FrameRingReceiver<TapTick>,
+        pos_rx: &FrameRingReceiver<PositionReport>,
+        bound: Duration,
+    ) {
+        self.0
+            .park_unless(|| tap_rx.is_empty() && pos_rx.is_empty(), bound);
+    }
+}
+
+/// The wait before 2026-11-13: a plain nap a tick cannot end. TEST ONLY, the
+/// old side of the old-vs-new identical-output test.
+#[cfg(test)]
+struct SleepWait;
+
+#[cfg(test)]
+impl IdleWait for SleepWait {
+    fn idle(
+        &self,
+        _tap_rx: &FrameRingReceiver<TapTick>,
+        _pos_rx: &FrameRingReceiver<PositionReport>,
+        bound: Duration,
+    ) {
+        std::thread::sleep(bound);
+    }
+}
+
+/// The thread's channel ends.
+struct LoopEnds {
+    tap_rx: FrameRingReceiver<TapTick>,
+    pos_rx: FrameRingReceiver<PositionReport>,
     cmd_tx: FrameRingSender<PaperCmd>,
     events_tx: mpsc::Sender<LiveOrderEvent>,
+}
+
+/// The `tv-live-fill` thread (see the module docs). Runs until the process
+/// exits or a day roll cannot reconfigure the chain.
+fn run_live_fill_thread<E: StrategyEngine>(
+    chain: LiveFillChain<E>,
+    ends: LoopEnds,
+    tap_loss: &AtomicU64,
+    wake: Arc<ChainWake>,
 ) {
-    // Busy-polled: producers never take the wake path.
-    tap_rx.set_busy_polling(true);
-    pos_rx.set_busy_polling(true);
+    wake.register_current_thread();
+    let start = Instant::now();
+    info!("live paper fill chain: thread running (paper only)");
+    run_chain_loop(chain, ends, tap_loss, &ParkWait(wake), || {
+        let mono = i64::try_from(start.elapsed().as_nanos()).unwrap_or(i64::MAX);
+        Some((wall_ist_ns(), mono))
+    });
+}
+
+/// The thread's loop. `clock` gives each pass its (wall IST, monotonic)
+/// nanoseconds; `None` ends the loop (tests only: production never returns
+/// `None`). Returns when `clock` ends it or a day roll is refused.
+fn run_chain_loop<E: StrategyEngine, W: IdleWait>(
+    mut chain: LiveFillChain<E>,
+    mut ends: LoopEnds,
+    tap_loss: &AtomicU64,
+    wait: &W,
+    mut clock: impl FnMut() -> Option<(i64, i64)>,
+) {
+    // Busy-polled: producers never take the ring's own wake path; the tap
+    // wakes this thread through `ChainWake` instead (§28.6).
+    ends.tap_rx.set_busy_polling(true);
+    ends.pos_rx.set_busy_polling(true);
     // Executes the command channel refused in one pass: at most one pass of
     // finished orders, sized once (LF-9 finding 2).
     let mut unsent: Vec<PositionReport> = Vec::with_capacity(fill_window::MAX_PENDING_ORDERS * 4);
-    let start = Instant::now();
     let mut idle: u32 = 0;
     let mut drops = SendDrops::default();
     let mut publisher = CounterPublisher::new(chain.counters(), chain.taints_added());
     let mut last_publish = Instant::now();
-    info!("live paper fill chain: thread running (paper only)");
     loop {
         let mut n = 0usize;
         while n < MAX_TICKS_PER_PASS {
-            match tap_rx.try_recv() {
+            match ends.tap_rx.try_recv() {
                 Some(t) => {
                     chain.on_tap(&t);
                     n += 1;
@@ -630,15 +712,17 @@ fn run_live_fill_thread<E: StrategyEngine>(
             }
         }
         // What the runtime booked since the last pass (LF-9 finding 2).
-        apply_position_reports(&mut chain, &mut pos_rx);
-        let mono = i64::try_from(start.elapsed().as_nanos()).unwrap_or(i64::MAX);
+        apply_position_reports(&mut chain, &mut ends.pos_rx);
+        let Some((wall, mono)) = clock() else {
+            return;
+        };
         // Losses the tap counted, read out of band: a tick dropped behind the
         // ones still queued taints before this pass releases anything.
         chain.note_tap_loss(tap_loss.load(Ordering::Relaxed));
         // A pass that stopped at the per-pass cap left ticks queued: the book
         // clock must not run past the stream it has read.
         let backlogged = n >= MAX_TICKS_PER_PASS;
-        if let Err(e) = pass_step(&mut chain, &mut publisher, wall_ist_ns(), mono, backlogged) {
+        if let Err(e) = pass_step(&mut chain, &mut publisher, wall, mono, backlogged) {
             error!(
                 code = ErrorCode::OrderReady01GateRefused.code_str(),
                 source = "live_fill_day_roll_refused",
@@ -649,7 +733,13 @@ fn run_live_fill_thread<E: StrategyEngine>(
             metrics::gauge!(ENGINE_CONFIGURED_GAUGE).set(0.0);
             return;
         }
-        forward_outputs(&mut chain, &cmd_tx, &events_tx, &mut drops, &mut unsent);
+        forward_outputs(
+            &mut chain,
+            &ends.cmd_tx,
+            &ends.events_tx,
+            &mut drops,
+            &mut unsent,
+        );
         if last_publish.elapsed() >= Duration::from_secs(COUNTER_PUBLISH_INTERVAL_SECS) {
             last_publish = Instant::now();
             publisher.publish(chain.counters(), chain.taints_added());
@@ -661,12 +751,16 @@ fn run_live_fill_thread<E: StrategyEngine>(
             } else {
                 IDLE_SLEEP_MS
             };
-            std::thread::sleep(Duration::from_millis(nap));
+            wait.idle(&ends.tap_rx, &ends.pos_rx, Duration::from_millis(nap));
         } else {
             idle = 0;
         }
     }
 }
+
+#[cfg(test)]
+#[path = "wake_tests.rs"]
+mod wake_tests;
 
 #[cfg(test)]
 mod tests {
@@ -789,6 +883,24 @@ mod tests {
         let tap = take_tap_sender().expect("tap slot filled");
         let link = take_paper_link().expect("paper slot filled");
         assert!(take_tap_sender().is_none(), "taken once");
+        // §28.6 wiring: the tap's wake is the one the chain thread parks on.
+        // Only the spawned `tv-live-fill` thread ever declares itself parked,
+        // so a fresh `ChainWake` handed to the thread (not the link's) leaves
+        // this one unparked forever and fails here.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !tap.wake.is_parked() {
+            assert!(
+                Instant::now() < deadline,
+                "the chain thread never parked on the tap link's wake: start_chain \
+                 must hand the SAME Arc<ChainWake> to TapLink and to the thread"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            Arc::strong_count(&tap.wake),
+            2,
+            "the link and the running thread share one wake"
+        );
         drop(tap);
         drop(link);
     }

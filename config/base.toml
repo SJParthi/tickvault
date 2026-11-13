@@ -982,6 +982,10 @@ paper_fill = true
 self_test = true
 reconcile_interval_secs = 300
 mark_channel_capacity = 8192
+# Connect-only TLS pre-warm of the order host at 09:14 IST (owner card
+# 2026-11-13, no-rest rule §12.16): DNS + TCP + TLS handshake, then close.
+# No HTTP request, no order. OFF until real orders start.
+prewarm_order_connection = false
 
 # ===========================================================================
 # Live PAPER fill chain (plan item LF-6b, owner rules 2026-11-12). OFF.

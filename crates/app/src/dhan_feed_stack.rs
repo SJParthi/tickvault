@@ -1911,6 +1911,16 @@ impl LiveIngest {
         }
     }
 
+    /// Wakes the live fill chain thread once for the frame just walked
+    /// (§28.6 review: never per tick). O(1); one branch when idle.
+    #[inline]
+    // TEST-EXEMPT: one-line forward to LiveFillTap::flush_wake (tested in live_fill_tap.rs); its one call per frame is pinned by live_fill_wake_wiring_guard.rs.
+    pub(crate) fn flush_live_fill_wake(&mut self) {
+        if let Some(tap) = self.live_fill_tap.as_mut() {
+            tap.flush_wake();
+        }
+    }
+
     /// A live tick the chain will not see although it may have traded (an
     /// abandoned frame tail, or a folded tick whose row append failed, LF-6b):
     /// moves the live fill tap's loss count. O(1), no allocation; loss arms
@@ -7410,6 +7420,10 @@ async fn run_frame_drain(
                             )
                             .unwrap_or(u64::MAX),
                         );
+                        // §28.6: one chain wake per frame, after the walk and
+                        // after the three stage timings above, so its futex
+                        // wake is never counted as fold work.
+                        ingest.flush_live_fill_wake();
                         folded = folded.saturating_add(outcome.folded);
                         unparseable = unparseable.saturating_add(outcome.unparseable);
                         // Stamp the SOCKET as delivering, gated on the frame
@@ -17785,8 +17799,7 @@ async fn run_dhan_feed_stack(mut params: DhanFeedStackParams) {
     // LF-6b: the live paper fill chain's tap, only when the boot built the
     // chain (an approved strategy engine exists); never today.
     if let Some(link) = crate::live_fill::take_tap_sender() {
-        ingest = ingest
-            .with_live_fill_tap(live_fill_tap::LiveFillTap::new(link.tx).with_loss_out(link.loss));
+        ingest = ingest.with_live_fill_tap(live_fill_tap::LiveFillTap::from_link(link));
         info!("live paper fill chain: tap armed on the frame drain");
     }
     info!(

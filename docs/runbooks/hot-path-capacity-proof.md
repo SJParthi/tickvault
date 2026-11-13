@@ -154,6 +154,28 @@ WHERE l.ts IN today() AND l.stage = 'receipt_to_fold' AND l.max_ns > 1000000
 ORDER BY l.ts;
 ```
 
+## NIC coalescing trial (one measured day, from 2026-11-13)
+
+Owner card (2), Fri 13 Nov 2026: "Yes, measure 1 day (Recommended)" — "About 0–20 µs per packet faster, slightly more CPU. Applied outside market hours; easy to undo." While the trial is on, `tickvault host-tuning apply` sets the default-route NIC to `rx-usecs 0`, `adaptive-rx off` (receive interrupt coalescing off). The switch and the last day are two lines of `deploy/systemd/tickvault-host-tuning.service` (`TV_NIC_RX_COALESCE=off`, `TV_NIC_RX_COALESCE_UNTIL=2026-11-16`); the first run after that day puts the saved values back.
+
+Check it applied, from the boot journal (`journalctl -u tickvault-host-tuning -b`), one line:
+
+- `host-tuning: NIC ens34 rx coalescing rx-usecs=20 adaptive-rx=on -> rx-usecs=0 adaptive-rx=off (verified; trial until 2026-11-16 IST)`: on, and read back.
+- `... skipped — not readable here ...` or a `WARNING` line: the trial did NOT run; the day is not a trial day.
+- `... not touched — HH:MM IST is inside 09:00-15:45 IST ...`: the unit ran mid-session (a late boot, or an emergency deploy that overrode the deploy block), so the trial was not started; it starts at the next run outside that window. A day with this line and no earlier `verified` line is not a trial day.
+- The values found before the trial stay in `/opt/tickvault/nic-coalesce.before` until the restore removes it.
+
+What can and cannot show the gain:
+
+- **No stage measures the gain itself.** Every stage clock starts after the kernel has handed the packet to our socket read, so the up to 20 µs the NIC used to hold a packet is before `socket_to_wal`, `ring_dwell` and `receipt_to_fold` begin. Those stages can only show side effects: more interrupts and softirq work on core 0 (QuestDB's core), and the reader thread's run delay. Do not claim a latency win from them. The gain is also small next to the vendor's own delay (about 0.75 s p50).
+- Compare the trial day with the previous trading day, same 09:15–15:30 window, with the section 2 and 3 queries:
+  - `hot_path_latency_minute`: `p99_ns`, `p999_ns` and `max_ns` for `socket_to_wal`, `ring_dwell` and `receipt_to_fold`. Unchanged or lower is the expected result; higher means the extra interrupts hurt.
+  - `host_capacity_minute`: `host_cpu_busy_pct`, `process_cpu_pct`, `reader_cpu_wait_max_ns_per_s`, `drain_cpu_wait_max_ns_per_s`. "Slightly more CPU" is the expected cost; a clear rise in reader or drain CPU wait is a reason to undo.
+  - Local `/metrics`: growth of `tv_hot_thread_run_delay_ns_total{thread="ws_reader_0"}` (and `ws_reader_1` to `ws_reader_3`) over the session, against the previous day.
+- The app records no interrupt counts. If wanted, read the NIC's lines in `/proc/interrupts` by hand at the open and at the close of both days.
+
+Undo early, outside market hours: put `TV_NIC_RX_COALESCE=keep` in `/etc/tickvault/host-tuning.env` (it wins over the unit and is read at each start, so no reload is needed), then `systemctl restart tickvault-host-tuning`. Only the env-file route survives a deploy: every deploy copies the repo unit over `/etc/systemd/system/tickvault-host-tuning.service`, reloads systemd and restarts the unit, which puts `TV_NIC_RX_COALESCE=off` back and applies the trial again; deleting the two `Environment=` lines does not undo it either, because the code's own defaults are also `off` and the same date. A quicker undo that lasts only until the next deploy: change `Environment=TV_NIC_RX_COALESCE=off` to `keep` in the unit, then `systemctl daemon-reload && systemctl restart tickvault-host-tuning` (without the daemon-reload systemd keeps the cached unit, only warns that the file changed, and the restart applies the trial again). An EC2 stop/start is NOT an undo while the trial is on: it resets the card to the driver's defaults, but `tickvault-host-tuning` runs at every boot and, with the switch still `off` and the date not past, sets `rx-usecs 0` / `adaptive-rx off` again before the app starts (journal line `... -> rx-usecs=0 adaptive-rx=off (verified; trial until ...)`). A stop/start leaves the card at its defaults only together with the `keep` switch, or after `TV_NIC_RX_COALESCE_UNTIL` has passed. Pinned by `test_stop_start_during_the_trial_reapplies_it_so_it_is_not_an_undo`.
+
 ## Known limits
 
 - The verdict requires every selected distinct minute from one process. It does not merge separate process lifetimes into a whole-day proof.

@@ -5,7 +5,22 @@
 //!   the consumer's `try_recv` that keeps the ring from filling.
 //! * `live_fill/tap_full` — the drop arm: a ring held full, `offer` counts
 //!   the drop.
-//!   Budget key `live_fill_tap` (substring-matches both).
+//! * `live_fill/tap_accept_wake_armed` — `tap_accept` with the chain
+//!   thread's wake armed (§28.6, 2026-11-13): one more `bool` store; the
+//!   wake itself runs once per frame (`flush_wake`), not here. Budget key
+//!   `live_fill_tap` (substring-matches all three).
+//! * `live_fill/wake_edge` — the idle-to-busy edge (§28.6 review): one
+//!   `offer` plus the frame's `flush_wake` while a real chain thread is
+//!   parked and asleep, so it pays the swap and the futex wake. In steady
+//!   state this is at most one per FRAME, not rare. Timed with `iter_custom`
+//!   (only the `offer` and `flush_wake`). NOT GATED: its
+//!   name matches no budget key (a syscall is not held to the 100 ns tap
+//!   budget), and it runs only when `TV_BENCH_WAKE_EDGE` is set, because
+//!   `scripts/bench-gate.sh` applies its 5% regression arm to EVERY Criterion
+//!   bench it finds, budgeted or not, and one futex wake plus a context
+//!   switch on a shared runner swings far more than 5% (about 800 ns at
+//!   10%). The nightly and post-merge runs never set it. Read the number:
+//!   `TV_BENCH_WAKE_EDGE=1 cargo bench -p tickvault-app --bench live_fill -- wake_edge`.
 //! * `live_fill/chain_on_tap` — one tick through the chain thread's
 //!   `on_tap` (stream watch, candle book, instrument probe, engine `on_tick`)
 //!   on 500 instruments × (1 s, 60 s), plus one pass per 500 ticks. Budget
@@ -23,7 +38,7 @@ use std::hint::black_box;
 use criterion::{Criterion, criterion_group, criterion_main};
 
 use tickvault_app::dhan_feed_stack::live_fill_tap::{
-    LiveFillTap, TapTick, TapVolume, live_fill_tap_ring,
+    ChainWake, LiveFillTap, TapTick, TapVolume, live_fill_tap_ring,
 };
 use tickvault_app::live_fill::chain::{ChainParams, ChainSetup, ContractSpec, LiveFillChain};
 use tickvault_common::tick_types::ParsedTick;
@@ -53,6 +68,21 @@ fn bench_tap(c: &mut Criterion) {
             black_box(rx.try_recv());
         });
     });
+    // §28.6: the same accept with the chain thread's wake armed, the
+    // common per-tick case: one more `bool` store (the wake is per frame).
+    let (armed_tx, mut armed_rx) = live_fill_tap_ring(1_024);
+    let mut armed = LiveFillTap::new(armed_tx).with_wake(std::sync::Arc::new(ChainWake::new()));
+    c.bench_function("live_fill/tap_accept_wake_armed", |b| {
+        b.iter(|| {
+            black_box(armed.offer(black_box(&parsed), None, true, false, TapVolume::default()));
+            black_box(armed_rx.try_recv());
+        });
+    });
+    // Not gated (see the module header): run only on request, so the
+    // nightly's regression arm never compares it.
+    if std::env::var_os(WAKE_EDGE_ENV).is_some() {
+        bench_wake_edge(c, &parsed);
+    }
     let (full_tx, _full_rx) = live_fill_tap_ring(1);
     let mut full = LiveFillTap::new(full_tx);
     let _ = full.offer(&parsed, None, true, false, TapVolume::default());
@@ -61,6 +91,55 @@ fn bench_tap(c: &mut Criterion) {
             black_box(full.offer(black_box(&parsed), None, true, false, TapVolume::default()))
         });
     });
+}
+
+/// Set (to anything) to run `live_fill/wake_edge`; unset in CI.
+const WAKE_EDGE_ENV: &str = "TV_BENCH_WAKE_EDGE";
+
+/// The idle-to-busy edge: a helper thread drains the ring and parks; each
+/// timed `offer` finds it parked and asleep and pays the unpark syscall.
+fn bench_wake_edge(c: &mut Criterion, parsed: &ParsedTick) {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+    let (tx, mut rx) = live_fill_tap_ring(1_024);
+    let wake = Arc::new(ChainWake::new());
+    let mut tap = LiveFillTap::new(tx).with_wake(Arc::clone(&wake));
+    let stop = Arc::new(AtomicBool::new(false));
+    let (w, s) = (Arc::clone(&wake), Arc::clone(&stop));
+    let helper = std::thread::spawn(move || {
+        w.register_current_thread();
+        while !s.load(Ordering::Relaxed) {
+            while rx.try_recv().is_some() {}
+            w.park_unless(|| rx.is_empty(), Duration::from_millis(50));
+        }
+    });
+    c.bench_function("live_fill/wake_edge", |b| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                // Wait until the helper declared itself parked, then give it
+                // time to fall asleep in the kernel.
+                while !wake.is_parked() {
+                    std::hint::spin_loop();
+                }
+                let settle = Instant::now();
+                while settle.elapsed() < Duration::from_micros(30) {
+                    std::hint::spin_loop();
+                }
+                let t0 = Instant::now();
+                black_box(tap.offer(black_box(parsed), None, true, false, TapVolume::default()));
+                tap.flush_wake();
+                total += t0.elapsed();
+            }
+            total
+        });
+    });
+    stop.store(true, Ordering::Relaxed);
+    wake.wake();
+    let _ = tap.offer(parsed, None, true, false, TapVolume::default());
+    tap.flush_wake();
+    let _ = helper.join();
 }
 
 fn chain() -> LiveFillChain<ReferenceDouble> {

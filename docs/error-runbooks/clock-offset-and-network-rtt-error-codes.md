@@ -102,3 +102,13 @@ and no DEDUP key).
 
 **Source:** `crates/app/src/network_rtt.rs`,
 `crates/storage/src/network_rtt_session_persistence.rs`.
+
+**Also raised by the order host pre-warm (2026-11-13, `source = "order_prewarm"`).**
+With `[order_runtime] prewarm_order_connection = true` (default false), once a
+trading day at 09:14 IST the app opens one TCP + TLS handshake to the REST
+API host so the first order of the day can resume the TLS session (no HTTP
+request is sent). A failed run is the same coded `warn!` with
+`source = "order_prewarm"` and `error` one of the steps above. Log only, no
+page; the first order then does a full handshake, exactly as without the
+pre-warm. Source: `crates/app/src/order_prewarm.rs`. Rule:
+`no-rest-except-live-feed-2026-06-27.md` §12.16.

@@ -32,8 +32,9 @@
 //! clock step is ever seen). Before each frame the chain gets one pass at
 //! every grid instant (`pass_ns`, 1 ms by default) up to that receipt, then
 //! the frame's ticks; so a decision lands on the first grid instant at or
-//! after its release, which is the live thread's best case (it naps 1 ms, or
-//! 5 ms after 50 idle passes). The chain's paper commands are not sent to an
+//! after its release, which is the live thread's best case (since 2026-11-13 it
+//! wakes on each new tick, and otherwise passes at least every 1 ms, or 5 ms
+//! after 50 idle passes). The chain's paper commands are not sent to an
 //! order runtime: each Execute is written as rows by
 //! `live_fill::paper_rows`, with a deterministic `PAPER-R<n>` id, no
 //! round-trip time and the model's fill taken as booked. PAPER ONLY: nothing

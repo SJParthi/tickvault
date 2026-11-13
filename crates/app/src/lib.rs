@@ -349,6 +349,9 @@ pub mod order_leg_pnl_boot;
 /// pnl_audit tables via one bounded mpsc(1024) consumer task; daily
 /// OnEod heartbeat + counters-vs-rows reconcile (OMS-GAP-02 on mismatch).
 pub mod order_observability;
+/// Connect-only TLS pre-warm of the order REST host at 09:14 IST (owner card
+/// 2026-11-13, no-rest rule §12.16). Default OFF.
+pub mod order_prewarm;
 /// Order runtime (dry-run) — cluster A, operator directive 2026-07-14
 /// (`.claude/plans/active-plan-order-runtime-dryrun.md`): the single-owner
 /// supervised task owning the paper OMS + RiskEngine on the dhan-off prod
