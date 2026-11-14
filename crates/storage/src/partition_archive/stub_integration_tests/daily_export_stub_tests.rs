@@ -941,6 +941,56 @@ async fn test_export_stops_when_the_disk_is_below_the_floor() {
     assert!(puts(&s3_log).is_empty());
 }
 
+/// Regression (2026-11-14 evening audit, MEDIUM): free space is checked again
+/// right after the quiesce lock is taken (the wait can last minutes, and a
+/// writer beside the export can fill the disk meanwhile). Fine before the
+/// lock and short after it: the lock is released, the export stops for disk
+/// (not a failure), and nothing is exported or uploaded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_export_partition_quiesced_rechecks_the_disk_after_taking_the_lock() {
+    let objects: StubObjects = Arc::new(Mutex::new(HashMap::new()));
+    let (qdb_url, qlog) = spawn_stub(qdb(NO_AUDIT, three_rows())).await;
+    let (ilp_url, _) = spawn_stub(ilp_responder(204)).await;
+    let (s3_url, s3_log) = spawn_stub(create_only_s3(Arc::clone(&objects))).await;
+    let archiver = build_archiver(&qdb_url, &ilp_url, &s3_url, test_retention_cfg(200)).await;
+    let lock: &'static crate::archive_quiesce::ArchiveQuiesce =
+        Box::leak(Box::new(crate::archive_quiesce::ArchiveQuiesce::new()));
+    let mut ex = DailyExporter::with_quiesce(archiver, lock, std::time::Duration::from_secs(5));
+    // The first check (before the lock) sees no floor; every later one (after
+    // the lock) sees the whole volume as floor: the disk filled meanwhile.
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    let fills = |total: u64| {
+        if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            0
+        } else {
+            total
+        }
+    };
+    let out = run_with(&mut ex, &unbounded, &fills)
+        .await
+        .expect("not an error");
+    assert_eq!(out, ExportOutcome::Stopped(StopReason::Disk));
+    assert!(
+        calls.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+        "checked before and after the lock"
+    );
+    assert!(
+        !qlog
+            .lock()
+            .expect("q")
+            .iter()
+            .any(|r| r.target.starts_with("/exp")),
+        "nothing exported"
+    );
+    assert!(puts(&s3_log).is_empty(), "nothing uploaded");
+    assert!(
+        lock.hold_writers(std::time::Duration::from_millis(200))
+            .await
+            .is_some(),
+        "the shared side was released"
+    );
+}
+
 /// Regression (2026-11-14 review, MEDIUM): a partition never starts with
 /// less than its worst case left before 08:30, and a lock wait cut by that
 /// clock is a stop, never a failure and never a sort in the session.

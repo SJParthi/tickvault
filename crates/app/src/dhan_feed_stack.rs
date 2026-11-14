@@ -1754,6 +1754,10 @@ pub struct LiveIngest {
     /// Quote 43). Set once per frame by the live drain and the replay; one
     /// `bool` store.
     frame_receipt_is_wal_stamp: bool,
+    /// `true` while the frame being drained has no WAL copy (the WAL refused
+    /// it): its `no_trade_today` rows are never skipped (Quote 61, 2026-11-14
+    /// audit fix). Set per frame by the live drain, `false` on replay.
+    frame_wal_unbacked: bool,
     /// Late-attach seed batches waiting for the drain's idle arm (plan item
     /// DT-A1, 2026-10-28), seeded [`SEED_STEP_INSTRUMENTS`] at a time.
     seed_queue: SeedQueue,
@@ -2159,6 +2163,7 @@ impl LiveIngest {
             aux_repeat: aux_repeat::production_filter(),
             market_data_floor_unix_nanos: None,
             frame_receipt_is_wal_stamp: true,
+            frame_wal_unbacked: false,
             seed_queue: SeedQueue::new(),
         }
     }
@@ -8780,6 +8785,7 @@ pub fn drain_main_feed_frame(
     // the WAL recorded as receipt-unknown keeps its packets in `ticks`.
     ingest.frame_receipt_is_wal_stamp =
         crate::tick_quote_route::receipt_is_wal_stamp(frame.received_at_nanos);
+    ingest.frame_wal_unbacked = !frame.wal_backed;
     // A single WebSocket message may carry SEVERAL stacked packets — the
     // frame cap is `MAX_PACKETS_PER_FRAME` (70,000) of them. Walking the frame
     // packet by packet is what stops packets 2..N being silently discarded.
@@ -16929,6 +16935,7 @@ pub fn refold_wal_frames(
         // in `ticks` either way).
         ingest.frame_receipt_is_wal_stamp =
             crate::tick_quote_route::receipt_is_wal_stamp(*wal_received_at_nanos);
+        ingest.frame_wal_unbacked = false;
         // Plan ITEM 47: frames before this one were not replayed, so no
         // instrument's volume baseline may carry across. `while`, not `if`,
         // so a duplicate index is consumed rather than stalling the cursor.

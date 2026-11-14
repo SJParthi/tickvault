@@ -302,3 +302,40 @@ fn test_check_never_skip_writes_every_row_and_pins_the_key_for_the_day() {
     assert!(feed(&mut f, KEY, &base(DAY_10AM + NANOS_PER_DAY + 3)));
     assert!(!feed(&mut f, KEY, &base(DAY_10AM + NANOS_PER_DAY + 4)));
 }
+
+/// 2026-11-14 audit fix: a row whose frame has no WAL copy is always written
+/// (the skip rests on the WAL keeping the packet), and the key is not pinned,
+/// so a later WAL-backed repeat of the same values is skipped against it.
+#[test]
+fn test_check_always_write_writes_a_repeat_and_does_not_pin_the_key() {
+    let mut f = filter();
+    let always = |f: &mut AuxRepeatFilter, r: &AuxPacketRow| match f.check_always_write(KEY, r) {
+        AuxRepeatVerdict::Write(v) => {
+            f.note_written(KEY, v);
+            true
+        }
+        AuxRepeatVerdict::Skip => false,
+    };
+    assert!(feed(&mut f, KEY, &base(DAY_10AM)));
+    assert!(
+        always(&mut f, &base(DAY_10AM + 1)),
+        "an exact repeat with no WAL copy is written"
+    );
+    assert!(always(&mut f, &base(DAY_10AM + 2)), "and again");
+    assert!(
+        !feed(&mut f, KEY, &base(DAY_10AM + 3)),
+        "a later WAL-backed repeat is skipped against it: the key is not pinned"
+    );
+    // A pin set by `check_never_skip` is kept.
+    let mut g = filter();
+    let first = g.check_never_skip(KEY, &base(DAY_10AM));
+    assert!(
+        matches!(first, AuxRepeatVerdict::Write(_)),
+        "first row must be written"
+    );
+    if let AuxRepeatVerdict::Write(v) = first {
+        g.note_written(KEY, v);
+    }
+    assert!(always(&mut g, &base(DAY_10AM + 1)));
+    assert!(feed(&mut g, KEY, &base(DAY_10AM + 2)), "the pin stays");
+}
