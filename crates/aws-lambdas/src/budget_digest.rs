@@ -45,7 +45,7 @@ pub const GST_MULT: f64 = 1.18;
 /// `hard_stop_guard::STANDING_BUDGET_KILL_USD` ($170 since operator Quote 30, 2026-10-13; $100 from
 /// November 2026 per operator Quote 33, then $85 per operator Quote 36, then $75 (GST included) from November 2026 per operator Quote 37,
 /// 2026-10-21, with October 2026 capped at $170, then $185 by operator Quote 45, 2026-10-28;
-/// November 2026 is $90 by operator Quote 52 and every month from December 2026 is $62 by
+/// November 2026 is $90 by operator Quote 52 ($140 since Quote 59, 2026-11-14) and every month from December 2026 is $62 by
 /// operator Quote 54, both 2026-11-11).
 ///
 /// History: $55 → $25 (2026-07-19) → $35 (2026-07-31) → $100 (2026-08-08)
@@ -54,7 +54,7 @@ pub const GST_MULT: f64 = 1.18;
 /// changes nothing for any month, and stays as the backstop) → $170
 /// (2026-10-13, operator Quote 30: AWS at or under ₹15,000 a month) → $185
 /// (2026-10-28, operator Quote 45: October 2026 only; November onward $75)
-/// → $90 November 2026 only (Quote 52) → $62 from December 2026 (Quote 54).
+/// → $90 November 2026 only (Quote 52) → $140 November 2026 only (Quote 59) → $62 from December 2026 (Quote 54).
 /// KEEP IN SYNC with budget.tf limit_amount + budget-guards.tf
 /// BUDGET_KILL_USD + hard_stop_guard::DEFAULT_BUDGET_KILL_USD —
 /// `budget_ceiling_lockstep_guard.rs` fails the build if they drift.

@@ -3691,3 +3691,22 @@ The Security & Audit check on PR #2246 (head `6af0654`) failed `cargo audit` on 
 - Any `Cargo.toml` change or new dependency, or enabling reqwest's HTTP/3 feature.
 - Committing `.claude/settings.json` with the `cargo update` deny rule removed.
 - Adding these advisories to an ignore list instead.
+
+#### Quote 59 (2026-11-14, ~10:50 IST) — NOVEMBER 2026 ONLY: THE STOP LINE MOVES $90 → $140 SO THE BOX KEEPS RUNNING; DECEMBER ONWARD STAYS $62 WITH GST (preserve EXACTLY)
+
+Owner wrote (2026-11-14), verbatim, typos kept: "dont sto pthis month dude let it run but by the srticter law stick to 5500 inr from decoemebr onwards with the strict estiamtion strict law taht to oafetr atx charegs dude okay? hwo rbo how?"
+
+The free Budgets API read that morning: November actual **$60.83**, AWS forecast **$126.09**, against the **$90** line of Quote 52, so the box would have been stopped in the last week of November.
+
+| Card | Owner's tap | What the card said |
+|---|---|---|
+| "November: AWS has spent $60.83 so far and forecasts $126, so the current $90 stop would shut the server late this month. To let it run, the November stop line has to move to a number. Which one? (December onward stays your ₹5,500 cap, $62 with GST, unchanged.)" | **"$140 (Recommended)"** | "Above the $126 forecast with margin, so the server keeps running all November. Still a hard stop if something runs away. About ₹12,400 with GST at most." |
+
+**What this changes, and nothing else:** `NOVEMBER_2026_KILL_USD` = **$140** and the native `limit_amount` = **"140"**, for November 2026 (UTC month) only. The live budget counts tax, so $140 is the bill paid. From 1 December 2026 the standing line is **$62 from 1 December**, GST included (about ₹5,500), exactly as Quote 54 set: the code clamp enforces it by itself, and the native `limit_amount` moves from "140" to **"62"** on or after 1 December (the lockstep guard fails every PR from 1 December while it still reads 140). Quote 54 and its REJECT rows are unchanged.
+
+##### What violates Quote 59 (REJECT)
+- Any month other than November 2026 above $62 without a fresh dated quote, or treating $140 as standing.
+- Leaving the native `limit_amount` at "140" into December, or moving it to anything but "62".
+- A native stop below $140 during November 2026 (it would stop the box early).
+- Changing instance, disk, IOPS, throughput or depth under Quote 59.
+- Calling $140 an expected bill: it is a ceiling; the forecast that day was $126.
