@@ -105,6 +105,11 @@ const CEILINGS: &[(&str, &str)] = &[
         "crates/app/src/xverify_day_record.rs",
         "DAY_RECORD_MAX_INSTRUMENTS",
     ),
+    // 2026-11-14 (operator Quote 61): the no_trade_today repeat filter's keys.
+    (
+        "crates/storage/src/feed_aux_repeat.rs",
+        "FEED_AUX_REPEAT_MAX_TRACKED",
+    ),
 ];
 
 /// Read `const NAME: usize = <literal>;` out of a file, underscores stripped.
@@ -202,7 +207,7 @@ fn guard_self_test() {
     );
     assert_eq!(
         CEILINGS.len(),
-        17,
+        18,
         "the ceiling list changed size — that is fine, but it should be a \
          deliberate edit with the reason recorded, not a silent drift"
     );

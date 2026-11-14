@@ -10,6 +10,15 @@
 //! connect are persisted, `feed` in every DEDUP key, and kept OUT of the candle
 //! fold so no candle changes.
 //!
+//! ⚠ NARROWED 2026-11-14 by operator Quote 61 (the "2026-11-14 note" at the
+//! end of that section, and the Quote 61 record in
+//! `daily-universe-scope-expansion-2026-05-27.md`): the "snapshot on connect"
+//! is every live packet for a contract with no trade yet today, and its row is
+//! not written again when it repeats the contract's last written row exactly
+//! (`feed_aux_repeat`; a contract on two main-feed sockets is never skipped).
+//! The WAL and `raw-frames/` keep every such packet; every other packet class
+//! here is persisted as before.
+//!
 //! Until this module those packets were decoded and dropped:
 //!
 //! | Packet | What happened before |
@@ -18,7 +27,7 @@
 //! | previous close (code 6) | close kept in RAM only, previous OI discarded |
 //! | market status (code 7) | counted as `non_tick`, discarded |
 //! | disconnect (code 50) | counted and logged, reason not stored |
-//! | connect snapshot (exchange day ≠ receipt day) | refused before any write |
+//! | live packet for a contract with no trade yet today (exchange day ≠ receipt day; `no_trade_today` from the 2026-11-18 receipt cutover, `connect_snapshot` before; repeats skipped, Quote 61) | refused before any write |
 //! | tick stamped outside 09:00–15:40 | refused by the `ticks` window gate |
 //!
 //! ## Why a separate table and not `ticks`
@@ -117,10 +126,21 @@ pub enum AuxPacketKind {
     PrevClose,
     /// Market status packet (response code 7, header only).
     MarketStatus,
-    /// A tick whose exchange day is not its receipt day — the snapshot Dhan
-    /// sends on connect for a contract that last traded on an earlier day
-    /// (and its mirror, a forward-dated stamp). Refused by `ticks`.
+    /// The OLD label (`connect_snapshot`) of a [`Self::NoTradeToday`] row,
+    /// kept for frames RECEIVED before [`NO_TRADE_TODAY_FIRST_RECEIPT_IST_SECS`]
+    /// so a replay of a pre-cutover frame writes the same `kind` the binary
+    /// that captured it wrote (`kind` is in the DEDUP key; a new label would
+    /// store the packet twice). Chosen by [`wrong_day_kind`].
     ConnectSnapshot,
+    /// A live tick whose exchange day is not its receipt day: a contract with
+    /// no trade yet today still carries its last trade from an earlier day
+    /// (and the mirror, a forward-dated stamp). Refused by `ticks`. Labelled
+    /// `no_trade_today` for frames received from
+    /// [`NO_TRADE_TODAY_FIRST_RECEIPT_IST_SECS`] (operator Quote 61); earlier
+    /// frames keep [`Self::ConnectSnapshot`], the old, misleading name (these
+    /// are ordinary live packets, not reconnect snapshots). Exact repeats of a
+    /// contract's previous row are skipped (`feed_aux_repeat`, Quote 61).
+    NoTradeToday,
     /// Server disconnect packet (response code 50); the reason is `reason_code`.
     Disconnect,
     /// A tick whose exchange time falls outside 09:00–15:40 IST (or outside
@@ -130,13 +150,14 @@ pub enum AuxPacketKind {
 
 impl AuxPacketKind {
     /// Every kind, in index order.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::OpenInterest,
         Self::PrevClose,
         Self::MarketStatus,
         Self::ConnectSnapshot,
         Self::Disconnect,
         Self::OutOfWindowTick,
+        Self::NoTradeToday,
     ];
 
     /// The `kind` SYMBOL value.
@@ -149,6 +170,7 @@ impl AuxPacketKind {
             Self::ConnectSnapshot => "connect_snapshot",
             Self::Disconnect => "disconnect",
             Self::OutOfWindowTick => "out_of_window_tick",
+            Self::NoTradeToday => "no_trade_today",
         }
     }
 
@@ -162,7 +184,36 @@ impl AuxPacketKind {
             Self::ConnectSnapshot => 3,
             Self::Disconnect => 4,
             Self::OutOfWindowTick => 5,
+            Self::NoTradeToday => 6,
         }
+    }
+}
+
+/// The first receipt instant labelled `no_trade_today`: 2026-11-18 00:00:00
+/// IST, as IST epoch seconds. A wrong-day frame received earlier was written
+/// as `connect_snapshot` by the binary that captured it; `kind` is in the
+/// table's DEDUP key, so a replay of that frame must write the same label or
+/// the packet is stored twice. Same shape as `tick_quote_route`'s
+/// `TICK_QUOTES_FIRST_RECEIPT_IST_SECS`. Set after the expected deploy (the
+/// next session after 2026-11-14). **Honest limit:** if the new binary is
+/// deployed after this instant, a replay of a frame the OLD binary received on
+/// or after it (the boot's re-read tail) writes a second row under the new
+/// label. Before the instant the new binary keeps the old label, so an early
+/// deploy costs nothing.
+pub const NO_TRADE_TODAY_FIRST_RECEIPT_IST_SECS: i64 = 1_794_960_000;
+
+/// The `kind` of a wrong-day row whose frame was received at
+/// `received_at_utc_nanos` (UTC epoch nanos, the WAL receipt stamp, so live
+/// and replay agree). Pure, O(1).
+#[must_use]
+pub const fn wrong_day_kind(received_at_utc_nanos: i64) -> AuxPacketKind {
+    let receipt_ist_secs = received_at_utc_nanos
+        .saturating_add(IST_UTC_OFFSET_NANOS)
+        .div_euclid(1_000_000_000);
+    if receipt_ist_secs >= NO_TRADE_TODAY_FIRST_RECEIPT_IST_SECS {
+        AuxPacketKind::NoTradeToday
+    } else {
+        AuxPacketKind::ConnectSnapshot
     }
 }
 
@@ -284,7 +335,7 @@ impl AuxPacketRow {
 
     /// A row carrying a whole tick: the price, trade time, volume, day OHLC and
     /// open-interest fields the packet carried. Used for the two tick shapes
-    /// `ticks` refuses (a connect snapshot and an out-of-window tick).
+    /// `ticks` refuses (a no-trade-today packet and an out-of-window tick).
     #[must_use]
     pub fn from_tick(kind: AuxPacketKind, tick: &ParsedTick, capture_seq: i64) -> Option<Self> {
         let mut row = Self::from_header(
@@ -620,6 +671,38 @@ mod tests {
         assert_eq!(names.len(), AuxPacketKind::ALL.len());
     }
 
+    /// Operator Quote 61 (2026-11-14): new wrong-day rows are labelled
+    /// `no_trade_today` (they are live packets, not reconnect snapshots); the
+    /// old value survives only as the label of pre-cutover frames.
+    #[test]
+    fn test_aux_packet_kind_as_str_labels_the_wrong_day_row_no_trade_today() {
+        assert_eq!(AuxPacketKind::NoTradeToday.as_str(), "no_trade_today");
+        assert_eq!(AuxPacketKind::ConnectSnapshot.as_str(), "connect_snapshot");
+    }
+
+    /// Finding (2026-11-14 review): `kind` is in the DEDUP key, so a replay of
+    /// a frame received before the cutover must write the label the binary
+    /// that captured it wrote, or the packet is stored twice. The label is a
+    /// pure function of the WAL receipt stamp, so live and replay agree.
+    #[test]
+    fn test_wrong_day_kind_keeps_the_old_label_before_the_receipt_cutover() {
+        let cutover_utc_nanos =
+            NO_TRADE_TODAY_FIRST_RECEIPT_IST_SECS * 1_000_000_000 - IST_UTC_OFFSET_NANOS;
+        assert_eq!(
+            wrong_day_kind(cutover_utc_nanos - 1),
+            AuxPacketKind::ConnectSnapshot,
+            "received one nanosecond before the cutover: the old label"
+        );
+        assert_eq!(
+            wrong_day_kind(cutover_utc_nanos),
+            AuxPacketKind::NoTradeToday
+        );
+        assert_eq!(wrong_day_kind(0), AuxPacketKind::ConnectSnapshot);
+        // 2026-11-11 10:00 IST (a day the old binary captured): old label.
+        let nov_11 = (1_794_355_200 + 10 * 3_600) * 1_000_000_000 - IST_UTC_OFFSET_NANOS;
+        assert_eq!(wrong_day_kind(nov_11), AuxPacketKind::ConnectSnapshot);
+    }
+
     #[test]
     fn test_aux_price_nulls_zero_and_non_finite_and_widens_cleanly() {
         assert_eq!(aux_price(0.0), None);
@@ -665,7 +748,7 @@ mod tests {
     #[test]
     fn test_from_tick_carries_trade_fields_and_never_the_trade_time_as_ts() {
         let t = tick();
-        let row = AuxPacketRow::from_tick(AuxPacketKind::ConnectSnapshot, &t, 9).expect("fits");
+        let row = AuxPacketRow::from_tick(AuxPacketKind::NoTradeToday, &t, 9).expect("fits");
         assert_eq!(row.ts_ist_nanos, t.received_at_nanos + IST_UTC_OFFSET_NANOS);
         assert_eq!(
             row.exchange_ts_ist_nanos,

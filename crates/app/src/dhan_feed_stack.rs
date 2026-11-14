@@ -102,6 +102,8 @@ pub mod live_fill_tap;
 // Plan item LF-8 (2026-11-12): the drain's per-tick fold verdict, pure, shared
 // with the offline replay so the two cannot drift.
 pub mod fold_verdict;
+// Operator Quote 61 (2026-11-14): exact repeats of a no-trade-today row skipped.
+mod aux_repeat;
 use std::time::Instant;
 
 use secrecy::ExposeSecret;
@@ -1737,6 +1739,8 @@ pub struct LiveIngest {
     /// the volume ranking, whose monotonicity gate a stale cumulative would
     /// re-latch; that ranking is removed with `top_volume`.
     replaying_wal: bool,
+    /// Quote 61: the last written `no_trade_today` row per composite key.
+    aux_repeat: tickvault_storage::feed_aux_repeat::AuxRepeatFilter,
     /// A market-data floor (Unix nanos) given to this ingest IN ADDITION to
     /// the process-wide one (`market_data_floor`); [`refold_wal_frames`]
     /// judges receipts against the higher of the two. Production leaves it
@@ -2150,6 +2154,7 @@ impl LiveIngest {
             catch_up_overrun_counter: metrics::counter!(CATCHUP_SEAL_OVERRUN_COUNTER),
             catch_up_progress: &CATCHUP_PROGRESS,
             replaying_wal: false,
+            aux_repeat: aux_repeat::production_filter(),
             market_data_floor_unix_nanos: None,
             frame_receipt_is_wal_stamp: true,
             seed_queue: SeedQueue::new(),
@@ -2936,14 +2941,6 @@ impl LiveIngest {
         }
     }
 
-    /// Persists a tick that `ticks` refuses outright (the prior-day connect
-    /// snapshot) as a `feed_aux_packets` row of `kind`. O(1).
-    fn append_aux_tick(&mut self, kind: AuxPacketKind, tick: &ParsedTick, capture_seq: i64) {
-        if let Some(row) = AuxPacketRow::from_tick(kind, tick, capture_seq) {
-            let _appended = self.append_aux_row(&row);
-        }
-    }
-
     /// One aux append through the tick writer; counts the row as pending so
     /// the size trigger and the flush see it. A failure is already counted and
     /// logged inside the writer.
@@ -3449,12 +3446,12 @@ impl LiveIngest {
             // and timestamp are judged first above — so this is exactly "the
             // day rule refused it, and nothing else did".
             if wrong_day {
-                // Item 45h (zero loss, 2026-09-29): the prior-day connect
-                // snapshot is a real received packet. It must never reach
-                // `ticks` (2026-09-10 directive) and never a candle, so it is
-                // kept in `feed_aux_packets`, stamped at RECEIPT, where no
-                // candle reads it. One ILP append, no allocation.
-                self.append_aux_tick(AuxPacketKind::ConnectSnapshot, tick, capture_seq);
+                // Item 45h: a live packet for a contract with no trade yet
+                // today never reaches `ticks` (2026-09-10) or a candle; it is
+                // kept in `feed_aux_packets` (`no_trade_today`), stamped at
+                // RECEIPT. Quote 61 (2026-11-14): an exact repeat of the
+                // contract's previous row is skipped. O(1), no allocation.
+                self.append_no_trade_today(tick, capture_seq);
                 return IngestOutcome::RefusedWrongDay;
             }
             return IngestOutcome::AggregatorRefused;
@@ -16772,6 +16769,8 @@ pub fn refold_wal_frames(
     // `replaying_wal` field for why a replayed frame must never reach the
     // volume ranking.
     ingest.replaying_wal = true;
+    // Quote 61: a pass re-reading frames writes each contract's first row again.
+    ingest.aux_repeat.clear();
     // Plan ITEM 47: while replaying, a candle the replay could only partly
     // see is counted instead of emitted, so it never overwrites the complete
     // candle the live process already stored under the same key.
@@ -16937,7 +16936,7 @@ pub fn refold_wal_frames(
                 break;
             }
             if gap_idx == frame_idx && !gap_marked_here {
-                ingest.aggregator.mark_replay_gap();
+                ingest.mark_replay_gap();
                 out.gaps_marked = out.gaps_marked.saturating_add(1);
                 gap_marked_here = true;
             }
@@ -16964,7 +16963,7 @@ pub fn refold_wal_frames(
         if skipped_below_floor {
             skipped_below_floor = false;
             if !gap_marked_here {
-                ingest.aggregator.mark_replay_gap();
+                ingest.mark_replay_gap();
                 out.gaps_marked = out.gaps_marked.saturating_add(1);
             }
         }
@@ -17429,6 +17428,8 @@ pub fn refold_wal_frames(
     // here, which is why the guard is set and cleared in this function and
     // not at either caller.
     ingest.replaying_wal = false;
+    // Quote 61: live must never skip against a replayed (older) row.
+    ingest.aux_repeat.clear();
     // Plan ITEM 47: replay mode stays ON across the boot replay and every
     // catch-up round, which are consecutive with nothing live folded between
     // them. It ends once, at the hand-over to the live drain

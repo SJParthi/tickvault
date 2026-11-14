@@ -47,6 +47,7 @@
 //!   `contract` — the same omission, never a guess.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 
 use arc_swap::{ArcSwap, Guard};
@@ -68,6 +69,21 @@ pub type CandleContractLabels = HashMap<CandleContractKey, Arc<str>, ahash::Rand
 static LABELS: LazyLock<ArcSwap<CandleContractLabels>> =
     LazyLock::new(|| ArcSwap::from_pointee(CandleContractLabels::default()));
 
+/// Publishes of the name table so far (both publish paths, only when they
+/// stored a table). A reader that remembers rows judged against one table
+/// compares this number to learn that a name may have changed since (operator
+/// Quote 61: `feed_aux_repeat`). Only ever grows.
+static LABELS_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// How many times the name table has been published in this process. Moves
+/// on every [`publish_candle_contract_labels`] and on every
+/// [`publish_candle_contract_labels_if_empty`] that stored its table. One
+/// acquire load, O(1); read per wrong-day packet by the aux repeat filter.
+#[must_use]
+pub fn candle_contract_labels_generation() -> u64 {
+    LABELS_GENERATION.load(Ordering::Acquire)
+}
+
 /// Replaces the whole table atomically and returns how many names it holds.
 ///
 /// A replace, never a merge: yesterday's names for expired ids must not
@@ -76,6 +92,9 @@ pub fn publish_candle_contract_labels(labels: CandleContractLabels) -> usize {
     let labels = sanitize_labels(labels);
     let n = labels.len();
     LABELS.store(Arc::new(labels));
+    // After the store, Release: a reader that sees the new generation then
+    // loads the new table, never the old one under the new number.
+    LABELS_GENERATION.fetch_add(1, Ordering::Release);
     metrics::gauge!("tv_candle_contract_labels_published").set(n as f64);
     n
 }
@@ -101,6 +120,7 @@ pub fn publish_candle_contract_labels_if_empty(labels: CandleContractLabels) -> 
         }
     });
     if stored {
+        LABELS_GENERATION.fetch_add(1, Ordering::Release);
         metrics::gauge!("tv_candle_contract_labels_published").set(incoming.len() as f64);
     }
     stored
@@ -184,6 +204,32 @@ mod tests {
         TEST_PUBLISH_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Quote 61 review (2026-11-14): the generation moves on every publish
+    /// that stores a table and not on a refused boot publish, so the aux
+    /// repeat filter writes each key's next row after a name change.
+    #[test]
+    fn test_candle_contract_labels_generation_moves_on_every_stored_publish() {
+        let _g = lock();
+        publish_candle_contract_labels(CandleContractLabels::default());
+        let empty = candle_contract_labels_generation();
+        let mut boot = CandleContractLabels::default();
+        boot.insert((13, "IDX_I"), Arc::<str>::from("NIFTY"));
+        assert!(publish_candle_contract_labels_if_empty(boot.clone()));
+        let after_boot = candle_contract_labels_generation();
+        assert!(after_boot > empty, "a stored boot publish moves it");
+        assert!(!publish_candle_contract_labels_if_empty(boot.clone()));
+        assert_eq!(
+            candle_contract_labels_generation(),
+            after_boot,
+            "a refused boot publish does not"
+        );
+        publish_candle_contract_labels(boot);
+        assert!(
+            candle_contract_labels_generation() > after_boot,
+            "a replace moves it, even with the same names"
+        );
     }
 
     #[test]

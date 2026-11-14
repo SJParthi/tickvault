@@ -245,6 +245,11 @@ fn ingest_tick_seam_does_not_allocate_per_tick() {
 
 #[test]
 fn gate_is_not_vacuous() {
+    // Serialised with the profiled gates (Quote 61 review, 2026-11-14): an
+    // ingest built and dropped here moves process-wide state the wrong-day
+    // gate reads (the aux repeat gap epoch), and its allocations would land in
+    // another test's profiling window.
+    let _serial = DHAT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // The budget above is an UPPER bound, which a loop that never ran would
     // satisfy trivially. This proves the seam does real work.
     //
@@ -558,6 +563,8 @@ fn frame_drain_gate_is_not_vacuous() {
     use tickvault_app::dhan_feed_stack::{counters, drain_main_feed_frame};
     use tickvault_core::websocket::pool_budget::DhanEndpointType;
     use tickvault_core::websocket::pool_supervisor::CapturedFrame;
+    // Serialised with the profiled gates, for the reason in `gate_is_not_vacuous`.
+    let _serial = DHAT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
     let mut buf = vec![0u8; 50];
     buf[0] = 4;
@@ -868,5 +875,90 @@ fn full_mode_frame_with_inline_depth_book_rows_does_not_allocate_per_tick() {
          (ceiling {MAX_BLOCKS_BOOK})",
         stats.total_blocks,
         FRAMES * 4
+    );
+}
+
+/// Operator Quote 61 (2026-11-14): the wrong-day (`no_trade_today`) path,
+/// where an exact repeat of a contract's previous row is SKIPPED by a map
+/// keyed on `(security_id, segment)` and pre-sized at 25,000 keys. Inside the
+/// window: 4 contracts repeating (skip) with a price change every 200 packets
+/// (write and update in place), and a NEW contract every 10th packet (1,000
+/// first rows: write and insert). The inserts are what measure the pre-size:
+/// a map built unsized grows about ten times on the way to 1,000 keys.
+///
+/// Non-vacuity: every tick must come back `RefusedWrongDay`, and the rows
+/// staged across the window must equal the count a plain model of the rule
+/// predicts (a filter that never skips, or always skips, fails here).
+#[test]
+fn wrong_day_repeats_do_not_allocate_per_tick() {
+    let _serial = DHAT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    use std::collections::HashMap;
+    use tickvault_app::dhan_feed_stack::IngestOutcome;
+
+    let wrong_day = |sid: u64, price: f32| {
+        let mut t = tick(sid, price, SESSION_EPOCH_SECS - 86_400);
+        t.exchange_segment_code = 2; // NSE_FNO
+        t.received_at_nanos = SESSION_RECEIPT_NANOS;
+        t
+    };
+    let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
+    // Warm-up outside the window: first touch of each repeating contract.
+    for i in 0..4u64 {
+        let _ = ingest.ingest_tick_at(&wrong_day(70_000 + i, 50.0), i, 0, 1_000);
+    }
+
+    let ticks: Vec<_> = (0..FOLDS)
+        .map(|n| {
+            if n % 10 == 9 {
+                wrong_day(80_000 + n / 10, 60.0)
+            } else {
+                wrong_day(70_000 + n % 4, 50.0 + ((n / 200) as f32) * 0.05)
+            }
+        })
+        .collect();
+    // The rule, modelled outside the window: write when the price differs
+    // from the contract's last written price (the warm-up wrote 50.0).
+    let mut model: HashMap<u64, u32> = (0..4u64).map(|i| (70_000 + i, 50.0f32.to_bits())).collect();
+    let expected_writes = ticks
+        .iter()
+        .filter(|t| {
+            model.insert(t.security_id, t.last_traded_price.to_bits())
+                != Some(t.last_traded_price.to_bits())
+        })
+        .count();
+    let rows_before = ingest.pending_rows();
+
+    let profiler = dhat::Profiler::builder().testing().build();
+    let mut wrong_day_outcomes = 0u64;
+    for (n, t) in ticks.iter().enumerate() {
+        let n = n as u64;
+        if matches!(
+            ingest.ingest_tick_at(t, 100 + n, 0, 1_000 + n),
+            IngestOutcome::RefusedWrongDay
+        ) {
+            wrong_day_outcomes += 1;
+        }
+    }
+    let stats = dhat::HeapStats::get();
+    drop(profiler);
+
+    assert_eq!(
+        wrong_day_outcomes, FOLDS,
+        "every tick must take the wrong-day path, or this gate measures another one"
+    );
+    assert_eq!(
+        ingest.pending_rows() - rows_before,
+        expected_writes as u64,
+        "rows staged across the window must match the rule (both arms ran)"
+    );
+    assert!(
+        expected_writes > 1_000 && expected_writes < 2_000,
+        "the window must hold both writes and skips: {expected_writes} writes"
+    );
+    assert!(
+        stats.total_blocks <= 4,
+        "the no_trade_today repeat filter allocated {} blocks over {FOLDS} packets \
+         (ceiling 4): a per-packet allocation, or a map that grows, on the live drain",
+        stats.total_blocks
     );
 }

@@ -3710,3 +3710,33 @@ The free Budgets API read that morning: November actual **$60.83**, AWS forecast
 - A native stop below $140 during November 2026 (it would stop the box early).
 - Changing instance, disk, IOPS, throughput or depth under Quote 59.
 - Calling $140 an expected bill: it is a ceiling; the forecast that day was $126.
+
+#### Quote 61 (2026-11-14) — EXACT REPEATS OF A CONTRACT'S "NO TRADE TODAY" ROW IN `feed_aux_packets` ARE SKIPPED; A NARROW EXCEPTION TO QUOTE 27 (decision card, preserve EXACTLY)
+
+| Card question | Owner's tap | What the option said |
+|---|---|---|
+| "The 'connection snapshot' rows are NOT a price bug: no price or candle is wrong or missing. They are updates for option contracts that haven't traded yet today (so they still carry an old trade date), and 99.7% of them repeat the row before (about 3.2 million rows a day, roughly 80–140 MB a day in S3). Your 'never lose anything' rule covers this table, and every packet is also kept in the raw-message backup in S3. What should I do?" | **"Skip exact repeats (Recommended)"** | "Store a row only when something in it changed (price, trade time, open interest, close). About 10,000 rows a day instead of 3.2 million. Nothing is lost: every repeat is identical to the row kept, and the raw backup keeps every packet. Also rename the label so nobody mistakes it for reconnects." |
+
+Measured before the card (read-only, S3 and the code at main `9a29d13`): 3,212,510 rows of kind `connect_snapshot` in `feed_aux_packets` on 2026-11-11, 99.69% identical to the same contract's previous row in `oi`, `ltp`, `exchange_ts` and `day_close`; `volume` and day open/high/low empty. They come from the day rule (a live packet whose exchange day is not its receipt day is refused by `ticks` and written to `feed_aux_packets`).
+
+**What Quote 61 changes, and nothing else:**
+
+| Item | Locked value |
+|---|---|
+| What may be skipped | ONLY a `feed_aux_packets` row of the wrong-day kind whose every stored value column (`oi`, `prev_close`, `prev_oi`, `ltp`, `exchange_ts`, `volume`, `day_open`, `day_high`, `day_low`, `day_close`, `oi_day_high`, `oi_day_low`, `reason_code`), compared bit for bit with NULL distinct from 0, equals the last row WRITTEN for the same composite key `(security_id, exchange segment)` on the same IST receipt day, and whose `kind` is the same. The other stored columns: `ts`, `received_at` and `capture_seq` differ on every packet and are not compared; `security_id` and `segment` are the key; `feed` is fixed per writer; the `contract` name is not compared per row but read from the published name table at staging, and every publish of that table moves the gap epoch, so the next row per key is written with the current name (2026-11-14 review). |
+| Label | Rows for frames RECEIVED from 2026-11-18 00:00 IST (`NO_TRADE_TODAY_FIRST_RECEIPT_IST_SECS`) carry `kind = no_trade_today`; earlier frames keep `connect_snapshot`, live and on replay, because `kind` is in the DEDUP key and a replayed pre-cutover frame must overwrite its own row (2026-11-14 review). Stored rows are never rewritten. Honest limit: a deploy after the cutover makes a replay of the old binary's tail frames from that date write a second row under the new label. |
+| State | One map per drain, pre-sized at 25,000 keys, never grown; past the cap a new key's rows are all WRITTEN (counted on `tv_feed_aux_repeat_untracked_total`); cleared at the IST receipt-day roll and at the start AND the end of every WAL replay pass (so live never skips against a replayed, possibly older row). A row is remembered once STAGED; every remembered row is stamped with a gap epoch (main-feed frames shed before the drain, rows that did not reach QuestDB, the name table's publish generation, and every replay gap inside a pass), and a row stamped before the epoch moved never arms a skip, so the first packet after a ring shed, a failed batch, a name publish or a replay gap is written (2026-11-14 review). Honest limit: the catch-up drain refolds one WAL segment per pass, so a replayed session writes each contract's first row again per segment and per gap (more rows than a live run, never fewer). Honest limit: packets skipped between a later-failed row's staging and the moment its failure is counted are not written again. A contract the main feed carries on two sockets (the 2026-10-02 backup copy; the live set in force, or the replay's publication for the frame) is NEVER skipped, and stays unskippable for the rest of the IST day and the replay pass: a ring shed is counted on its own socket's read task and is not ordered against the other socket's frames, so a repeat from the second socket could be judged before the shed moved the epoch (2026-11-14 review). Skips counted on `tv_feed_aux_repeat_skipped_total` (local `/metrics` only, never paged). |
+| Raw frames | The WAL and `raw-frames/` keep every packet, unchanged. |
+| Everything else | Unchanged: Quote 27 binds every other row, kind and table. |
+
+##### What violates Quote 61 (REJECT)
+- Skipping a row that differs from the key's last written row in any stored value column, or comparing by a hash that can collide instead of exactly.
+- Skipping any other `feed_aux_packets` kind, or any row of `ticks`, `tick_quotes`, `market_depth`, `market_depth_book`, `candles_*` or any other table, under Quote 61.
+- Skipping anything from the WAL or `raw-frames/`, or shortening their retention, under Quote 61.
+- A dedup state that can grow without bound, or that SKIPS (rather than writes) when full.
+- Arming a skip from a row stamped before a ring shed, a not-landed row, a name-table publish or a replay gap (the gap epoch), or carrying the state into or out of a WAL replay pass.
+- Skipping a row whose `kind` differs from the key's last written row, or comparing the `contract` name in a way a name publish does not invalidate.
+- Rewriting the `kind` of rows already stored, or deleting any `connect_snapshot` row.
+- Skipping a row of a contract the main feed carries on two sockets, or one that was carried on two sockets earlier the same IST day or replay pass.
+- A page, alarm, metric filter or EMF name for the skip counters.
+- Recording Quote 61 here without the matching dated note in `websocket-connection-scope-lock.md` (its 2026-09-29 ZERO LOSS section forbids a new drop disposition without a quote THERE).
