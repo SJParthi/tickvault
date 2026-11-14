@@ -40,6 +40,24 @@ paths:
 >
 > **⚠ OPERATOR RULING 2026-07-19 — 30 GB accepted, t4g.medium as-of-now, NEW HARD TARGET < ₹1,000/mo:** verbatim quote + the itemized sub-1K path live in the dedicated "OPERATOR RULING 2026-07-19" section below. The base bill alone (~₹1,077/mo at the ~176-hr auto-schedule basis) EXCEEDS the target — <₹1,000 is UNREACHABLE without at least one operator-gated lever; see the lever table.
 
+## COST NOTE 2026-11-14 — the daily Brutex export and its read-only role (Quote 60)
+
+Owner, 2026-11-14: "yes build the daily export and read-only login dude"; cards "Everything daily, kept forever", "CSV.gz, same as now (Recommended)", "Role your Mac login switches into (Recommended)". Full record and REJECT list: `daily-universe-scope-expansion-2026-05-27.md` §0 Quote 60. The first card priced a second copy of every day (about $4.5 more each month, breaking the ₹5,500 cap within months); the build does NOT make a second copy: it writes each partition to the archive's own key and the archive later reuses it.
+
+| Cost | Size | Basis |
+|---|---|---|
+| Manifest, counts file and DONE per day | about $0 (kilobytes a day) | Assumed |
+| Partitions in S3 earlier than the archive would put them (ticks ~15 days, candles ~90) while still on the box | roughly $1–2 a month | Assumed, sizes not measured |
+| PUT/HEAD/LIST requests | a few hundred a day, cents a month | Assumed |
+| Content-addressed copies for partitions changed after the export | Unknown | depends on late rows after 15:45; the export now waits for the evening WAL replay and for the after-close depth pass while it can still write (2026-11-14 review), which removes the regular cases |
+| **Disk-pressure archiving during the session** (2026-11-14 review): inside 08:30 to 15:40 IST the archiver never sorts, so a pressure pass that moves an hour whose ordered export object already sits at the canonical key writes a full content-addressed second copy of it (counted on `tv_partition_archive_export_unordered_in_session_total`) | once the export has run about 15 days, every hour moved under pressure during the session is a full second copy (100% of the bytes moved in session that day) | **Open owner decision, NOT accepted by any quote** (third review, 2026-11-14: this row said "accepted trade"); Unknown size, read the counter. Outside pressure a failed ordered export now keeps the partition, and a failed HeadObject no longer causes a copy |
+| **Schema or QuestDB change** (third review): a column added to an export table, or a QuestDB upgrade that renders a value differently, makes every partition exported and not yet archived (about 15 days of hour tables, 90 days of candles) differ from its export object, so each goes up a second time, kept forever | one-time, up to about 15 days of tick and depth data plus 90 days of candles | **Open owner decision before any such change**; the manifest records each table's CSV header (`columns`) |
+| Box held until 18:00 while the session day waits for its soft gates with nothing else moving (the one-hour stall rule no longer releases a due export; never past its 20:45 horizon) | at most about 1.5 hours on such a day | Assumed, about $0.30 on that day |
+| **Box kept up after the close while the export runs** | **15 to 45 minutes a trading day at the r8g.large rate (the export waits for the hourly 15:15 candle, sealed about 16:19, so it runs about 16:20 to 16:45; the box stops after it, past 16:30)** | **Assumed, to be measured; this is the real added cost (about $0.05 to $0.15 a trading day, Assumed from the ~$0.19 per held hour figure)** |
+| Brutex downloads to the Mac | about $0.11/GB beyond the 100 GB a month free transfer; Glacier IR reads of `raw-frames/` older than 30 days about $0.03/GB more | Assumed; the one line Brutex's own use can move |
+
+December's $62 line (Quote 54) is unchanged.
+
 ## OPERATOR RULING 2026-11-14 — November 2026 only: stop at $140 so the box keeps running; December onward stays $62 with GST (Quote 59)
 
 Owner, 2026-11-14: "dont sto pthis month dude let it run but by the srticter law stick to 5500 inr from decoemebr onwards with the strict estiamtion strict law taht to oafetr atx charegs dude okay?", then tapped "$140 (Recommended)" on the card "November: AWS has spent $60.83 so far and forecasts $126, so the current $90 stop would shut the server late this month." Full record and REJECT list: `daily-universe-scope-expansion-2026-05-27.md` §0 Quote 59.

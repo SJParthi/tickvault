@@ -53,3 +53,8 @@ output "binary_git_sha_ssm_param" {
   description = "B9 deploy provenance: SSM param holding the git SHA of the last successfully deployed binary (written by deploy-aws.yml after a verified swap)"
   value       = "/tickvault/${var.environment}/deploy/binary-git-sha"
 }
+
+output "brutex_readonly_role_arn" {
+  description = "Owner Quote 60: the read-only role Brutex switches into from the owner's Mac login (role_arn in the [profile brutex] of ~/.aws/config)"
+  value       = aws_iam_role.brutex_readonly.arn
+}

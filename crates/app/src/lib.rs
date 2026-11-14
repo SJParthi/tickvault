@@ -99,6 +99,8 @@ pub mod boot_helpers;
 pub mod boot_wal_confirm;
 /// After-close repair of `contract` names a boot wrote blank (2026-10-09).
 pub mod contract_name_repair_boot;
+// Owner Quote 60: the daily Brutex export scheduler.
+pub mod brutex_export_boot;
 /// The previous close per instrument, fed from the response-code-6 packets
 /// the drain used to decode and discard. Without it the gainer-eligibility
 /// filter has nothing to divide by.

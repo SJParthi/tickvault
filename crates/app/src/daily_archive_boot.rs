@@ -824,6 +824,9 @@ pub fn spawn_supervised_daily_archive_loop(
     // tally it guards is process-wide), so a session that opened before it
     // is never measured from a tally that missed an earlier process's drops.
     let armed_at_unix_secs = chrono::Utc::now().timestamp();
+    // Owner Quote 60: the daily Brutex export rides the same config and arm.
+    let _brutex_export =
+        crate::brutex_export_boot::spawn_brutex_export_loop(questdb.clone(), cfg.clone());
     Some(tokio::spawn(async move {
         loop {
             let d = data_dir.clone();

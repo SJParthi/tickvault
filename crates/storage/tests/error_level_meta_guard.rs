@@ -63,6 +63,11 @@ const FAILURE_WORDS: &[&str] = &["fail", "could not", "cannot", "couldn't", "not
 const REVIEWED_WARN_SITES: &[(&str, &str, &str)] = &[
     // ---- app ----
     (
+        "crates/app/src/brutex_export_boot.rs",
+        "brutex daily export attempt failed",
+        "one attempt of a retried export (15/30/60-minute backoff); nothing is deleted or overwritten and no DONE is written, so Brutex never reads a partial day; the day's final give-up and a sealed-incomplete day are both coded error! lines (owner Quote 60)",
+    ),
+    (
         "crates/app/src/clock_offset_page.rs",
         "the saved episode latch could not be read or written",
         "a small state file that only stops a second page for the same clock-offset episode after a restart; the poller and the offset row carry on, at worst one extra page, no market data is lost",

@@ -87,6 +87,132 @@ impl RepairRunState {
     }
 }
 
+/// The IST days (days since 1970-01-01) whose after-close repair this
+/// process ended: `finished` for a run with no failure, `unclean` for a day
+/// whose attempts ran out with a failure left. Read by the daily Brutex
+/// export (owner Quote 60), which never runs the session day before the
+/// repair ended, and names an unclean one in its manifest (2026-11-14
+/// review: an exhausted day had read as cleanly finished, so a day could be
+/// sealed complete with blank contract names).
+pub(crate) struct RepairDayCells {
+    finished: std::sync::atomic::AtomicI64,
+    unclean: std::sync::atomic::AtomicI64,
+}
+
+impl RepairDayCells {
+    /// Nothing ended yet.
+    pub(crate) const fn new() -> Self {
+        Self {
+            finished: std::sync::atomic::AtomicI64::new(i64::MIN),
+            unclean: std::sync::atomic::AtomicI64::new(i64::MIN),
+        }
+    }
+}
+
+/// This process's repair days.
+static REPAIR_DAYS: RepairDayCells = RepairDayCells::new();
+
+/// How a day's after-close name repair stands in this process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepairDayState {
+    /// Still running, or not run yet.
+    Pending,
+    /// A run ended with no failure.
+    Clean,
+    /// Every attempt ran and a failure is left: names may still be blank.
+    GaveUpWithFailures,
+}
+
+/// Days since 1970-01-01 of an IST `YYYY-MM-DD`; `None` for a bad date.
+fn repair_day_key(day: &str) -> Option<i64> {
+    chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d")
+        .ok()
+        .map(|d| {
+            d.signed_duration_since(chrono::NaiveDate::default())
+                .num_days()
+        })
+}
+
+/// Records that `today`'s repair is over for this process when `state` says
+/// so: finished cleanly, or out of attempts with a failure left. O(1).
+fn note_repair_over(cells: &RepairDayCells, today: &str, state: &RepairRunState) {
+    let Some(key) = repair_day_key(today) else {
+        return;
+    };
+    if state.finished {
+        cells
+            .finished
+            .fetch_max(key, std::sync::atomic::Ordering::Relaxed);
+    } else if state.attempts >= REPAIR_MAX_ATTEMPTS_PER_DAY {
+        cells
+            .unclean
+            .fetch_max(key, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Records one finished run of `today` and, when the day is over for this
+/// process, publishes it to the Brutex export's readiness gate (owner
+/// Quote 60). The repair loop's only bookkeeping call (pinned by
+/// `test_the_repair_loop_publishes_through_record_run`). O(1).
+fn record_run(cells: &RepairDayCells, state: &mut RepairRunState, today: &str, failures: u32) {
+    state.record(today, failures);
+    note_repair_over(cells, today, state);
+}
+
+/// `day`'s state in `cells`. A clean run wins over an earlier exhaustion of
+/// the same day. O(1).
+fn state_in(cells: &RepairDayCells, day: chrono::NaiveDate) -> RepairDayState {
+    let key = day
+        .signed_duration_since(chrono::NaiveDate::default())
+        .num_days();
+    if cells.finished.load(std::sync::atomic::Ordering::Relaxed) == key {
+        RepairDayState::Clean
+    } else if cells.unclean.load(std::sync::atomic::Ordering::Relaxed) == key {
+        RepairDayState::GaveUpWithFailures
+    } else {
+        RepairDayState::Pending
+    }
+}
+
+/// How `day`'s names stand against this process's repair runs, counting a
+/// run of a LATER day whose lookback reaches it (2026-11-14 third review):
+/// the newest cleanly finished run of a day from `day` to
+/// [`REPAIR_LOOKBACK_DAYS`] after it makes `day` `Clean` (it named every
+/// blank its files can name, so no later run rewrites it); else the newest
+/// exhausted run in that reach makes it `GaveUpWithFailures`; else
+/// `Pending` (a run still to come may rewrite it). The cells keep only the
+/// newest day of each kind, so an older clean run beside a newer one out of
+/// reach reads `Pending` (the direction that waits). O(1).
+fn covered_state_in(cells: &RepairDayCells, day: chrono::NaiveDate) -> RepairDayState {
+    let key = day
+        .signed_duration_since(chrono::NaiveDate::default())
+        .num_days();
+    let in_reach = |run: i64| run >= key && run - key <= i64::from(REPAIR_LOOKBACK_DAYS);
+    if in_reach(cells.finished.load(std::sync::atomic::Ordering::Relaxed)) {
+        RepairDayState::Clean
+    } else if in_reach(cells.unclean.load(std::sync::atomic::Ordering::Relaxed)) {
+        RepairDayState::GaveUpWithFailures
+    } else {
+        RepairDayState::Pending
+    }
+}
+
+/// [`covered_state_in`] on this process's repair days (owner Quote 60):
+/// what the Brutex export reads for a catch-up day. O(1).
+#[must_use]
+// TEST-EXEMPT: a load of the process cells; the rule is test_covered_state_counts_a_later_run_that_reaches_the_day
+pub fn repair_covered_state(day: chrono::NaiveDate) -> RepairDayState {
+    covered_state_in(&REPAIR_DAYS, day)
+}
+
+/// How this process's after-close name repair of `day` stands (owner
+/// Quote 60). O(1).
+#[must_use]
+// TEST-EXEMPT: a load of the process cells; the rule is test_repair_state_is_set_only_when_the_day_is_over
+pub fn repair_state_for(day: chrono::NaiveDate) -> RepairDayState {
+    state_in(&REPAIR_DAYS, day)
+}
+
 /// `true` when the repair should run now: after the close, and today has
 /// neither finished nor used up [`REPAIR_MAX_ATTEMPTS_PER_DAY`].
 #[must_use]
@@ -217,7 +343,7 @@ pub async fn run_contract_name_repair_loop(config: QuestDbConfig) {
             let outcome = run_outcome(total.failures);
             metrics::counter!("tv_contract_name_repair_runs_total", "outcome" => outcome)
                 .increment(1);
-            state.record(&today, total.failures);
+            record_run(&REPAIR_DAYS, &mut state, &today, total.failures);
             info!(
                 rows_restored = total.rows_restored,
                 failures = total.failures,
@@ -264,6 +390,109 @@ mod tests {
         state.record("2026-10-13", 0);
         assert!(state.finished);
         assert!(!repair_is_due(close, "2026-10-13", &state));
+    }
+
+    /// Owner Quote 60 (and the 2026-11-14 review): the export reads the
+    /// repair as over only once a run finished or the attempts ran out, and
+    /// tells the two apart.
+    #[test]
+    fn test_repair_state_is_set_only_when_the_day_is_over() {
+        let cells = RepairDayCells::new();
+        let day = chrono::NaiveDate::from_ymd_opt(2031, 1, 7).expect("date");
+        let mut state = RepairRunState::default();
+        record_run(&cells, &mut state, "2031-01-07", 2);
+        assert_eq!(
+            state_in(&cells, day),
+            RepairDayState::Pending,
+            "one failure is not the end"
+        );
+        record_run(&cells, &mut state, "2031-01-07", 0);
+        assert_eq!(state_in(&cells, day), RepairDayState::Clean);
+        assert_eq!(
+            state_in(&cells, day.pred_opt().expect("d")),
+            RepairDayState::Pending
+        );
+        assert_eq!(repair_day_key("bad"), None);
+    }
+
+    /// Regression (2026-11-14 third review, MEDIUM): a catch-up day reads
+    /// clean once a later run whose lookback reaches it finished cleanly;
+    /// before any such run it is pending (a run to come may rewrite it).
+    #[test]
+    fn test_covered_state_counts_a_later_run_that_reaches_the_day() {
+        let cells = RepairDayCells::new();
+        let past = chrono::NaiveDate::from_ymd_opt(2031, 1, 10).expect("date");
+        assert_eq!(covered_state_in(&cells, past), RepairDayState::Pending);
+        let mut state = RepairRunState::default();
+        record_run(&cells, &mut state, "2031-01-13", 0);
+        assert_eq!(covered_state_in(&cells, past), RepairDayState::Clean);
+        assert_eq!(
+            covered_state_in(&cells, past.succ_opt().expect("d")),
+            RepairDayState::Clean
+        );
+        let later = chrono::NaiveDate::from_ymd_opt(2031, 1, 14).expect("d");
+        assert_eq!(
+            covered_state_in(&cells, later),
+            RepairDayState::Pending,
+            "a later day than the run"
+        );
+        let early = chrono::NaiveDate::from_ymd_opt(2031, 1, 5).expect("d");
+        assert_eq!(
+            covered_state_in(&cells, early),
+            RepairDayState::Pending,
+            "out of the run's reach"
+        );
+        let cells = RepairDayCells::new();
+        let mut state = RepairRunState::default();
+        for _ in 0..REPAIR_MAX_ATTEMPTS_PER_DAY {
+            record_run(&cells, &mut state, "2031-01-12", 1);
+        }
+        assert_eq!(
+            covered_state_in(&cells, past),
+            RepairDayState::GaveUpWithFailures
+        );
+        assert_eq!(
+            repair_covered_state(chrono::NaiveDate::from_ymd_opt(1999, 1, 1).expect("d")),
+            RepairDayState::Pending
+        );
+    }
+
+    /// Regression (2026-11-14 review, MEDIUM): a day whose attempts all ran
+    /// with a failure left is NOT cleanly finished: the export names it.
+    #[test]
+    fn test_exhausted_repair_with_failures_is_not_clean() {
+        let cells = RepairDayCells::new();
+        let day = chrono::NaiveDate::from_ymd_opt(2031, 1, 8).expect("date");
+        let mut state = RepairRunState::default();
+        for _ in 0..REPAIR_MAX_ATTEMPTS_PER_DAY {
+            record_run(&cells, &mut state, "2031-01-08", 1);
+        }
+        assert_eq!(state_in(&cells, day), RepairDayState::GaveUpWithFailures);
+    }
+
+    /// The loop publishes through `record_run` on the process cells (a
+    /// revert to a bare `state.record` would leave the export gate forever
+    /// pending).
+    #[test]
+    fn test_the_repair_loop_publishes_through_record_run() {
+        let src = include_str!("contract_name_repair_boot.rs");
+        let body = src
+            .split("pub async fn run_contract_name_repair_loop")
+            .nth(1)
+            .and_then(|rest| rest.split("#[cfg(test)]").next())
+            .expect("loop body");
+        assert!(
+            body.contains("record_run(&REPAIR_DAYS, &mut state, &today, total.failures)"),
+            "the loop must publish each run through record_run"
+        );
+        assert!(
+            !body.contains("state.record("),
+            "no bare state.record in the loop"
+        );
+        assert_eq!(
+            repair_state_for(chrono::NaiveDate::from_ymd_opt(1999, 1, 1).expect("d")),
+            RepairDayState::Pending
+        );
     }
 
     #[test]

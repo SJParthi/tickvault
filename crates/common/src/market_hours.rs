@@ -123,6 +123,39 @@ pub fn installed_calendar_says_muhurat(date: chrono::NaiveDate) -> Option<bool> 
     calendar_says_muhurat(SESSION_CALENDAR.get().map(Arc::as_ref), date)
 }
 
+/// The sessions IST `date` holds, by the installed calendar, for the daily
+/// Brutex export (owner Quote 60): whether it is a regular trading day and,
+/// on a Muhurat date, the session's end as IST seconds of day (86,400 when
+/// the calendar lists the date without published times, so the export waits
+/// past midnight). `None` with no calendar installed. O(1).
+#[must_use]
+// TEST-EXEMPT: covered by test_calendar_session_day_reports_trading_and_muhurat_end
+pub fn installed_calendar_session_day(date: chrono::NaiveDate) -> Option<SessionDayInfo> {
+    calendar_session_day(SESSION_CALENDAR.get().map(Arc::as_ref), date)
+}
+
+/// What [`installed_calendar_session_day`] reports for one date.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionDayInfo {
+    /// A regular NSE trading day.
+    pub trading: bool,
+    /// End of the Muhurat session (IST seconds of day) on a Muhurat date.
+    pub muhurat_end_secs: Option<u32>,
+}
+
+/// [`installed_calendar_session_day`] over an explicit calendar. Pure, O(1).
+fn calendar_session_day(
+    calendar: Option<&TradingCalendar>,
+    date: chrono::NaiveDate,
+) -> Option<SessionDayInfo> {
+    calendar.map(|c| SessionDayInfo {
+        trading: c.is_trading_day(date),
+        muhurat_end_secs: c
+            .is_muhurat_trading_day(date)
+            .then(|| c.muhurat_session_secs(date).map_or(86_400, |(_, end)| end)),
+    })
+}
+
 /// [`installed_calendar_says_muhurat`] over an explicit calendar. Pure, O(1).
 #[must_use]
 fn calendar_says_muhurat(
@@ -1017,4 +1050,66 @@ mod tests {
             proptest::prop_assert_eq!((u64::from(sec_of_day) + wait) % u64::from(SECONDS_PER_DAY), 0);
         }
     }
+}
+
+/// Owner Quote 60: the export scheduler's view of a date.
+#[cfg(test)]
+#[test]
+fn test_calendar_session_day_reports_trading_and_muhurat_end() {
+    use crate::config::{MuhuratTradingEntry, TradingConfig};
+    let cfg = TradingConfig {
+        market_open_time: "09:00:00".to_string(),
+        market_close_time: "15:30:00".to_string(),
+        order_cutoff_time: "15:29:00".to_string(),
+        data_collection_start: "09:00:00".to_string(),
+        data_collection_end: "15:30:00".to_string(),
+        timezone: "Asia/Kolkata".to_string(),
+        max_orders_per_second: 10,
+        nse_holidays: vec![],
+        muhurat_trading_dates: vec![
+            MuhuratTradingEntry {
+                date: "2026-11-08".to_string(),
+                name: "Diwali 2026".to_string(),
+                session_start_ist: "18:00".to_string(),
+                session_end_ist: "19:15".to_string(),
+            },
+            MuhuratTradingEntry {
+                date: "2027-10-31".to_string(),
+                name: "unpublished".to_string(),
+                ..Default::default()
+            },
+        ],
+        nse_mock_trading_dates: vec![],
+    };
+    let cal = TradingCalendar::from_config(&cfg).expect("calendar");
+    let d = |y, m, dd| chrono::NaiveDate::from_ymd_opt(y, m, dd).expect("date");
+    assert_eq!(
+        calendar_session_day(Some(&cal), d(2026, 11, 8)),
+        Some(SessionDayInfo {
+            trading: false,
+            muhurat_end_secs: Some(19 * 3600 + 15 * 60)
+        })
+    );
+    assert_eq!(
+        calendar_session_day(Some(&cal), d(2027, 10, 31)).and_then(|s| s.muhurat_end_secs),
+        Some(86_400)
+    );
+    assert_eq!(
+        calendar_session_day(Some(&cal), d(2026, 11, 9)),
+        Some(SessionDayInfo {
+            trading: true,
+            muhurat_end_secs: None
+        })
+    );
+    assert_eq!(calendar_session_day(None, d(2026, 11, 9)), None);
+    // The wrapper reads the INSTALLED calendar (whichever test installed it
+    // first in this binary), never a guess.
+    let date = d(2026, 11, 9);
+    assert_eq!(
+        installed_calendar_session_day(date),
+        SESSION_CALENDAR.get().map(|c| SessionDayInfo {
+            trading: c.is_trading_day(date),
+            muhurat_end_secs: None,
+        })
+    );
 }

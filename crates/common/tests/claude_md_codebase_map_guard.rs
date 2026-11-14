@@ -336,6 +336,35 @@ fn claude_md_carries_no_shell_mangled_dollar_amount() {
     );
 }
 
+/// 2026-11-14 review: the Quote 60 cost note in `aws-budget.md` (auto-loaded
+/// every session) read "about -e.05 to -e.15 a trading day" for the one
+/// Assumed number the owner is told to measure. CLAUDE.md alone was scanned;
+/// this scans every auto-loaded project rule file too.
+#[test]
+fn rule_files_carry_no_shell_mangled_dollar_amount() {
+    let dir = repo_root().join(".claude/rules/project");
+    let mut bad = Vec::new();
+    let entries =
+        std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("cannot list {}: {e}", dir.display()));
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("md") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        for at in shell_mangled_amounts(&text) {
+            let line = text[..at].matches('\n').count().saturating_add(1);
+            bad.push(format!("{}:{line}", path.display()));
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "dollar amounts eaten by shell expansion (`-e.<digits>`): {bad:?}. Rewrite \
+         each as `$<amount>` with an editor or a single-quoted heredoc."
+    );
+}
+
 #[test]
 fn shell_mangle_scanner_finds_the_planted_case_and_skips_real_flags() {
     assert_eq!(

@@ -436,6 +436,14 @@ fn the_supervisor_model_matches_drain_hold_rs() {
         "evening_step == crate::evening_drain::EveningStep::Restart && !stalled",
         "let backlog = work.wal_backlog.unwrap_or(0);",
         "crate::evening_drain::state_for_restart(evening, day, backlog, now_unix)",
+        // Owner Quote 60 (2026-11-14 third review): the Brutex export's
+        // wiring in the supervisor. The restart waits only while an export
+        // RUNS; the export reads tonight's pending replay; a due export is
+        // never released by the stall rule; the day's work reads both flags.
+        "work.evening_work_done(),",
+        "let stalled = stall_releases_hold(",
+        "brutex_export_pending: crate::brutex_export_boot::export_pending(),",
+        "brutex_export_running: crate::brutex_export_boot::export_running(),",
     ] {
         assert!(
             src.contains(needle),
@@ -446,6 +454,14 @@ fn the_supervisor_model_matches_drain_hold_rs() {
     assert!(compact.contains(
         "crate::evening_drain::load_state_for_evening(evening_path,chrono::Utc::now().timestamp(),)"
     ), "the recovery model must use the real state path and current clock");
+    // Owner Quote 60: the evening replay's pending value is STORED where the
+    // Brutex export reads it (2026-11-14 third review).
+    assert!(
+        compact.contains(
+            "EVENING_REPLAY_PENDING.store(evening_replay_value(evening_step,work.wal_backlog),"
+        ),
+        "the supervisor must publish the pending evening replay"
+    );
     // The restart is asked only after the record landed.
     let fn_at = src
         .find("async fn request_evening_restart(")

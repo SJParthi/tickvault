@@ -479,6 +479,13 @@ daily_free_target_session_multiplier_pct = 150
 # 40 GiB, used until five sessions have been measured.
 daily_free_target_fallback_session_bytes = 42949672960
 drain_hold_counts_archive = true
+# Owner Quote 60 (2026-11-14): the daily Brutex export. After 15:45 IST each
+# trading day the tick, quote, aux, depth and candle partitions of the day go
+# to their canonical archive keys (create-only, ordered by the DEDUP key), then
+# questdb-partitions/_daily/<D>/manifest-<n>.json and DONE. Never deletes or
+# overwrites. false stops the export and its amend records; the archiver still
+# sorts only against an existing object and only outside 08:30-15:45 IST.
+brutex_export_enabled = true
 
 # [valkey] section DELETED in #O4 (2026-05-24). Valkey removed from
 # the runtime; the dual-instance lock moved to AWS SSM Parameter Store

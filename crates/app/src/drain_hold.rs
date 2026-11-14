@@ -192,6 +192,17 @@ pub struct DayWork {
     /// (nothing left, target met, a stale reading, or the switch off). See
     /// `archive_backlog::backlog_holds`.
     pub archive_backlog_bytes: Option<u64>,
+    /// Today's daily Brutex export is due and not sealed or given up, or an
+    /// export runs (owner Quote 60). Holds the box (`is_done`), and the
+    /// one-hour stall rule does not release it (the export waits for its
+    /// gates on purpose; bounded by its 20:45 horizon). Never the evening
+    /// WAL restart.
+    pub brutex_export_pending: bool,
+    /// A Brutex export is running right now. Only this holds the evening
+    /// WAL restart back (2026-11-14 review): a restart never cuts an export,
+    /// and a DUE export never makes the restart wait, so the day's shed
+    /// frames are replayed BEFORE the day is sealed, not after.
+    pub brutex_export_running: bool,
 }
 
 impl DayWork {
@@ -199,7 +210,9 @@ impl DayWork {
     /// not done, the direction that keeps the box up. O(1).
     #[must_use]
     pub fn is_done(&self) -> bool {
-        self.data_in_database() && self.archive_backlog_bytes.is_none()
+        self.data_in_database()
+            && self.archive_backlog_bytes.is_none()
+            && !self.brutex_export_pending
     }
 
     /// [`Self::is_done`] without the archive copy work: the day's data is in
@@ -222,6 +235,17 @@ impl DayWork {
             && self.suspended == Some(0)
             && !self.sink_suspect
             && !self.wal_holding
+    }
+
+    /// What the evening WAL restart reads as "the day's other work is done":
+    /// the day's data is in the database AND no Brutex export is RUNNING
+    /// (owner Quote 60), so the restart never cuts an export. A due export
+    /// waiting for its gates does not hold the restart: the export waits for
+    /// the replay instead (2026-11-14 review). O(1).
+    #[must_use]
+    // TEST-EXEMPT: covered by test_evening_step_waits_only_while_an_export_runs
+    pub fn evening_work_done(&self) -> bool {
+        self.data_in_database() && !self.brutex_export_running
     }
 
     /// Whether the skipped-depth buckets stop holding the box: every pass
@@ -291,6 +315,13 @@ impl DayWork {
                 )
             } else {
                 String::new()
+            }
+            + if self.brutex_export_running {
+                " brutex_export=running"
+            } else if self.brutex_export_pending {
+                " brutex_export=pending"
+            } else {
+                ""
             }
     }
 }
@@ -431,6 +462,8 @@ pub fn measure_day_work(today_ist: chrono::NaiveDate) -> DayWork {
         archive_backlog_bytes: crate::archive_backlog::held_backlog_bytes(
             chrono::Utc::now().timestamp(),
         ),
+        brutex_export_pending: crate::brutex_export_boot::export_pending(),
+        brutex_export_running: crate::brutex_export_boot::export_running(),
     }
 }
 
@@ -584,6 +617,50 @@ impl HoldState {
     }
 }
 
+/// Whether a stall releases the hold: never while the Brutex export is due
+/// or running (2026-11-14 review). The session day waits for its gates
+/// until 18:00 on purpose, with nothing moving; releasing at the one-hour
+/// stall would stop the box before the export ever ran. Bounded: the export
+/// is "due" only until its 20:45 horizon, and nothing holds past 07:30.
+/// Pure, O(1).
+#[must_use]
+pub fn stall_releases_hold(stalled: bool, work: &DayWork) -> bool {
+    stalled && !work.brutex_export_pending
+}
+
+/// Whether the evening WAL drain will still replay tonight: it holds the box
+/// (a restart is planned or waited for) and frames are waiting. Read by the
+/// Brutex export (owner Quote 60), which seals the session day only after
+/// that replay. Published once a minute by the supervisor; `false` outside
+/// the hold window. O(1).
+static EVENING_REPLAY_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// [`EVENING_REPLAY_PENDING`]'s value for one evaluation. Pure, O(1).
+#[must_use]
+pub fn evening_replay_value(
+    step: crate::evening_drain::EveningStep,
+    wal_backlog: Option<u64>,
+) -> bool {
+    step.holds() && wal_backlog.is_some_and(|n| n > 0)
+}
+
+/// Whether tonight's evening WAL drain still has a replay to make (owner
+/// Quote 60, 2026-11-14 review). O(1).
+#[must_use]
+// TEST-EXEMPT: a load of the published flag; its value is test_evening_replay_value_needs_a_holding_step_and_a_backlog
+pub fn evening_replay_pending() -> bool {
+    EVENING_REPLAY_PENDING.load(Ordering::Relaxed)
+}
+
+/// The work count the drain hold's stall rule watches: rows the after-close
+/// depth pass wrote plus objects the Brutex export placed (owner Quote 60), so
+/// a running export is progress. Pure, O(1).
+#[must_use]
+// TEST-EXEMPT: covered by test_export_objects_count_as_drain_progress
+pub fn drain_progress_count(pass_rows: u64, export_objects: u64) -> u64 {
+    pass_rows.saturating_add(export_objects)
+}
+
 /// Spawns the drain-hold supervisor for `environment`. Runs for the life of
 /// the process; outside 15:40–07:30 IST it only sleeps.
 // TEST-EXEMPT: an endless loop over the SSM client; its decisions are HoldState::step, hold_value and hold_until_unix, all unit-tested.
@@ -602,6 +679,7 @@ pub fn spawn_drain_hold_supervisor(environment: String) -> tokio::task::JoinHand
             if !in_hold_window(secs_ist) {
                 state = HoldState::default();
                 progress = ProgressTracker::default();
+                EVENING_REPLAY_PENDING.store(false, Ordering::Relaxed);
                 // Past the hold window's end plus the stop lag, tonight is over.
                 if secs_ist >= DRAIN_HOLD_CEILING_SECS_IST + HELD_STOP_LAG_SECS {
                     HELD_TONIGHT.store(false, Ordering::Release);
@@ -674,7 +752,8 @@ pub fn spawn_drain_hold_supervisor(environment: String) -> tokio::task::JoinHand
                 Some(evening) if on_aws => crate::evening_drain::evening_step(
                     &evening,
                     evening_day,
-                    work.data_in_database(),
+                    // Owner Quote 60: the restart waits for the export.
+                    work.evening_work_done(),
                     crate::evening_drain::crossverify_settled(xverify_marker, secs_ist),
                     work.wal_backlog,
                     now_unix,
@@ -702,15 +781,28 @@ pub fn spawn_drain_hold_supervisor(environment: String) -> tokio::task::JoinHand
                 }
             }
             work.wal_holding = evening_step.holds();
+            EVENING_REPLAY_PENDING.store(
+                evening_replay_value(evening_step, work.wal_backlog),
+                Ordering::Relaxed,
+            );
             #[allow(clippy::cast_precision_loss)] // APPROVED: a bucket count, far below 2^53
             let floor_blocked = work.floor_blocked_buckets() as f64;
             metrics::gauge!(FLOOR_BLOCKED_BUCKETS_GAUGE).set(floor_blocked);
-            let pass_rows = crate::dhan_feed_stack::deferred_depth_pass::pass_rows_written_total();
-            let stalled = progress.observe_with_archive(
+            // An object the Brutex export placed is progress too (Quote 60).
+            let pass_rows = drain_progress_count(
+                crate::dhan_feed_stack::deferred_depth_pass::pass_rows_written_total(),
+                tickvault_storage::partition_archive::daily_export::objects_placed_total(),
+            );
+            // A due or running Brutex export is never released by the stall
+            // rule (2026-11-14 review).
+            let stalled = stall_releases_hold(
+                progress.observe_with_archive(
+                    &work,
+                    pass_rows,
+                    tickvault_storage::partition_archive::archive_drops_total(),
+                    now_unix,
+                ),
                 &work,
-                pass_rows,
-                tickvault_storage::partition_archive::archive_drops_total(),
-                now_unix,
             );
             let done = work.is_done();
             let restart_now =
@@ -890,6 +982,111 @@ mod tests {
             suspended: Some(0),
             ..DayWork::default()
         }
+    }
+
+    /// Owner Quote 60: a due Brutex export holds the box.
+    #[test]
+    fn test_brutex_export_pending_keeps_day_not_done() {
+        assert!(done_work().is_done());
+        let work = DayWork {
+            brutex_export_pending: true,
+            ..done_work()
+        };
+        assert!(!work.is_done());
+        assert!(work.left_text().ends_with(" brutex_export=pending"));
+        assert!(!done_work().left_text().contains("brutex"));
+    }
+
+    /// ... but never the evening WAL restart, which waits for it instead.
+    #[test]
+    fn test_brutex_export_pending_does_not_block_data_in_database() {
+        let work = DayWork {
+            brutex_export_pending: true,
+            ..done_work()
+        };
+        assert!(work.data_in_database());
+    }
+
+    /// Regression (2026-11-14 review, HIGH): the evening restart waits only
+    /// while an export RUNS (a restart never cuts one); an export that is
+    /// merely due no longer makes it wait, so the day's shed frames are
+    /// replayed before the export seals the day, not after.
+    #[test]
+    fn test_evening_step_waits_only_while_an_export_runs() {
+        let pending = DayWork {
+            brutex_export_pending: true,
+            ..done_work()
+        };
+        let running = DayWork {
+            brutex_export_pending: true,
+            brutex_export_running: true,
+            ..done_work()
+        };
+        assert!(done_work().evening_work_done());
+        assert!(
+            pending.evening_work_done(),
+            "a due export never holds the restart"
+        );
+        assert!(!running.evening_work_done());
+        assert!(running.left_text().ends_with(" brutex_export=running"));
+        let state = crate::evening_drain::EveningState::default();
+        let evening = 17 * 3600;
+        let step = |done: bool| {
+            crate::evening_drain::evening_step(&state, 1, done, true, Some(9), 1_000_000, evening)
+        };
+        assert_eq!(
+            step(running.evening_work_done()),
+            crate::evening_drain::EveningStep::Wait
+        );
+        assert_ne!(
+            step(pending.evening_work_done()),
+            crate::evening_drain::EveningStep::Wait,
+            "the restart may go while the export only waits"
+        );
+    }
+
+    /// Regression (2026-11-14 review, MEDIUM): the one-hour stall rule never
+    /// releases the hold while the export is due or running.
+    #[test]
+    fn test_stall_releases_hold_never_for_a_due_export() {
+        let pending = DayWork {
+            brutex_export_pending: true,
+            ..done_work()
+        };
+        assert!(stall_releases_hold(true, &done_work()));
+        assert!(!stall_releases_hold(true, &pending));
+        assert!(!stall_releases_hold(false, &done_work()));
+    }
+
+    /// Regression (2026-11-14 review, HIGH): the export reads a pending
+    /// evening replay only while a holding step has frames to replay.
+    #[test]
+    fn test_evening_replay_value_needs_a_holding_step_and_a_backlog() {
+        use crate::evening_drain::EveningStep;
+        assert!(evening_replay_value(EveningStep::Wait, Some(3)));
+        assert!(evening_replay_value(EveningStep::Restart, Some(1)));
+        assert!(!evening_replay_value(EveningStep::Wait, Some(0)));
+        assert!(!evening_replay_value(EveningStep::Wait, None));
+        assert!(!evening_replay_value(EveningStep::Idle, Some(3)));
+        assert!(!evening_replay_value(EveningStep::GaveUp, Some(3)));
+    }
+
+    /// Owner Quote 60: an object the export placed moves the stall clock.
+    #[test]
+    fn test_export_objects_count_as_drain_progress() {
+        assert!(drain_progress_count(5, 1) > drain_progress_count(5, 0));
+        assert_eq!(drain_progress_count(u64::MAX, 1), u64::MAX);
+    }
+
+    /// `measure_day_work` reads the export scheduler's pending flag.
+    #[test]
+    fn test_measure_day_work_reads_the_export_pending_flag() {
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 10, 29).expect("date");
+        crate::brutex_export_boot::set_export_pending_for_test(true);
+        let pending = measure_day_work(day).brutex_export_pending;
+        crate::brutex_export_boot::set_export_pending_for_test(false);
+        assert!(pending);
+        assert!(!measure_day_work(day).brutex_export_pending);
     }
 
     // Regression: 2026-11-05 (PR DP-4) — the after-close pass stopped ~700
