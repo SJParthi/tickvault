@@ -2196,6 +2196,11 @@ fn test_regression_a_dropped_counter_restart_tick_never_lengthens_a_chain_bar() 
     ];
     let (fold, chain, c) = fold_and_chain_with(option, &ticks, &[2], OPEN - 600, 0);
     assert!(c.volume_unknown[0], "the day volume is unknown");
+    assert_eq!(
+        c.counters().dropped_tick_restarts,
+        1,
+        "the restart is carried"
+    );
     let next = b + 60;
     assert_eq!(
         chain.get(&next).map(|v| v.0),
@@ -2354,4 +2359,146 @@ fn test_regression_a_setup_checked_before_midnight_is_never_todays_setup() {
 /// [`rising`] for a session opening at `open`.
 fn rising_at(open: i64) -> impl Fn(i64) -> f32 {
     move |s| if s < open + 60 { 100.0 } else { 101.0 }
+}
+
+/// Audit 2026-11-14, finding 2: runs one instrument through a vendor counter
+/// restart that the tap DID deliver (the fold flags it `stale_packet` and
+/// `cumulative_restarted` together), then moves the tap's global loss count
+/// at `loss_at` (another instrument's loss: this one loses no tick). Returns
+/// each released 1 m bar's (open, volume) and the chain. TEST DOUBLE ticks.
+fn run_tapped_restart(
+    loss_at: Option<u32>,
+    stale_at: Option<u32>,
+) -> (Vec<(i64, u64)>, LiveFillChain<Recorder>) {
+    let mut c = chain(Recorder::default(), true);
+    let mut cum: u32 = 3_000_000_000;
+    let mut high = cum;
+    for i in 0..180u32 {
+        let s = OPEN + i64::from(i);
+        let drop_seq = u32::from(loss_at.is_some_and(|l| i >= l));
+        let mut t = tap(s, s * NS + 300_000_000, 100.0, cum, drop_seq);
+        t.volume_delta = 100;
+        t.first_bucket_volume_delta = 100;
+        if i == 30 {
+            // The restart: below the high mark, so the fold also reads it
+            // stale; its own delta is lost to the re-anchor.
+            cum = 1_000;
+            high = cum;
+            t.cum_volume = cum;
+            t.volume_delta = 0;
+            t.first_bucket_volume_delta = 0;
+            t.cumulative_restarted = true;
+            t.stale_packet = true;
+        } else if stale_at == Some(i) {
+            // A true stale packet: a little below the high mark, no credit.
+            t.cum_volume = high - 50;
+            t.volume_delta = 0;
+            t.first_bucket_volume_delta = 0;
+            t.stale_packet = true;
+            t.new_trade = false;
+            t.older_trade = true;
+        } else if i > 0 {
+            cum += 100;
+            high = cum;
+            t.cum_volume = cum;
+        }
+        c.on_tap(&t);
+        pass(&mut c, s * NS + 400_000_000);
+        c.drain_outputs(|_| {});
+    }
+    pass(&mut c, (OPEN + 185) * NS);
+    c.drain_outputs(|_| {});
+    let bars = c
+        .engine()
+        .bars
+        .iter()
+        .map(|b| (b.open_ist_secs, b.volume))
+        .collect();
+    (bars, c)
+}
+
+/// Audit 2026-11-14, finding 2: a tapped counter-restart tick is recorded,
+/// so a loss of another instrument right after it (the loss count moves on
+/// the very next tick) is not read as a restart on a dropped tick. Before,
+/// the restart tick was skipped as stale, that next tick fell below the
+/// pre-restart cumulative, and the chain carried a false restart
+/// (`restart_pending`) and marked the day volume unknown, refusing every
+/// entry for the day.
+#[test]
+fn test_regression_tapped_restart_then_a_later_loss_is_not_a_dropped_restart() {
+    let (clean, _) = run_tapped_restart(None, None);
+    let (bars, c) = run_tapped_restart(Some(31), None);
+    assert!(!c.volume_unknown[0], "entries stay allowed");
+    assert_eq!(c.counters().volume_unknown_marked, 0);
+    assert_eq!(c.counters().missed_volume_discarded, 0);
+    assert_eq!(c.counters().dropped_tick_restarts, 0, "no false restart");
+    assert_eq!(bars, clean, "the loss of another instrument moves no bar");
+    assert_eq!(bars.len(), 3, "{bars:?}");
+}
+
+/// Audit 2026-11-14, finding 2: a loss between the last tapped tick and the
+/// tapped restart tick (the loss count moves ON the restart tick) may
+/// have dropped ticks whose volume the fold counted against the old
+/// counter; no forward difference can find it, so the day volume is marked
+/// unknown; no second restart is carried (the chain saw the fold's own), so
+/// the bars stay the fold's.
+///
+/// The bars alone cannot tell (audit round 4, 2026-11-14): a carried
+/// restart lands on the very next trade, while the fold's own restart still
+/// has every frame's chain broken, so it changes no bar. The
+/// `dropped_tick_restarts` counter, moved only where a restart is carried,
+/// is what fails when the false restart comes back.
+#[test]
+fn test_tapped_restart_after_a_loss_marks_volume_unknown_without_a_false_restart() {
+    let (clean, _) = run_tapped_restart(None, None);
+    let (bars, c) = run_tapped_restart(Some(30), None);
+    assert!(c.volume_unknown[0]);
+    assert_eq!(c.counters().volume_unknown_marked, 1);
+    assert_eq!(c.counters().dropped_tick_restarts, 0, "no false restart");
+    assert_eq!(bars, clean);
+}
+
+/// Audit 2026-11-14, finding 2: a TRUE stale packet (below the high mark,
+/// not a restart) is still skipped: the high mark stays, so the next tick
+/// after a loss differences against it and finds nothing missed.
+#[test]
+fn test_true_stale_packet_is_still_skipped_by_note_cumulative() {
+    let (clean, _) = run_tapped_restart(None, Some(60));
+    let (bars, c) = run_tapped_restart(Some(61), Some(60));
+    assert!(!c.volume_unknown[0]);
+    assert!(!c.restart_pending[0]);
+    assert_eq!(c.counters().missed_volume_discarded, 0);
+    assert_eq!(c.cum_seen[0].map(|s| s.0), Some(1_000 + 100 * 148));
+    assert_eq!(bars, clean);
+}
+
+/// Audit 2026-11-14, finding 2: the fold itself flags a vendor counter
+/// restart as BOTH `stale_packet` and `cumulative_restarted`, which is the
+/// pair `note_cumulative` must read as a restart, not a stale packet.
+#[test]
+fn test_fold_flags_a_counter_restart_as_stale_and_restarted() {
+    use tickvault_common::feed::Feed as TickFeed;
+    use tickvault_common::tick_types::ParsedTick;
+    let mut fold = crate::dhan_feed_stack::live_fold(64);
+    fold.set_live_capture_start(u32::try_from(OPEN - 600).expect("fits"));
+    let mut last = None;
+    for (n, cum) in [3_000_000_000_u32, 3_000_000_100, 1_000]
+        .into_iter()
+        .enumerate()
+    {
+        let secs = OPEN + 600 + 20 * i64::try_from(n).expect("fits");
+        let tick = ParsedTick {
+            security_id: 52_175,
+            exchange_segment_code: 2,
+            last_traded_price: 100.0,
+            exchange_timestamp: u32::try_from(secs).expect("fits"),
+            received_at_nanos: secs * NS + 300_000_000 - IST_OFFSET_NS_FOR_TESTS,
+            volume: cum,
+            ..ParsedTick::default()
+        };
+        last = Some(fold.consume_tick(TickFeed::Dhan, &tick, None, |_, _, _, _, _| {}));
+    }
+    let stats = last.expect("three ticks");
+    assert!(stats.cumulative_restarted);
+    assert!(stats.stale_packet);
 }

@@ -12,11 +12,24 @@
 //!
 //! 1. Reads the flagged benchmarks from the gate's `FAIL: ... regression`
 //!    lines, and each one's bench binary from the bench log.
-//! 2. Picks the BASELINE build of that binary: the copy the baseline run
+//! 2. Picks the BASELINE build of that binary (`pick_baseline`): when the
+//!    restored cache key ends in the head commit, the head binary itself,
+//!    even if a saved copy is there; otherwise the copy the baseline run
 //!    saved with its Criterion records (`<criterion>/tv_ab_bins/`, restored
-//!    from the same cache entry, so built from the baseline commit); or, when
-//!    the restored cache key ends in the head commit, the head binary itself.
-//!    Neither available: it refuses.
+//!    from the same cache entry, so built from the baseline commit). Neither
+//!    available: it refuses.
+//!
+//!    Same commit first (2026-11-14): nightly run 43536429172 failed the 5%
+//!    gate against baseline run 43476616865, both on commit e9b812d, because
+//!    the A/B pitted the baseline run's saved binary against the head binary:
+//!    two BUILDS of one commit, not two versions of the code. A commit cannot
+//!    regress against itself, so on the same commit both halves run the head
+//!    build and only the runner's noise is left. Two different commits still
+//!    use the saved binary, under the unchanged 5% rule and absolute budgets.
+//!
+//! Every output starts with a `BASELINE:` line saying what was compared
+//! (`baseline_status`): no baseline restored, a key with no commit, the head
+//! commit itself, or another commit.
 //! 3. On THIS runner, back to back: runs the baseline binary
 //!    (`--save-baseline tv_ab`), then the head binary (`--baseline tv_ab`),
 //!    filtered to exactly the flagged ids, so Criterion writes each flagged
@@ -149,6 +162,60 @@ fn gate_key(root: &str) -> String {
     // The awk is `gsub(/\/change/, "", bench)`: EVERY occurrence goes.
     let rel = format!("{root}/change");
     rel.replace("/change", "").replace('/', "_").to_lowercase()
+}
+
+/// Which build plays the BASELINE half of one A/B pair.
+#[derive(Debug, Clone, PartialEq)]
+enum BaselineBuild {
+    /// The head binary, on both sides: the baseline is the head commit.
+    Head,
+    /// The binary the baseline run saved: built from another commit.
+    Saved(PathBuf),
+}
+
+impl BaselineBuild {
+    fn describe(&self) -> &'static str {
+        match self {
+            BaselineBuild::Head => {
+                "the head binary on both sides (same commit: two builds of one commit are \
+                 never compared)"
+            }
+            BaselineBuild::Saved(_) => "the baseline run's saved binary",
+        }
+    }
+}
+
+/// The baseline build for one bench target. The same commit ALWAYS uses the
+/// head binary, even when the baseline run saved one: a saved binary of the
+/// head commit is a second build of the same code, and comparing two builds
+/// of one commit is what failed nightly run 43536429172 (both e9b812d).
+/// Another commit uses the saved binary, or nothing (the caller refuses).
+fn pick_baseline(same_commit: bool, saved: Option<PathBuf>) -> Option<BaselineBuild> {
+    if same_commit {
+        Some(BaselineBuild::Head)
+    } else {
+        saved.map(BaselineBuild::Saved)
+    }
+}
+
+/// The first line of every output: what the regression arm compared against,
+/// so an absolute-only pass is never read as a regression check.
+fn baseline_status(baseline_key: &str, head_sha: &str) -> String {
+    let key = baseline_key.trim();
+    if key.is_empty() {
+        return "  BASELINE: none restored (empty cache key): this run had NO 5% regression \
+                check, only the absolute budgets."
+            .to_string();
+    }
+    let head = head_sha.trim().to_ascii_lowercase();
+    match sha_from_cache_key(key) {
+        None => format!("  BASELINE: cache key '{key}' names no commit."),
+        Some(sha) if sha == head => format!(
+            "  BASELINE: the head commit {sha} itself (SAME-COMMIT): a regression against it is \
+             the runner or the build, not the code."
+        ),
+        Some(sha) => format!("  BASELINE: commit {sha}, head commit {head}."),
+    }
 }
 
 /// Every benchmark root (relative to the Criterion dir) with a change record.
@@ -454,16 +521,18 @@ fn recheck(inp: &Inputs) -> Result<Vec<String>, String> {
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
         let target = bench_target(&name).ok_or_else(|| format!("{exe}: not a bench binary"))?;
-        let (base, which) = match saved_bin_for(&saved_bins, target) {
-            Some(saved) => (saved, "the baseline run's saved binary"),
-            None if same_commit => (head.clone(), "the head binary (same commit)"),
-            None => {
-                return Err(format!(
+        let picked =
+            pick_baseline(same_commit, saved_bin_for(&saved_bins, target)).ok_or_else(|| {
+                format!(
                     "no saved baseline binary for {target}, and the baseline commit is not \
                      the head commit (cache key '{}')",
                     inp.baseline_key
-                ));
-            }
+                )
+            })?;
+        let which = picked.describe();
+        let base = match picked {
+            BaselineBuild::Head => head.clone(),
+            BaselineBuild::Saved(saved) => saved,
         };
         ab_pair(inp, &base, &head, &members)?;
         for f in members {
@@ -500,17 +569,21 @@ fn outcome(args: &[String]) -> (String, i32) {
             root,
         })
     })();
+    let status = baseline_status(
+        &std::env::var("BENCH_AB_BASELINE_KEY").unwrap_or_default(),
+        &std::env::var("GITHUB_SHA").unwrap_or_default(),
+    );
     match inputs.and_then(|inp| recheck(&inp)) {
         Ok(lines) => (
             format!(
-                "\n  SAME-RUNNER A/B: {} flagged benchmark(s) re-measured; the gate runs again on the result.\n{}\n",
+                "\n{status}\n  SAME-RUNNER A/B: {} flagged benchmark(s) re-measured; the gate runs again on the result.\n{}\n",
                 lines.len(),
                 lines.join("\n")
             ),
             0,
         ),
         Err(e) => (
-            format!("\n  SAME-RUNNER A/B NOT RUN: {e}. The regression verdict stands.\n"),
+            format!("\n{status}\n  SAME-RUNNER A/B NOT RUN: {e}. The regression verdict stands.\n"),
             1,
         ),
     }
@@ -554,6 +627,53 @@ mod tests {
         );
         assert_eq!(sha_from_cache_key(""), None);
         assert_eq!(sha_from_cache_key(&format!("k-{}", "g".repeat(40))), None);
+    }
+
+    #[test]
+    fn the_same_commit_always_runs_the_head_build_on_both_sides() {
+        let saved = PathBuf::from("target/criterion/tv_ab_bins/pipeline-6d4df94fc326a801");
+        // Regression 2026-11-14 (run 43536429172 vs 43476616865, both
+        // e9b812d): a saved binary of the SAME commit must not be used.
+        assert_eq!(
+            pick_baseline(true, Some(saved.clone())),
+            Some(BaselineBuild::Head)
+        );
+        assert_eq!(pick_baseline(true, None), Some(BaselineBuild::Head));
+        // Another commit: the saved binary, or nothing (refused).
+        assert_eq!(
+            pick_baseline(false, Some(saved.clone())),
+            Some(BaselineBuild::Saved(saved))
+        );
+        assert_eq!(pick_baseline(false, None), None);
+        assert!(BaselineBuild::Head.describe().contains("both sides"));
+        assert!(
+            BaselineBuild::Saved(PathBuf::new())
+                .describe()
+                .contains("saved binary")
+        );
+    }
+
+    #[test]
+    fn baseline_status_names_a_missed_restore_and_a_same_commit_baseline() {
+        let head = "4189e98a8c0ffee0000000000000000000000abc";
+        let other = "0123456789abcdef0123456789abcdef01234567";
+        for empty in ["", "  "] {
+            let s = baseline_status(empty, head);
+            assert!(s.contains("none restored"), "{s}");
+            assert!(s.contains("NO 5% regression check"), "{s}");
+        }
+        let same = baseline_status(&format!("criterion-baseline-fp-1-{head}"), head);
+        assert!(same.contains("SAME-COMMIT"), "{same}");
+        let same_upper = baseline_status(
+            &format!("criterion-baseline-fp-1-{}", head.to_uppercase()),
+            &head.to_uppercase(),
+        );
+        assert!(same_upper.contains("SAME-COMMIT"), "{same_upper}");
+        let diff = baseline_status(&format!("criterion-baseline-fp-1-{other}"), head);
+        assert!(!diff.contains("SAME-COMMIT"), "{diff}");
+        assert!(diff.contains(other) && diff.contains(head), "{diff}");
+        let no_sha = baseline_status("criterion-baseline-fp-1", head);
+        assert!(no_sha.contains("names no commit"), "{no_sha}");
     }
 
     #[test]

@@ -551,6 +551,15 @@ impl BackupDedup {
         self.slots.is_empty()
     }
 
+    /// Whether the contract `(security_id, segment)` is in the set in force
+    /// (carried on two main-feed sockets). One bool, one filter bit and at
+    /// most one hash probe: O(1), zero allocation.
+    #[inline]
+    #[must_use]
+    pub fn holds(&self, security_id: u64, segment: u8) -> bool {
+        self.slot_of(security_id, segment).is_some()
+    }
+
     /// Replaces the set in place. Cold: allocates for the new set. The drain
     /// never calls this; it adopts a publication in [`Self::on_frame`].
     pub fn install(&mut self, set: &[(u64, u8)]) {
@@ -1464,6 +1473,18 @@ mod tests {
         d.install(&[(42, SEG), (42, SEG), (42, 1)]);
         assert_eq!(d.len(), 2);
         assert!(!d.is_empty());
+    }
+
+    #[test]
+    fn test_holds_answers_on_the_composite_key_of_the_set_in_force() {
+        let mut d = BackupDedup::new();
+        assert!(!d.holds(42, SEG), "an inactive table holds nothing");
+        d.install(&[(42, SEG)]);
+        assert!(d.holds(42, SEG));
+        assert!(!d.holds(42, SEG + 1), "same id, other segment (I-P1-11)");
+        assert!(!d.holds(43, SEG));
+        d.install(&[]);
+        assert!(!d.holds(42, SEG), "an emptied set holds nothing");
     }
 
     #[test]

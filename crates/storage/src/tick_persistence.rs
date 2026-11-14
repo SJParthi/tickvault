@@ -2550,7 +2550,7 @@ pub struct TickWriter {
     /// `tv_feed_aux_rows_total{kind}` handles, one per
     /// [`AuxPacketKind`], resolved once so an append is a counter increment
     /// and never a label-vector allocation (plan item 45h).
-    aux_counters: [metrics::Counter; 6],
+    aux_counters: [metrics::Counter; AuxPacketKind::ALL.len()],
     /// `feed_aux_packets` rows appended by this writer over its life. The
     /// buffer carries `ticks` and `feed_aux_packets` rows together, so
     /// `pending` alone cannot say which table a pending row is for.
@@ -2568,7 +2568,7 @@ pub struct TickWriter {
 /// Pre-resolves the per-kind `tv_feed_aux_rows_total` handles (plan item 45h).
 /// The label value is a `&'static str` from a closed set, resolved once per
 /// writer, so the append path never builds a label vector.
-fn aux_row_counters() -> [metrics::Counter; 6] {
+fn aux_row_counters() -> [metrics::Counter; AuxPacketKind::ALL.len()] {
     AuxPacketKind::ALL.map(|k| {
         let c = metrics::counter!(FEED_AUX_ROWS_COUNTER, "kind" => k.as_str());
         c.increment(0);

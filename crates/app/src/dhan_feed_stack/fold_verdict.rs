@@ -23,7 +23,7 @@ use tickvault_trading::candles::ConsumeStats;
 pub enum FoldVerdict {
     /// Nothing is written and nothing folds. `wrong_day`: the 2026-09-10 day
     /// rule refused it and nothing else did, so the packet is kept in
-    /// `feed_aux_packets` as a connect snapshot.
+    /// `feed_aux_packets` as `no_trade_today` (exact repeats skipped, Quote 61).
     HardRefusal { wrong_day: bool },
     /// The row is written; no candle bucket opened.
     CandleOnly,

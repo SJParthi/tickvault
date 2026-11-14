@@ -246,9 +246,9 @@ fn the_wrong_day_return_keeps_the_packet_in_feed_aux() {
         .unwrap_or(0);
     let window = &src[start..ret];
     assert!(
-        window.contains("self.append_aux_tick(AuxPacketKind::ConnectSnapshot, tick, capture_seq);"),
-        "the connect snapshot must be appended to feed_aux_packets just before \
-         the wrong-day return"
+        window.contains("self.append_no_trade_today(tick, capture_seq);"),
+        "the no-trade-today packet must be appended to feed_aux_packets just \
+         before the wrong-day return (exact repeats skipped, Quote 61)"
     );
     assert!(
         !window.contains("append_tick_with_seq"),
