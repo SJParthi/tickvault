@@ -2739,11 +2739,22 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ErrorEvents {
     }
 }
 
+/// Keeps a second, inert `tracing` dispatcher registered for the whole test
+/// process. While a scoped subscriber is the only registered dispatcher,
+/// tracing-core caches a callsite as `never` when a thread with no
+/// subscriber reaches it first, and the scoped subscriber then misses the
+/// line. Call before installing the scoped subscriber.
+fn keep_callsite_interest_shared() {
+    static ANCHOR: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+    ANCHOR.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+}
+
 /// The number of `error!` lines one `record_subscribe_expiry_scope` call
 /// writes.
 fn errors_logged_by_record(report: &SubscribeScopeReport, day: u32) -> usize {
     use tracing_subscriber::layer::SubscriberExt;
     let n = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    keep_callsite_interest_shared();
     let subscriber = tracing_subscriber::registry().with(ErrorEvents(std::sync::Arc::clone(&n)));
     tracing::subscriber::with_default(subscriber, || record_subscribe_expiry_scope(report, day));
     n.load(Ordering::Relaxed)

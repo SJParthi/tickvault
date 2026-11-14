@@ -385,9 +385,20 @@ impl LogBuf {
     }
 }
 
+/// Keeps a second, inert `tracing` dispatcher registered for the whole test
+/// process. While a scoped subscriber is the only registered dispatcher,
+/// tracing-core caches a callsite as `never` when a thread with no
+/// subscriber reaches it first, and the scoped subscriber then misses the
+/// line. Call before installing the scoped subscriber.
+fn keep_callsite_interest_shared() {
+    static ANCHOR: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+    ANCHOR.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+}
+
 /// Captures this thread's log lines (the `#[tokio::test]` runtime is
 /// current-thread, so every task the test drives logs here).
 fn capture_logs() -> (LogBuf, tracing::subscriber::DefaultGuard) {
+    keep_callsite_interest_shared();
     let buf = LogBuf::default();
     let writer = buf.clone();
     let subscriber = tracing_subscriber::fmt()

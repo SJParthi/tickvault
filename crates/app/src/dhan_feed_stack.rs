@@ -102,6 +102,8 @@ pub mod live_fill_tap;
 // Plan item LF-8 (2026-11-12): the drain's per-tick fold verdict, pure, shared
 // with the offline replay so the two cannot drift.
 pub mod fold_verdict;
+// Audit finding 3 (2026-11-14): the exit seal's window, Muhurat session included.
+pub mod mid_session_exit;
 use std::time::Instant;
 
 use secrecy::ExposeSecret;
@@ -8460,7 +8462,7 @@ async fn run_frame_drain(
     // Only after the session. An exit inside the ingest window (a deploy, a
     // restart) leaves every open bucket missing its remaining trades, so it
     // seals only the complete ones and withholds the rest (audit PR31b-2).
-    let (close_emitted, close_dropped) = if is_mid_session_exit(now_ist_secs_of_day()) {
+    let (close_emitted, close_dropped) = if mid_session_exit::is_mid_session_exit_now() {
         ingest.seal_complete_buckets_at_mid_session_exit()
     } else {
         ingest.seal_open_buckets_at_close()
@@ -16401,7 +16403,7 @@ fn close_lane_before_dial(
         );
     }
     // The drain's tail.
-    let (close_emitted, close_dropped) = if is_mid_session_exit(now_ist_secs_of_day()) {
+    let (close_emitted, close_dropped) = if mid_session_exit::is_mid_session_exit_now() {
         ingest.seal_complete_buckets_at_mid_session_exit()
     } else {
         ingest.seal_open_buckets_at_close()
@@ -19388,6 +19390,10 @@ pub const fn ist_secs_of_day_from_millis(now_millis: u64) -> u64 {
 /// since a restart cannot rebuild a bucket that began before its capture
 /// start. Force-sealing them misses only a trade delivered after the exit,
 /// which the measured lag (at most 199 s) makes rare.
+///
+/// The REGULAR window only. Both exits call
+/// [`mid_session_exit::is_mid_session_exit_now`], which adds a Muhurat date's
+/// session (audit finding 3, 2026-11-14).
 #[must_use]
 pub const fn is_mid_session_exit(secs_of_day: u64) -> bool {
     secs_of_day >= tickvault_common::constants::TICK_PERSIST_START_SECS_OF_DAY_IST as u64
@@ -33769,7 +33775,8 @@ mod shutdown_before_dial_tests {
     /// The calls of the drain's shutdown tail, in order. Each must appear in
     /// both bodies, and in this order in both.
     // `shutdown_top_volume_writer` left the tail on 2026-10-22 (plan item 62).
-    const SHUTDOWN_TAIL: [&str; 10] = [
+    const SHUTDOWN_TAIL: [&str; 11] = [
+        "mid_session_exit::is_mid_session_exit_now()",
         "seal_complete_buckets_at_mid_session_exit()",
         "seal_open_buckets_at_close()",
         "flush_and_record(",

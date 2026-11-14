@@ -123,6 +123,26 @@ pub fn installed_calendar_says_muhurat(date: chrono::NaiveDate) -> Option<bool> 
     calendar_says_muhurat(SESSION_CALENDAR.get().map(Arc::as_ref), date)
 }
 
+/// The configured Muhurat session of IST `date` (`[[trading.muhurat_trading_dates]]`
+/// `session_start_ist` / `session_end_ist`, IST seconds of day, end
+/// exclusive), by the installed calendar. `None` when no calendar is
+/// installed, `date` is not a Muhurat date, or its times are not published.
+/// Added 2026-11-14 (audit finding 3) for the drain's mid-session exit
+/// window. O(1): one hash probe.
+#[must_use]
+pub fn installed_muhurat_session_secs(date: chrono::NaiveDate) -> Option<(u32, u32)> {
+    calendar_muhurat_session_secs(SESSION_CALENDAR.get().map(Arc::as_ref), date)
+}
+
+/// [`installed_muhurat_session_secs`] over an explicit calendar. Pure, O(1).
+#[must_use]
+fn calendar_muhurat_session_secs(
+    calendar: Option<&TradingCalendar>,
+    date: chrono::NaiveDate,
+) -> Option<(u32, u32)> {
+    calendar.and_then(|c| c.muhurat_session_secs(date))
+}
+
 /// [`installed_calendar_says_muhurat`] over an explicit calendar. Pure, O(1).
 #[must_use]
 fn calendar_says_muhurat(
@@ -715,6 +735,55 @@ mod tests {
             SESSION_CALENDAR
                 .get()
                 .map(|c| c.is_muhurat_trading_day(ordinary))
+        );
+    }
+
+    #[test]
+    fn test_installed_muhurat_session_secs_reads_the_configured_times() {
+        use crate::config::{MuhuratTradingEntry, TradingConfig};
+        let entry = |date: &str, start: &str, end: &str| MuhuratTradingEntry {
+            date: date.to_string(),
+            name: "Diwali".to_string(),
+            session_start_ist: start.to_string(),
+            session_end_ist: end.to_string(),
+        };
+        let cfg = TradingConfig {
+            market_open_time: "09:00:00".to_string(),
+            market_close_time: "15:30:00".to_string(),
+            order_cutoff_time: "15:29:00".to_string(),
+            data_collection_start: "09:00:00".to_string(),
+            data_collection_end: "15:30:00".to_string(),
+            timezone: "Asia/Kolkata".to_string(),
+            max_orders_per_second: 10,
+            nse_holidays: vec![],
+            muhurat_trading_dates: vec![
+                entry("2026-11-08", "18:00", "19:00"),
+                entry("2025-10-21", "", ""),
+            ],
+            nse_mock_trading_dates: vec![],
+        };
+        let cal = TradingCalendar::from_config(&cfg).unwrap();
+        let day = |y, m, d| chrono::NaiveDate::from_ymd_opt(y, m, d).unwrap();
+        assert_eq!(
+            calendar_muhurat_session_secs(Some(&cal), day(2026, 11, 8)),
+            Some((18 * 3600, 19 * 3600))
+        );
+        assert_eq!(
+            calendar_muhurat_session_secs(Some(&cal), day(2025, 10, 21)),
+            None,
+            "times not published"
+        );
+        assert_eq!(
+            calendar_muhurat_session_secs(Some(&cal), day(2026, 11, 9)),
+            None
+        );
+        assert_eq!(calendar_muhurat_session_secs(None, day(2026, 11, 8)), None);
+        // The wrapper reads whichever calendar this binary installed.
+        assert_eq!(
+            installed_muhurat_session_secs(day(2026, 11, 8)),
+            SESSION_CALENDAR
+                .get()
+                .and_then(|c| c.muhurat_session_secs(day(2026, 11, 8)))
         );
     }
 
