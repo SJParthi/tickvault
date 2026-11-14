@@ -92,6 +92,16 @@ impl tracing::Subscriber for CapturingSubscriber {
     fn exit(&self, _span: &tracing::span::Id) {}
 }
 
+/// Keeps a second, inert `tracing` dispatcher registered for the whole test
+/// process. While a scoped subscriber is the only registered dispatcher,
+/// tracing-core caches a callsite as `never` when a thread with no
+/// subscriber reaches it first, and the scoped subscriber then misses the
+/// line. Call before installing the scoped subscriber.
+fn keep_callsite_interest_shared() {
+    static ANCHOR: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+    ANCHOR.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+}
+
 impl CapturingSubscriber {
     fn snapshot(&self) -> Vec<CapturedEvent> {
         self.events.lock().map(|g| g.clone()).unwrap_or_default()
@@ -308,6 +318,7 @@ fn test_config_validate_warns_once_per_expired_configured_sandbox_gate() {
     // A configured cutoff in the past that is neither the compiled default
     // nor the 1970-01-01 disable sentinel → the expired-gate warn fires.
     config.strategy.sandbox_only_until = "2020-01-02".to_string();
+    keep_callsite_interest_shared();
     let subscriber = CapturingSubscriber::default();
     let result = tracing::subscriber::with_default(subscriber.clone(), || config.validate());
     assert!(
@@ -419,6 +430,7 @@ fn instrument(id: u64, segment: ExchangeSegment, symbol: &str) -> SubscribedInst
 
 #[test]
 fn test_instrument_registry_collision_logs_coded_info_event() {
+    keep_callsite_interest_shared();
     let subscriber = CapturingSubscriber::default();
     let registry = tracing::subscriber::with_default(subscriber.clone(), || {
         InstrumentRegistry::from_instruments(vec![

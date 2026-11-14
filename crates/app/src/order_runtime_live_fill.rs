@@ -180,6 +180,24 @@ pub(super) async fn handle_live_fill_cmd(
                 queue_exit_retry(book, risk, ctx, ExitRetry::waiting(x));
                 return true;
             }
+            // An entry for an instrument whose exit is waiting must not book
+            // before that exit (audit 2026-11-14): placed at once, a reversal
+            // entry booked first, the exit's resend was clamped against the
+            // position the entry left and refused, and the book ended flat
+            // where the decisions meant short. So what waits is sent first,
+            // in order, through the gates as they stand now (round 2: the
+            // entry is never held, so it takes no slot in the exits' queue
+            // and is never booked later at a stale price). If the instrument
+            // still has an exit waiting, the shared gate that refused it is
+            // closed, and the entry is refused now, as its own attempt would
+            // have been.
+            if waits_for_same_instrument(&book.live_fill_exit_retry, &x) {
+                let refusal = retry_live_fill_exits(oms, risk, book, ctx).await;
+                if waits_for_same_instrument(&book.live_fill_exit_retry, &x) {
+                    refuse_behind_waiting_exit(risk, ctx, &x, refusal);
+                    return true;
+                }
+            }
             match execute(oms, risk, book, ctx, &x).await {
                 Placed::RetryExit(err) => {
                     queue_exit_retry(book, risk, ctx, ExitRetry::new(x, err));
@@ -237,6 +255,32 @@ impl ExitRetry {
             last_err: "queued_behind_earlier_exits".to_owned(),
         }
     }
+}
+
+/// Whether an exit waiting for a resend is for `x`'s instrument (the
+/// composite `(security_id, segment)` key). O(waiting), at most
+/// [`LIVE_FILL_EXIT_RETRY_CAPACITY`]; O(1) when nothing waits. Cold.
+fn waits_for_same_instrument(waiting: &[ExitRetry], x: &PaperExecution) -> bool {
+    waiting
+        .iter()
+        .any(|r| r.x.security_id == x.security_id && r.x.segment == x.segment)
+}
+
+/// Refuses an entry whose instrument still has an exit waiting after the
+/// waiting exits were sent: one Reject row naming the gate refusal that
+/// ended that round, and the position report. Nothing is booked. Cold.
+fn refuse_behind_waiting_exit(
+    risk: &RiskEngine,
+    ctx: &RuntimeCtx,
+    x: &PaperExecution,
+    refusal: Option<String>,
+) {
+    let gate = refusal.unwrap_or_else(|| "queued_behind_earlier_exits".to_owned());
+    let mut seq = x.next_seq;
+    emit(ctx, &x.base, LiveOrderEventKind::Reject, &mut seq, |row| {
+        paper_rows::fill_reject(row, x, format!("{gate};behind_waiting_exit"));
+    });
+    report_position(risk, ctx, x);
 }
 
 /// A refusal that clears as time passes: the per-second rate limit, the
@@ -315,19 +359,27 @@ fn queue_exit_retry(book: &mut BookState, risk: &RiskEngine, ctx: &RuntimeCtx, r
     report_position(risk, ctx, &r.x);
 }
 
-/// Sends every waiting exit again (the 1 s housekeeping tick). Each one is
-/// clamped afresh against the position held now, so an exit whose position
-/// another order already closed is refused `exit_without_position`. O(1) when
-/// nothing waits; else O(waiting), at most
+/// Sends every waiting exit again: on the 1 s housekeeping tick, and when an
+/// entry arrives for an instrument whose exit waits (audit 2026-11-14). Each
+/// exit is clamped afresh against the position held now, so an exit whose
+/// position another order already closed is refused `exit_without_position`.
+/// Returns the gate refusal that ended the round, `None` when every exit was
+/// sent. O(1) when nothing waits; else O(waiting), at most
 /// [`LIVE_FILL_EXIT_RETRY_CAPACITY`]. Cold.
+///
+/// Honest limit: a round run for an arriving entry and refused counts one
+/// more attempt on the exit at the head of the queue, so a burst of such
+/// entries spends its [`LIVE_FILL_EXIT_RETRY_MAX_ATTEMPTS`] sooner than one
+/// hour; each such attempt is a real refused place (the entry's own attempt
+/// would have cost the same order-budget unit before).
 pub(super) async fn retry_live_fill_exits(
     oms: &mut OrderManagementSystem,
     risk: &mut RiskEngine,
     book: &mut BookState,
     ctx: &RuntimeCtx,
-) {
+) -> Option<String> {
     if book.live_fill_exit_retry.is_empty() {
-        return;
+        return None;
     }
     let waiting = std::mem::take(&mut book.live_fill_exit_retry);
     // The first refusal ends the round (LF-6b review round 3, findings 3 and
@@ -335,10 +387,10 @@ pub(super) async fn retry_live_fill_exits(
     // budget, order book, circuit), so the exits after it would only be
     // refused too, each costing an order-budget unit (the OMS takes it before
     // the rate check) and a High alert. They go back in order, untouched.
-    let mut gate_closed = false;
+    let mut refusal: Option<String> = None;
     let mut sent: u64 = 0;
     for mut r in waiting {
-        if gate_closed {
+        if refusal.is_some() {
             book.live_fill_exit_retry.push(r);
             continue;
         }
@@ -346,14 +398,15 @@ pub(super) async fn retry_live_fill_exits(
         match execute(oms, risk, book, ctx, &r.x).await {
             Placed::RetryExit(err) => {
                 r.attempts = r.attempts.saturating_add(1);
-                r.last_err = err;
-                gate_closed = true;
+                r.last_err.clone_from(&err);
+                refusal = Some(err);
                 queue_exit_retry(book, risk, ctx, r);
             }
             Placed::Done => report_position(risk, ctx, &r.x),
         }
     }
     metrics::counter!(LIVE_FILL_EXIT_RETRIES_COUNTER).increment(sent);
+    refusal
 }
 
 // The exit clamp (`clamp_exit`) moved to `live_fill::paper_rows` unchanged
@@ -1340,6 +1393,193 @@ mod tests {
             .map(|s| i64::try_from(*s).expect("fits"))
             .collect();
         assert_eq!(order, want);
+    }
+
+    /// Audit 2026-11-14 (finding 1): long 100, the exit was refused by the
+    /// rate gate and waits, then a reversal entry (sell 100) for the same
+    /// instrument arrives while the gate has room. The waiting exit is sent
+    /// first, then the entry, and the book ends short 100. Placed at once, the
+    /// entry booked first (100 → 0), the exit's resend found nothing held and
+    /// was refused `exit_without_position`, and the book ended flat. An entry
+    /// for another instrument is placed without touching the queue.
+    #[tokio::test]
+    async fn test_regression_entry_waits_behind_a_waiting_exit_for_the_same_instrument() {
+        let (tx, mut rx) = mpsc::channel(1_024);
+        let ctx = ctx(tx);
+        let mut oms = oms();
+        let mut risk = RiskEngine::new(2.0, 1_000, 1_000_000.0);
+        let mut book = BookState::new();
+        let seg = ExchangeSegment::NseEquity;
+        let sid = 8_100;
+        let order = |side: Side, exit: bool| {
+            let mut x = execution(100, 100);
+            x.security_id = sid;
+            x.side = side;
+            x.exit = exit;
+            PaperCmd::Execute(Box::new(x))
+        };
+        handle_live_fill_cmd(
+            &mut oms,
+            &mut risk,
+            &mut book,
+            &ctx,
+            order(Side::Buy, false),
+        )
+        .await;
+        assert_eq!(risk.net_lots_for_in_segment(sid, seg), 100);
+        // The exit a rolling gate refused, put in the queue directly so the
+        // test does not depend on the limiter refilling within a deadline.
+        let mut exit = execution(100, 100);
+        exit.security_id = sid;
+        exit.side = Side::Sell;
+        exit.exit = true;
+        book.live_fill_exit_retry.push(ExitRetry::new(
+            Box::new(exit),
+            "place_refused:rate limited".to_owned(),
+        ));
+        // Another instrument's entry is placed, and the exit still waits.
+        let other = PaperCmd::Execute(Box::new(execution_for(8_300, Side::Buy, false)));
+        handle_live_fill_cmd(&mut oms, &mut risk, &mut book, &ctx, other).await;
+        assert_eq!(risk.net_lots_for_in_segment(8_300, seg), 1);
+        assert_eq!(book.live_fill_exit_retry.len(), 1);
+        assert_eq!(risk.net_lots_for_in_segment(sid, seg), 100);
+        while rx.try_recv().is_ok() {}
+        // The reversal entry: the exit is sent first, then the entry.
+        handle_live_fill_cmd(
+            &mut oms,
+            &mut risk,
+            &mut book,
+            &ctx,
+            order(Side::Sell, false),
+        )
+        .await;
+        assert!(book.live_fill_exit_retry.is_empty());
+        assert_eq!(risk.net_lots_for_in_segment(sid, seg), -100, "short 100");
+        let rows = drain_any(&mut rx);
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r.0 == LiveOrderEventKind::Fill)
+                .count(),
+            2,
+            "{rows:?}"
+        );
+        assert!(
+            rows.iter().all(|r| r.0 != LiveOrderEventKind::Reject),
+            "{rows:?}"
+        );
+    }
+
+    /// A dry-run OMS whose per-minute order budget is spent: every place is
+    /// refused `OrderBudgetExhausted` (a refusal that rolls over) until 60 s
+    /// after its first order. No other gate can refuse in the meantime (the
+    /// rate limit is far above the orders placed).
+    async fn oms_with_spent_minute_budget() -> OrderManagementSystem {
+        let mut oms = oms_with_rate(100_000);
+        let mut spent = false;
+        for _ in 0..2_000 {
+            let request = PlaceOrderRequest {
+                security_id: 1,
+                exchange_segment: ExchangeSegment::NseEquity,
+                transaction_type: TransactionType::Buy,
+                order_type: OrderType::Limit,
+                product_type: ProductType::Intraday,
+                validity: OrderValidity::Day,
+                quantity: 1,
+                price: 100.0,
+                trigger_price: 0.0,
+                lot_size: 1,
+                expiry_date: None,
+            };
+            if let Err(err) = oms.place_order(request).await {
+                assert!(
+                    matches!(err, OmsError::OrderBudgetExhausted { .. }),
+                    "unexpected refusal while spending the budget: {err}"
+                );
+                spent = true;
+                break;
+            }
+        }
+        assert!(spent, "the per-minute order budget never ran out");
+        oms
+    }
+
+    /// Audit 2026-11-14 (round 2, findings 2 to 4): an entry for an
+    /// instrument whose exit waits is never held. With the shared gate still
+    /// closed (the minute's order budget spent), the waiting exit is sent
+    /// first, refused and kept; the entry is refused at once with a Reject row
+    /// naming the gate, as its own attempt would have been, so it takes no
+    /// slot in the exits' queue and is never booked later at a stale price.
+    /// Before, each entry was queued behind the exit (the queue grew by one
+    /// per entry, crowding out later exits) and booked whenever the gate
+    /// reopened, up to an hour later. Deterministic: the refusal is the spent
+    /// minute budget, which holds for 60 s, not a 1 s rate-limit refill.
+    #[tokio::test]
+    async fn test_regression_entry_behind_a_waiting_exit_is_refused_when_the_gate_is_closed() {
+        let (tx, mut rx) = mpsc::channel(1_024);
+        let ctx = ctx(tx);
+        let mut risk = RiskEngine::new(2.0, 1_000, 1_000_000.0);
+        let mut book = BookState::new();
+        let seg = ExchangeSegment::NseEquity;
+        let (a, b) = (8_400, 8_500);
+        let paper = |sid: u64, qty: i64, side: Side, exit: bool| {
+            let mut x = execution(qty, qty);
+            x.security_id = sid;
+            x.side = side;
+            x.exit = exit;
+            Box::new(x)
+        };
+        let mut booking = oms();
+        let cmd = PaperCmd::Execute(paper(a, 100, Side::Buy, false));
+        handle_live_fill_cmd(&mut booking, &mut risk, &mut book, &ctx, cmd).await;
+        assert_eq!(risk.net_lots_for_in_segment(a, seg), 100);
+        book.live_fill_exit_retry.push(ExitRetry::new(
+            paper(a, 100, Side::Sell, true),
+            "place_refused:order budget".to_owned(),
+        ));
+        let mut closed = oms_with_spent_minute_budget().await;
+        while rx.try_recv().is_ok() {}
+        for _ in 0..3 {
+            let entry = PaperCmd::Execute(paper(a, 100, Side::Sell, false));
+            handle_live_fill_cmd(&mut closed, &mut risk, &mut book, &ctx, entry).await;
+        }
+        // An entry for another instrument meets the closed gate itself.
+        let other = PaperCmd::Execute(paper(b, 1, Side::Buy, false));
+        handle_live_fill_cmd(&mut closed, &mut risk, &mut book, &ctx, other).await;
+        assert_eq!(risk.net_lots_for_in_segment(a, seg), 100, "nothing booked");
+        assert_eq!(risk.net_lots_for_in_segment(b, seg), 0);
+        let left: Vec<(u64, bool, u32)> = book
+            .live_fill_exit_retry
+            .iter()
+            .map(|r| (r.x.security_id, r.x.exit, r.attempts))
+            .collect();
+        assert_eq!(
+            left,
+            vec![(a, true, 4)],
+            "only the exit waits; each entry's round tried it once"
+        );
+        let rows = drain_any(&mut rx);
+        let rejects: Vec<&str> = rows
+            .iter()
+            .filter(|r| r.0 == LiveOrderEventKind::Reject)
+            .filter_map(|r| r.2.as_deref())
+            .collect();
+        assert_eq!(rejects.len(), 4, "{rows:?}");
+        for reason in &rejects[..3] {
+            assert!(
+                reason.starts_with("place_refused:") && reason.ends_with(";behind_waiting_exit"),
+                "{reason}"
+            );
+        }
+        assert!(rejects[3].starts_with("place_refused:"), "{}", rejects[3]);
+        assert!(
+            rows.iter().all(|r| r.0 != LiveOrderEventKind::Fill),
+            "{rows:?}"
+        );
+        // With the gate open again, the tick books the exit and nothing else.
+        let mut open = oms();
+        retry_live_fill_exits(&mut open, &mut risk, &mut book, &ctx).await;
+        assert!(book.live_fill_exit_retry.is_empty());
+        assert_eq!(risk.net_lots_for_in_segment(a, seg), 0, "flat, not short");
     }
 
     fn drain_any(

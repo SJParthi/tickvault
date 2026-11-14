@@ -4298,6 +4298,7 @@ mod tests {
         );
         // `OrderUpdate` never reaches this module in production, so no other
         // test moves its slot of the process-wide throttle.
+        crate::test_support::keep_callsite_interest_shared();
         tracing::subscriber::with_default(subscriber, || {
             for _ in 0..4 {
                 report_oversize_refusal(DhanEndpointType::OrderUpdate, &err);

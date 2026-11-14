@@ -182,6 +182,12 @@ jobs:
       # slower on the same runner too and still fails; if the tool cannot
       # re-measure (no saved binary, bench failure, more than 16 flagged), rc
       # stays 2. Proof: crates/common/tests/bench_ab_recheck.rs.
+      # SAME COMMIT (2026-11-14, run 43536429172 vs 43476616865, both
+      # e9b812d): when the key's commit is the head commit the head binary
+      # plays BOTH parts even if a saved one exists, since two builds of one
+      # commit can differ by more than 5%. The summary names the restored key,
+      # or says no baseline was restored, so an absolute-only pass is never
+      # read as a regression check.
       - name: Run bench-gate (absolute budgets + 5% regression)
         id: gate
         # `bash -eo pipefail`: `cmd | tee log && rc=0 || rc=$?` keeps cmd's
@@ -196,7 +202,7 @@ jobs:
           if [ "$rc" = 2 ] && cargo run -q --profile bench -p tickvault-common --bin bench_ab_recheck -- target/criterion bench-output.log gate-output.log 2>&1 | tee -a gate-output.log; then rc=0; bash scripts/bench-gate.sh | tee -a gate-output.log || rc=$?; fi
           rm -rf target/criterion/tv_ab_bins && mkdir target/criterion/tv_ab_bins && grep -o 'target/release/deps/[^)]*' bench-output.log | sort -u | xargs -r cp -t target/criterion/tv_ab_bins/ || true
           echo "gate_rc=$rc" >> "$GITHUB_OUTPUT"
-          printf '## Bench Gate Results\n```\n%s\n```\n' "$(cat gate-output.log)" >> "$GITHUB_STEP_SUMMARY"
+          printf '## Bench Gate Results\nBaseline restored: %s\n```\n%s\n```\n' "${BENCH_AB_BASELINE_KEY:-NONE (cache restore missed): this run had NO 5% regression check, only the absolute budgets}" "$(cat gate-output.log)" >> "$GITHUB_STEP_SUMMARY"
           exit "$rc"
 
       # Save the baseline whenever the benches completed and there was NO

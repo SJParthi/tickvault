@@ -286,6 +286,10 @@ pub struct ChainCounters {
     /// and 9): their entries are refused `day_volume_unknown` for the day
     /// (exits still go out).
     pub volume_unknown_marked: u64,
+    /// Counter restarts read on a dropped tick and carried to the
+    /// instrument's next trade (`note_cumulative`): each breaks the chain's
+    /// bars as the fold's own restart does. Not a metric.
+    pub dropped_tick_restarts: u64,
 }
 
 /// Context carried with a held order, for its rows.
@@ -862,11 +866,30 @@ impl<E: StrategyEngine> LiveFillChain<E> {
     /// difference too. Before, a wrap on a tapped tick after any loss
     /// anywhere (the loss count is global) read as a restart on a dropped
     /// tick and marked the instrument's volume unknown for the day.
+    ///
+    /// Audit 2026-11-14 (finding 2): the fold reads a counter restart as a
+    /// fall below its high mark, so a restart tick carries `stale_packet`
+    /// AND `cumulative_restarted`. It was skipped as stale, `cum_seen` kept
+    /// the pre-restart cumulative, and the next tick after any later loss
+    /// (the loss count is global) read as a restart on a dropped tick:
+    /// `restart_pending`, day volume unknown, entries refused for the day.
+    /// A restart tick is now recorded (its new cumulative and `drop_seq`);
+    /// only a stale packet that is not a restart is skipped. When the loss
+    /// count moved between the instrument's last tapped tick and its restart
+    /// tick, ticks dropped before the restart had volume the fold counted
+    /// that no forward difference can find, so the day volume is marked
+    /// unknown (as the old reading did, without the false restart). O(1).
     #[inline]
     fn note_cumulative(&mut self, ki: u32, t: &TapTick) {
         let k = ki as usize;
-        if k >= self.cum_seen.len() || t.stale_packet {
+        if k >= self.cum_seen.len() || (t.stale_packet && !t.cumulative_restarted) {
             return;
+        }
+        if t.cumulative_restarted
+            && let Some((_, seq)) = self.cum_seen[k]
+            && seq != t.drop_seq
+        {
+            self.mark_volume_unknown(k);
         }
         if self.cum_seen[k].is_none()
             && !t.fold_seed
@@ -885,6 +908,8 @@ impl<E: StrategyEngine> LiveFillChain<E> {
                 self.missed_volume[k] = self.missed_volume[k].saturating_add(missed);
             } else {
                 self.restart_pending[k] = true;
+                self.counters.dropped_tick_restarts =
+                    self.counters.dropped_tick_restarts.saturating_add(1);
                 self.mark_volume_unknown(k);
             }
         }
