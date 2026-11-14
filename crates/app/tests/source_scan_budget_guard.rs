@@ -28,6 +28,14 @@ const BUDGET: &[(&str, usize)] = &[
     ("api_token_rotation.rs", 1),
     ("bin/smoke_test.rs", 1),
     ("boot_helpers.rs", 1),
+    // 2026-11-14 (owner Quote 60, second review): one wiring scan pinning that
+    // the export loop reads every readiness gate, marks a run for the evening
+    // restart and books each run's end (an endless loop over QuestDB and S3
+    // cannot be staged in a unit test). Paired behaviour tests:
+    // `test_compose_reasons_labels_hard_soft_and_note`,
+    // `test_apply_run_end_books_each_end`,
+    // `test_past_day_forced_two_days_on_and_across_a_weekend`.
+    ("brutex_export_boot.rs", 1),
     // 2026-10-26 (audit J3): +5 wiring scans, one per audit consumer, pinning
     // that each starts the audit DDL re-run when its own ensure is refused (a
     // refusal at the one moment a consumer starts cannot be staged in a unit
@@ -49,7 +57,12 @@ const BUDGET: &[(&str, usize)] = &[
     // Paired behaviour tests: the `test_observe_*` episode tests and
     // `test_feed_clock_offset_episode_uses_the_ist_minute_and_window`.
     ("clock_offset_page.rs", 1),
-    ("contract_name_repair_boot.rs", 1),
+    // 1 -> 2 (2026-11-14, owner Quote 60 second review): pins that the repair
+    // loop publishes each run through `record_run` (a revert to a bare
+    // `state.record` left the export gate pending with every test green).
+    // Paired behaviour tests: `test_repair_state_is_set_only_when_the_day_is_over`,
+    // `test_exhausted_repair_with_failures_is_not_clean`.
+    ("contract_name_repair_boot.rs", 2),
     // 1 -> 2 (2026-11-07, PR AA step 1, owner Quote 51): pins that the daily
     // loop seeds the quiesce counters before its first pass (the loop cannot
     // run without QuestDB and S3). Paired behaviour half in the same test:

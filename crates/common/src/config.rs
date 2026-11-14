@@ -2516,6 +2516,17 @@ pub struct PartitionRetentionConfig {
     /// be copied to S3 and dropped (step 6). Never past 07:30 IST.
     #[serde(default = "default_archive_switch_on")]
     pub drain_hold_counts_archive: bool,
+    /// The daily Brutex export (owner Quote 60, 2026-11-14): after the
+    /// close, day D's tick, quote, aux, depth and candle partitions are
+    /// written to their canonical archive keys (create-only, rows ordered by
+    /// the DEDUP key), then a manifest and a `DONE` marker under
+    /// `questdb-partitions/_daily/<D>/`, and the archiver's amend records
+    /// for copies a manifest may not name. `false` turns those off; the
+    /// archiver's DEDUP-key ordering does not follow the switch (it sorts only
+    /// against an existing canonical object, outside the trading-day window).
+    /// Never deletes or overwrites.
+    #[serde(default)]
+    pub brutex_export_enabled: bool,
     /// Internal marker: this config drives a DISK-PRESSURE archive pass.
     ///
     /// NOT a config knob. `#[serde(skip)]` means no TOML can set it and an
@@ -2573,6 +2584,7 @@ impl Default for PartitionRetentionConfig {
             daily_free_target_fallback_session_bytes:
                 default_daily_free_target_fallback_session_bytes(),
             drain_hold_counts_archive: true,
+            brutex_export_enabled: false,
             under_disk_pressure: false,
         }
     }

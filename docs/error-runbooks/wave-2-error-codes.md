@@ -432,6 +432,66 @@ QuestDB partition to S3 and the upload failed. Idempotency-key
 
 **Source:** `crates/storage/src/s3_archive.rs` (Wave 2 Item 9.4)
 
+**`source = "brutex_daily_export"` (owner Quote 60, 2026-11-14).** The daily
+Brutex export gave up on a day (3 attempts with a 15/30/60-minute backoff;
+from 20:45 IST the session day is retried as a catch-up day, without a hold)
+and wrote no `DONE`, so Brutex sees the day as not exported. Nothing was
+deleted or overwritten. Log-only: no CloudWatch filter matches STORAGE-GAP-04,
+and the export adds no page. Each failed attempt is a coded `warn!` with the
+same code and the reason (recount mismatch while rows still landed, the
+scratch volume under 2 GiB free, S3 unreachable, a content-addressed key
+already holding other bytes).
+1. Look in S3: `questdb-partitions/_daily/<D>/` lists every attempt's
+   `manifest-<n>.json`; a `DONE` there means the day is sealed after all.
+2. A later poll or process retries the day as a catch-up day: a past day
+   runs once nothing delays it, and anyway (sealed `complete = false`,
+   the manifest naming what was pending) once it is 2 days old, so a
+   weekend never hides it. A day that still leaves the 7-day window with no
+   `DONE` logs `source = "brutex_daily_export_left_window"` (below).
+3. Turn it off with `[partition_retention] brutex_export_enabled = false`
+   (the archiver keeps sorting only against an existing object, or one it
+   cannot rule out, and only outside 08:30-15:40 IST, so it still reuses
+   what the export placed; amend records continue for every day that already
+   has a `DONE`).
+
+**`source = "brutex_daily_export_left_window"`.** A session day left the
+7-day catch-up window with no `DONE`. Logged ONCE PER PROCESS for every
+session day up to a week past the window (from 2026-11-14 on), so each boot
+and evening-drain restart of that week logs it again (about 7 to 28 identical
+lines for one missed day). Brutex never gets that day from the export; its
+partitions still reach S3 through the archive and appear as amend records.
+Log-only: until a noise-lock row adds a page, the app logs (or Brutex finding
+no `DONE`) are the only way the owner learns of a missed export.
+
+**`source = "brutex_daily_export_incomplete"`.** The day was sealed with
+`complete = false`; the manifest's `incomplete_reasons` name what was still
+pending. On the session day the manifest also names, per arrival-time
+table, the hours left out because they could still take rows
+(`open_from_ist`, `open_partitions_left_out`; not a reason, `complete` is
+unchanged) and, per object, whether its rows are sorted
+(`ordered_by_dedup_key`). The possible reasons: `wal_not_applied:<t>` including `partition_archive_audit`,
+`spill_pending:<t>`, `wal_backlog:<n>` or `wal_backlog_unreadable` (frames
+shed during the session that no replay reached tonight),
+`deferred_depth_marks_floor_blocked`, `contract_names_repair_failed`,
+`contract_names_repair_pending` (a forced catch-up day after the session
+day's midnight, before a repair run reached it), a hard gate on a forced
+catch-up day,
+`archived_copy_unconfirmed:<t>/<p>`, or `no_ticks_captured` on a forced
+catch-up day. DONE is final; later copies appear only as amend records
+`_daily/<D>/amend-*.json` (every verified archiver copy of an export-table
+partition gets one, a reuse included). Log-only, like the line above.
+
+**Stopped, not failed.** An attempt stops (not counted, nothing sealed)
+when the window would close before the next partition could finish (30
+minutes before 08:30 IST on a session day) or when the scratch volume is
+under the after-close depth pass's floor or the disk-pressure line
+(`pressure_high_water_pct`, whichever is larger) plus the partition's size (retried
+15 minutes later, so the export never pushes the disk toward the 5% line
+where pinned WAL segments are deleted, and never holds the quiesce lock a
+pressure archive pass needs).
+Source: `crates/storage/src/partition_archive/daily_export.rs`,
+`crates/app/src/brutex_export_boot.rs`.
+
 ## STORAGE-GAP-05 — disk pressure could not be relieved
 
 **Severity: Critical.** Fires ONCE per pressure episode (edge-latched).

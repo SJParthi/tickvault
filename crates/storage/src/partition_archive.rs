@@ -126,6 +126,8 @@ mod snapshot_gate;
 mod hour_path;
 // PR AA review finding 11: bytes of hour-path partitions dropped per IST day.
 mod drop_tally;
+// Owner Quote 60 (2026-11-14): the daily Brutex export to the canonical keys.
+pub mod daily_export;
 
 use hour_path::{
     HOUR_PATH_TABLES, TICK_SPILL_TABLES, hot_hour_floor, hour_window_for,
@@ -760,6 +762,27 @@ fn partition_range_naive(name: &str) -> Option<(chrono::NaiveDateTime, chrono::N
 /// allowlist-validated partition name.
 pub(crate) fn build_export_sql(table: &str, start: &str, end: &str) -> String {
     format!("SELECT * FROM {table} WHERE ts >= '{start}' AND ts < '{end}'")
+}
+
+/// [`build_export_sql`] with an optional `ORDER BY` (owner Quote 60): the
+/// daily Brutex export orders the rows by the table's DEDUP key, and the
+/// archiver orders the same way whenever an object already sits at the
+/// canonical key and the clock is outside 08:30 to the session's ingest end
+/// (`daily_export::archiver_export_order`; the export switch plays no part),
+/// so an unchanged partition exports to the same bytes twice and the archive
+/// reuses the export's object. `None` is exactly [`build_export_sql`].
+/// Pure, O(1).
+// TEST-EXEMPT: covered by test_build_export_sql_orders_by_dedup_key_when_enabled
+pub(crate) fn build_export_sql_ordered(
+    table: &str,
+    start: &str,
+    end: &str,
+    order_by: Option<&str>,
+) -> String {
+    match order_by {
+        Some(key) => format!("{} ORDER BY {key}", build_export_sql(table, start, end)),
+        None => build_export_sql(table, start, end),
+    }
 }
 
 /// Post-export recount SQL over the identical range (verify leg (a)).
@@ -1828,6 +1851,10 @@ pub struct PartitionArchiver {
     /// depth-hour exclusion relies on holds (PR AA review finding 12):
     /// [`snapshot_gate::process_depth_ack_bound_trusted`] in production.
     depth_ack_bound_trusted: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
+    /// Whether the clock is inside the trading-day window (08:30 to the
+    /// session's export opening; owner Quote 60): the archiver never sorts
+    /// there. [`daily_export::in_trading_day_window_now`] in production.
+    trading_window_now: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
 }
 
 /// How the archiver reads a table's spill folder (PR AA review).
@@ -2077,6 +2104,7 @@ impl PartitionArchiver {
             depth_ack_bound_trusted: std::sync::Arc::new(
                 snapshot_gate::process_depth_ack_bound_trusted,
             ),
+            trading_window_now: std::sync::Arc::new(daily_export::in_trading_day_window_now),
         }))
     }
 
@@ -2129,6 +2157,7 @@ impl PartitionArchiver {
             depth_ack_bound_trusted: std::sync::Arc::new(
                 snapshot_gate::process_depth_ack_bound_trusted,
             ),
+            trading_window_now: std::sync::Arc::new(daily_export::in_trading_day_window_now),
         })
     }
 
@@ -3458,6 +3487,38 @@ impl PartitionArchiver {
         summary.verified = summary.verified.saturating_add(1);
         metrics::counter!("tv_partition_archive_verified_total").increment(1);
 
+        // Owner Quote 60 (2026-11-14 reviews): EVERY verified copy of an
+        // export-table partition gets its amend record BEFORE the audit row
+        // and the drop, whatever the day's DONE state, a reuse of the
+        // canonical object included: an hour an earlier export attempt
+        // placed and this pass reused and drops is in no manifest when the
+        // next attempt cannot yet read this pass's audit row. Not written:
+        // the drop is withheld and the partition retried next pass. With the
+        // export switched off it is still written for a day that has a DONE
+        // (2026-11-14 third review: the rollback must not hide later copies
+        // of sealed days from Brutex).
+        if let Err(err) = daily_export::note_archived_copy(
+            &self.cold,
+            self.cfg.brutex_export_enabled,
+            table,
+            partition,
+            &s3_key,
+            proof.rows,
+            proof.gzip_bytes,
+            &proof.gzip_sha256_hex,
+        )
+        .await
+        {
+            self.record_failure(
+                table,
+                partition,
+                ArchiveOutcome::AuditFailed,
+                &format!("brutex amend record not written — drop withheld: {err:#}"),
+                summary,
+            );
+            return None;
+        }
+
         // 4. Audit-GATED (F2): the `verified` row must be ACK-flushed
         //    (ILP-over-HTTP) BEFORE the drop — a failed flush WITHHOLDS the
         //    drop (the partition is kept; retried next run).
@@ -3826,8 +3887,52 @@ impl PartitionArchiver {
         end: &str,
     ) -> Result<ExportedCsv> {
         let path = self.temp_dir.join(format!("{table}-{partition}.csv.gz"));
-        let sql = build_export_sql(table, start, end);
-        self.export_query_csv(&sql, path).await
+        // Owner Quote 60 (2026-11-14 review): the export tables are exported
+        // in DEDUP-key order ONLY when an object already sits at the canonical
+        // key (the daily export placed it, or an earlier archive) and the
+        // clock is outside the trading-day window, so this archive reuses that
+        // object instead of writing a second copy. Never a sort on QuestDB in
+        // session; never dependent on the export switch. A FAILED HeadObject
+        // reads as "may exist" (2026-11-14 third review): read as absent, it
+        // made an unordered export that the next HEAD found different from
+        // the export's ordered object, a second full copy kept forever.
+        let in_window = (self.trading_window_now)();
+        let canonical_exists = daily_export::export_order_by(table).is_some()
+            && daily_export::canonical_maybe_exists(
+                &self
+                    .cold
+                    .head(&canonical_archive_key(table, partition))
+                    .await,
+            );
+        if canonical_exists && in_window {
+            metrics::counter!("tv_partition_archive_export_unordered_in_session_total")
+                .increment(1);
+        }
+        let order_by = daily_export::archiver_export_order(table, canonical_exists, in_window);
+        let sql = build_export_sql_ordered(table, start, end, order_by);
+        match self.export_query_csv(&sql, path.clone()).await {
+            Err(err) if order_by.is_some() && self.cfg.under_disk_pressure => {
+                // Freeing the disk never waits on the sort: under pressure,
+                // one retry in the old order (cost: at worst a
+                // content-addressed second copy). Outside pressure the
+                // partition is kept and the ordered export retried next pass
+                // (2026-11-14 review), so a transient error never becomes a
+                // permanent duplicate in S3.
+                metrics::counter!("tv_partition_archive_export_unordered_fallback_total")
+                    .increment(1);
+                warn!(
+                    code = ErrorCode::StorageGap04S3ArchiveFailed.code_str(),
+                    table,
+                    partition,
+                    error = %format!("{err:#}"),
+                    "partition archive: the ordered export failed; retrying once \
+                     without ORDER BY"
+                );
+                self.export_query_csv(&build_export_sql(table, start, end), path)
+                    .await
+            }
+            other => other,
+        }
     }
 
     /// Streams the `/exp` CSV of `sql` through gzip into `path`, counting
@@ -6162,6 +6267,8 @@ mod stub_integration_tests {
     mod tg_export_regressions_tests;
     // PR TG-4: the real-QuestDB export contention test (#[ignore]d, weekly lane).
     mod tg4_export_contention_tests;
+    // Owner Quote 60: the daily Brutex export against the same stubs.
+    mod daily_export_stub_tests;
 
     /// One parsed stub request (method + decoded target + lowercased headers).
     #[derive(Clone, Debug)]
@@ -6600,6 +6707,9 @@ mod stub_integration_tests {
         archiver.dropped_tally = Box::leak(Box::new(drop_tally::HourPathDropTally::new()));
         // ... and counts its accepted DROPs in its own ledger (PR AA-G review).
         archiver.drop_ledger = Box::leak(Box::new(super::ArchiveDropLedger::new()));
+        // Outside the trading-day window unless a test says otherwise, so a
+        // test never depends on the hour it runs at (owner Quote 60).
+        archiver.trading_window_now = Arc::new(|| false);
         archiver
     }
 
@@ -8255,8 +8365,14 @@ mod stub_integration_tests {
 
         assert_eq!(summary.failed, 1, "empty body = export failure, not 0 rows");
         assert_eq!(summary.dropped, 0);
+        // Owner Quote 60: the archiver HEADs the canonical key before an
+        // export-table export (to decide the order); nothing is PUT.
         assert!(
-            s3_log.lock().expect("s3 log").is_empty(),
+            !s3_log
+                .lock()
+                .expect("s3 log")
+                .iter()
+                .any(|r| r.method == "PUT"),
             "nothing uploaded"
         );
         assert!(

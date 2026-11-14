@@ -70,6 +70,8 @@ fn done_work() -> DayWork {
         wal_backlog: Some(0),
         wal_holding: false,
         archive_backlog_bytes: None,
+        brutex_export_pending: false,
+        brutex_export_running: false,
     }
 }
 

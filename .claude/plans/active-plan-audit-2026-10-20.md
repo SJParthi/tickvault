@@ -2808,3 +2808,441 @@ This item carries the 15-row + 7-row guarantee matrix by reference to `.claude/r
   - 2026-11-13 (PR C review, 6 findings, all judged real, still unticked): (1) C-3: `offer` no longer wakes per queued tick; it sets one `bool` and the drain calls `LiveFillTap::flush_wake` once per frame right after `drain_main_feed_frame` (`LiveIngest::flush_live_fill_wake`), so a chain thread that catches up and parks mid-frame is not woken (and on 2 cores cannot preempt the drain) once per tick; tests `test_flush_wake_costs_at_most_one_unpark_per_frame_while_the_consumer_reparks` (failed with the per-tick wake: 72 unparks for 6 frames) and the wiring guard `main_feed_arm_flushes_the_chain_wake_once_per_frame` (+ bite test); (2) C-2 gained its `- Files:` and `- Tests:` lines; (3) C-2: the code now never STARTS the trial between 09:00 and 15:45 IST (`nic_rx_coalesce_run`; a restore, the undo, still runs), because an override deploy or a mid-session boot runs the unit; the unit text and §12.16's "deploys are blocked" wording corrected; tests `test_nic_rx_coalesce_run_never_starts_the_trial_inside_market_hours` (failed without the gate: the 11:00 run wrote the card), `test_nic_rx_coalesce_run_still_restores_inside_market_hours`; (4) the Dhan email stays NOT READY: its packet samples and JSON need the box's `ticks` rows, which no database reachable from this session could give (Blocker, not invented); (5) the email now states our zone ID slot and asks Dhan for zone IDs, not letters, and drops "multi-AZ setup" (the instance runs in one zone); (6) the env-file undo-order guard reads each file from its NIC undo block (`undo_order_holds`, bite test `nic_undo_order_check_ignores_an_env_file_named_before_the_nic_block`).
   - 2026-11-13 (PR C review, second pass, 3 findings, 2 fixed, 1 Blocker): (1) the old-vs-new wake test's exact unpark count assumed every queued tick met a real park; a consumer stalled between its parked-flag store and its ring check took the tick without parking, so the count fell short at random. The producer now queues only once the thread is inside `park_timeout` (test-only `ChainWake::parks_entered`), test `test_regression_a_consumer_stalled_before_its_ring_check_still_meets_the_park` (forced 2 ms check stall + 5 ms flush delay; failed with the old `is_parked` gate: unpark count short); production handshake unchanged. (2) `ingest.flush_live_fill_wake()` moved after the frame's stage timings (first statement after `record_receipt_to_fold_nanos`), so the futex wake is no longer timed in `drain_main_frame` / `drain_main_tick` / `receipt_to_fold`; guard `frame_flush_holds` rewritten (bite test `frame_flush_check_refuses_a_missing_timed_or_late_flush` refuses the old placement). (3) the Dhan email stays NOT READY (Blocker): QuestDB at 127.0.0.1:9000 unreachable from this session (verified 2026-11-13), so its zone ID, packet samples and JSON cannot be filled without inventing them.
   - Items C-1, C-2 and C-3 carry the 15-row + 7-row guarantee matrix by reference to `.claude/rules/project/per-wave-guarantee-matrix.md`.
+
+## ITEM BRUTEX-EXPORT — Brutex daily export + read-only role (owner Quote 60, 2026-11-14)
+
+> Folded in from its own `active-plan-brutex-export.md` (2026-11-14 second review) so the
+> active-plan count stays at the V7 cap of 5 without archiving another workstream's plan.
+> Its six design sections are the `###` headings below.
+
+
+**Status:** IN_PROGRESS
+**Date:** 2026-11-14
+**Approved by:** Parthiban (owner), 2026-11-14: "yes build the daily export and read-only login dude"; cards "Everything daily, kept forever", "CSV.gz, same as now (Recommended)", "Role your Mac login switches into (Recommended)".
+**Crates:** tickvault-storage (`crates/storage/src/partition_archive.rs`, new `crates/storage/src/partition_archive/daily_export.rs`), tickvault-app (new `crates/app/src/brutex_export_boot.rs`, `crates/app/src/daily_archive_boot.rs`, `crates/app/src/drain_hold.rs`, `crates/app/src/contract_name_repair_boot.rs`), tickvault-common (`crates/common/src/market_hours.rs`, `crates/common/src/config.rs`, new guard tests), terraform (`deploy/aws/terraform/brutex-readonly-role.tf`, `outputs.tf`).
+
+> **Guarantee matrices:** every item below carries the 15-row + 7-row matrices
+> by cross-reference to `.claude/rules/project/per-wave-guarantee-matrix.md`
+> (the canonical copy), instantiated in Design / Test Plan / Observability.
+> Honest claim wording (charter §F): the export is "complete inside the tested
+> envelope": every listed object is verified (S3 length + SHA-256 + recount)
+> before the manifest names it, and DONE is written last. It is NOT a claim
+> that every row of the day is in it; the manifest says what was pending.
+
+### Owner decisions (to record rule-file-first, item 1)
+
+| Card | Choice |
+|---|---|
+| Daily export: what goes in | "Everything daily, kept forever" (every trading day by about 4:15 PM IST, list of files, row counts, checksums, a done file; never deleted) |
+| Format | "CSV.gz, same as now (Recommended)" |
+| Read-only login | "Role your Mac login switches into (Recommended)" (read-only, Brutex files only, no new password or key) |
+
+### Design
+
+#### Determinism verdict (evidence)
+
+| Layer | Verdict | Evidence |
+|---|---|---|
+| gzip header | **Verified deterministic** | `GzEncoder::new(.., Compression::default())` uses `GzBuilder::new()`: mtime 0, OS byte 0xff, level 6 (flate2 1.1.11 `src/gz/mod.rs` `into_header`); measured header `1f 8b 08 00 00 00 00 00 00 ff` |
+| deflate body vs input chunking | **Verified deterministic** (for the sample) | the app build uses the miniz_oxide backend (`cargo tree -e features -i flate2 -p tickvault-app`: no zlib feature); a scratch program fed a 36.8 MB CSV through the same encoder in 6 split patterns (whole, 1 byte, 7/8191/65536/3, 16 KiB, 100000/1/31, 1 MiB): all 6 outputs byte-identical (6,697,864 bytes) |
+| CSV bytes from QuestDB `/exp` | **NOT deterministic today** | `build_export_sql` is `SELECT * FROM {t} WHERE ts >= .. AND ts < ..` with **no ORDER BY**, so rows come in physical order: ts ascending, ties in commit/merge order. `ticks` stamps exchange time in whole seconds, so ties are thousands per second. Day-D partitions are rewritten after 16:15 by the evening WAL replay (DEDUP upsert of identical rows), spill replay, the after-close depth pass and the contract name repair (`INSERT … SELECT`). Whether a dedup merge keeps the old tie order is Unknown (QuestDB source not checked), so an unchanged ROW SET can come back in a different ORDER and different bytes |
+| value formatting | Assumed deterministic | QuestDB renders the same stored value the same way within one QuestDB version (9.3.5 pinned); an upgrade can change it (Limitation: new bytes, a sidecar, never a loss) |
+
+**Consequence (design rule):** both export paths (the daily export AND the
+archiver) add an explicit total `ORDER BY` on the table's DEDUP key columns,
+taken from the DEDUP constants themselves so they cannot drift:
+
+| Table | ORDER BY (= DEDUP key constant) |
+|---|---|
+| `ticks` | `DEDUP_KEY_TICKS` = ts, security_id, segment, capture_seq, feed |
+| `tick_quotes` | `DEDUP_KEY_TICK_QUOTES` = ts, security_id, segment, capture_seq, feed |
+| `feed_aux_packets` | `DEDUP_KEY_FEED_AUX_PACKETS` = ts, security_id, segment, kind, capture_seq, feed |
+| `market_depth` | `DEDUP_KEY_MARKET_DEPTH` = ts, security_id, segment, depth_kind, side, level, capture_seq, feed |
+| `market_depth_book` | `DEDUP_KEY_MARKET_DEPTH_BOOK` = ts, security_id, segment, depth_kind, side, capture_seq, feed |
+| every emitted candle table | `DEDUP_KEY_CANDLES` = ts, security_id, segment, feed |
+
+DEDUP UPSERT keys are unique per row, so the order is total. Every other
+table the archiver sweeps keeps today's query (no Brutex reader, no need).
+**Stated effect on already-archived objects:** only partitions that already
+have a canonical object AND are re-exported (an earlier upload that was not
+dropped) produce new ordered bytes and therefore one sidecar each, once. A
+partition never uploaded is unaffected. Nothing is deleted or overwritten.
+
+**Risk (unmeasured):** QuestDB must sort each partition before the first
+byte. A `ticks` hour is ~10M rows (Assumed from 64,349,753 ticks/session);
+time and memory of that sort on the r8g.large are Unknown. Mitigation: the
+archiver falls back ONCE per partition to the unordered query when the
+ordered export fails (counted, `tv_partition_archive_export_unordered_fallback_total`),
+so an ORDER BY failure can never stop the disk from being freed (cost: a
+sidecar for that partition, never a loss). The daily export does not fall
+back (an unordered export would defeat reuse); it records the table as
+failed and retries.
+
+#### What the daily export writes
+
+For trading/Muhurat day D, for each table in the export set (`ticks`,
+`tick_quotes`, `feed_aux_packets`, `market_depth`, `market_depth_book`, and
+`emitted_candle_table_names()`), for each QuestDB partition whose name starts
+with D (hour tables `D T00..T23`, candle tables `D`):
+
+1. export with the ordered SQL through the archiver's own `export_query_csv`
+   (same gzip, same SHA-256, same quote-aware record count) into its OWN temp
+   dir `data/tmp/brutex-export/` (never the archiver's dir, which
+   `clean_temp_dir` empties), with an instrument tally hook (below);
+2. place it with the archiver's own `place_archive` (HeadObject; same length
+   AND same stored SHA-256 → reuse; absent → conditional PutObject
+   `If-None-Match: "*"` + `checksum_sha256` at
+   `questdb-partitions/<table>/<partition>.csv.gz`; different content → the
+   content-addressed sidecar `<partition>.sha-<hex>.csv.gz`);
+3. verify: recount (`count(), max(ts)`) equals the exported rows, S3 length
+   equals the local gzip length (same `verify_archive` rules). A mismatch
+   (a write landed during the export) retries the partition once, then marks
+   the table failed for this attempt;
+4. NO audit row, NO drop, NO delete. The export never calls
+   `drop_partition`, `delete_s3_object`, `DeleteObject` or `DROP` (source
+   scan guard).
+
+A partition already archived AND dropped before the export (the hour path
+can drop a depth hour after 4 h under disk pressure) is listed from its
+`partition_archive_audit` `verified` row (key, rows, SHA-256), confirmed
+with a HeadObject, placement `archived_before_export`, instrument counts
+`unknown` for that partition.
+
+Then, in this order, each a conditional PutObject that never overwrites:
+
+5. `questdb-partitions/_daily/<D>/instrument-counts-<n>.csv.gz`: rows per
+   `(table, security_id, segment, feed)`, counted from the very bytes
+   uploaded (header-indexed, quote-aware field split on the raw stream; a
+   `HashMap` on the composite key, cold path). Chosen over a separate
+   `GROUP BY` query because it cannot disagree with the file. The sum per
+   table must equal the table's exported rows or the attempt fails.
+6. `questdb-partitions/_daily/<D>/manifest-<n>.json`: schema version, D,
+   attempt n, export start/end IST, app git sha, `complete` + list of
+   `incomplete_reasons`, cross-verify state of D at export time, per table
+   the ORDER BY used, total rows, and per partition: key, placement
+   (`uploaded` / `reused` / `sidecar` / `archived_before_export`), rows,
+   csv bytes, gzip bytes, SHA-256 hex; plus the counts file's key, bytes and
+   SHA-256.
+7. re-HeadObject every listed key (length + SHA-256 still match; guards the
+   one race where the archiver deletes its OWN just-uploaded object on its
+   pre-drop mismatch arm);
+8. LAST: `questdb-partitions/_daily/<D>/DONE` = `{manifest_key,
+   manifest_sha256_hex, written_at_ist}`.
+
+**Re-run rule (simplest correct):** DONE exists → nothing to do. No DONE →
+list `_daily/<D>/manifest-*.json`, n = highest + 1 (1 if none), write
+counts-n, manifest-n, then DONE pointing at manifest-n. Brutex reads DONE
+first and only the manifest it names. Old attempts stay (never deleted). A
+412 on DONE means another writer sealed the day first: read it, done.
+Later corrections (a partition rewritten after DONE) appear as the
+archiver's sidecar objects; item 8 adds an `_daily/<D>/amend-<table>-<partition>-<sha12>.json`
+record so Brutex can find them without listing every key.
+
+#### When day D is final enough
+
+Pure scheduler (`brutex_export_boot`), polling every 60 s:
+
+| Gate | Rule |
+|---|---|
+| Window | allowed only outside `[08:30, 15:45)` IST on a trading or Muhurat day; on a Muhurat date also only after its configured `session_end_ist` + 360 s. Pure `export_window_open(date, secs, is_session_day, muhurat_end)`, proptest: never true inside the forbidden window |
+| Session day | `archive_session_day` rule: before 07:30 the clock belongs to the previous day |
+| Live side final (today only) | `dhan_live_crossverify_boot::live_side_readiness` (catch-up sweep published, seal writer drained after it, `candles_1m` WAL applied) |
+| Contract names (today only) | the after-close name repair of D finished (new `CONTRACT_REPAIR_DONE_DAY` atomic set by `contract_name_repair_boot` after a run with 0 failures or the last attempt) |
+| Per table | WAL snapshot: read `sequencerTxn` S, wait for `writerTxn >= S` (`snapshot_gate::wait_for_snapshot`, ≤ 300 s); the table's spill folder not pending (`spill_dirs_have_pending_data`) |
+| Hard gates (session day, never run anyway) | `seal_not_drained` (live side not final), `candles_not_final` (the catch-up sweep has not sealed past the day's last candle bucket end, 16:15 on a normal day, the hourly 15:15 bar), `contract_names_unrepaired` (only while the clock is still on the session date) |
+| Soft gates (session day) | `wal_not_applied:<t>`, `spill_pending:<t>`, `deferred_depth_marks`: waited for until 18:00 IST (window + 2 h 15 min), then the export runs and names them in `incomplete_reasons` |
+| Backoff | a failed attempt waits 15 min, then 30, then 60 before the next |
+| Give up | 3 attempts per day; then one coded `error!`. From 20:45 IST (window + 5 h) the session day is handled like a catch-up day (no hold, no time give-up) |
+| Catch-up | the session day FIRST, then every trading/Muhurat day of the last 7 calendar days without DONE, oldest first; a past day runs once its WAL is applied and no skipped-depth marks wait, or on its last chance (the oldest day of the window) whatever is pending |
+| Window re-check | before every day, table and partition; a closed window stops the attempt (`Stopped`, not counted) |
+| Done cache | a local `daily_task_marker` ("brutex_export") after DONE is confirmed, so a poll costs no S3 call once a day is sealed; S3 DONE stays the authority |
+
+#### Where it lives
+
+- `crates/storage/src/partition_archive/daily_export.rs` (new submodule):
+  pure planners (table set, ORDER BY map, partition filter, manifest/DONE
+  JSON, attempt number, instrument tally) + `run_daily_export(day)` on a
+  dedicated `PartitionArchiver` built with its own temp dir. Keeps
+  `partition_archive.rs` (9,201 lines, ceiling 10,000 without a pin row)
+  growth to the ORDER BY change, the fallback, and `pub(crate)` on the
+  reused functions.
+- `crates/app/src/brutex_export_boot.rs` (new): the scheduler; spawned from
+  inside `daily_archive_boot::spawn_supervised_daily_archive_loop` (same
+  questdb + retention config, same `archive_enabled` gate), because
+  `main.rs` is AT its size pin (7,158 = 6,958 + 200) and may not grow.
+- Calendar: one new `market_hours::installed_calendar_says_trading_day`
+  (common; escalates tests to the workspace).
+- Config: `[partition_retention] brutex_export_enabled` (serde default false;
+  `config/base.toml` true). The archiver's ORDER BY does NOT follow the
+  switch since the 2026-11-14 review (see "Review fixes" below).
+
+#### Drain hold
+
+`DayWork` gains `brutex_export_pending` (one atomic load, published by the
+scheduler: today is an export day, past 15:45, no DONE, not given up).
+`is_done()` requires it false; `data_in_database()` does not (the evening WAL
+restart is not blocked by it, same as the archive backlog). Each placed
+object bumps a progress counter read by `ProgressTracker` as an anchor, so a
+stuck export releases after the usual hour; 07:30 cap unchanged.
+`evening_drain::evening_step` waits only while an export RUNS (`DayWork::brutex_export_running`; a planned restart mid-export would waste the attempt); a due export waits for the restart's replay instead (2026-11-14 second review).
+
+#### Read-only role (terraform, applied by the owner's terraform-apply run)
+
+`deploy/aws/terraform/brutex-readonly-role.tf`:
+- `aws_iam_role.brutex_readonly`, name `tv-${var.environment}-brutex-readonly`,
+  trust: `Principal.AWS = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root"`,
+  `Action = "sts:AssumeRole"`, `max_session_duration = 43200`, standard tags.
+- inline policy, nothing else: `s3:ListBucket` on `arn:aws:s3:::tv-${var.environment}-cold`
+  with `StringLike s3:prefix = ["questdb-partitions/*", "instrument-snapshots/*", "raw-frames/*"]`;
+  `s3:GetObject` + `s3:GetObjectAttributes` on those three prefixes `/*` only.
+- `outputs.tf`: `brutex_readonly_role_arn`.
+- The bucket uses default SSE-S3 (no KMS key in terraform), so no `kms:` grant
+  is needed. No secret, user or access key is created.
+- Brutex side (owner, one line in `~/.aws/config`):
+  `[profile brutex]` / `role_arn = <output>` / `source_profile = <owner login>`.
+
+### Edge Cases
+
+| # | Case | Expected |
+|---|---|---|
+| 1 | Holiday / weekend | no export, no hold |
+| 2 | Muhurat date | export after session end + 6 min, same steps |
+| 3 | App boots after 16:30 (evening deploy) | catch-up exports D and up to 7 days back that lack DONE |
+| 4 | Partition dropped by the hour path before export | listed from its verified audit row + HeadObject, `archived_before_export`, counts `unknown` |
+| 5 | Table absent (`market_depth` never created, depth off) | table entry `absent`, rows 0, not a failure |
+| 6 | Table with no partition for D | entry with rows 0, no partitions |
+| 7 | Canonical key already holds identical bytes (archiver got there first) | `reused`, no upload |
+| 8 | Canonical key holds different bytes | sidecar uploaded, manifest names the sidecar |
+| 9 | Late row lands during the export | recount mismatch → one retry → table failed for this attempt, next attempt n+1 |
+| 10 | Concurrent archiver upload of the same partition | conditional put 412 → HeadObject → reuse or sidecar |
+| 11 | Archiver deletes its own upload on its mismatch arm after export listed it | step 7 re-head catches it, attempt fails, rerun |
+| 12 | Crash between manifest-n and DONE | rerun writes manifest-(n+1) and DONE; manifest-n stays, unreferenced |
+| 13 | Two runs race on DONE | one wins (412 for the other), loser reads it and stops |
+| 14 | Temp volume below the archive floor (2 GiB) | partition skipped, reason `temp_space`, attempt fails |
+| 15 | QuestDB down / S3 unreachable | attempt fails, retried after the 15/30/60-minute backoff; give up after 3 attempts per process |
+| 16 | No cold bucket configured (dev, no env var) | export disabled, one `info!` |
+| 17 | Clock just past midnight | session-day rule: before 07:30 = previous day |
+| 18 | A table later gains a column (ALTER ADD) | new header → sidecar at archive time, manifest unchanged (Limitation) |
+| 19 | A table whose DEDUP is not enabled on the box (LH-01 shape) | ORDER BY may tie on duplicate keys → bytes may differ → sidecar, never loss (Limitation) |
+| 20 | Evening drain planned restart due | deferred only while an export RUNS; a due export waits for the restart's replay instead |
+| 21 | CSV field with comma/quote/newline | quote-aware field split; counts sum must equal rows |
+
+### Failure Modes
+
+| Failure | Detect | Effect | Recover |
+|---|---|---|---|
+| ORDER BY sort too slow / too big in QuestDB | export error or timeout (600 s) | daily export attempt failed (backoff, retry); archiver falls back to unordered once | set `[partition_retention] brutex_export_enabled = false` (stops the export; the archiver still sorts only outside the trading-day window and only against an existing object); measure (follow-up) |
+| S3 put refused / timeout | error from `put_if_absent_path` | no DONE | next poll, attempt n+1 |
+| Manifest names a key that vanished | step-7 re-head | no DONE | rerun |
+| Export never finishes | give-up after 3 attempts per process (no time give-up: past 20:45 the session day is handled as a catch-up day) | coded `error!` STORAGE-GAP-04 `source="brutex_daily_export"`, no DONE for D; Brutex sees no DONE | next day's catch-up retries D (7-day window) |
+| Drain hold keeps box up forever | ProgressTracker anchor + give-up + 07:30 cap | at most until 20:45 for the session day's export (the stall rule does not release a due export) | none needed |
+| Export competes with archive temp dir | separate temp dir | none | n/a |
+| Role too wide | terraform guard test | build fails | n/a |
+| Pager noise | none added | export failure is log-only (STORAGE-GAP-04 is in no CloudWatch filter, verified grep of `error-code-alarms.tf`; `partition_archive_failed` was removed by Quote 53) | owner may add a page later with a noise-lock row |
+
+### Test Plan
+
+Scoped: `cargo test -p tickvault-storage`, `-p tickvault-app`, workspace for
+the common change. Every fix test fails without its fix (bite-checked).
+
+- Pure: `test_export_order_by_equals_dedup_key_for_every_export_table`
+  (pins each ORDER BY to its DEDUP constant), `test_build_export_sql_orders_by_dedup_key_when_enabled`,
+  `test_build_export_sql_unchanged_for_tables_outside_the_export_set`.
+- Determinism: `test_gzip_of_same_csv_is_byte_identical_across_chunk_splits`
+  (the archiver's encoder path, split patterns, same SHA-256),
+  `test_gzip_header_has_zero_mtime_and_unknown_os`.
+- Window: `proptest_export_never_runs_inside_the_session_window_on_a_session_day`,
+  `test_muhurat_export_waits_for_session_end`, `test_session_day_before_0730_is_previous_day`.
+- Manifest: `test_manifest_json_golden`, `test_done_names_manifest_and_its_sha`,
+  `test_next_attempt_number_from_listing`, `test_done_present_means_nothing_to_do`.
+- Tally: `proptest_instrument_tally_sum_equals_record_count`
+  (quoted fields with commas/newlines), `test_tally_keys_on_security_id_segment_feed`.
+- Stub integration (existing `stub_integration_tests` pattern, stubbed
+  QuestDB + S3): `test_daily_export_uploads_then_archiver_reuses_without_sidecar`,
+  `test_daily_export_lists_dropped_partition_from_audit`,
+  `test_daily_export_never_overwrites_an_existing_key`,
+  `test_daily_export_writes_done_last`, `test_recount_mismatch_fails_the_attempt`,
+  `test_archiver_falls_back_once_to_unordered_export`.
+- Source scans: `test_daily_export_module_never_deletes_or_drops` (no
+  `delete_s3_object`, `DeleteObject`, `drop_partition`, `DROP`).
+- Drain hold: `test_brutex_export_pending_keeps_day_not_done`,
+  `test_brutex_export_pending_does_not_block_data_in_database`,
+  `test_evening_step_waits_only_while_an_export_runs`.
+- Terraform guard `crates/common/tests/brutex_readonly_role_guard.rs`:
+  `test_brutex_role_trusts_only_this_account_root`, `test_brutex_role_actions_are_exactly_list_get_getattributes`,
+  `test_brutex_role_prefixes_are_exactly_three`, `test_brutex_role_has_no_put_delete_or_wildcard`,
+  `test_brutex_role_max_session_is_12h`, `test_brutex_role_arn_is_an_output`.
+- Measurement: NOT built (no QuestDB holding a production-size hour is
+  reachable from this session). The first live run reports it through
+  `tv_brutex_export_duration_secs` and the per-day `info!` line; see the
+  follow-up under "Review fixes".
+- Existing guards that must stay green: `source_size_ratchet_guard`,
+  `rust_only_guard`, `shell_budget_guard`, `claude_md_codebase_map_guard`,
+  `aws_infra_wiring`, `terraform_tag_value_guard`, `dedup_segment_meta_guard`,
+  `pub-fn-test-guard.sh`, `pub-fn-wiring-guard.sh`.
+
+### Rollback
+
+- `[partition_retention] brutex_export_enabled = false` in config: no
+  export, no hold, no amend records. The archiver keeps sorting only when an
+  object already sits at the canonical key and only outside the trading-day
+  window (so objects the export placed are still reused, never re-copied).
+  Objects already written stay (never deleted; Quote 27).
+- Role: remove `brutex-readonly-role.tf` and the output; the next terraform
+  apply deletes the role (no data touched).
+- Code revert is safe: nothing reads `_daily/` inside tickvault.
+
+### Observability
+
+- Local `/metrics` only (no EMF name, no filter, no alarm, so no noise-lock
+  row): `tv_brutex_export_runs_total{outcome="done|failed|skipped_done|gave_up"}`,
+  `tv_brutex_export_objects_total{placement}`, `tv_brutex_export_rows_total{table}`,
+  `tv_brutex_export_duration_secs` (last run), `tv_brutex_export_last_done_day`
+  (days since epoch), `tv_partition_archive_export_unordered_fallback_total`,
+  all registered at 0 at boot.
+- Logs: one `info!` per sealed day (D, attempt, tables, rows, bytes,
+  seconds, complete, reasons); coded `error!` STORAGE-GAP-04
+  `source="brutex_daily_export"` on give-up (log-only); runbook paragraph in
+  `docs/error-runbooks/wave-2-error-codes.md`.
+- Brutex-side proof: DONE + manifest in S3 (the record itself).
+- Drain hold line `left_text` names `brutex_export_pending`.
+
+### Plan Items
+
+- [x] 1. Record Quote 60 rule-file-first (owner quote + three cards + design + REJECT rows: any delete/overwrite/expiration of export objects, export inside the session window, a role wider than the three prefixes or with Put/Delete, a duplicate-copy design)
+  - Files: docs/claude-rules-full/project/daily-universe-scope-expansion-2026-05-27.md, .claude/rules/project/daily-universe-scope-expansion-2026-05-27.md, .claude/rules/project/aws-budget.md
+  - Tests: daily_universe_scope_guard
+- [x] 2. ORDER BY on the DEDUP key for the export table set (the archiver sorts only against an existing canonical object outside the session, independent of the switch since the 2026-11-14 review), plus the archiver's one-time unordered fallback under disk pressure
+  - Files: crates/storage/src/partition_archive.rs, crates/common/src/config.rs, config/base.toml
+  - Tests: test_export_order_by_equals_dedup_key_for_every_export_table, test_build_export_sql_orders_by_dedup_key_when_enabled, test_build_export_sql_unchanged_for_tables_outside_the_export_set, test_archiver_falls_back_once_to_unordered_export, test_gzip_of_same_csv_is_byte_identical_across_chunk_splits, test_gzip_header_has_zero_mtime_and_unknown_os
+- [x] 3. Daily export module: plan, export, place, verify, instrument tally, counts file, manifest, re-head, DONE; never delete
+  - Files: crates/storage/src/partition_archive/daily_export.rs, crates/storage/src/partition_archive.rs
+  - Tests: test_manifest_json_golden, test_done_names_manifest_and_its_sha, test_next_attempt_number_from_listing, test_done_present_means_nothing_to_do, proptest_instrument_tally_sum_equals_record_count, test_tally_keys_on_security_id_segment_feed, test_daily_export_uploads_then_archiver_reuses_without_sidecar, test_daily_export_lists_dropped_partition_from_audit, test_daily_export_never_overwrites_an_existing_key, test_daily_export_writes_done_last, test_recount_mismatch_fails_the_attempt, test_daily_export_module_never_deletes_or_drops
+- [x] 4. Scheduler: window, session day, readiness gates, deadline, give-up, catch-up, done cache; spawned from the daily archive spawn; repair-done atomic; calendar accessor
+  - Files: crates/app/src/brutex_export_boot.rs, crates/app/src/daily_archive_boot.rs, crates/app/src/contract_name_repair_boot.rs, crates/app/src/lib.rs, crates/common/src/market_hours.rs
+  - Tests: proptest_export_never_runs_inside_the_session_window_on_a_session_day, test_muhurat_export_waits_for_session_end, test_session_day_before_0730_is_previous_day, test_session_day_step_hard_gates_never_run_anyway, test_failed_attempt_backs_off_before_the_next, test_past_day_waits_for_ready_until_its_last_chance, test_visit_order_is_session_day_first_then_oldest_first, test_candle_final_target_is_the_hourly_bar_end, test_repair_state_is_set_only_when_the_day_is_over, test_the_repair_loop_publishes_through_record_run, test_calendar_session_day_reports_trading_and_muhurat_end
+- [x] 5. Drain hold + evening restart wiring
+  - Files: crates/app/src/drain_hold.rs
+  - Tests: test_brutex_export_pending_keeps_day_not_done, test_brutex_export_pending_does_not_block_data_in_database, test_evening_step_waits_only_while_an_export_runs, test_export_objects_count_as_drain_progress, test_measure_day_work_reads_the_export_pending_flag
+- [x] 6. Read-only role terraform + guard
+  - Files: deploy/aws/terraform/brutex-readonly-role.tf, deploy/aws/terraform/outputs.tf, crates/common/tests/brutex_readonly_role_guard.rs
+  - Tests: test_brutex_role_trusts_only_this_account_root, test_brutex_role_actions_are_exactly_list_get_getattributes, test_brutex_role_prefixes_are_exactly_three, test_brutex_role_has_no_put_delete_or_wildcard, test_brutex_role_max_session_is_12h, test_brutex_role_arn_is_an_output
+- [x] 7. Observability: metrics registered at 0, runbook paragraph, CLAUDE.md O(1) table rows for the new structures (the tally HashMap, the scheduler poll)
+  - Files: crates/storage/src/partition_archive/daily_export.rs, docs/error-runbooks/wave-2-error-codes.md, CLAUDE.md
+  - Tests: test_brutex_export_metrics_registered_at_zero
+- [x] 8. Amend records for partitions the archiver re-uploads as sidecars after a day's DONE
+  - Files: crates/storage/src/partition_archive.rs, crates/storage/src/partition_archive/daily_export.rs
+  - Tests: test_archiver_copy_writes_one_amend_record_without_done, test_amend_failure_keeps_the_partition
+- [x] 9. Keep the unmeasured sort off the live session: the export runs only outside the trading-day window and stops at 08:30; the archiver sorts only outside it and only against an existing canonical object (the measurement itself is a follow-up, see "Review fixes")
+  - Files: crates/storage/src/partition_archive.rs, crates/storage/src/partition_archive/daily_export.rs
+  - Tests: test_archiver_never_sorts_inside_the_trading_window, test_archiver_streams_unordered_when_no_object_exists, test_archiver_orders_only_against_an_existing_object_outside_the_session, test_stop_before_the_window_closes_writes_no_done
+- [x] 10. Third hostile review fixes (2026-11-14): arrival-time hours still open left out and named; the session day waits for the close hour to end; a partition dropped without the lock mid-export recorded as dropped; the disk-pressure line in the export floor; a failed HEAD makes the archiver sort; amend records for sealed days with the switch off; a loop panic booked as a failed attempt with the running flag cleared; name-repair gates for catch-up days; per-object ordered flag and per-table columns; drain-hold wiring pinned
+  - Files: crates/storage/src/partition_archive/daily_export.rs, crates/storage/src/partition_archive.rs, crates/storage/src/contract_name_repair.rs, crates/app/src/brutex_export_boot.rs, crates/app/src/contract_name_repair_boot.rs, crates/app/tests/chaos_combined_evening_drain.rs
+  - Tests: test_open_arrival_hours_are_left_out_of_the_session_day, test_arrival_open_from_and_left_out_as_open_cut_at_the_open_hour, test_arrival_close_secs_is_the_close_hour_end, test_partition_dropped_without_the_lock_mid_export_is_not_a_failure, test_pressure_free_floor_bytes_is_the_room_below_high_water, test_export_floor_bytes_includes_the_pressure_line, test_archiver_head_failure_still_orders_and_reuses, test_canonical_maybe_exists_reads_a_failed_head_as_maybe, test_switch_off_still_amends_a_sealed_day, test_book_panicked_run_counts_the_run_as_failed, test_blocks_even_forced_holds_a_repair_even_on_a_forced_past_day, test_covered_state_counts_a_later_run_that_reaches_the_day, test_repair_run_covers_day_only_while_a_run_reaches_the_day, test_compose_reasons_labels_hard_soft_and_note, test_manifest_json_golden, test_merge_lists_the_archived_bulk_beside_the_re_created_rows, the_supervisor_model_matches_drain_hold_rs, test_the_loop_marks_a_run_and_reads_every_gate
+
+### Cost note (for aws-budget.md, all Assumed until a bill)
+
+No duplicate copy: the archive later reuses the export's object. New cost is
+(a) objects reach S3 earlier than the archive would put them (ticks ~15 days,
+candles ~90 days earlier; roughly $1–2 a month of standing storage, Assumed
+sizes), (b) a few hundred PUT/HEAD requests a day (cents a month), (c) sidecars
+for partitions changed after the export (Unknown fraction), (d) **Brutex
+downloads**: internet egress beyond the account's 100 GB a month free tier
+(about $0.11/GB, Assumed) and Glacier Instant Retrieval reads of `raw-frames/`
+older than 30 days (about $0.03/GB). (d) is the one that can move the bill;
+December's $62 line (Quote 54) is unchanged.
+
+### Scenarios
+
+| # | Scenario | Expected |
+|---|---|---|
+| 1 | Normal trading day | DONE for D after the hourly 15:15 bar seals (~16:19) and the export runs: ~16:25 to 16:45 (Assumed, unmeasured), archive later reuses every object |
+| 2 | Export slower than 16:30 | drain hold keeps the box up until DONE or 20:45 (07:30 cap and the one-hour stall rule unchanged) |
+| 3 | Box off for 2 days | catch-up exports both days, partitions dropped meanwhile listed from audit |
+| 4 | Partition changed at night | archive writes a sidecar + amend record; DONE manifest unchanged |
+| 5 | Brutex assumes the role | can list/get the three prefixes, nothing else |
+
+### Implementation notes (2026-11-14)
+
+- Switch is `[partition_retention] brutex_export_enabled` (in `PartitionRetentionConfig`, not a new `[brutex_export]` section), so `main.rs` (at its size pin) stays unchanged and one config value reaches both the export and the archiver's ORDER BY.
+- The export places objects with its own routine (`DailyExporter::place`) using the archiver's HeadObject, `classify_existing`, canonical/sidecar keys and create-only upload, because the archiver's `place_archive` writes failure audit rows and the export writes none.
+- The instrument tally re-reads the local gzip (the exact bytes uploaded) instead of tapping the export stream, so `export_query_csv` is unchanged.
+- An archived-before-export partition whose S3 copy cannot be confirmed is recorded as `archived_copy_unconfirmed:<table>/<partition>` in `incomplete_reasons` (the day is still sealed), not a failed attempt.
+- Item 9 (measure the ordered export on a production-size `ticks` hour) is NOT done: no production QuestDB was reachable (the server is stopped).
+
+### Review fixes (2026-11-14, hostile review of this branch)
+
+| Finding | Fix | Test (fails without the fix) |
+|---|---|---|
+| CRITICAL / HIGH: the export took no lock; the hour-path archiver could drop a day-D partition mid-export (listed hour missing from the manifest, or an EMPTY sidecar listed with 0 rows, DONE written) | each partition is exported under the SHARED side of the archive quiesce lock after a re-list under that lock (the archiver drops only under the exclusive side); a vanished partition must be covered by an intact verified archive copy or the attempt fails; the audit rows are read AFTER every table; a listed partition exporting 0 rows fails the attempt | `test_hour_dropped_mid_export_is_listed_or_refused_never_sealed_empty`, `test_export_waits_for_the_archive_quiesce_lock`, `test_merge_requires_a_copy_for_every_vanished_partition` |
+| HIGH: a partition archived, dropped and re-created by late rows listed only one object | every distinct verified copy is listed (`parse_archived_rows` keeps every key); the export's own object is not repeated; `rows_may_overlap` tells Brutex to union by the DEDUP key | `test_parse_archived_rows_keeps_every_copy_of_a_partition`, `test_merge_lists_the_archived_bulk_beside_the_re_created_rows` |
+| HIGH: an orphan counts file (manifest PUT failed) wedged the day | `next_attempt` takes the highest `n` of manifests AND counts files | `test_next_attempt_number_from_listing`, `test_orphan_counts_file_does_not_wedge_the_day` |
+| HIGH x2 / MEDIUM x2: the window was checked once per poll; a run started before 08:30 read on into the session | `keep_going` (the window) is re-checked before every day, table, partition and the seal; a stop is not an attempt | `test_stop_before_the_window_closes_writes_no_done` |
+| HIGH x2: past days ran before today and released the drain hold | the session day is visited first; the hold is set while ANY export runs | `test_visit_order_is_session_day_first_then_oldest_first` |
+| HIGH / MEDIUM: no backoff, three attempts in three minutes | 15 / 30 / 60 minute backoff | `test_failed_attempt_backs_off_before_the_next` |
+| HIGH: candles 30m/60m exported before their last bars were sealed (second copy every day, Brutex missing bars) | hard gate `candles_not_final` until the catch-up sweep passes the day's last candle bucket end (16:15) | `test_candle_final_target_is_the_hourly_bar_end` |
+| HIGH: export ran before this process's contract-name repair | hard gate, never run anyway (only while the clock is on the session date) | `test_session_day_step_hard_gates_never_run_anyway` |
+| (review follow-on) a process booted after midnight would GIVE UP a session day it never tried (time give-up) | past 20:45 the session day is handled like a catch-up day (no hold, no time give-up) | `test_session_day_step_hard_gates_never_run_anyway` |
+| MEDIUM: soft gates ran anyway at 16:05 | waited for until 18:00 | `test_session_day_step_hard_gates_never_run_anyway` |
+| MEDIUM: a day with no data sealed complete (Rule 11) | no `ticks` object → refused; sealed INCOMPLETE (`no_ticks_captured`) only on its last chance | `test_a_day_with_no_ticks_is_never_sealed_complete` |
+| MEDIUM: amend records only after DONE, not for a reused sidecar, before verify, never retried | written for every verified archiver copy the manifest may not name (uploaded, or content-addressed), after verify, before the audit row and drop, whatever DONE says; idempotent; a failure withholds the drop | `test_archiver_copy_writes_one_amend_record_without_done`, `test_amend_failure_keeps_the_partition` |
+| MEDIUM x3 / HIGH: archiver ORDER BY in session, tied to the switch | the archiver sorts only against an existing canonical object and only outside the trading-day window; never reads the switch | `test_archiver_never_sorts_inside_the_trading_window`, `test_archiver_streams_unordered_when_no_object_exists`, `test_archive_with_the_switch_off_still_reuses_the_export_object` |
+| HIGH: two new self-source scans grew `source_scan_budget_guard` | both removed; behaviour tests instead | `source_scan_budget_guard` green |
+| MEDIUM: vacuous metric/calendar tests, untested wiring | local recorder test; calendar test reads the installed calendar; `evening_work_done`, `drain_progress_count`, `record_run` extracted and tested | `test_brutex_export_metrics_registered_at_zero`, `test_calendar_session_day_reports_trading_and_muhurat_end`, `test_evening_step_waits_only_while_an_export_runs`, `test_export_objects_count_as_drain_progress`, `test_measure_day_work_reads_the_export_pending_flag`, `test_repair_state_is_set_only_when_the_day_is_over, test_the_repair_loop_publishes_through_record_run` |
+| MEDIUM: incomplete or missed days never surfaced | a sealed-incomplete day logs coded `error!` STORAGE-GAP-04 `source="brutex_daily_export_incomplete"`; still LOG-ONLY (no CloudWatch filter matches STORAGE-GAP-04; no daily report runs after the export). A page needs a noise-lock row and an owner quote: open decision | n/a (log line) |
+| MEDIUM: recheck after DONE vs the archiver deleting its own upload | covered by the lock: the archiver uploads, verifies and deletes its own upload only under the exclusive side, so a key the export places or reuses under the shared side is never one of an in-flight archiver run | `test_export_waits_for_the_archive_quiesce_lock` |
+
+**Follow-up, not in this PR (Risk):** the ordered `/exp` export of a
+production-size `ticks` or `market_depth_book` hour is still unmeasured
+(time and QuestDB memory). It now runs only outside the trading-day window
+(after 15:45, or before 08:30), so it cannot slow live capture, but a sort
+QuestDB cannot finish fails the attempt (retried, then given up, with no
+DONE). Measure on the first live run (`tv_brutex_export_duration_secs`, the
+sealed-day `info!` line).
+
+**Honest limits:** while the export holds the shared side of the quiesce lock for one partition (a big `ticks` hour can take minutes), an archive pass waiting for the exclusive side gives up after `archive_quiesce_wait_secs` (120 s) and holds its remaining hour-path partitions for its next pass (`quiesce_busy`, keep more, never a loss). **Honest limits:** a day sealed INCOMPLETE stays sealed (DONE is final);
+later copies appear only as amend records. After midnight this process no
+longer waits for the session day's contract-name repair. The candle gate
+trusts `CATCHUP_PROGRESS`; a process with no live lane for the day reads
+the candles as final (a predecessor's exit seal or the mid-session
+hand-over sealed them).
+
+### Review fixes (2026-11-14, second hostile review of this branch)
+
+| Finding | Fix | Test (fails without the fix) |
+|---|---|---|
+| HIGH x2: a day sealed `complete: true` while its shed frames still waited for the evening WAL replay, which the export forced to run AFTER DONE | the evening restart waits only while an export RUNS (`DayWork::brutex_export_running`); the session day waits (hard `wal_backlog_replaying`) while `drain_hold::evening_replay_pending`; a backlog no replay reaches tonight is named (`wal_backlog:<n>`, `complete` false) | `test_evening_step_waits_only_while_an_export_runs`, `test_evening_replay_value_needs_a_holding_step_and_a_backlog`, `test_compose_reasons_labels_hard_soft_and_note` |
+| HIGH: only a 2 GiB floor before each partition gzip; the export could push the disk past the 5% pinned-delete line and hold the lock a pressure pass needs | before the lock: the after-close floor plus the partition's on-disk size free, else `Stopped(Disk)` (not counted, retried in 15 min) | `test_export_space_ok_needs_floor_plus_partition`, `test_export_stops_when_the_disk_is_below_the_floor`, `test_apply_run_end_books_each_end` |
+| HIGH: the archiver's no-sort window ran to 15:45 while the daily leg opens 15:40:02 (every opening hour copied twice) | no-sort window ends at the ingest end (15:40) | `test_archiver_sort_forbidden_until_archiver_sort_end_secs`, `test_the_archive_leg_opens_after_the_archiver_sort_window` |
+| HIGH: a not-ready past day was forced only as the oldest window day (a weekend hid it) and dropped out silently | forced once 2 days old; a session day leaving the window without DONE is logged once (`brutex_daily_export_left_window`) | `test_past_day_forced_two_days_on_and_across_a_weekend`, `test_days_leaving_window_start_at_first_export_day` |
+| MEDIUM: past 20:45 the session day skipped its hard gates; past days never read spill folders | past the horizon `today_reasons` (hard gates kept); `pending_reasons` reads spill folders for every day | `test_the_loop_marks_a_run_and_reads_every_gate` (source scan), `test_pending_reasons_name_a_lagging_table` |
+| MEDIUM: a canonical reuse got no amend record; the audit table's WAL lag was invisible | amend record for every verified copy; `wal_not_applied:partition_archive_audit` is a reason | `test_archiver_copy_writes_one_amend_record_without_done`, `test_pending_reasons_name_a_lagging_archive_audit_table` |
+| MEDIUM: a partition could start minutes before 08:30 and run into the session | needs 30 min left before 08:30; the lock wait is cut to the time left; the window re-checked after the lock | `test_secs_until_forbidden_bounds_a_run_before_0830`, `test_export_never_starts_a_partition_it_cannot_finish_before_0830` |
+| MEDIUM: a failed ordered archiver export always fell back to unordered (permanent duplicate) | fallback only under disk pressure | `test_failed_ordered_export_keeps_the_partition_outside_pressure` |
+| MEDIUM x2: sealed at 18:00 while the after-close depth pass still wrote into the day's hours | hard `deferred_depth_pass_running` while marks exist and the pass is not floor-blocked for an hour; floor-blocked is named only | `test_compose_reasons_labels_hard_soft_and_note` |
+| MEDIUM: pressure-leg in-session sidecar copies undocumented | recorded as an accepted trade in `aws-budget.md` and Quote 60 | docs |
+| MEDIUM: an exhausted name repair read as finished | `RepairDayState::GaveUpWithFailures`, named `contract_names_repair_failed` | `test_exhausted_repair_with_failures_is_not_clean` |
+| MEDIUM: the stall rule released the hold while the export waited | `stall_releases_hold` never releases a due export | `test_stall_releases_hold_never_for_a_due_export` |
+| MEDIUM x2: vacuous / untested wiring | `in_trading_day_window_at` pinned on a real date; repair loop and export loop wiring source-scanned | `test_in_trading_day_window_at_bites_on_a_session_day`, `test_the_repair_loop_publishes_through_record_run`, `test_the_loop_marks_a_run_and_reads_every_gate` |
+| MEDIUM: a shell-mangled dollar amount in `aws-budget.md` | fixed; the guard now scans every project rule file | `rule_files_carry_no_shell_mangled_dollar_amount` |
+| MEDIUM: another workstream's APPROVED plan (dhan-order-surface, item E2 unchecked) was archived to stay at the V7 cap | restored; this plan is folded in here instead of a sixth active file | (plan gate V7: 5 active files) |
+| MEDIUM: stale docs (ordering tied to the switch, `table_partitions`, the catch-up text) | corrected in the code doc, CLAUDE.md row and runbook | docs |
+
+### Review fixes (2026-11-14, third hostile review of this branch)
+
+| Finding | Verdict and fix | Test (fails without the fix) |
+|---|---|---|
+| MEDIUM x2: `tick_quotes` and `feed_aux_packets` (arrival time) keep taking day-D rows after the close while the feed stays up; the export sealed `<D>T16` while still open (rows missing from a "complete" day, a second copy at archive time, a recount that could fail the day) | Real. The session day leaves out every arrival-time hour still able to take rows (`arrival_open_from`: from the start of the hour that ended less than 2 min before the run) and names it (`open_from_ist`, `open_partitions_left_out`); it never runs before the close hour ended plus 2 min (hard `arrival_hours_open`, `arrival_close_secs`: 16:02). A left-out hour is archived as one object with an amend record | `test_open_arrival_hours_are_left_out_of_the_session_day`, `test_arrival_open_from_and_left_out_as_open_cut_at_the_open_hour`, `test_arrival_close_secs_is_the_close_hour_end`, `test_compose_reasons_labels_hard_soft_and_note` |
+| MEDIUM: amend records stopped with the switch off, hiding later copies of sealed days | Real. Written for any day with a DONE (one HEAD per copy while off; an unreadable DONE writes it) | `test_switch_off_still_amends_a_sealed_day` (and the switch-off reuse test now expects the record) |
+| MEDIUM: `process_one` drops without the quiesce lock; a drop mid-export failed the attempt (3 races gave up the day) | Real. After a failed or empty export the partition is re-listed; gone = dropped mid-export, listed from its verified copy. Module doc corrected | `test_partition_dropped_without_the_lock_mid_export_is_not_a_failure` |
+| MEDIUM: between the after-close floor and the pressure line the export starved the pressure archiver of the exclusive lock | Real. The export floor is the larger of the after-close floor and the room below `pressure_high_water_pct` (`export_floor_bytes`, `pressure_free_floor_bytes`), checked before each partition and its lock. Honest limit: a disk that fills during one partition is not re-read until the next | `test_pressure_free_floor_bytes_is_the_room_below_high_water`, `test_export_floor_bytes_includes_the_pressure_line` |
+| MEDIUM x2 (same defect): the panic arm left `EXPORT_RUNNING` set and the respawn lost the attempt count | Real (debug builds; release aborts on panic). The flag is a drop guard, the panic arm clears both flags, and the run in flight is booked as a failed attempt in a carry the respawn starts from | `test_book_panicked_run_counts_the_run_as_failed`, `test_the_loop_marks_a_run_and_reads_every_gate` |
+| MEDIUM: a failed HEAD read as "absent" made the archiver write a second full copy | Real. A failed HEAD reads "may exist", so the archiver sorts (safe both ways) | `test_archiver_head_failure_still_orders_and_reuses`, `test_canonical_maybe_exists_reads_a_failed_head_as_maybe` |
+| MEDIUM: catch-up days ran with no name-repair gate (sealed with blanks, rewritten later, second copy) | Real. A catch-up day (and the session day after midnight) waits while a repair run can rewrite it (`repair_run_covers_day`, hard) and while no run that reaches it has ended (`repair_covered_state`, soft `contract_names_repair_pending`); both hold even a forced day until the session day's midnight (the running one always). The `contract_names_not_repaired` NOTE is gone | `test_blocks_even_forced_holds_a_repair_even_on_a_forced_past_day`, `test_covered_state_counts_a_later_run_that_reaches_the_day`, `test_repair_run_covers_day_only_while_a_run_reaches_the_day` |
+| MEDIUM: byte reuse depends on the column set and QuestDB formatting | Real, not fixable in code without losing columns from the archive. The manifest records each table's CSV header (`columns`); recorded as an OPEN OWNER DECISION in Quote 60 and `aws-budget.md` (a schema or QuestDB change needs the owner's decision on the one-time second copy first) | `test_manifest_json_golden` (columns) |
+| MEDIUM: objects archived before the export are often unordered, but the manifest said one order per table | Real. `ordered_by_dedup_key` per object (`false` for `archived_before_export`) | `test_merge_lists_the_archived_bulk_beside_the_re_created_rows`, `test_manifest_json_golden` |
+| MEDIUM: in-session pressure moves write a second copy of every exported hour; "accepted trade" without an owner quote | Real; NOT fixed in code (the only fixes are a sort on QuestDB during capture, or a reuse judged on row count, which an upsert can fool). Re-labelled an OPEN OWNER DECISION in Quote 60 and `aws-budget.md`; needs an owner card with the size bound | n/a (Blocker: owner decision) |
+| MEDIUM: the drain-hold supervisor's export wiring had no pin | Real. Five needles plus one whitespace-free check added to the existing scan (no new scan) | `the_supervisor_model_matches_drain_hold_rs` (bite-checked: removing the replay-pending store fails it) |
+| MEDIUM: this plan's ticked items named two tests that do not exist, and said 19:30 | Real. Names and Failure Modes corrected; this table added | `plan-verify.sh` |
+| MEDIUM: a TEST-EXEMPT cited a missing test | Real. It cites the real tests, and the scan now asserts both flags start false and that the pending flag is set only in the Run arm | `test_the_loop_marks_a_run_and_reads_every_gate` |
+| MEDIUM: the rule file said a day leaving the window is "logged once"; the owner has no notification channel | Real. "once per process" (about 7 to 28 lines), and the rule file, runbook and module doc now say that until a noise-lock row exists the owner learns of a missed export only from the app logs | docs |
