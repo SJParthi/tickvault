@@ -254,7 +254,11 @@ resource "aws_budgets_budget" "tv_monthly" {
   #   in code now; this native stop stays "90" until the end of November and
   #   moves to "62" (not "75") in a follow-up change on or after 1 December,
   #   never before (the lockstep guard requires exactly "62" from December).
-  limit_amount      = "90"
+  # 2026-11-14 (operator Quote 59, daily-universe §0, owner card "$140
+  #   (Recommended)"): November 2026 only, $90 -> $140, so the box keeps running
+  #   ($60.83 spent by 14 Nov, AWS forecast $126). From 1 December this native
+  #   stop moves to "62" exactly as Quote 54 set (follow-up on or after 1 Dec).
+  limit_amount      = "140"
   limit_unit        = "USD"
   time_unit         = "MONTHLY"
   time_period_start = "2026-05-01_00:00"

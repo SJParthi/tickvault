@@ -80,8 +80,9 @@ pub const DEFAULT_BUDGET_KILL_USD: f64 = 185.0;
 /// raised to $170 (≈₹15,000) by operator Quote 30 on 2026-10-13, and lowered
 /// to $100 from November 2026 by operator Quote 33 (2026-10-21), then to **$85 from
 /// November 2026** by operator Quote 36 (the same evening), and to **$75
-/// from November 2026, GST included,** by operator Quote 37. November 2026 alone is $90
-/// (`NOVEMBER_2026_KILL_USD`, operator Quote 52, 2026-11-11). From December
+/// from November 2026, GST included,** by operator Quote 37. November 2026 alone is $140
+/// (`NOVEMBER_2026_KILL_USD`: $90 by operator Quote 52, 2026-11-11, raised to $140
+/// by Quote 59, 2026-11-14, owner card "$140 (Recommended)" against a $126 forecast). From December
 /// 2026 the standing line is **$62, GST included** (about ₹5,500), operator
 /// Quote 54 (2026-11-11, owner card "Cap ₹5,500"). October
 /// 2026 keeps the configured $170 (`OCTOBER_2026_ALLOWANCE`): its spend was
@@ -113,12 +114,13 @@ pub const OCTOBER_2026_KILL_USD: f64 = 185.0;
 /// November 2026 only (operator Quote 52, 2026-11-11, owner card "Raise Nov
 /// to $90 only (Recommended)"): about $21 of the month's bill was two disks
 /// attached to nothing, so the then-standing $75 line would have stopped the box
-/// around 18 to 24 November. December onward is on the standing line, $62
+/// around 18 to 24 November. Quote 59 (2026-11-14) raised November to $140:
+/// $60.83 spent by 14 Nov and AWS forecast $126, so $90 would have stopped it. December onward is on the standing line, $62
 /// since operator Quote 54 (2026-11-11).
 pub const NOVEMBER_2026_ALLOWANCE: (i32, u32) = (2026, 11);
 
-/// The line November 2026 is capped at, whatever is configured (Quote 52).
-pub const NOVEMBER_2026_KILL_USD: f64 = 90.0;
+/// The line November 2026 is capped at, whatever is configured (Quote 52; raised $90 -> $140 by Quote 59, 2026-11-14).
+pub const NOVEMBER_2026_KILL_USD: f64 = 140.0;
 
 // Each one-month line must sit between the standing line and the configured
 // fallback, so the clamp never raises a configured value.
@@ -2885,10 +2887,11 @@ aws events enable-rule --name tv-prod-daily-start\n"
     }
 
     #[test]
-    fn test_regression_effective_ceiling_november_2026_is_the_90_dollar_line() {
-        // Regression: 2026-11-11 — November 2026 only is $90 (Quote 52); the
+    fn test_regression_effective_ceiling_november_2026_is_the_140_dollar_line() {
+        // Regression: 2026-11-11 — November 2026 only is $90 (Quote 52), $140 since
+        // Quote 59 (2026-11-14); the
         // standing line is $62 from December (Quote 54).
-        assert_eq!(effective_budget_kill_usd(170.0, 2026, 11), 90.0);
+        assert_eq!(effective_budget_kill_usd(170.0, 2026, 11), 140.0);
         assert_eq!(
             effective_budget_kill_usd(185.0, 2026, 11),
             NOVEMBER_2026_KILL_USD
@@ -2901,7 +2904,7 @@ aws events enable-rule --name tv-prod-daily-start\n"
     #[test]
     fn test_quote54_standing_line_is_62_from_december_2026() {
         // Operator Quote 54 (2026-11-11, owner card "Cap ₹5,500"): $62 a
-        // month, GST included, from 1 December 2026. November stays $90.
+        // month, GST included, from 1 December 2026. November is $140 (Quote 59).
         assert!((STANDING_BUDGET_KILL_USD - 62.0).abs() < f64::EPSILON);
         assert_eq!(
             effective_budget_kill_usd(DEFAULT_BUDGET_KILL_USD, 2026, 12),
@@ -2913,7 +2916,7 @@ aws events enable-rule --name tv-prod-daily-start\n"
         );
         assert_eq!(
             effective_budget_kill_usd(DEFAULT_BUDGET_KILL_USD, 2026, 11),
-            90.0
+            140.0
         );
         assert_eq!(
             effective_budget_kill_usd(DEFAULT_BUDGET_KILL_USD, 2026, 10),
@@ -3010,15 +3013,15 @@ aws events enable-rule --name tv-prod-daily-start\n"
     }
 
     #[tokio::test]
-    async fn test_regression_quote52_november_line_is_90_dollars() {
-        // Operator Quote 52 (2026-11-11): November 2026 only, the line is $90.
-        // $85 month-to-date (a breach at the old standing $75) must not stop the
-        // box; $91 must.
+    async fn test_regression_quote59_november_line_is_140_dollars() {
+        // Operator Quote 52 (2026-11-11): November 2026 only, the line was $90;
+        // Quote 59 (2026-11-14) raised it to $140. $139 month-to-date must not stop
+        // the box; $141 must.
         let env = GuardEnv {
             budget_kill_usd: DEFAULT_BUDGET_KILL_USD,
             ..test_env()
         };
-        for (spend, should_stop) in [(85.0, false), (91.0, true)] {
+        for (spend, should_stop) in [(139.0, false), (141.0, true)] {
             let (ec2, sns, events) = (
                 FakeEc2::new("running"),
                 FakeSns::default(),
@@ -3163,11 +3166,11 @@ aws events enable-rule --name tv-prod-daily-start\n"
         assert_ne!(out["breach"], json!(true));
         assert!(ec2.stopped.borrow().is_empty());
         assert!(events.disabled.borrow().is_empty());
-        // November 2026: the same configured $185 is clamped to $90 (Quote 52);
+        // November 2026: the same configured $185 is clamped to $140 (Quote 59);
         // December onward to the standing $62 (Quote 54).
         assert_eq!(
             effective_budget_kill_usd(DEFAULT_BUDGET_KILL_USD, 2026, 11),
-            90.0
+            140.0
         );
         assert_eq!(
             effective_budget_kill_usd(DEFAULT_BUDGET_KILL_USD, 2026, 12),
