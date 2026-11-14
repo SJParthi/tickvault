@@ -72,6 +72,15 @@
 //! the replay pass), so a copy still in flight after the contract leaves the
 //! backup set is written too.
 //!
+//! # Frames with no WAL copy (never skipped)
+//!
+//! The skip rests on the WAL keeping every packet. A frame the WAL refused
+//! still reaches the drain through the ring, but has no copy anywhere else,
+//! so the caller judges its rows with [`AuxRepeatFilter::check_always_write`]:
+//! always written, never counted as skipped. The key is not pinned, so a later
+//! repeat from a WAL-backed frame is judged against the noted values as usual
+//! (2026-11-14 audit fix).
+//!
 //! # Complexity and space
 //!
 //! O(1) average per packet: one call of the epoch function (three
@@ -104,7 +113,10 @@ pub const FEED_AUX_REPEAT_MAX_TRACKED: usize = 25_000;
 
 /// Rows skipped because they repeated the key's last written row. Local
 /// `/metrics` only; not a loss (the identical row is stored, the packet is in
-/// the raw frame log), never paged.
+/// the WAL and the raw frame log), never paged. Only rows of WAL-backed frames
+/// are skipped: a frame the WAL refused is judged with
+/// [`AuxRepeatFilter::check_always_write`] and never counted here (2026-11-14
+/// audit fix).
 pub const FEED_AUX_REPEAT_SKIPPED_COUNTER: &str = "tv_feed_aux_repeat_skipped_total";
 
 /// Rows written for a key the full map could not track. Local `/metrics`
@@ -214,7 +226,7 @@ impl AuxRepeatFilter {
     /// [`Self::check_never_skip`] (and still remembered) is never skipped.
     /// O(1) average, no allocation.
     pub fn check(&mut self, key: (u64, u8), row: &AuxPacketRow) -> AuxRepeatVerdict {
-        self.judge(key, row, false)
+        self.judge(key, row, false, false)
     }
 
     /// [`Self::check`] for a contract the main feed carries on two sockets
@@ -223,10 +235,28 @@ impl AuxRepeatFilter {
     /// "Contracts on two sockets" in the module docs). O(1) average, no
     /// allocation.
     pub fn check_never_skip(&mut self, key: (u64, u8), row: &AuxPacketRow) -> AuxRepeatVerdict {
-        self.judge(key, row, true)
+        self.judge(key, row, true, true)
     }
 
-    fn judge(&mut self, key: (u64, u8), row: &AuxPacketRow, never_skip: bool) -> AuxRepeatVerdict {
+    /// [`Self::check`] for a row whose packet has NO WAL copy (the WAL
+    /// refused its frame, so the drain got it through the ring unbacked):
+    /// always `Write`, because the skip rests on the WAL keeping the packet
+    /// (Quote 61). The key is NOT pinned: once the values are noted, a later
+    /// repeat from a WAL-backed frame is judged against them as usual
+    /// (2026-11-14 audit fix). O(1) average, no allocation.
+    pub fn check_always_write(&mut self, key: (u64, u8), row: &AuxPacketRow) -> AuxRepeatVerdict {
+        self.judge(key, row, true, false)
+    }
+
+    /// `write_always`: never `Skip`. `pin`: the noted values keep the key
+    /// unskippable (a remembered pin is kept whatever is asked).
+    fn judge(
+        &mut self,
+        key: (u64, u8),
+        row: &AuxPacketRow,
+        write_always: bool,
+        pin: bool,
+    ) -> AuxRepeatVerdict {
         let day = row.ts_ist_nanos.div_euclid(NANOS_PER_DAY);
         if day != self.day {
             self.last.clear();
@@ -236,11 +266,11 @@ impl AuxRepeatFilter {
         let mut values = AuxRowValues::of(row, epoch);
         match self.last.get(&key) {
             Some(prev) if prev.never_skip => values.never_skip = true,
-            Some(prev) if !never_skip && *prev == values => {
+            Some(prev) if !write_always && *prev == values => {
                 self.skipped.increment(1);
                 return AuxRepeatVerdict::Skip;
             }
-            _ => values.never_skip = never_skip,
+            _ => values.never_skip = pin,
         }
         AuxRepeatVerdict::Write(values)
     }

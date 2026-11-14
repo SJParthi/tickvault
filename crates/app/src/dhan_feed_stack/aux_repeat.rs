@@ -10,7 +10,9 @@
 //! live drain never inherits a replayed (possibly older) row, and inside a pass
 //! every replay gap goes through [`LiveIngest::mark_replay_gap`], so the first
 //! row per contract after a gap is written. A contract the main feed carries
-//! on two sockets (the backup copy) is never skipped (`carried_twice`).
+//! on two sockets (the backup copy) is never skipped (`carried_twice`), and
+//! neither is a row of a frame the WAL refused (`frame_wal_unbacked`, 2026-11-14
+//! audit fix): the skip rests on the WAL keeping every packet.
 
 use tickvault_common::tick_types::ParsedTick;
 use tickvault_core::websocket::pool_supervisor::live_shed::main_feed_live_shed_total;
@@ -52,8 +54,9 @@ fn no_trade_today_row(tick: &ParsedTick, capture_seq: i64) -> Option<AuxPacketRo
 impl LiveIngest {
     /// Writes the `no_trade_today` row for `tick` unless it repeats the
     /// contract's last written row exactly, with no gap since (skipped and
-    /// counted). A row is remembered once it is staged; a staged row that
-    /// later fails to land moves the gap epoch, so the next repeat is written.
+    /// counted). A row of a frame with no WAL copy is never skipped. A row is
+    /// remembered once it is staged; a staged row that later fails to land
+    /// moves the gap epoch, so the next repeat is written.
     /// O(1) average, no allocation.
     pub(super) fn append_no_trade_today(&mut self, tick: &ParsedTick, capture_seq: i64) {
         let Some(row) = no_trade_today_row(tick, capture_seq) else {
@@ -62,6 +65,10 @@ impl LiveIngest {
         let key = (tick.security_id, tick.exchange_segment_code);
         let verdict = if self.carried_twice(key) {
             self.aux_repeat.check_never_skip(key, &row)
+        } else if self.frame_wal_unbacked {
+            // The skip rests on the WAL keeping the packet; this frame has no
+            // WAL copy, so its row is always written (2026-11-14 audit fix).
+            self.aux_repeat.check_always_write(key, &row)
         } else {
             self.aux_repeat.check(key, &row)
         };

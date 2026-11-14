@@ -203,6 +203,15 @@ impl ArchiveQuiesce {
         ReplayIntent { quiesce: self }
     }
 
+    /// Whether an old-hour replay is registered right now (2026-11-14
+    /// evening audit): the Brutex export holds a forced past day back while
+    /// one runs, since it can still write rows of that day. One atomic load,
+    /// O(1).
+    #[must_use]
+    pub fn replay_registered(&self) -> bool {
+        self.replay_intents.load(Ordering::Acquire) > 0
+    }
+
     /// A writer's side, waiting at most `wait`. `None` on timeout (an
     /// archiver holds or is queued for the lock).
     pub async fn shared(&self, wait: Duration) -> Option<RwLockReadGuard<'_, ()>> {
@@ -290,6 +299,14 @@ pub fn replay_quiesce_wait_until(
 // TEST-EXEMPT: process-lock wrapper; intend_replay covered by test_regression_archiver_stands_aside_while_a_replay_is_registered
 pub fn intend_old_hour_replay() -> ReplayIntent<'static> {
     ARCHIVE_QUIESCE.intend_replay()
+}
+
+/// Whether an old-hour replay is registered on the process lock right now.
+/// See [`ArchiveQuiesce::replay_registered`].
+#[must_use]
+// TEST-EXEMPT: process-lock wrapper; replay_registered covered by test_replay_registered_follows_every_intent_until_the_last_drops
+pub fn old_hour_replay_registered() -> bool {
+    ARCHIVE_QUIESCE.replay_registered()
 }
 
 /// The process lock under the catch-up drain's rule. See
@@ -449,6 +466,22 @@ mod tests {
         assert!(q.hold_writers(Duration::from_millis(10)).await.is_none());
         drop(second);
         assert!(q.hold_writers(Duration::from_millis(10)).await.is_some());
+    }
+
+    /// 2026-11-14 evening audit: `replay_registered` reads true from the
+    /// first registered replay until the last one drops (the Brutex export
+    /// holds a forced past day back on it).
+    #[test]
+    fn test_replay_registered_follows_every_intent_until_the_last_drops() {
+        let q = ArchiveQuiesce::new();
+        assert!(!q.replay_registered());
+        let first = q.intend_replay();
+        assert!(q.replay_registered());
+        let second = q.intend_replay();
+        drop(first);
+        assert!(q.replay_registered(), "one replay is still registered");
+        drop(second);
+        assert!(!q.replay_registered());
     }
 
     /// PR AA review: a catch-up chunk outside the capture window waits until

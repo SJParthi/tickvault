@@ -645,3 +645,44 @@ fn test_append_no_trade_today_replay_never_skips_a_backed_up_contract_like_live(
         "the replay writes every row the live drain wrote"
     );
 }
+
+/// 2026-11-14 audit fix: the skip rests on the WAL keeping every packet. A
+/// frame the WAL refused (it reached the drain through the ring, unbacked)
+/// has no copy anywhere else, so its exact repeat is written, never skipped;
+/// a later WAL-backed repeat of the same values is skipped against it.
+#[test]
+fn test_append_no_trade_today_writes_an_exact_repeat_from_an_unbacked_frame() {
+    let mut ingest = ingest();
+    let unbacked = |ingest: &mut LiveIngest, seq: u64, n: u32| {
+        drain_main_feed_frame(
+            ingest,
+            &CapturedFrame {
+                seq,
+                endpoint: DhanEndpointType::MainFeed,
+                connection_index: 0,
+                received_at: std::time::Instant::now(),
+                received_at_nanos: at(n),
+                wal_backed: false,
+                bytes: ticker(2, 66_422, 142.5, YESTERDAY).into(),
+            },
+            at(n),
+            1_000,
+            counters(),
+        )
+    };
+    let _ = drain(&mut ingest, 1, ticker(2, 66_422, 142.5, YESTERDAY), at(0));
+    assert_eq!(ingest.writer.aux_rows_appended(), 1);
+    let _ = unbacked(&mut ingest, 2, 1);
+    let _ = unbacked(&mut ingest, 3, 2);
+    assert_eq!(
+        ingest.writer.aux_rows_appended(),
+        3,
+        "exact repeats with no WAL copy are written (nothing skipped)"
+    );
+    let _ = drain(&mut ingest, 4, ticker(2, 66_422, 142.5, YESTERDAY), at(3));
+    assert_eq!(
+        ingest.writer.aux_rows_appended(),
+        3,
+        "a later WAL-backed repeat is skipped: the flag is per frame"
+    );
+}

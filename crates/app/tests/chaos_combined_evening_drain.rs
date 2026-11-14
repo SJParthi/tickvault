@@ -462,6 +462,24 @@ fn the_supervisor_model_matches_drain_hold_rs() {
         ),
         "the supervisor must publish the pending evening replay"
     );
+    // 2026-11-14 evening audit: every store is marked published right after
+    // it (inside and outside the hold window), and the export's read also
+    // counts a replay running now and the planned restart before the first
+    // publish. Behaviour: `test_replay_pending_from_holds_until_the_first_publish_on_a_planned_boot`.
+    let body = &src[..src.find("#[cfg(test)]").expect("tests")];
+    assert_eq!(
+        body.matches("EVENING_REPLAY_PENDING.store(").count(),
+        body.matches("EVENING_REPLAY_PUBLISHED.store(true, Ordering::Release);")
+            .count(),
+        "each store of the pending flag is followed by its published mark"
+    );
+    for needle in [
+        "tickvault_storage::wal_replay_frame_cap::planned_evening_drain_boot(),",
+        "tickvault_storage::archive_quiesce::old_hour_replay_registered(),",
+        "EVENING_REPLAY_PUBLISHED.load(Ordering::Acquire);",
+    ] {
+        assert!(body.contains(needle), "drain_hold.rs lost: {needle}");
+    }
     // The restart is asked only after the record landed.
     let fn_at = src
         .find("async fn request_evening_restart(")

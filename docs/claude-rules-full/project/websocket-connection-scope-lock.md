@@ -8377,11 +8377,14 @@ on the same IST receipt day with no gap since (the full rule and its limits are
 in the Quote 61 record). A contract the main feed carries on two sockets (the
 2026-10-02 backup copy) is never skipped. The packet itself is not dropped: the
 WAL and `raw-frames/` keep it, unchanged, and inline depth from the same packet
-is written as before.
+is written as before. **⚠ CORRECTED 2026-11-14 (evening audit):** this holds
+only for a frame the WAL kept. A frame the WAL refused reaches the drain
+through the ring with no copy anywhere else, so its row is never skipped
+(always written, not counted as skipped).
 
 REJECT under this note: skipping any other packet class, `feed_aux_packets`
 kind or table; skipping anything in the WAL or `raw-frames/`; skipping a row
-that differs in any stored column; any widening of this disposition without a
+that differs in any stored column, or a row of a frame the WAL refused; any widening of this disposition without a
 further dated quote HERE.
 
 ### 2026-10-01 — UNSUBSCRIBE AND SUBSCRIBE, NOT DISCONNECT AND RECONNECT: depth-200 changes contract in place, and a ghost is answered with a fresh unsubscribe

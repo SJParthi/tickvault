@@ -54,9 +54,15 @@
 //! floor AND the disk-pressure line ([`pressure_free_floor_bytes`]: below
 //! it the pressure archiver needs the exclusive side of the lock) plus the
 //! partition's size free, and [`EXPORT_PARTITION_WORST_SECS`] left before
-//! 08:30 on a session day; otherwise it stops (not a failure) before taking
-//! the quiesce lock, so it never holds the lock a disk reclaim needs and
-//! never reads on into the session.
+//! 08:30 on a session day; otherwise it stops (not a failure). Both are
+//! checked before taking the quiesce lock and again right after it (the
+//! wait can last minutes), so it never reads on into the session.
+//! **Honest limit (2026-11-14 evening audit):** a writer working beside it
+//! (the after-close depth pass, the spill replay, a WAL catch-up beside a
+//! forced or noted day) can still push free space under the pressure line
+//! while one partition is exported; the pressure pass then waits for that
+//! one partition (at most [`EXPORT_PARTITION_WORST_SECS`]), and the next
+//! partition stops for disk.
 //!
 //! **This module never deletes, drops or overwrites anything and writes no
 //! `partition_archive_audit` row** (pinned by
@@ -413,11 +419,14 @@ pub fn left_out_as_open(
             .is_ok_and(|start| start >= cut)
 }
 
-/// Free bytes the volume must keep so the disk-pressure archiver never
+/// Free bytes the volume must keep so the disk-pressure archiver rarely
 /// needs the lock the export holds (2026-11-14 third review): the bytes
 /// below `high_water_pct` used (pressure starts AT that line). The export
 /// stops (not a failure) before a partition that would take the volume
-/// under it. Pure, O(1).
+/// under it, checked before and right after taking the lock; a writer
+/// beside it can still cross the line during one partition, delaying the
+/// pressure pass by at most that partition (2026-11-14 evening audit).
+/// Pure, O(1).
 #[must_use]
 pub fn pressure_free_floor_bytes(total: u64, high_water_pct: u8) -> u64 {
     let free_pct = 100_u64.saturating_sub(u64::from(high_water_pct.min(100)));
@@ -554,21 +563,28 @@ pub enum Placement {
     Sidecar,
     /// The content-addressed key already held these exact bytes.
     SidecarReused,
-    /// A verified archiver copy this export did not place (archived and
-    /// dropped before or during the export, or an earlier copy of a partition
-    /// that late rows re-created); listed from its audit row and confirmed in
-    /// S3.
+    /// A verified archiver copy this export did not place, made BEFORE this
+    /// attempt started (or with no readable copy time): an earlier copy of a
+    /// partition that late rows re-created, or one archived and dropped
+    /// before the export reached it; listed from its audit row and confirmed
+    /// in S3.
     ArchivedBeforeExport,
+    /// A verified archiver copy this export did not place, made at or after
+    /// this attempt started (its audit row's time): it can hold rows newer
+    /// than the object this export placed for the same partition, so a
+    /// reader prefers it by `copied_at_ist` (2026-11-14 evening audit).
+    ArchivedDuringExport,
 }
 
 impl Placement {
     /// Every placement, for the zero-registered counter labels.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Uploaded,
         Self::Reused,
         Self::Sidecar,
         Self::SidecarReused,
         Self::ArchivedBeforeExport,
+        Self::ArchivedDuringExport,
     ];
 
     /// Stable label.
@@ -580,6 +596,7 @@ impl Placement {
             Self::Sidecar => "sidecar",
             Self::SidecarReused => "sidecar_reused",
             Self::ArchivedBeforeExport => "archived_before_export",
+            Self::ArchivedDuringExport => "archived_during_export",
         }
     }
 }
@@ -822,9 +839,40 @@ pub struct ManifestPartition {
     /// order: `true` for an object this export wrote or matched byte for
     /// byte (uploaded, reused, content-addressed); `false` for a copy the
     /// archiver made before the export ([`Placement::ArchivedBeforeExport`]),
-    /// which is often unordered (2026-11-14 third review). A reader that
-    /// needs the order sorts a `false` object itself.
+    /// which is often unordered (2026-11-14 third review). A copy made during
+    /// the export ([`Placement::ArchivedDuringExport`]) is `true` only when
+    /// this export had already placed an object of the same partition when
+    /// the copy was recorded: the canonical key then existed, and the
+    /// archiver sorts whenever it does (outside the trading-day window).
+    /// **Honest limits:** under disk pressure a failed sorted export falls
+    /// back to the old order (`tv_partition_archive_export_unordered_fallback_total`),
+    /// and the archive's exact-gate path takes no lock, so it can read the
+    /// canonical key just before this export placed it. A reader that needs
+    /// the order sorts a `false` object itself.
     pub ordered_by_dedup_key: bool,
+    /// When this object's rows were copied (IST, `YYYY-MM-DDTHH:MM:SS.ffffff+05:30`):
+    /// the placement time for an object this export placed, the audit row's
+    /// time for an archiver copy; `None` when an audit row carries no
+    /// readable time (2026-11-14 evening audit).
+    #[serde(rename = "copied_at_ist", serialize_with = "ser_copied_at")]
+    pub copied_at_ist_nanos: Option<i64>,
+}
+
+/// Renders IST nanos (QuestDB's IST-as-UTC convention) as
+/// `YYYY-MM-DDTHH:MM:SS.ffffff+05:30`. Pure, O(1).
+fn ist_nanos_text(nanos: i64) -> String {
+    let secs = nanos.div_euclid(1_000_000_000);
+    let sub = u32::try_from(nanos.rem_euclid(1_000_000_000)).unwrap_or(0);
+    chrono::DateTime::from_timestamp(secs, sub).map_or_else(String::new, |t| {
+        format!("{}+05:30", t.naive_utc().format("%Y-%m-%dT%H:%M:%S%.6f"))
+    })
+}
+
+fn ser_copied_at<S: serde::Serializer>(v: &Option<i64>, s: S) -> Result<S::Ok, S::Error> {
+    match v {
+        Some(n) => s.serialize_str(&ist_nanos_text(*n)),
+        None => s.serialize_none(),
+    }
 }
 
 /// One table in the manifest.
@@ -854,6 +902,10 @@ pub struct ManifestTable {
     /// partition's objects keyed on the DEDUP key (`order_by`), which is unique
     /// per row.
     pub rows_may_overlap: bool,
+    /// When two objects of one partition carry different values for one
+    /// DEDUP key, take the one with the latest `copied_at_ist` (2026-11-14
+    /// evening audit): copies are snapshots, so the later one holds the
+    /// later value.
     pub partitions: Vec<ManifestPartition>,
 }
 
@@ -1113,10 +1165,21 @@ pub(crate) struct ArchivedRow {
     pub rows: u64,
     pub gzip_bytes: u64,
     pub sha256_hex: String,
+    /// The audit row's time (IST nanos); `None` when absent or unreadable.
+    pub copied_at_ist_nanos: Option<i64>,
+}
+
+/// Parses an audit `ts` (`YYYY-MM-DDTHH:MM:SS.ffffffZ`, IST written as Z) into
+/// IST nanos. Pure, O(1).
+fn parse_audit_ts(text: &str) -> Option<i64> {
+    chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%dT%H:%M:%S%.fZ")
+        .ok()?
+        .and_utc()
+        .timestamp_nanos_opt()
 }
 
 /// Parses the verified-audit-row query (`table_name, partition_name, s3_key,
-/// rows_archived, gzip_bytes, gzip_sha256`). EVERY distinct copy of a
+/// rows_archived, gzip_bytes, gzip_sha256, ts`; `ts` optional). EVERY distinct copy of a
 /// partition is kept (an archived bulk and a later copy of rows that
 /// re-created the partition are both data); the last row per
 /// `(table, partition, key)` wins. Fail-closed: an unreadable body is
@@ -1135,6 +1198,7 @@ pub(crate) fn parse_archived_rows(json: &str) -> Option<Vec<ArchivedRow>> {
             rows: num(3)?,
             gzip_bytes: num(4)?,
             sha256_hex: text(5)?,
+            copied_at_ist_nanos: text(6).as_deref().and_then(parse_audit_ts),
         };
         by_copy.insert(
             (row.table.clone(), row.partition.clone(), row.key.clone()),
@@ -1180,12 +1244,18 @@ enum TableStep {
 
 /// Adds every verified archived copy of `t`'s table that the export did not
 /// itself place, and checks every vanished partition is covered. `confirm`
-/// answers whether a copy is intact in S3. Sorts the partitions and sets
-/// `rows` and `rows_may_overlap`. O(copies log copies).
+/// answers whether a copy is intact in S3. A copy recorded at or after
+/// `started_ist_nanos` (this attempt's start) is
+/// [`Placement::ArchivedDuringExport`], ordered when this export had placed
+/// the same partition by then; any other is
+/// [`Placement::ArchivedBeforeExport`], not known to be ordered (2026-11-14
+/// evening audit). Sorts the partitions and sets `rows` and
+/// `rows_may_overlap`. O(copies × placed + copies log copies).
 async fn merge_archived<F, Fut>(
     t: &mut TableResult,
     archived: &[ArchivedRow],
     reasons: &mut Vec<String>,
+    started_ist_nanos: i64,
     confirm: F,
 ) -> Result<()>
 where
@@ -1193,6 +1263,13 @@ where
     Fut: std::future::Future<Output = Result<bool>>,
 {
     let placed: BTreeSet<String> = t.entry.partitions.iter().map(|p| p.key.clone()).collect();
+    // (partition, placement time) of the objects this export placed.
+    let placed_at: Vec<(String, Option<i64>)> = t
+        .entry
+        .partitions
+        .iter()
+        .map(|p| (p.partition.clone(), p.copied_at_ist_nanos))
+        .collect();
     for row in archived.iter().filter(|r| r.table == t.entry.table) {
         if placed.contains(&row.key) {
             continue;
@@ -1204,20 +1281,35 @@ where
             ));
             continue;
         }
+        let during = row
+            .copied_at_ist_nanos
+            .is_some_and(|ts| ts >= started_ist_nanos);
+        let placement = if during {
+            Placement::ArchivedDuringExport
+        } else {
+            Placement::ArchivedBeforeExport
+        };
+        let ordered = during
+            && placed_at.iter().any(|(p, at)| {
+                *p == row.partition
+                    && at
+                        .zip(row.copied_at_ist_nanos)
+                        .is_some_and(|(at, ts)| at <= ts)
+            });
         note_object_placed();
-        metrics::counter!("tv_brutex_export_objects_total",
-            "placement" => Placement::ArchivedBeforeExport.as_str())
-        .increment(1);
+        metrics::counter!("tv_brutex_export_objects_total", "placement" => placement.as_str())
+            .increment(1);
         t.entry.partitions.push(ManifestPartition {
             partition: row.partition.clone(),
             key: row.key.clone(),
-            placement: Placement::ArchivedBeforeExport,
+            placement,
             rows: row.rows,
             gzip_bytes: row.gzip_bytes,
             sha256_hex: row.sha256_hex.clone(),
             csv_bytes: None,
             instrument_counts_known: false,
-            ordered_by_dedup_key: false,
+            ordered_by_dedup_key: ordered,
+            copied_at_ist_nanos: row.copied_at_ist_nanos,
         });
     }
     for gone in &t.vanished {
@@ -1364,6 +1456,7 @@ impl DailyExporter {
         opts: ExportOptions<'_>,
     ) -> Result<ExportOutcome> {
         let started = now_ist_text();
+        let started_ist_nanos = super::now_ist_nanos();
         let clock = std::time::Instant::now();
         if self.is_sealed(day).await? {
             metrics::counter!("tv_brutex_export_runs_total", "outcome" => "skipped_done")
@@ -1408,13 +1501,19 @@ impl DailyExporter {
         let archived = self.archived_rows(day).await?;
         for t in &mut results {
             let cold = &self.archiver.cold;
-            merge_archived(t, &archived, &mut reasons, |row| async move {
-                let meta = cold.head(&row.key).await?;
-                let want = hex_to_base64(&row.sha256_hex);
-                Ok(meta.as_ref().is_some_and(|m| {
-                    m.len == row.gzip_bytes && want.is_some() && m.checksum_sha256_b64 == want
-                }))
-            })
+            merge_archived(
+                t,
+                &archived,
+                &mut reasons,
+                started_ist_nanos,
+                |row| async move {
+                    let meta = cold.head(&row.key).await?;
+                    let want = hex_to_base64(&row.sha256_hex);
+                    Ok(meta.as_ref().is_some_and(|m| {
+                        m.len == row.gzip_bytes && want.is_some() && m.checksum_sha256_b64 == want
+                    }))
+                },
+            )
             .await
             .inspect_err(|_| {
                 metrics::counter!("tv_brutex_export_runs_total", "outcome" => "failed")
@@ -1540,8 +1639,8 @@ impl DailyExporter {
     /// audit table is none.
     async fn archived_rows(&self, day: NaiveDate) -> Result<Vec<ArchivedRow>> {
         let sql = format!(
-            "SELECT table_name, partition_name, s3_key, rows_archived, gzip_bytes, gzip_sha256 \
-             FROM {PARTITION_ARCHIVE_AUDIT_TABLE} WHERE outcome = 'verified' \
+            "SELECT table_name, partition_name, s3_key, rows_archived, gzip_bytes, gzip_sha256, \
+             ts FROM {PARTITION_ARCHIVE_AUDIT_TABLE} WHERE outcome = 'verified' \
              AND ts >= '{}T00:00:00.000000Z' ORDER BY ts",
             day.format("%Y-%m-%d")
         );
@@ -1681,9 +1780,15 @@ impl DailyExporter {
     /// unless [`EXPORT_PARTITION_WORST_SECS`] are left before 08:30, and
     /// ([`StopReason::Disk`]) unless the volume keeps `floor_for_total` (the
     /// after-close floor and the disk-pressure line) plus `expected_bytes`
-    /// free, so a filling disk never has the export holding the lock a
-    /// pressure archive pass needs (2026-11-14 third review). The lock wait is cut
-    /// to the time left; after the lock the window is checked again.
+    /// free (2026-11-14 third review). The lock wait is cut to the time
+    /// left; after the lock the window AND the free space are checked again,
+    /// and a short disk releases the lock and stops (2026-11-14 evening
+    /// audit). **Honest limit:** a writer working beside the export (the
+    /// after-close depth pass, the spill replay, a WAL catch-up beside a
+    /// forced or noted day) can still push free space under the pressure
+    /// line during one partition; the pressure pass then waits for at most
+    /// that one partition ([`EXPORT_PARTITION_WORST_SECS`]), and the next
+    /// partition stops with [`StopReason::Disk`].
     async fn export_partition_quiesced(
         &mut self,
         table: &str,
@@ -1728,6 +1833,22 @@ impl DailyExporter {
         if !(opts.keep_going)() || (opts.time_left)().is_some_and(|l| l < worst) {
             drop(guard);
             return Ok(PartitionStep::Stop(StopReason::Window));
+        }
+        // Free space again, now the lock is held (2026-11-14 evening audit):
+        // the wait above can last minutes, and another writer can fill the
+        // disk meanwhile. Short now: release the lock and stop (not a failure).
+        let probe = self.probe_scratch_volume();
+        if !export_space_ok(probe, expected_bytes, opts.floor_for_total) {
+            drop(guard);
+            warn!(
+                table,
+                partition,
+                expected_bytes,
+                free_bytes = probe.map(|(f, _)| f),
+                "brutex export: the disk filled while waiting for the archive lock; \
+                 lock released and stopped (not a failure), tried again later"
+            );
+            return Ok(PartitionStep::Stop(StopReason::Disk));
         }
         let still = self.archiver.partition_sizes(table).await?;
         if !still.iter().any(|(n, _)| n == partition) {
@@ -1838,6 +1959,7 @@ impl DailyExporter {
                 csv_bytes: Some(exported.csv_bytes),
                 instrument_counts_known: true,
                 ordered_by_dedup_key: true,
+                copied_at_ist_nanos: Some(super::now_ist_nanos()),
             },
             counts,
             columns: tally.header().to_vec(),
@@ -2180,6 +2302,7 @@ mod tests {
                     csv_bytes: None,
                     instrument_counts_known: false,
                     ordered_by_dedup_key: true,
+                    copied_at_ist_nanos: Some(1_794_571_200_123_456_789),
                 }],
             }],
             instrument_counts: ObjectRef {
@@ -2198,7 +2321,8 @@ mod tests {
              \"open_from_ist\":\"2026-11-13T16:00:00+05:30\",\
              \"open_partitions_left_out\":[\"2026-11-13T16\"],\"rows\":3,\"rows_may_overlap\":false,\"partitions\":[{\"partition\":\"2026-11-13T09\",\
              \"key\":\"k\",\"placement\":\"sidecar_reused\",\"rows\":3,\"gzip_bytes\":9,\
-             \"sha256_hex\":\"ab\",\"csv_bytes\":null,\"instrument_counts_known\":false,\"ordered_by_dedup_key\":true}]}],\
+             \"sha256_hex\":\"ab\",\"csv_bytes\":null,\"instrument_counts_known\":false,\"ordered_by_dedup_key\":true,\
+             \"copied_at_ist\":\"2026-11-13T12:00:00.123456+05:30\"}]}],\
              \"instrument_counts\":{\"key\":\"c\",\"bytes\":1,\"sha256_hex\":\"cd\"}}"
         );
     }
@@ -2252,6 +2376,7 @@ mod tests {
             csv_bytes: Some(1),
             instrument_counts_known: true,
             ordered_by_dedup_key: true,
+            copied_at_ist_nanos: None,
         }
     }
 
@@ -2263,6 +2388,7 @@ mod tests {
             rows,
             gzip_bytes: 9,
             sha256_hex: "bb".into(),
+            copied_at_ist_nanos: None,
         }
     }
 
@@ -2301,9 +2427,13 @@ mod tests {
             archived("2026-11-13T10", "side", 40),
         ];
         let mut reasons = Vec::new();
-        block_on(merge_archived(&mut t, &archived, &mut reasons, |_| async {
-            Ok(true)
-        }))
+        block_on(merge_archived(
+            &mut t,
+            &archived,
+            &mut reasons,
+            0,
+            |_| async { Ok(true) },
+        ))
         .expect("merge");
         let keys: Vec<&str> = t.entry.partitions.iter().map(|p| p.key.as_str()).collect();
         assert_eq!(keys, ["canonical", "side"]);
@@ -2320,6 +2450,84 @@ mod tests {
         assert!(reasons.is_empty());
     }
 
+    /// Regression (2026-11-14 evening audit, LOW): this export places a
+    /// partition, then the archiver copies the same partition (late rows made
+    /// its bytes differ, so a content-addressed copy) DURING the export. That
+    /// copy is newer, so it is `archived_during_export`, ordered (the
+    /// canonical key existed when it was made), and carries its copy time; a
+    /// reader prefers it for a DEDUP key by the latest `copied_at_ist`. A copy
+    /// made before the attempt started stays `archived_before_export`, not
+    /// known to be ordered; a copy with no readable time reads as before.
+    #[test]
+    fn test_merge_archived_labels_a_copy_made_during_the_export() {
+        let started = 1_000;
+        let placed_at = 1_500;
+        let mut mine = entry("2026-11-13T10", "canonical", 40);
+        mine.copied_at_ist_nanos = Some(placed_at);
+        let mut t = table_result(vec![mine], vec![]);
+        let at = |partition: &str, key: &str, ts: Option<i64>| ArchivedRow {
+            copied_at_ist_nanos: ts,
+            ..archived(partition, key, 41)
+        };
+        let copies = vec![
+            at("2026-11-13T10", "side", Some(2_000)),
+            at("2026-11-13T10", "old", Some(500)),
+            at("2026-11-13T11", "other", Some(1_200)),
+            at("2026-11-13T10", "untimed", None),
+        ];
+        let mut reasons = Vec::new();
+        block_on(merge_archived(
+            &mut t,
+            &copies,
+            &mut reasons,
+            started,
+            |_| async { Ok(true) },
+        ))
+        .expect("merge");
+        let got: Vec<(&str, Placement, bool, Option<i64>)> = t
+            .entry
+            .partitions
+            .iter()
+            .map(|p| {
+                (
+                    p.key.as_str(),
+                    p.placement,
+                    p.ordered_by_dedup_key,
+                    p.copied_at_ist_nanos,
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("canonical", Placement::Uploaded, true, Some(placed_at)),
+                ("old", Placement::ArchivedBeforeExport, false, Some(500)),
+                ("side", Placement::ArchivedDuringExport, true, Some(2_000)),
+                ("untimed", Placement::ArchivedBeforeExport, false, None),
+                // During the export, but this export placed no object of
+                // that partition first: not known to be ordered.
+                ("other", Placement::ArchivedDuringExport, false, Some(1_200)),
+            ]
+        );
+        assert_eq!(
+            serde_json::to_string(&Placement::ArchivedDuringExport).expect("json"),
+            "\"archived_during_export\""
+        );
+        assert!(Placement::ALL.contains(&Placement::ArchivedDuringExport));
+        assert_eq!(
+            parse_audit_ts("2026-11-13T12:00:00.123456Z"),
+            Some(1_794_571_200_123_456_000)
+        );
+        assert_eq!(
+            ist_nanos_text(1_794_571_200_123_456_789),
+            "2026-11-13T12:00:00.123456+05:30"
+        );
+        let body = "{\"dataset\":[[\"ticks\",\"2026-11-13T10\",\"k\",5,10,\"aa\",\
+                    \"2026-11-13T12:00:00.000000Z\"]]}";
+        let rows = parse_archived_rows(body).expect("rows");
+        assert_eq!(rows[0].copied_at_ist_nanos, Some(1_794_571_200_000_000_000));
+    }
+
     /// Regression (2026-11-14 review, CRITICAL): a partition dropped before
     /// the export could lock it is listed from its audit row; with no intact
     /// copy the day is refused, never sealed without the hour.
@@ -2327,23 +2535,27 @@ mod tests {
     fn test_merge_requires_a_copy_for_every_vanished_partition() {
         let mut t = table_result(vec![], vec!["2026-11-13T10"]);
         let mut reasons = Vec::new();
-        let err = block_on(merge_archived(&mut t, &[], &mut reasons, |_| async {
+        let err = block_on(merge_archived(&mut t, &[], &mut reasons, 0, |_| async {
             Ok(true)
         }))
         .expect_err("no copy yet");
         assert!(format!("{err:#}").contains("2026-11-13T10"), "{err:#}");
         let mut t = table_result(vec![], vec!["2026-11-13T10"]);
         let copy = vec![archived("2026-11-13T10", "canonical", 5)];
-        let err = block_on(merge_archived(&mut t, &copy, &mut reasons, |_| async {
+        let err = block_on(merge_archived(&mut t, &copy, &mut reasons, 0, |_| async {
             Ok(false)
         }))
         .expect_err("copy not intact");
         assert!(format!("{err:#}").contains("no intact"), "{err:#}");
         assert_eq!(reasons, ["archived_copy_unconfirmed:ticks/2026-11-13T10"]);
         let mut t = table_result(vec![], vec!["2026-11-13T10"]);
-        block_on(merge_archived(&mut t, &copy, &mut Vec::new(), |_| async {
-            Ok(true)
-        }))
+        block_on(merge_archived(
+            &mut t,
+            &copy,
+            &mut Vec::new(),
+            0,
+            |_| async { Ok(true) },
+        ))
         .expect("covered");
         assert_eq!(t.entry.rows, 5);
         assert!(!t.entry.rows_may_overlap);
@@ -2418,6 +2630,7 @@ mod tests {
             "tv_brutex_export_runs_total{outcome=incomplete}",
             "tv_brutex_export_objects_total{placement=uploaded}",
             "tv_brutex_export_objects_total{placement=archived_before_export}",
+            "tv_brutex_export_objects_total{placement=archived_during_export}",
             "tv_partition_archive_export_unordered_fallback_total{}",
             "tv_partition_archive_export_unordered_in_session_total{}",
             "tv_partition_archive_amend_records_total{}",
@@ -2614,8 +2827,9 @@ mod tests {
     }
 
     /// Regression (2026-11-14 third review, MEDIUM): the export's disk floor
-    /// includes the disk-pressure line, so it never holds the quiesce lock
-    /// while the pressure archiver needs the exclusive side.
+    /// includes the disk-pressure line, so it starts no partition (checked
+    /// before and right after taking the quiesce lock) while the pressure
+    /// archiver needs the exclusive side.
     #[test]
     fn test_pressure_free_floor_bytes_is_the_room_below_high_water() {
         let gib = 1_u64 << 30;

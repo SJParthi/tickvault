@@ -644,12 +644,42 @@ pub fn evening_replay_value(
     step.holds() && wal_backlog.is_some_and(|n| n > 0)
 }
 
-/// Whether tonight's evening WAL drain still has a replay to make (owner
-/// Quote 60, 2026-11-14 review). O(1).
+/// Set once the supervisor has stored [`EVENING_REPLAY_PENDING`] in this
+/// process (2026-11-14 evening audit). Before that the flag's `false` is
+/// only its start value, not a verdict.
+static EVENING_REPLAY_PUBLISHED: AtomicBool = AtomicBool::new(false);
+
+/// Whether a WAL replay will still write old rows (2026-11-14 evening
+/// audit): the supervisor's `published_value` once it has `published`; on
+/// the planned evening restart (`planned_boot`) a replay is pending until
+/// then (the export loop starts before the supervisor's first verdict, and
+/// that boot exists to replay); and always while a replay is running in this
+/// process (`replay_running`: the boot refold or the catch-up drain, which
+/// can run on a boot the evening step no longer holds for). Pure, O(1).
 #[must_use]
-// TEST-EXEMPT: a load of the published flag; its value is test_evening_replay_value_needs_a_holding_step_and_a_backlog
+pub fn replay_pending_from(
+    published_value: bool,
+    published: bool,
+    planned_boot: bool,
+    replay_running: bool,
+) -> bool {
+    replay_running || published_value || (!published && planned_boot)
+}
+
+/// Whether a WAL replay will still write old rows: one runs in this process,
+/// or tonight's evening WAL drain still has one to make (owner Quote 60,
+/// 2026-11-14 review and evening audit). Read by the Brutex export. Four
+/// atomic loads, O(1).
+#[must_use]
+// TEST-EXEMPT: loads of the flags; the decision is test_replay_pending_from_holds_until_the_first_publish_on_a_planned_boot and test_evening_replay_value_needs_a_holding_step_and_a_backlog
 pub fn evening_replay_pending() -> bool {
-    EVENING_REPLAY_PENDING.load(Ordering::Relaxed)
+    let published = EVENING_REPLAY_PUBLISHED.load(Ordering::Acquire);
+    replay_pending_from(
+        EVENING_REPLAY_PENDING.load(Ordering::Relaxed),
+        published,
+        tickvault_storage::wal_replay_frame_cap::planned_evening_drain_boot(),
+        tickvault_storage::archive_quiesce::old_hour_replay_registered(),
+    )
 }
 
 /// The work count the drain hold's stall rule watches: rows the after-close
@@ -680,6 +710,7 @@ pub fn spawn_drain_hold_supervisor(environment: String) -> tokio::task::JoinHand
                 state = HoldState::default();
                 progress = ProgressTracker::default();
                 EVENING_REPLAY_PENDING.store(false, Ordering::Relaxed);
+                EVENING_REPLAY_PUBLISHED.store(true, Ordering::Release);
                 // Past the hold window's end plus the stop lag, tonight is over.
                 if secs_ist >= DRAIN_HOLD_CEILING_SECS_IST + HELD_STOP_LAG_SECS {
                     HELD_TONIGHT.store(false, Ordering::Release);
@@ -785,6 +816,7 @@ pub fn spawn_drain_hold_supervisor(environment: String) -> tokio::task::JoinHand
                 evening_replay_value(evening_step, work.wal_backlog),
                 Ordering::Relaxed,
             );
+            EVENING_REPLAY_PUBLISHED.store(true, Ordering::Release);
             #[allow(clippy::cast_precision_loss)] // APPROVED: a bucket count, far below 2^53
             let floor_blocked = work.floor_blocked_buckets() as f64;
             metrics::gauge!(FLOOR_BLOCKED_BUCKETS_GAUGE).set(floor_blocked);
@@ -1069,6 +1101,25 @@ mod tests {
         assert!(!evening_replay_value(EveningStep::Wait, None));
         assert!(!evening_replay_value(EveningStep::Idle, Some(3)));
         assert!(!evening_replay_value(EveningStep::GaveUp, Some(3)));
+    }
+
+    /// Regression (2026-11-14 evening audit, MEDIUM): the flag starts
+    /// `false` in a new process and the Brutex export loop starts before the
+    /// supervisor's first verdict. On the planned evening restart that start
+    /// value no longer reads as "no replay"; a replay running in this
+    /// process always reads as pending, whatever was published; once the
+    /// supervisor has published, its verdict stands.
+    #[test]
+    fn test_replay_pending_from_holds_until_the_first_publish_on_a_planned_boot() {
+        // value, published, planned boot, replay running
+        assert!(replay_pending_from(false, false, true, false));
+        assert!(!replay_pending_from(false, true, true, false));
+        assert!(replay_pending_from(true, true, true, false));
+        assert!(!replay_pending_from(false, false, false, false));
+        assert!(replay_pending_from(false, true, false, true));
+        assert!(replay_pending_from(false, false, false, true));
+        // The wiring (every store marked published; the loads) is pinned by
+        // `chaos_combined_evening_drain.rs`, which reads this file's source.
     }
 
     /// Owner Quote 60: an object the export placed moves the stall clock.

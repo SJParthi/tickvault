@@ -41,16 +41,23 @@
 //! day) the session day is handled like a catch-up day (no drain hold), with
 //! its hard gates still read. A past day runs once nothing delays it, and
 //! anyway (its pending reasons in the manifest) once it is
-//! [`PAST_DAY_FORCE_AFTER_DAYS`] days old or the oldest of the window, so a
-//! day is never left waiting on a gate that never clears (a weekend no
+//! [`PAST_DAY_FORCE_AFTER_DAYS`] days old or at its last chance
+//! ([`last_window_chance`]: no later session day keeps it in the window), so
+//! a day is never left waiting on a gate that never clears (a weekend no
 //! longer hides a day's last chance); only a name repair rewriting the day,
 //! or due to reach it before the session day's midnight
 //! ([`BLOCKS_EVEN_FORCED`]), holds even a forced day back (2026-11-14 third
-//! review). A day gives up after [`MAX_ATTEMPTS_PER_DAY`] attempts in one
-//! process, with one coded `error!` (STORAGE-GAP-04, `source =
-//! "brutex_daily_export"`); a loop that panics books its run as a failed
-//! attempt ([`book_panicked_run`]). A session day that leaves the window
-//! with no DONE logs the same code with `source =
+//! review), and a WAL replay still to run holds a forced day back too,
+//! except a day at its last chance ([`WAL_REPLAY_HOLDS_FORCED`], 2026-11-14
+//! evening audit). A replay counts as pending while one runs in this
+//! process, while tonight's evening drain will make one, and on the planned
+//! evening restart until the drain hold first publishes
+//! ([`crate::drain_hold::evening_replay_pending`]). A day gives up after
+//! [`MAX_ATTEMPTS_PER_DAY`] attempts in one process, with one coded
+//! `error!` (STORAGE-GAP-04, `source = "brutex_daily_export"`); a loop
+//! that panics books its run as a failed attempt ([`book_panicked_run`]).
+//! A session day that leaves the window with no DONE logs the same code
+//! with `source =
 //! "brutex_daily_export_left_window"` ONCE PER PROCESS (each boot of the
 //! following [`LEFT_WINDOW_LOOKBACK_DAYS`] days reports it again), and a day
 //! sealed INCOMPLETE `source = "brutex_daily_export_incomplete"`. All are
@@ -287,13 +294,27 @@ pub fn ready(reasons: &[String]) -> bool {
 /// Whether `reasons` hold a FORCED catch-up day back (2026-11-14 third
 /// review): a repair run rewriting it now, always; a repair still to come
 /// tonight, until `after_midnight` (the clock past the session day's
-/// midnight). Pure, O(reasons).
+/// midnight); and a WAL replay still to run ([`WAL_REPLAY_HOLDS_FORCED`]),
+/// unless `last_chance` ([`last_window_chance`]: no later session day keeps
+/// the day in the window, so it never leaves the window with no DONE). The
+/// evening replay is bounded (at most 3 restarts, none after 05:00 IST,
+/// stops when the backlog does not shrink), and a boot replay by the catch-up
+/// drain's deadline, so this hold ends the same night (2026-11-14 evening
+/// audit: shed frames of a forced day replayed after its export landed in an
+/// already-exported partition, a second copy, rows missing from Brutex's
+/// manifest). Pure, O(reasons).
 #[must_use]
-pub fn blocks_even_forced(reasons: &[String], after_midnight: bool) -> bool {
-    reasons
-        .iter()
-        .any(|r| r == BLOCKS_EVEN_FORCED[0] || (!after_midnight && r == BLOCKS_EVEN_FORCED[1]))
+pub fn blocks_even_forced(reasons: &[String], after_midnight: bool, last_chance: bool) -> bool {
+    reasons.iter().any(|r| {
+        r == BLOCKS_EVEN_FORCED[0]
+            || (!after_midnight && r == BLOCKS_EVEN_FORCED[1])
+            || (!last_chance && r == WAL_REPLAY_HOLDS_FORCED)
+    })
 }
+
+/// The reason that holds a forced past day back, except one at its last
+/// chance: a WAL replay will still write rows of it.
+pub const WAL_REPLAY_HOLDS_FORCED: &str = "wal_backlog_replaying";
 
 /// What the scheduler read about the gates outside the export tables.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -317,7 +338,9 @@ pub struct Gates {
     pub arrival_hours_open: Option<bool>,
     /// Frames waiting in the WAL backlog; `None` = unreadable.
     pub wal_backlog: Option<u64>,
-    /// Tonight's evening WAL drain will still replay them.
+    /// A replay will still write them: one is running in this process, or
+    /// tonight's evening WAL drain will still make one (2026-11-14 evening
+    /// audit).
     pub evening_replay_pending: bool,
     /// Every after-close depth pass has stopped at its disk floor for an
     /// hour (the drain hold's cap): skipped depth will not be written now.
@@ -379,13 +402,41 @@ pub fn compose_reasons(base: Vec<String>, gates: Gates) -> Vec<String> {
     out
 }
 
-/// Whether a past `day` runs whatever is pending: the oldest day of the
-/// window, or [`PAST_DAY_FORCE_AFTER_DAYS`] days or more before the session
-/// day. Pure, O(1).
+/// Whether a past `day` runs whatever is pending: at its last chance
+/// ([`last_window_chance`]; the oldest day of the window always is), or
+/// [`PAST_DAY_FORCE_AFTER_DAYS`] days or more before the session day. O(1)
+/// plus at most [`CATCH_UP_DAYS`] calendar reads.
 #[must_use]
 pub fn past_day_forced(day: NaiveDate, session_day: NaiveDate) -> bool {
-    Some(day) == oldest_window_day(session_day)
+    last_window_chance(day, session_day)
         || session_day.signed_duration_since(day).num_days() >= PAST_DAY_FORCE_AFTER_DAYS
+}
+
+/// Whether `session_day`'s evening is `day`'s last chance to export: no
+/// later session day keeps `day` inside its window (2026-11-14 evening
+/// audit). The oldest day of the window always is; so is a day whose later
+/// window days are all a weekend or a holiday, when the box does not run the
+/// export. Reads the installed trading calendar ([`session_info`]); O(1)
+/// plus at most [`CATCH_UP_DAYS`] calendar reads.
+#[must_use]
+pub fn last_window_chance(day: NaiveDate, session_day: NaiveDate) -> bool {
+    last_window_chance_with(day, session_day, |d| {
+        export_open_secs(session_info(d)).is_some()
+    })
+}
+
+/// [`last_window_chance`] against `is_session` (a day the export can run
+/// on). Pure, O(1) plus at most [`CATCH_UP_DAYS`] calls of `is_session`.
+#[must_use]
+pub fn last_window_chance_with(
+    day: NaiveDate,
+    session_day: NaiveDate,
+    is_session: impl Fn(NaiveDate) -> bool,
+) -> bool {
+    !(1..CATCH_UP_DAYS)
+        .filter_map(|ahead| session_day.checked_add_signed(chrono::TimeDelta::days(ahead)))
+        .take_while(|later| oldest_window_day(*later).is_some_and(|oldest| oldest <= day))
+        .any(is_session)
 }
 
 /// The session days that have just left (or long left) the catch-up window
@@ -469,8 +520,8 @@ pub fn within_session_horizon(secs: u32, open: u32) -> bool {
 /// The step for a PAST day (catch-up, or the session day past its
 /// horizon): it runs once nothing delays it, or once `forced`
 /// ([`past_day_forced`]) whatever is pending, unless `blocked`
-/// ([`blocks_even_forced`]: a name repair rewriting it, or due to). Pure,
-/// O(1).
+/// ([`blocks_even_forced`]: a name repair rewriting it, or due to, or
+/// a WAL replay still to run on a day not at its last chance). Pure, O(1).
 #[must_use]
 // TEST-EXEMPT: covered by test_past_day_waits_for_ready_until_its_last_chance
 pub fn past_day_step(
@@ -495,7 +546,11 @@ pub fn past_day_step(
 
 /// The days visited for `session_day`: the session day FIRST (so a catch-up
 /// backlog never runs ahead of today's export or leaves the drain hold
-/// unaware of it), then the earlier days of the window, oldest first. Pure.
+/// unaware of it), then the earlier days of the window, oldest first. A
+/// forced past day waits while a WAL replay is pending, except a day at its
+/// last chance ([`last_window_chance`]), so a late replayed
+/// row of a forced day lands before its export, not after it (2026-11-14
+/// evening audit). Pure.
 #[must_use]
 pub fn visit_order(session_day: NaiveDate) -> Vec<NaiveDate> {
     let mut days = vec![session_day];
@@ -849,7 +904,8 @@ async fn run_export_loop(
             let step = if is_session_day {
                 session_day_step(ssecs, open, *state, now_unix, &reasons)
             } else {
-                let blocked = blocks_even_forced(&reasons, ssecs >= SECS_PER_DAY);
+                let last_chance = last_window_chance(day, session_day);
+                let blocked = blocks_even_forced(&reasons, ssecs >= SECS_PER_DAY, last_chance);
                 past_day_step(*state, now_unix, ready(&reasons), forced, blocked)
             };
             match step {
@@ -1092,20 +1148,33 @@ mod tests {
         let st = DayState::default();
         let running = reasons(&["contract_names_repair_running"]);
         let pending = reasons(&["contract_names_repair_pending"]);
-        assert!(blocks_even_forced(&running, false));
-        assert!(blocks_even_forced(&running, true));
-        assert!(blocks_even_forced(&pending, false));
-        assert!(!blocks_even_forced(&pending, true));
+        assert!(blocks_even_forced(&running, false, false));
+        assert!(blocks_even_forced(&running, true, true));
+        assert!(blocks_even_forced(&pending, false, false));
+        assert!(!blocks_even_forced(&pending, true, false));
         assert!(!blocks_even_forced(
             &reasons(&["spill_pending:ticks"]),
+            false,
             false
         ));
         assert_eq!(
-            past_day_step(st, 0, false, true, blocks_even_forced(&running, true)),
+            past_day_step(
+                st,
+                0,
+                false,
+                true,
+                blocks_even_forced(&running, true, false)
+            ),
             DayStep::Wait
         );
         assert_eq!(
-            past_day_step(st, 0, false, true, blocks_even_forced(&pending, true)),
+            past_day_step(
+                st,
+                0,
+                false,
+                true,
+                blocks_even_forced(&pending, true, false)
+            ),
             DayStep::Run
         );
         let spent = DayState {
@@ -1255,6 +1324,110 @@ mod tests {
     }
 
     use crate::contract_name_repair_boot::RepairDayState;
+
+    /// Regression (2026-11-14 evening audit, MEDIUM): a forced past day (two
+    /// or more days old) waits while tonight's evening WAL replay is still to
+    /// run, so shed frames of it replayed later never land in an
+    /// already-exported partition. The oldest day of the window still runs
+    /// (its last chance), and once the replay clears the forced day runs.
+    #[test]
+    fn test_blocks_even_forced_holds_a_forced_day_while_the_evening_replay_is_pending() {
+        let st = DayState::default();
+        let session = NaiveDate::from_ymd_opt(2026, 11, 13).expect("d");
+        let forced_day = NaiveDate::from_ymd_opt(2026, 11, 11).expect("d");
+        let oldest = oldest_window_day(session).expect("oldest");
+        assert!(past_day_forced(forced_day, session) && forced_day != oldest);
+        let replaying = compose_reasons(
+            vec![],
+            Gates {
+                wal_backlog: Some(12),
+                evening_replay_pending: true,
+                ..gates()
+            },
+        );
+        assert_eq!(replaying, reasons(&[WAL_REPLAY_HOLDS_FORCED]));
+        let step = |day: NaiveDate, r: &[String], after_midnight: bool| {
+            let blocked = blocks_even_forced(r, after_midnight, last_window_chance(day, session));
+            past_day_step(st, 0, ready(r), past_day_forced(day, session), blocked)
+        };
+        for after_midnight in [false, true] {
+            assert_eq!(
+                step(forced_day, &replaying, after_midnight),
+                DayStep::Wait,
+                "a forced day waits for tonight's evening replay"
+            );
+            assert_eq!(
+                step(oldest, &replaying, after_midnight),
+                DayStep::Run,
+                "the oldest window day still runs: its last chance"
+            );
+        }
+        let cleared = compose_reasons(vec![], gates());
+        assert_eq!(step(forced_day, &cleared, false), DayStep::Run);
+        // A backlog no replay reaches tonight does not hold a forced day.
+        let stuck = compose_reasons(
+            vec![],
+            Gates {
+                wal_backlog: Some(12),
+                ..gates()
+            },
+        );
+        assert_eq!(step(forced_day, &stuck, false), DayStep::Run);
+    }
+
+    /// Regression (2026-11-14 evening audit second review, MEDIUM): a day's
+    /// last chance is the last session evening that keeps it in the window,
+    /// not only the calendar oldest day. Monday 16 Nov on Friday 20 Nov: the
+    /// calendar oldest is Saturday 14, but the next session (Monday 23) has
+    /// left the 16th out, so Friday is its last chance and it runs through a
+    /// pending replay. On Thursday 19 it still has Friday, so it waits.
+    #[test]
+    fn test_last_window_chance_with_counts_only_later_session_days() {
+        let weekdays = |d: NaiveDate| {
+            use chrono::Datelike as _;
+            d.weekday().number_from_monday() <= 5
+        };
+        let ymd = |d: u32| NaiveDate::from_ymd_opt(2026, 11, d).expect("d");
+        let (mon, thu, fri) = (ymd(16), ymd(19), ymd(20));
+        assert_ne!(oldest_window_day(fri), Some(mon));
+        assert!(last_window_chance_with(mon, fri, weekdays));
+        assert!(!last_window_chance_with(mon, thu, weekdays));
+        // The calendar oldest day is always a last chance.
+        for session in [thu, fri, ymd(23)] {
+            let oldest = oldest_window_day(session).expect("d");
+            assert!(last_window_chance_with(oldest, session, weekdays));
+            assert!(last_window_chance_with(oldest, session, |_| true));
+        }
+        // A holiday that is the only later window day still in reach also
+        // makes the evening a last chance.
+        let holiday = |d: NaiveDate| weekdays(d) && d != ymd(23);
+        assert!(last_window_chance_with(ymd(17), fri, holiday));
+        assert!(!last_window_chance_with(ymd(17), fri, weekdays));
+        // Every session day: the day before the last in-window one waits.
+        assert!(!last_window_chance_with(ymd(17), ymd(18), |_| true));
+        // Wired: a day at its last chance runs through a pending replay, one
+        // that is not waits.
+        let replaying = reasons(&[WAL_REPLAY_HOLDS_FORCED]);
+        let st = DayState::default();
+        let run = |day, session| {
+            let last = last_window_chance_with(day, session, weekdays);
+            past_day_step(
+                st,
+                0,
+                ready(&replaying),
+                true,
+                blocks_even_forced(&replaying, false, last),
+            )
+        };
+        assert_eq!(run(mon, fri), DayStep::Run);
+        assert_eq!(run(mon, thu), DayStep::Wait);
+        // The calendar version agrees on this week (no NSE holiday 16-23 Nov).
+        assert_eq!(
+            last_window_chance(mon, fri),
+            last_window_chance_with(mon, fri, weekdays)
+        );
+        assert!(past_day_forced(mon, fri));
+    }
 
     /// Regression (2026-11-14 review, HIGH x2 + MEDIUM x3): every gate is
     /// read into a reason, and each reason is HARD, soft or a NOTE as
@@ -1501,7 +1674,8 @@ mod tests {
             "past_reasons(ex, day)",
             "past_day_forced(day, session_day)",
             "ready(&reasons)",
-            "blocks_even_forced(&reasons, ssecs >= SECS_PER_DAY)",
+            "blocks_even_forced(&reasons, ssecs >= SECS_PER_DAY, last_chance)",
+            "let last_chance = last_window_chance(day, session_day);",
             "let running = RunningFlag::set();",
             "drop(running);",
             "c.running = days.get(&day)",
