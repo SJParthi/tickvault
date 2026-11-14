@@ -1,5 +1,5 @@
 //! Item 45h (2026-10-02): every received non-tick packet class, the prior-day
-//! connect snapshot and the post-close tick are persisted to
+//! (`no_trade_today`) packet and the post-close tick are persisted to
 //! `feed_aux_packets`, never to `ticks` and never to a candle.
 //!
 //! The row CONTENT is pinned on the pure builder (`aux_row_for_non_tick`),

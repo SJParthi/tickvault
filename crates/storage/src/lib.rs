@@ -329,9 +329,12 @@ pub mod depth_spill_frame;
 pub mod depth_stage;
 // Plan item 45h (2026-10-02): the feed packets the parser decodes and the fold
 // does not use (open interest, previous close, market status, disconnect, the
-// connect snapshot, out-of-window ticks). Rows ride the `ticks` writer's
+// no-trade-today packet, out-of-window ticks). Rows ride the `ticks` writer's
 // buffer, offload thread and spill tier.
 pub mod feed_aux_persistence;
+// Operator Quote 61 (2026-11-14): exact repeats of a contract's
+// `no_trade_today` row are skipped; O(1) per packet, 25,000 keys, cleared daily.
+pub mod feed_aux_repeat;
 // Real-time proof that the live path is not waiting (2026-10-02): per-stage
 // latency buckets, stall counters and task heartbeats, Prometheus only.
 pub mod hot_path_telemetry;

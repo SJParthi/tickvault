@@ -37,7 +37,7 @@ struct LegacyAppender {
     out_of_window: OutOfWindowCounters,
     last_capture_seq: i64,
     flush_counters: TickFlushCounters,
-    aux_counters: [metrics::Counter; 6],
+    aux_counters: [metrics::Counter; AuxPacketKind::ALL.len()],
     aux_rows_appended: u64,
     quote_rows_appended: u64,
 }

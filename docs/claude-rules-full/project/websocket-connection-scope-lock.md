@@ -8335,7 +8335,7 @@ QuestDB before any socket dialled.
 | Ingest shed (`ShedLevel::InlineDepth` / `AllDepth`) | Stays as the disk and apply-lag pressure valve, but a shed frame is **marked unapplied** so its raw segment is kept and re-folded at the next out-of-session boot. A shed stops the QuestDB write NOW; it never loses the data. |
 | Boot WAL catch-up drain | **Paced**: it pauses between rounds while QuestDB apply lag is growing, and uses a short budget when it would still be running at 09:00. Leftover segments stay on disk (and in S3 under Quote 27). |
 | Loss counters and alarms | Carry an `origin` of `live` or `replay`; a replay deferral (WS-SPILL-02 `replay_*` sources) no longer reads as a lost frame. |
-| Received data that is never persisted today | Open-interest packets, market-status packets, `oi_day_high` / `oi_day_low`, ticks stamped outside 09:00–15:40 and the prior-day last-trade snapshot on connect are **persisted**: new columns via `ALTER ADD COLUMN IF NOT EXISTS` or a shared table tagged `feed`, `feed` in every DEDUP key. They are kept OUT of the candle fold where the fold refuses them today, so candles do not change. |
+| Received data that is never persisted today | Open-interest packets, market-status packets, `oi_day_high` / `oi_day_low`, ticks stamped outside 09:00–15:40 and the prior-day last-trade snapshot on connect are **persisted**: new columns via `ALTER ADD COLUMN IF NOT EXISTS` or a shared table tagged `feed`, `feed` in every DEDUP key. They are kept OUT of the candle fold where the fold refuses them today, so candles do not change. *(⚠ NARROWED 2026-11-14 by Quote 61, see the note at the end of this section: the "prior-day last-trade snapshot" is in fact every live packet for a contract with no trade yet today, and its row in `feed_aux_packets` is skipped when it repeats the contract's previous written row exactly. The WAL and `raw-frames/` keep every such packet.)* |
 | `market_depth` row shape | May move to one row per (packet, side) with `DOUBLE[]` price, quantity and orders arrays — a lossless storage change — only after a scratch-table test proves QuestDB 9.3.5 accepts DEDUP on that table and the depth spill format carries binary ILP. Until then the per-level row stays. |
 
 #### What a PR that violates this section looks like (REJECT)
@@ -8349,6 +8349,40 @@ QuestDB before any socket dialled.
   changes an existing candle, or writes a row without `feed`.
 - Switches `market_depth` to array rows before the scratch-table test is
   recorded, or drops any level, side or packet in the conversion.
+
+#### 2026-11-14 note — Quote 61: exact repeats of a "no trade today" row are not stored again
+
+Owner, 2026-11-14, decision card (recorded in full, with its REJECT list, as
+Quote 61 in `daily-universe-scope-expansion-2026-05-27.md`). Card question:
+"The 'connection snapshot' rows are NOT a price bug: no price or candle is wrong
+or missing. They are updates for option contracts that haven't traded yet today
+(so they still carry an old trade date), and 99.7% of them repeat the row
+before (about 3.2 million rows a day, roughly 80–140 MB a day in S3). Your
+'never lose anything' rule covers this table, and every packet is also kept in
+the raw-message backup in S3. What should I do?" Owner's tap: **"Skip exact
+repeats (Recommended)"**: "Store a row only when something in it changed
+(price, trade time, open interest, close). About 10,000 rows a day instead of
+3.2 million. Nothing is lost: every repeat is identical to the row kept, and
+the raw backup keeps every packet. Also rename the label so nobody mistakes it
+for reconnects."
+
+This is the dated quote the REJECT row above ("Adds a new 'drop' disposition
+for received market data anywhere in the live or replay path") requires, for
+ONE disposition only: in the live drain AND the WAL replay, the
+`feed_aux_packets` row of a live packet whose exchange day is not its receipt
+day (`kind = no_trade_today`, `connect_snapshot` for frames received before
+2026-11-18 IST) is not written when its kind and every stored value column
+equal, bit for bit, the last row written for the same `(security_id, segment)`
+on the same IST receipt day with no gap since (the full rule and its limits are
+in the Quote 61 record). A contract the main feed carries on two sockets (the
+2026-10-02 backup copy) is never skipped. The packet itself is not dropped: the
+WAL and `raw-frames/` keep it, unchanged, and inline depth from the same packet
+is written as before.
+
+REJECT under this note: skipping any other packet class, `feed_aux_packets`
+kind or table; skipping anything in the WAL or `raw-frames/`; skipping a row
+that differs in any stored column; any widening of this disposition without a
+further dated quote HERE.
 
 ### 2026-10-01 — UNSUBSCRIBE AND SUBSCRIBE, NOT DISCONNECT AND RECONNECT: depth-200 changes contract in place, and a ghost is answered with a fresh unsubscribe
 
