@@ -40,6 +40,15 @@ paths:
 >
 > **⚠ OPERATOR RULING 2026-07-19 — 30 GB accepted, t4g.medium as-of-now, NEW HARD TARGET < ₹1,000/mo:** verbatim quote + the itemized sub-1K path live in the dedicated "OPERATOR RULING 2026-07-19" section below. The base bill alone (~₹1,077/mo at the ~176-hr auto-schedule basis) EXCEEDS the target — <₹1,000 is UNREACHABLE without at least one operator-gated lever; see the lever table.
 
+## OPERATOR RULING 2026-11-14 — November 2026 only: stop at $140 so the box keeps running; December onward stays $62 with GST (Quote 59)
+
+Owner, 2026-11-14: "dont sto pthis month dude let it run but by the srticter law stick to 5500 inr from decoemebr onwards with the strict estiamtion strict law taht to oafetr atx charegs dude okay?", then tapped "$140 (Recommended)" on the card "November: AWS has spent $60.83 so far and forecasts $126, so the current $90 stop would shut the server late this month." Full record and REJECT list: `daily-universe-scope-expansion-2026-05-27.md` §0 Quote 59.
+
+| | Before (Quote 52) | After (Quote 59) |
+|---|---|---|
+| November 2026 (`NOVEMBER_2026_KILL_USD`, code clamp + native `limit_amount`) | $90 | **$140**, November 2026 (UTC month) only |
+| From 1 December 2026 | $62, GST included (Quote 54) | **unchanged: $62 from 1 December**, GST included (about ₹5,500); native `limit_amount` "140" -> "62" on or after 1 December |
+
 ## OPERATOR RULING 2026-11-11 (later) — from 1 December 2026 the stop line is $62, GST included (Quote 54)
 
 Owner, 2026-11-11, asked on a decision card "From December, should the AWS bill be hard-capped at ₹5,000 a month?", chose "Cap ₹5,500": "Stop line $62 (about ₹5,500 with GST). A bit of headroom above the expected bill, still close to ₹5,000." Full record and REJECT list: `daily-universe-scope-expansion-2026-05-27.md` §0 Quote 54. It supersedes Quote 53's "keep the $75 stop" row only; Quote 53's other rows (alarms, shipped metrics, dashboard, raw-frame storage class) stand.

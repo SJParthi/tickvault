@@ -4,7 +4,7 @@
 //! `budget.tf limit_amount`, the one native action stops the prod box; the
 //! hard-stop-guard Lambda additionally disables the morning start cron.
 //! The native line must equal the EFFECTIVE guard/digest line of the current
-//! UTC month: $90 in November 2026 only (Quote 52), $62 from December
+//! UTC month: $140 in November 2026 only (Quote 52, raised by Quote 59), $62 from December
 //! (Quote 54, 2026-11-11; it was $75 under Quote 37).
 //! Their configured $185 values preserve the October-only allowance and are
 //! clamped by UTC billing month. Four places encode these two roles:
@@ -94,7 +94,7 @@ fn hcl_quoted_number(body: &str, key: &str) -> f64 {
 
 /// Whether the native `limit_amount` in `budget.tf` is allowed in the UTC
 /// month `now_month`: from November 2026 exactly the line the hourly guard uses
-/// that month ($90 in November 2026 only, Quote 52; $62 from December, Quote 54). The refusal names the one-line fix and
+/// that month ($140 in November 2026 only, Quote 52/59; $62 from December, Quote 54). The refusal names the one-line fix and
 /// says the apply is still needed (2026-11-11 review 2: from 1 December every
 /// PR's All Green fails here until the follow-up lands, so the message must
 /// say exactly what to do). Pure.
@@ -116,21 +116,21 @@ fn native_limit_verdict(tf_limit: f64, now_month: (i32, u32)) -> Result<(), Stri
     }
     if now_month == NOVEMBER_2026_ALLOWANCE {
         return Err(format!(
-            "the native limit (${tf_limit}) must be ${expected} for November 2026 (Quote 52): the \
-             hourly guard allows up to $90 this month, so a lower native stop would stop the box \
-             early. Set `limit_amount = \"90\"` in deploy/aws/terraform/budget.tf."
+            "the native limit (${tf_limit}) must be ${expected} for November 2026 (Quote 52/59): the \
+             hourly guard allows up to $140 this month, so a lower native stop would stop the box \
+             early. Set `limit_amount = \"140\"` in deploy/aws/terraform/budget.tf."
         ));
     }
     Err(format!(
-        "the native limit (${tf_limit}) must be the standing ${expected}, or $90 only until \
+        "the native limit (${tf_limit}) must be the standing ${expected}, or $140 only until \
          the end of November 2026 (now {now_month:?}). Fix (Quote 52/54 follow-up, its own \
          PR): set `limit_amount = \"{expected}\"` in deploy/aws/terraform/budget.tf, then run \
-         the terraform apply; until the apply runs the native AWS stop stays at $90 and only \
+         the terraform apply; until the apply runs the native AWS stop stays at $140 and only \
          the Lambda's code clamp enforces ${expected}."
     ))
 }
 
-/// Native $62 from December 2026 (Quote 54; $90 during November 2026 only, Quote 52) must match the
+/// Native $62 from December 2026 (Quote 54; $140 during November 2026 only, Quote 52/59) must match the
 /// effective lines, while the three configured values retain the explicitly historical October allowance.
 #[test]
 fn budget_ceiling_agrees_across_all_four_sites() {
@@ -143,9 +143,9 @@ fn budget_ceiling_agrees_across_all_four_sites() {
         &read(&root.join("deploy/aws/terraform/budget-guards.tf")),
         "BUDGET_KILL_USD",
     );
-    // The native line is the standing $62 (Quote 54), or November 2026's $90 (Quote 52)
+    // The native line is the standing $62 (Quote 54), or November 2026's $140 (Quote 52/59)
     // while the current UTC month is no later than November 2026. This reads
-    // the wall clock on purpose: from 1 December 2026 a native "90" fails the
+    // the wall clock on purpose: from 1 December 2026 a native "140" fails the
     // build, so the one-month raise cannot quietly become the new normal.
     let now = chrono::Utc::now();
     let now_month = (chrono::Datelike::year(&now), chrono::Datelike::month(&now));
@@ -213,7 +213,7 @@ fn october_allowance_brackets_the_recorded_bill_high_estimate() {
     let october_line = effective_budget_kill_usd(DEFAULT_BUDGET_KILL_USD, 2026, 10);
     // 2026-10-13 (Quote 30): the IOPS reduction made the October projection
     // about $165 (Assumed). Retain that historical check without imposing
-    // October's bill on the separately authorized later lines ($90 November, $62 from December).
+    // October's bill on the separately authorized later lines ($140 November, Quote 59; $62 from December).
     const BILL_HIGH_USD: f64 = 165.0;
     assert!(
         october_line > BILL_HIGH_USD,
@@ -302,7 +302,8 @@ fn standing_cap_is_62_from_december_and_each_allowance_is_one_month() {
     assert!((OCTOBER_2026_KILL_USD - 185.0).abs() < f64::EPSILON);
     // Operator Quote 52 (2026-11-11): November 2026 only, $75 -> $90.
     assert_eq!(NOVEMBER_2026_ALLOWANCE, (2026, 11));
-    assert!((NOVEMBER_2026_KILL_USD - 90.0).abs() < f64::EPSILON);
+    // Quote 59 (2026-11-14): November 2026 only, $90 -> $140.
+    assert!((NOVEMBER_2026_KILL_USD - 140.0).abs() < f64::EPSILON);
 
     // Every month of the next three years EXCEPT 2026-09, 2026-10 and 2026-11
     // resolves to $62.
@@ -344,7 +345,7 @@ fn standing_cap_is_62_from_december_and_each_allowance_is_one_month() {
     }
 }
 
-// Regression: 2026-11-11 — review 2. From 1 December 2026 a native "90"
+// Regression: 2026-11-11 — review 2. From 1 December 2026 a native "140"
 // fails every PR; the refusal must name the one-line fix and say the
 // terraform apply is still needed, so an unrelated hotfix author can act on it.
 #[test]
@@ -353,7 +354,7 @@ fn native_limit_verdict_names_the_fix_from_december() {
     assert!(native_limit_verdict(NOVEMBER_2026_KILL_USD, (2026, 11)).is_ok());
     assert!(native_limit_verdict(NOVEMBER_2026_KILL_USD, (2026, 10)).is_ok());
     let refusal = native_limit_verdict(NOVEMBER_2026_KILL_USD, (2026, 12))
-        .expect_err("$90 is refused from December 2026");
+        .expect_err("$140 is refused from December 2026");
     assert!(refusal.contains("limit_amount = \"62\""), "{refusal}");
     // Quote 54: the old standing $75 is refused from December too.
     let stale = native_limit_verdict(75.0, (2026, 12)).expect_err("$75 is refused from December");
@@ -366,8 +367,8 @@ fn native_limit_verdict_names_the_fix_from_december() {
     assert!(refusal.contains("terraform apply"), "{refusal}");
     assert!(native_limit_verdict(100.0, (2026, 11)).is_err());
     // An early revert in November is refused too: the native stop would sit
-    // below the guard's $90 and stop the box early (PR 2221 review).
+    // below the guard's $140 and stop the box early (PR 2221 review).
     let early = native_limit_verdict(STANDING_BUDGET_KILL_USD, (2026, 11))
         .expect_err("$62 is refused in November 2026");
-    assert!(early.contains("limit_amount = \"90\""), "{early}");
+    assert!(early.contains("limit_amount = \"140\""), "{early}");
 }
