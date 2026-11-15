@@ -106,6 +106,8 @@ pub mod fold_verdict;
 mod aux_repeat;
 // Audit finding 3 (2026-11-14): the exit seal's window, Muhurat session included.
 pub mod mid_session_exit;
+// 2026-11-15 audit (live-5): the WAL replay is paced on a non-trading day.
+mod replay_pace;
 use std::time::Instant;
 
 use secrecy::ExposeSecret;
@@ -16543,17 +16545,12 @@ fn pace_stall_warn_due(latch: &AtomicBool, stalls: u32) -> bool {
 /// behaviour (rescue, replay again at the next out-of-session boot) is the
 /// better trade. Outside it, the same wall-clock budget the catch-up drain
 /// uses (`wal_catchup_budget_secs`), so a pre-open boot still stops pacing
-/// by 08:58.
+/// by 08:58. On a weekend or NSE holiday the window holds no live data, so
+/// the replay is paced there too (2026-11-15 audit, live-5; no calendar: as
+/// before). See `replay_pace`.
 #[must_use]
 pub fn wal_replay_pace_until(ist_secs_of_day: u64, now: Instant) -> Option<Instant> {
-    let start = tickvault_common::constants::TICK_PERSIST_START_SECS_OF_DAY_IST as u64;
-    let end = TICK_PERSIST_END_SECS_OF_DAY_IST as u64;
-    if ist_secs_of_day >= start && ist_secs_of_day < end {
-        return None;
-    }
-    now.checked_add(std::time::Duration::from_secs(wal_catchup_budget_secs(
-        ist_secs_of_day,
-    )))
+    replay_pace::wal_replay_pace_until_on(ist_secs_of_day, now, silence_page_allowed_today())
 }
 
 /// The pacing loop, with its effects passed in so it can be tested without a
@@ -19333,17 +19330,24 @@ async fn run_dhan_feed_stack(mut params: DhanFeedStackParams) {
 /// trading morning at ~09:01.
 const CONTINUOUS_SESSION_START_SECS_OF_DAY_IST: u64 = 9 * 3_600 + 15 * 60;
 
+/// IST seconds-of-day at which continuous trading ends (15:30:00), the end of
+/// the silence page (2026-11-15 audit, live-1: it ended at the 15:40 capture
+/// end and paged every day at 15:31 when the options stopped). Capture still
+/// runs to `TICK_PERSIST_END_SECS_OF_DAY_IST`.
+const CONTINUOUS_SESSION_END_SECS_OF_DAY_IST: u64 = 15 * 3_600 + 30 * 60;
+const _: () =
+    assert!(CONTINUOUS_SESSION_END_SECS_OF_DAY_IST <= TICK_PERSIST_END_SECS_OF_DAY_IST as u64);
+
 /// True when `secs_of_day` (IST) is inside the window where an instrument is
 /// EXPECTED to be ticking, so silence is evidence of a fault.
 ///
 /// Narrower than the persistence window on purpose — see
 /// [`CONTINUOUS_SESSION_START_SECS_OF_DAY_IST`] for why the 09:00–09:15
-/// pre-open is excluded. Pure and total, so both boundaries are testable
-/// without a clock.
+/// pre-open is excluded, and the end constant for the 15:30–15:40 tail.
 #[must_use]
 pub const fn is_within_market_hours_ist(secs_of_day: u64) -> bool {
     secs_of_day >= CONTINUOUS_SESSION_START_SECS_OF_DAY_IST
-        && secs_of_day < TICK_PERSIST_END_SECS_OF_DAY_IST as u64
+        && secs_of_day < CONTINUOUS_SESSION_END_SECS_OF_DAY_IST
 }
 
 /// The Muhurat evening session's continuous part: the Muhurat persist window
@@ -27178,14 +27182,16 @@ mod tests {
     /// The market-hours gate on the silence PAGE, at its exact boundaries.
     ///
     /// Pure and total, so the edges are pinned without a clock. The gate is
-    /// half-open on purpose: 09:00:00 is in, 15:40:00 is out. An inclusive
-    /// upper bound would page on the very second the persistence window
-    /// closes, which is the one second the whole universe is guaranteed to
-    /// look silent.
+    /// half-open on purpose: 09:15:00 is in, 15:30:00 is out (2026-11-15
+    /// audit, live-1: it was 15:40, and the options stopping at 15:30 paged
+    /// every trading day at 15:31). 15:30 to 15:40 is still captured.
     #[test]
     fn test_is_within_market_hours_ist_gates_the_silence_page_to_continuous_trading() {
         let open = CONTINUOUS_SESSION_START_SECS_OF_DAY_IST;
-        let close = u64::from(TICK_PERSIST_END_SECS_OF_DAY_IST);
+        let close = 15 * 3_600 + 30 * 60; // 15:30:00 IST, a literal so a revert bites
+        assert!(!is_within_market_hours_ist(
+            u64::from(TICK_PERSIST_END_SECS_OF_DAY_IST) - 1
+        ));
 
         assert!(!is_within_market_hours_ist(0), "midnight is not in session");
         assert!(
@@ -28832,27 +28838,6 @@ mod wal_refold_tests {
         let past = sim.clock.get();
         assert_eq!(run_pace(&sim, Some(past)), 0);
         assert_eq!(sim.flushes.get(), 1);
-    }
-
-    #[test]
-    fn test_wal_replay_pace_until_is_none_inside_the_capture_window() {
-        let now = Instant::now();
-        let start = tickvault_common::constants::TICK_PERSIST_START_SECS_OF_DAY_IST as u64;
-        let end = TICK_PERSIST_END_SECS_OF_DAY_IST as u64;
-        assert_eq!(wal_replay_pace_until(start, now), None, "09:00 is live");
-        assert_eq!(wal_replay_pace_until(end - 1, now), None);
-        // After the close: the full catch-up budget.
-        assert_eq!(
-            wal_replay_pace_until(end, now),
-            Some(now + std::time::Duration::from_secs(WAL_CATCHUP_BUDGET_SECS))
-        );
-        // 08:30 pre-open: never past the 08:58 stop.
-        let at_0830 = 8 * 3_600 + 30 * 60;
-        let until = wal_replay_pace_until(at_0830, now).expect("pre-open is paced");
-        assert!(
-            until.duration_since(now).as_secs()
-                <= WAL_CATCHUP_PREOPEN_STOP_SECS_OF_DAY_IST.saturating_sub(at_0830)
-        );
     }
 
     #[test]
