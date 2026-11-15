@@ -98,9 +98,10 @@ const WRAPPED: &[(&str, &str)] = &[
         "crates/storage/src/oom_monitor.rs",
         "crate::off_worker::off_worker(|| probe_oom_kill_count(&memory_events_path))",
     ),
+    // 2026-11-15: the export's gzip write moved to the sliced export.
     (
-        "crates/storage/src/partition_archive.rs",
-        "crate::off_worker::off_worker(|| encoder.write_all(&chunk))",
+        "crates/storage/src/partition_archive/sliced_export.rs",
+        "crate::off_worker::off_worker(|| encoder.write_all(bytes))",
     ),
     (
         "crates/storage/src/partition_archive.rs",
