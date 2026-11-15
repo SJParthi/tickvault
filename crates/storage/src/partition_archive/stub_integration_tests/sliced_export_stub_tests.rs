@@ -130,7 +130,7 @@ async fn test_sliced_export_refuses_a_slice_with_another_header() {
     });
     let (archiver, _) = archiver_for(responder).await;
     let path = archiver.temp_dir.join("refused.csv.gz");
-    let Err(err) = archiver
+    let err = archiver
         .export_ordered_csv(
             "ticks",
             HOUR,
@@ -138,9 +138,7 @@ async fn test_sliced_export_refuses_a_slice_with_another_header() {
             path.clone(),
         )
         .await
-    else {
-        panic!("a header mismatch must fail the export");
-    };
+        .expect_err("a header mismatch must fail the export");
     assert!(format!("{err:#}").contains("header differs"), "{err:#}");
     assert!(!path.exists(), "the temp file is removed");
 }

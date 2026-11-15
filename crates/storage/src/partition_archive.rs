@@ -92,16 +92,10 @@
 //! # Hot path
 //! ZERO involvement — this is the once-daily post-market cold task.
 
-#[cfg(test)]
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-#[cfg(test)]
-use flate2::Compression;
-#[cfg(test)]
-use flate2::write::GzEncoder;
 use questdb::ingress::{Buffer, ProtocolVersion, Sender, TimestampNanos};
 use reqwest::Client;
 use tracing::{debug, error, info, warn};
@@ -1816,6 +1810,7 @@ pub(crate) fn drop_wal_lagging(
 }
 
 /// Outcome of streaming one partition's `/exp` CSV through gzip to disk.
+#[derive(Debug)]
 struct ExportedCsv {
     rows: u64,
     csv_bytes: u64,
@@ -5564,6 +5559,11 @@ mod tests {
             "a zero intraday window must clamp to the current-day floor, never to zero"
         );
     }
+    use std::io::Write;
+
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+
     use super::*;
 
     fn cfg(retention_days: u32, market_data_hot_days: u32) -> PartitionRetentionConfig {
@@ -6512,6 +6512,11 @@ mod stub_integration_tests {
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    use std::io::Write;
+
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
 
     use super::*;
 
