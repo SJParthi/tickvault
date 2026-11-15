@@ -3,6 +3,14 @@
 > Session start: read THIS file only. Skip CLAUDE.md (auto-loads).
 > S6-Step8 (2026-04-14): The Tech Stack Bible was deleted. The single source of truth for all dependency versions is the workspace root `Cargo.toml` `[workspace.dependencies]` block.
 > Updated: 2026-03-17 (~2,439 tests).
+>
+> **⚠ CORRECTED 2026-11-15 (audit repo-5):** this map is a 2026-03-17
+> snapshot and is NOT current. Many files it lists are gone (for example
+> `tick_processor.rs`, `candle_aggregator.rs`, `candle_persistence.rs` and
+> `valkey_cache.rs`), and no function named `ensure_tick_table_dedup_keys`
+> exists today (the `ticks` key is set by `tick_persistence::ensure_ticks_table`).
+> For the real layout read the CODEBASE STRUCTURE section of `CLAUDE.md` and
+> `ls crates/`. The old text is kept as history.
 
 ## File Tree
 
@@ -77,7 +85,7 @@ tickvault/
 │   ├── storage/src/                    # Persistence layer
 │   │   ├── lib.rs                      # Re-exports: instrument_persistence, tick_persistence, candle_persistence
 │   │   ├── instrument_persistence.rs   # QuestDB ILP writer (4 tables)
-│   │   ├── tick_persistence.rs        # QuestDB ILP writer for ticks table + ensure_tick_table_dedup_keys()
+│   │   ├── tick_persistence.rs        # QuestDB ILP writer for ticks table + ensure_tick_table_dedup_keys() (⚠ CORRECTED 2026-11-15: no such fn; the key is set by ensure_ticks_table)
 │   │   ├── candle_persistence.rs      # QuestDB ILP writer for candles_1m table
 │   │   ├── materialized_views.rs      # QuestDB materialized views (candle aggregation)
 │   │   └── valkey_cache.rs            # Valkey (Redis) cache for rkyv-serialized instrument data
@@ -241,7 +249,7 @@ TickPersistenceWriter::new(config: &QuestDbConfig) -> Result<Self>
 TickPersistenceWriter::append_tick(&mut self, tick: &ParsedTick) -> Result<()>
 TickPersistenceWriter::flush_if_needed(&mut self) -> Result<()>
 TickPersistenceWriter::force_flush(&mut self) -> Result<()>
-ensure_tick_table_dedup_keys(config: &QuestDbConfig) -> ()
+ensure_tick_table_dedup_keys(config: &QuestDbConfig) -> () // ⚠ CORRECTED 2026-11-15: no such fn; see tick_persistence::ensure_ticks_table
 instrument_persistence::persist_instrument_snapshot(universe, questdb_config) -> Result<()>
 ```
 

@@ -13,7 +13,7 @@ paths:
   - "crates/core/src/auth/mid_session_watchdog.rs"
   - "crates/core/src/auth/token_health_gauge.rs"
   - "crates/core/src/auth/fast_boot_validation.rs"
-  - "crates/app/tests/fast_boot_token_validation_wiring_guard.rs"
+  - "crates/app/tests/fast_boot_token_validation_wiring_guard.rs"  # ⚠ CORRECTED 2026-11-15: deleted 2026-07-14 with fast_boot_validation; NOT ENFORCED
   - "crates/app/src/resource_monitor.rs"
   - "crates/storage/src/resource_monitor.rs"
 ---

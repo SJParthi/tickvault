@@ -92,13 +92,10 @@
 //! # Hot path
 //! ZERO involvement — this is the once-daily post-market cold task.
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use flate2::Compression;
-use flate2::write::GzEncoder;
 use questdb::ingress::{Buffer, ProtocolVersion, Sender, TimestampNanos};
 use reqwest::Client;
 use tracing::{debug, error, info, warn};
@@ -128,6 +125,8 @@ mod hour_path;
 mod drop_tally;
 // Owner Quote 60 (2026-11-14): the daily Brutex export to the canonical keys.
 pub mod daily_export;
+// 2026-11-15: the ordered export in time slices, header written once.
+mod sliced_export;
 
 use hour_path::{
     HOUR_PATH_TABLES, TICK_SPILL_TABLES, hot_hour_floor, hour_window_for,
@@ -1811,6 +1810,7 @@ pub(crate) fn drop_wal_lagging(
 }
 
 /// Outcome of streaming one partition's `/exp` CSV through gzip to disk.
+#[derive(Debug)]
 struct ExportedCsv {
     rows: u64,
     csv_bytes: u64,
@@ -2913,7 +2913,35 @@ impl PartitionArchiver {
         } else {
             worklist
         };
-        let worklist = fair_share_worklist(worklist, self.cfg.max_partitions_per_run as usize);
+        // 2026-11-15 (Quote 60 open limit): inside 08:30 to the ingest end
+        // the archiver never sorts, so moving a partition whose ordered
+        // export object already sits at its canonical key writes a second,
+        // content-addressed copy. A pressure pass there classifies every
+        // candidate BEFORE the per-run cap (review fix, same day: classified
+        // after it, today's not-yet-exported hours, the newest of each table,
+        // were cut by the cap first), fills the cap with the not-yet-exported
+        // ones, and gives an exported one only a slot they left. The loop
+        // below then skips an exported candidate once a not-yet-exported one
+        // has been dropped in this pass.
+        let cap_per_run = self.cfg.max_partitions_per_run as usize;
+        let (worklist, already_exported) =
+            if self.cfg.under_disk_pressure && (self.trading_window_now)() {
+                let exported = self.canonical_exported(&worklist).await;
+                (
+                    fair_share_preferring_unexported(worklist, &exported, cap_per_run),
+                    exported,
+                )
+            } else {
+                (
+                    fair_share_worklist(worklist, cap_per_run),
+                    std::collections::HashSet::new(),
+                )
+            };
+        // Set once a candidate with nothing at its canonical key was dropped
+        // in this pass; from then on an exported candidate is left for a
+        // later pass (counted as held by the gate), so the pass never writes
+        // a second copy after it already freed space without one.
+        let mut fresh_dropped = false;
         // PR AA review finding 11: the pass-start size of every hour-path
         // partition this pass may drop (the fallback for the listing taken
         // just before each drop's recount), read before any quiesce lock.
@@ -2979,6 +3007,16 @@ impl PartitionArchiver {
                 continue;
             }
             // O(1) EXEMPT: end
+            // 2026-11-15 review fix: an exported candidate is taken only
+            // while no not-yet-exported one has been dropped in this pass
+            // (one hash probe; the set is empty outside an in-session
+            // pressure pass).
+            let candidate_exported = !already_exported.is_empty()
+                && already_exported.contains(&(table, partition.clone()));
+            if skip_exported_candidate(candidate_exported, fresh_dropped) {
+                summary.held_by_gate = summary.held_by_gate.saturating_add(1);
+                continue;
+            }
             // PR AA step 2: a depth partition goes through the snapshot gate,
             // which holds every writer that can post into an old hour for the
             // whole of its copy and drop, and holds an hour the after-close
@@ -3030,6 +3068,9 @@ impl PartitionArchiver {
             }
             if step.exported() {
                 exported = exported.saturating_add(1);
+            }
+            if !candidate_exported && summary.dropped > before.0 {
+                fresh_dropped = true;
             }
             if step.wal_not_applied() {
                 wal_blocked.push(table);
@@ -3934,6 +3975,35 @@ impl PartitionArchiver {
         )))
     }
 
+    /// The candidates of `worklist` whose canonical archive key may already
+    /// hold an object (2026-11-15): one HeadObject per candidate of an export
+    /// table (`daily_export::export_order_by`), read the way the export reads
+    /// it (`daily_export::canonical_maybe_exists`: a failed HEAD counts as
+    /// "may exist"). Other tables are never asked. Cold: O(candidates) HEAD
+    /// requests, only on a pressure pass inside the trading-day window. Asked
+    /// of every candidate BEFORE the per-run cap (2026-11-15 review fix), so
+    /// on a box with a backlog it is one HEAD per eligible partition of an
+    /// export table, not per capped slot (Assumed tens of ms each).
+    async fn canonical_exported(
+        &self,
+        worklist: &[(&'static str, String)],
+    ) -> std::collections::HashSet<(&'static str, String)> {
+        let mut exported = std::collections::HashSet::new();
+        for (table, partition) in worklist {
+            if daily_export::export_order_by(table).is_none() {
+                continue;
+            }
+            let head = self
+                .cold
+                .head(&canonical_archive_key(table, partition))
+                .await;
+            if daily_export::canonical_maybe_exists(&head) {
+                exported.insert((*table, partition.clone()));
+            }
+        }
+        exported
+    }
+
     /// Streams the partition's `/exp` CSV through gzip into the temp dir,
     /// counting rows from the RAW byte stream. The disk-pressure loop can
     /// call this mid-session, so every file step and each chunk's gzip write
@@ -3969,8 +4039,20 @@ impl PartitionArchiver {
                 .increment(1);
         }
         let order_by = daily_export::archiver_export_order(table, canonical_exists, in_window);
-        let sql = build_export_sql_ordered(table, start, end, order_by);
-        match self.export_query_csv(&sql, path.clone()).await {
+        // 2026-11-15: the ordered export runs in `ts` slices, each its own
+        // request, joined into the same bytes the single query gave
+        // (`sliced_export`); the unordered export is one request, as before.
+        let exported = match order_by {
+            Some(key) => {
+                self.export_ordered_csv(table, partition, key, path.clone())
+                    .await
+            }
+            None => {
+                self.export_query_csv(&build_export_sql(table, start, end), path.clone())
+                    .await
+            }
+        };
+        match exported {
             Err(err) if order_by.is_some() && self.cfg.under_disk_pressure => {
                 // Freeing the disk never waits on the sort: under pressure,
                 // one retry in the old order (cost: at worst a
@@ -4002,72 +4084,11 @@ impl PartitionArchiver {
     /// (2026-10-29: the whole-table export was deleted with the rebuild
     /// tool; the partition export is now the only caller.)
     async fn export_query_csv(&self, sql: &str, path: PathBuf) -> Result<ExportedCsv> {
-        crate::off_worker::off_worker(|| std::fs::create_dir_all(&self.temp_dir))
-            .context("create archive temp dir")?;
-
-        let mut response = self
-            .export_client
-            .get(&self.exp_url)
-            .query(&[("query", sql)])
-            .send()
+        // 2026-11-15: one request through the shared slice path, its joiner
+        // in pass-through mode (every byte unchanged) and no deadline beyond
+        // the export client's own timeout.
+        self.export_requests_csv(&[sql.to_string()], None, path)
             .await
-            .context("/exp export request failed")?;
-        if !response.status().is_success() {
-            let status = response.status();
-            let body =
-                capture_rest_error_body(&read_body_capped(response).await.unwrap_or_default());
-            anyhow::bail!("/exp export returned {status}: {body}");
-        }
-
-        let file = crate::off_worker::off_worker(|| std::fs::File::create(&path))
-            .context("create archive temp file")?;
-        // Review round 2: the compressed stream is SHA-256-hashed as it is
-        // written — the digest is the content identity for the S3
-        // reuse/conflict decision and travels on the conditional PutObject.
-        let mut encoder = GzEncoder::new(
-            Sha256Writer::new(std::io::BufWriter::new(file)),
-            Compression::default(),
-        );
-        // F5 (review round 1): quote-aware RECORD counting — a raw `\n`
-        // count over-counts on STRING fields carrying embedded newlines.
-        let mut counter = CsvRecordCounter::default();
-        let mut csv_bytes: u64 = 0;
-        while let Some(chunk) = response.chunk().await.context("/exp stream read failed")? {
-            counter.update(&chunk);
-            csv_bytes = csv_bytes.saturating_add(chunk.len() as u64);
-            crate::off_worker::off_worker(|| encoder.write_all(&chunk))
-                .context("gzip write failed")?;
-        }
-        let digest = crate::off_worker::off_worker(|| {
-            let hashing_writer = encoder.finish().context("gzip finish failed")?;
-            let (mut writer, digest) = hashing_writer.finish();
-            writer.flush().context("temp file flush failed")?;
-            drop(writer);
-            anyhow::Ok(digest)
-        })?;
-        let gzip_sha256_b64 = base64_encode(&digest);
-        let gzip_sha256_hex = hex_encode(&digest);
-
-        let records = counter.records();
-        if records == 0 {
-            // Not even the CSV header arrived — an empty body is an export
-            // failure, never "0 rows" (audit Rule 11: no false-OK).
-            remove_temp_file(&path);
-            anyhow::bail!("/exp export returned an empty body (no CSV header)");
-        }
-        let gzip_bytes = crate::off_worker::off_worker(|| std::fs::metadata(&path))
-            .context("stat archive temp file")?
-            .len();
-        Ok(ExportedCsv {
-            // records − 1 header record = data rows (QuestDB /exp always
-            // emits the header record first).
-            rows: records.saturating_sub(1),
-            csv_bytes,
-            gzip_bytes,
-            gzip_sha256_b64,
-            gzip_sha256_hex,
-            path,
-        })
     }
 
     /// Uploads the gzip'd export to the cold bucket — CONDITIONAL create
@@ -4505,6 +4526,45 @@ fn spill_dir_has_pending_data(path: &Path) -> bool {
     false
 }
 
+/// The per-run worklist of an in-session pressure pass (2026-11-15, Quote 60
+/// open limit; review fix the same day): the candidates NOT in
+/// `already_exported` fair-shared into the cap first, then the exported ones
+/// fair-shared into whatever slots they left (none when they fill it), each
+/// group oldest first within its table as [`fair_share_worklist`] gives it.
+/// Classified before the cap, so a not-yet-exported candidate (the newest of
+/// its table) is never cut while an exported one keeps a slot. `cap == 0`
+/// means no cap, as in [`fair_share_worklist`]. Pure, O(n log n) (the two
+/// sorts inside [`fair_share_worklist`]), cold.
+#[must_use]
+pub(crate) fn fair_share_preferring_unexported(
+    worklist: Vec<(&'static str, String)>,
+    already_exported: &std::collections::HashSet<(&'static str, String)>,
+    cap: usize,
+) -> Vec<(&'static str, String)> {
+    let (fresh, exported): (Vec<_>, Vec<_>) = worklist
+        .into_iter()
+        .partition(|candidate| !already_exported.contains(candidate));
+    let mut out = fair_share_worklist(fresh, cap);
+    let left = if cap == 0 {
+        Some(0)
+    } else {
+        cap.checked_sub(out.len()).filter(|left| *left > 0)
+    };
+    if let Some(left) = left {
+        out.extend(fair_share_worklist(exported, left));
+    }
+    out
+}
+
+/// Whether the pass loop skips a candidate (2026-11-15 review fix): only an
+/// already-exported one, and only once a not-yet-exported candidate has been
+/// dropped in this pass. Outside an in-session pressure pass no candidate is
+/// marked exported, so nothing is skipped. Pure, O(1).
+#[must_use]
+pub(crate) const fn skip_exported_candidate(candidate_exported: bool, fresh_dropped: bool) -> bool {
+    candidate_exported && fresh_dropped
+}
+
 /// Fair-shares the per-run partition budget across tables, oldest-first
 /// within each table.
 ///
@@ -4739,6 +4799,83 @@ mod fair_share_tests {
             vec!["2026-08-01T09", "2026-08-02T09", "2026-08-03T09"],
             "monotonic per-table progress must survive the fair share"
         );
+    }
+
+    /// 2026-11-15 (Quote 60 open limit, review fix): candidates with nothing
+    /// at their canonical key fill the per-run cap first, the exported ones
+    /// take only the slots left, and the newest (unexported) hour survives a
+    /// cap smaller than the candidate count.
+    #[test]
+    fn test_fair_share_preferring_unexported_fills_the_cap_with_unexported_first() {
+        use super::fair_share_preferring_unexported;
+        let hour = |table: &'static str, h: u32| (table, format!("2026-08-01T{h:02}"));
+        let worklist = vec![
+            hour("ticks", 9),
+            hour("tick_quotes", 9),
+            hour("ticks", 10),
+            hour("tick_quotes", 10),
+        ];
+        let exported: std::collections::HashSet<(&'static str, String)> =
+            [hour("ticks", 9), hour("tick_quotes", 9)]
+                .into_iter()
+                .collect();
+        // No cap: every candidate, the unexported group first.
+        assert_eq!(
+            fair_share_preferring_unexported(worklist.clone(), &exported, 0),
+            vec![
+                hour("ticks", 10),
+                hour("tick_quotes", 10),
+                hour("ticks", 9),
+                hour("tick_quotes", 9),
+            ]
+        );
+        // Nothing exported: exactly the plain fair share.
+        let none = std::collections::HashSet::new();
+        assert_eq!(
+            fair_share_preferring_unexported(worklist.clone(), &none, 3),
+            fair_share_worklist(worklist.clone(), 3)
+        );
+        // Everything exported: exactly the plain fair share.
+        let all: std::collections::HashSet<_> = worklist.iter().cloned().collect();
+        assert_eq!(
+            fair_share_preferring_unexported(worklist.clone(), &all, 3),
+            fair_share_worklist(worklist, 3)
+        );
+
+        // More candidates than the cap, the one unexported hour the NEWEST:
+        // the plain fair share (oldest first) would cut it.
+        let backlog: Vec<_> = (9..=14).map(|h| hour("ticks", h)).collect();
+        let old: std::collections::HashSet<_> = (9..=13).map(|h| hour("ticks", h)).collect();
+        assert_eq!(
+            fair_share_worklist(backlog.clone(), 2),
+            vec![hour("ticks", 9), hour("ticks", 10)],
+            "the plain cap keeps only exported hours"
+        );
+        assert_eq!(
+            fair_share_preferring_unexported(backlog.clone(), &old, 2),
+            vec![hour("ticks", 14), hour("ticks", 9)]
+        );
+        assert_eq!(
+            fair_share_preferring_unexported(backlog.clone(), &old, 1),
+            vec![hour("ticks", 14)]
+        );
+        // Unexported hours fill the cap: no exported hour gets a slot.
+        let only_two: std::collections::HashSet<_> = (9..=12).map(|h| hour("ticks", h)).collect();
+        assert_eq!(
+            fair_share_preferring_unexported(backlog, &only_two, 2),
+            vec![hour("ticks", 13), hour("ticks", 14)]
+        );
+    }
+
+    /// 2026-11-15 review fix: the loop skips an exported candidate only once
+    /// an unexported one was dropped in the same pass.
+    #[test]
+    fn test_skip_exported_candidate_only_after_a_fresh_drop() {
+        use super::skip_exported_candidate;
+        assert!(!skip_exported_candidate(false, false));
+        assert!(!skip_exported_candidate(false, true));
+        assert!(!skip_exported_candidate(true, false));
+        assert!(skip_exported_candidate(true, true));
     }
 
     #[test]
@@ -5422,6 +5559,11 @@ mod tests {
             "a zero intraday window must clamp to the current-day floor, never to zero"
         );
     }
+    use std::io::Write;
+
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+
     use super::*;
 
     fn cfg(retention_days: u32, market_data_hot_days: u32) -> PartitionRetentionConfig {
@@ -6371,6 +6513,11 @@ mod stub_integration_tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
+    use std::io::Write;
+
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+
     use super::*;
 
     // PR TG (2026-11-06 incident): `/exp` 429 and slow-export regressions,
@@ -6380,6 +6527,8 @@ mod stub_integration_tests {
     mod tg4_export_contention_tests;
     // Owner Quote 60: the daily Brutex export against the same stubs.
     mod daily_export_stub_tests;
+    // 2026-11-15: the sliced ordered export is byte-identical to one query.
+    mod sliced_export_stub_tests;
 
     /// One parsed stub request (method + decoded target + lowercased headers).
     #[derive(Clone, Debug)]
@@ -6439,6 +6588,51 @@ mod stub_integration_tests {
             }
         }
         String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// Whether a stub `/exp` request is the FIRST (or only) request of its
+    /// export (2026-11-15): an ordered export arrives as `ts` slices
+    /// (`sliced_export`), and the stub's rows all sit in a partition's first
+    /// slice. An unordered request is always the only one.
+    fn is_first_export_slice(target: &str) -> bool {
+        if !target.contains("ORDER BY") {
+            return true;
+        }
+        let literal = |marker: &str| {
+            let rest = &target[target.find(marker)? + marker.len()..];
+            let s = &rest[..rest.find('\'')?];
+            chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.6fZ").ok()
+        };
+        let (Some(lo), Some(hi)) = (literal("ts >= '"), literal("ts < '")) else {
+            return true;
+        };
+        use chrono::Timelike as _;
+        if hi - lo < chrono::TimeDelta::hours(1) {
+            lo.minute() == 0 && lo.second() == 0
+        } else {
+            lo.hour() == 0 && lo.minute() == 0
+        }
+    }
+
+    /// The stub's `/exp` answer for `target`: `body` for the first slice of
+    /// an export, its header line alone for every later slice.
+    fn stub_export_body(target: &str, body: &str) -> Vec<u8> {
+        if is_first_export_slice(target) {
+            body.as_bytes().to_vec()
+        } else {
+            let header_end = body.find('\n').map_or(body.len(), |i| i + 1);
+            body.as_bytes()[..header_end].to_vec()
+        }
+    }
+
+    /// One entry per export (its first slice): whether it was ordered.
+    fn export_runs(log: &Mutex<Vec<SeenRequest>>) -> Vec<bool> {
+        log.lock()
+            .expect("qdb log")
+            .iter()
+            .filter(|r| r.target.starts_with("/exp") && is_first_export_slice(&r.target))
+            .map(|r| r.target.contains("ORDER BY"))
+            .collect()
     }
 
     /// Spawns a minimal HTTP/1.1 keep-alive stub on 127.0.0.1; returns
@@ -6671,7 +6865,7 @@ mod stub_integration_tests {
         Arc::new(move |req: &SeenRequest| {
             let t = &req.target;
             if t.starts_with("/exp") {
-                return (200, Vec::new(), csv_body.as_bytes().to_vec());
+                return (200, Vec::new(), stub_export_body(t, csv_body));
             }
             if t.contains("wal_tables()") {
                 let idx = usize::try_from(wal_probes.fetch_add(1, Ordering::SeqCst))

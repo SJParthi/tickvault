@@ -37,33 +37,81 @@
 //! there passes. The dead ratchet citations the audit found in the
 //! daily-universe full text (§18, §19, §25) were corrected by hand the same
 //! day; nothing here keeps them correct.
+//!
+//! ⚠ CHANGED 2026-11-15 (audit repo-4 follow-up): the paragraph above is now
+//! history. `SCANNED_DIRS` adds `docs/claude-rules-full/project/*.md` (the
+//! binding full rule texts), `.claude/rules/dhan/*.md` and
+//! `docs/error-runbooks/*.md` to `.claude/rules/project/*.md` and
+//! `CLAUDE.md`, so a dead citation in any of them now fails this guard, and
+//! the §18, §19 and §25 citations are held by it. Each scanned folder must
+//! hold at least one `.md` file, so a moved folder fails loudly instead of
+//! scanning nothing. Still not read: `docs/rules-archive/`,
+//! `docs/runbooks/`, `docs/architecture/` and every other doc.
+//!
+//! ⚠ CHANGED 2026-11-15 (review of the repo-4 follow-up): `KNOWN_MISSING`
+//! rows are `(token, file)` and excuse the token in that one file only.
+//! Matched on the token alone, they had excused six dead citations in the
+//! newly scanned folders (the Groww mint guard in the full minter text, the
+//! cadence contract guard in the 1-minute pipeline runbook); those lines now
+//! carry dated CORRECTED notes.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Citations of files or targets that do not exist, found when this guard was
-/// written, in files outside the TRU-8 scope. `(token, where cited)`. Sorted.
-/// SHRINK ONLY.
+/// written, in files outside the TRU-8 scope. `(token, file that cites it)`,
+/// the file as a path from the repo root. A row excuses the token in THAT
+/// file only, so the same dead citation in any other scanned file still
+/// fails (⚠ CHANGED 2026-11-15: rows were matched on the token alone, which
+/// excused the token in every scanned file). Sorted. SHRINK ONLY.
+///
+/// Why each is dead: the cadence guards went with the cadence module
+/// (2026-09-16), the Grafana guard with Grafana (2026-05-19), the Groww
+/// mint guard with the Groww feed (2026-08-21); the other two were never
+/// built.
 const KNOWN_MISSING: &[(&str, &str)] = &[
     (
         "cadence_composition_contract_guard.rs",
-        "cadence-error-codes.md (cadence module deleted 2026-09-16)",
+        ".claude/rules/project/cadence-error-codes.md",
     ),
     (
         "cadence_executor_purity_guard.rs",
-        "cadence-error-codes.md (cadence module deleted 2026-09-16)",
+        ".claude/rules/project/cadence-error-codes.md",
     ),
     (
         "grafana_dashboard_snapshot_filter_guard.rs",
-        "security-id-uniqueness.md, audit-findings-2026-04-17.md, gap-enforcement.md (Grafana retired 2026-05-19)",
+        ".claude/rules/project/audit-findings-2026-04-17.md",
+    ),
+    (
+        "grafana_dashboard_snapshot_filter_guard.rs",
+        ".claude/rules/project/gap-enforcement.md",
+    ),
+    (
+        "grafana_dashboard_snapshot_filter_guard.rs",
+        ".claude/rules/project/security-id-uniqueness.md",
     ),
     (
         "groww_no_mint_guard.rs",
-        "groww-shared-token-minter-2026-07-02.md (Groww feed removed 2026-08-21)",
+        ".claude/rules/project/groww-shared-token-minter-2026-07-02.md",
     ),
-    ("instrument_uniqueness_guard.rs", "gap-enforcement.md"),
-    ("make plan-research", "stream-resilience.md"),
+    (
+        "instrument_uniqueness_guard.rs",
+        ".claude/rules/project/gap-enforcement.md",
+    ),
+    (
+        "make plan-research",
+        ".claude/rules/project/stream-resilience.md",
+    ),
+];
+
+/// Folders whose `.md` files are scanned, beside `CLAUDE.md`. Each must hold
+/// at least one `.md` file.
+const SCANNED_DIRS: &[&str] = &[
+    ".claude/rules/project",
+    ".claude/rules/dhan",
+    "docs/claude-rules-full/project",
+    "docs/error-runbooks",
 ];
 
 const NOT_LIVE_MARKERS: &[&str] = &[
@@ -195,24 +243,60 @@ fn missing_citations(
     out
 }
 
+/// Splits the missing citations against the `(token, file)` rows of `known`.
+/// Returns the citations no row excuses (a row excuses its token in its own
+/// file only) and the rows that excuse nothing (stale).
+fn split_known<'a>(
+    missing: &'a [(String, String)],
+    known: &'a [(&'a str, &'a str)],
+) -> (Vec<&'a (String, String)>, Vec<(&'a str, &'a str)>) {
+    let file_of = |at: &'a str| at.rsplit_once(':').map_or(at, |(p, _)| p);
+    let excused =
+        |tok: &str, at: &'a str| known.iter().any(|(k, f)| *k == tok && *f == file_of(at));
+    let unexpected = missing
+        .iter()
+        .filter(|(tok, at)| !excused(tok, at))
+        .collect();
+    let stale = known
+        .iter()
+        .copied()
+        .filter(|(k, f)| {
+            !missing
+                .iter()
+                .any(|(tok, at)| tok == k && file_of(at) == *f)
+        })
+        .collect();
+    (unexpected, stale)
+}
+
 #[test]
 fn every_guard_cited_in_rules_exists() {
-    let names: Vec<&str> = KNOWN_MISSING.iter().map(|r| r.0).collect();
-    let mut sorted = names.clone();
+    let rows: Vec<(&str, &str)> = KNOWN_MISSING.to_vec();
+    let mut sorted = rows.clone();
     sorted.sort_unstable();
     sorted.dedup();
-    assert_eq!(names, sorted, "KNOWN_MISSING must be sorted and unique");
+    assert_eq!(rows, sorted, "KNOWN_MISSING must be sorted and unique");
 
     let root = repo_root();
     let mut docs = Vec::new();
-    let rules = root.join(".claude/rules/project");
-    for entry in std::fs::read_dir(&rules).expect("rules dir").flatten() {
-        let p = entry.path();
-        if p.extension().is_some_and(|e| e == "md") {
-            let text = std::fs::read_to_string(&p).expect("rule file readable");
-            let rel = p.strip_prefix(&root).unwrap_or(&p).display().to_string();
-            docs.push((rel, text));
+    for dir in SCANNED_DIRS {
+        let before = docs.len();
+        let rules = root.join(dir);
+        for entry in std::fs::read_dir(&rules)
+            .unwrap_or_else(|e| panic!("scanned folder {dir} unreadable: {e}"))
+            .flatten()
+        {
+            let p = entry.path();
+            if p.extension().is_some_and(|e| e == "md") {
+                let text = std::fs::read_to_string(&p).expect("rule file readable");
+                let rel = p.strip_prefix(&root).unwrap_or(&p).display().to_string();
+                docs.push((rel, text));
+            }
         }
+        assert!(
+            docs.len() > before,
+            "scanned folder {dir} holds no .md file; was it moved?"
+        );
     }
     docs.push((
         "CLAUDE.md".to_string(),
@@ -239,26 +323,35 @@ fn every_guard_cited_in_rules_exists() {
     );
 
     let missing = missing_citations(&docs, &files, &targets);
-    let unexpected: Vec<&(String, String)> = missing
-        .iter()
-        .filter(|(tok, _)| !names.contains(&tok.as_str()))
-        .collect();
+    let (unexpected, stale) = split_known(&missing, KNOWN_MISSING);
     assert!(
         unexpected.is_empty(),
         "rules cite guards or make targets that do not exist, as if they enforce \
          something: {unexpected:?}. Write the guard, or mark the line NOT ENFORCED / \
          NOT BUILT / PLANNED / DELETED with a dated CORRECTED note."
     );
-    let stale: Vec<&str> = names
-        .iter()
-        .copied()
-        .filter(|n| !missing.iter().any(|(tok, _)| tok == n))
-        .collect();
     assert!(
         stale.is_empty(),
         "STALE KNOWN_MISSING row(s) {stale:?}: the citation was fixed or the file now \
          exists. Remove the row in the same PR."
     );
+}
+
+/// The binding full rule texts, the Dhan rules and the runbooks stay in the
+/// scan (2026-11-15). Removing any folder from `SCANNED_DIRS` fails here.
+#[test]
+fn scan_scope_covers_full_rule_texts_dhan_rules_and_runbooks() {
+    for dir in [
+        ".claude/rules/project",
+        ".claude/rules/dhan",
+        "docs/claude-rules-full/project",
+        "docs/error-runbooks",
+    ] {
+        assert!(
+            SCANNED_DIRS.contains(&dir),
+            "{dir} must stay in SCANNED_DIRS"
+        );
+    }
 }
 
 #[test]
@@ -297,5 +390,39 @@ fn cited_guard_detector_bites() {
     assert_eq!(
         makefile_targets("a: b\n\tcmd\nX := 1\nwave-x: ## y\n.PHONY: a\n"),
         ["a", "wave-x"].iter().map(|s| (*s).to_string()).collect()
+    );
+}
+
+/// A `KNOWN_MISSING` row excuses its token in its own file only (2026-11-15).
+/// Before, rows matched the token alone, so a dead citation copied into any
+/// other scanned file passed unflagged.
+#[test]
+fn split_known_excuses_a_token_only_in_its_own_file() {
+    let missing = vec![
+        ("old_guard.rs".to_string(), "a/known.md:10".to_string()),
+        ("old_guard.rs".to_string(), "b/other.md:3".to_string()),
+        ("new_guard.rs".to_string(), "a/known.md:11".to_string()),
+    ];
+    let known = [
+        ("old_guard.rs", "a/known.md"),
+        ("old_guard.rs", "z/gone.md"),
+    ];
+    let (unexpected, stale) = split_known(&missing, &known);
+    let flagged: Vec<(&str, &str)> = unexpected
+        .iter()
+        .map(|(t, at)| (t.as_str(), at.as_str()))
+        .collect();
+    assert_eq!(
+        flagged,
+        vec![
+            ("old_guard.rs", "b/other.md:3"),
+            ("new_guard.rs", "a/known.md:11"),
+        ],
+        "a known token cited in another file must still be flagged"
+    );
+    assert_eq!(
+        stale,
+        vec![("old_guard.rs", "z/gone.md")],
+        "a row whose file no longer cites the token is stale"
     );
 }

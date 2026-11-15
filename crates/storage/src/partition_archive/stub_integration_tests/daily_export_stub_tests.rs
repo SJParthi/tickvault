@@ -115,7 +115,7 @@ fn qdb(audit: &'static str, tally: TallyStub) -> Responder {
     );
     Arc::new(move |req: &SeenRequest| {
         if req.target.starts_with("/exp") && req.target.contains("ORDER BY") {
-            return (200, Vec::new(), SORTED.as_bytes().to_vec());
+            return (200, Vec::new(), stub_export_body(&req.target, SORTED));
         }
         if req.target.contains("FROM partition_archive_audit") {
             return (200, Vec::new(), audit.as_bytes().to_vec());
@@ -380,13 +380,7 @@ async fn test_archiver_streams_unordered_when_no_object_exists() {
     let mut archiver = build_archiver(&qdb_url, &ilp_url, &s3_url, cfg).await;
     let summary = archiver.run_archive_pass().await;
     assert_eq!(summary.verified, 1);
-    let exports: Vec<bool> = qlog
-        .lock()
-        .expect("q")
-        .iter()
-        .filter(|r| r.target.starts_with("/exp"))
-        .map(|r| r.target.contains("ORDER BY"))
-        .collect();
+    let exports = export_runs(&qlog);
     assert_eq!(exports, vec![false]);
 }
 
@@ -780,13 +774,7 @@ async fn test_archiver_falls_back_once_to_unordered_export() {
         summary.verified, 1,
         "the unordered retry archived the partition"
     );
-    let exports: Vec<bool> = qlog
-        .lock()
-        .expect("q")
-        .iter()
-        .filter(|r| r.target.starts_with("/exp"))
-        .map(|r| r.target.contains("ORDER BY"))
-        .collect();
+    let exports = export_runs(&qlog);
     assert_eq!(
         exports,
         vec![true, false],
@@ -814,13 +802,7 @@ async fn test_failed_ordered_export_keeps_the_partition_outside_pressure() {
     let summary = archiver.run_archive_pass().await;
     assert_eq!(summary.verified, 0);
     assert_eq!(summary.dropped, 0);
-    let exports: Vec<bool> = qlog
-        .lock()
-        .expect("q")
-        .iter()
-        .filter(|r| r.target.starts_with("/exp"))
-        .map(|r| r.target.contains("ORDER BY"))
-        .collect();
+    let exports = export_runs(&qlog);
     assert_eq!(exports, vec![true], "no unordered retry outside pressure");
     assert!(
         puts(&s3_log).is_empty(),
@@ -1186,13 +1168,7 @@ async fn test_archiver_head_failure_still_orders_and_reuses() {
     let mut archiver = build_archiver(&qdb_url, &ilp_url, &s3_url, cfg).await;
     let summary = archiver.run_archive_pass().await;
     assert_eq!(summary.verified, 1);
-    let exports: Vec<bool> = qlog
-        .lock()
-        .expect("q")
-        .iter()
-        .filter(|r| r.target.starts_with("/exp"))
-        .map(|r| r.target.contains("ORDER BY"))
-        .collect();
+    let exports = export_runs(&qlog);
     assert_eq!(exports, vec![true], "the failed HEAD still orders");
     assert_eq!(summary.gzip_bytes_uploaded, 0, "the export's object reused");
     assert!(!has_sidecar(&objects), "no second copy");
@@ -1213,7 +1189,7 @@ async fn test_open_arrival_hours_are_left_out_of_the_session_day() {
     );
     let responder: Responder = Arc::new(move |req: &SeenRequest| {
         if req.target.starts_with("/exp") && req.target.contains("ORDER BY") {
-            return (200, Vec::new(), SORTED.as_bytes().to_vec());
+            return (200, Vec::new(), stub_export_body(&req.target, SORTED));
         }
         if req.target.contains("FROM partition_archive_audit") {
             return (200, Vec::new(), NO_AUDIT.as_bytes().to_vec());
@@ -1261,4 +1237,138 @@ async fn test_open_arrival_hours_are_left_out_of_the_session_day() {
             .any(|p| p.ends_with(&format!("tick_quotes/{late}.csv.gz"))),
         "nothing placed at the open hour's key"
     );
+}
+
+/// The second hour every pressure-order test lists beside [`PART`].
+const PART_LATER: &str = "2026-04-01T10";
+
+/// An archiver for a disk-pressure pass inside the trading-day window
+/// (at most one partition, as the in-session gate sets it) over `ticks`
+/// hours [`PART`] and [`PART_LATER`].
+async fn in_session_pressure_archiver(
+    objects: &StubObjects,
+) -> (PartitionArchiver, Arc<Mutex<Vec<SeenRequest>>>) {
+    pressure_archiver(objects, 200, Some(1)).await
+}
+
+/// The same pass with a per-run cap of `max_per_run` and the caller's pass
+/// cap `pass_cap` (`None`: no cap, as a pre-open pass from 08:30 to 08:45
+/// or a pass before a weekend Muhurat gate has).
+async fn pressure_archiver(
+    objects: &StubObjects,
+    max_per_run: u32,
+    pass_cap: Option<u32>,
+) -> (PartitionArchiver, Arc<Mutex<Vec<SeenRequest>>>) {
+    let responder = qdb_responder_tables(
+        vec![("ticks", vec![PART, PART_LATER])],
+        three_rows(),
+        UNSORTED,
+        Arc::new(|_| (200, wal_tables_body(&[], &[]))),
+    );
+    let (qdb_url, qlog) = spawn_stub(responder).await;
+    let (ilp_url, _) = spawn_stub(ilp_responder(204)).await;
+    let (s3_url, _) = spawn_stub(create_only_s3(Arc::clone(objects))).await;
+    let mut cfg = test_retention_cfg(max_per_run);
+    cfg.under_disk_pressure = true;
+    let mut archiver = build_archiver(&qdb_url, &ilp_url, &s3_url, cfg)
+        .await
+        .with_pass_limits(crate::partition_archive::ArchivePassLimits {
+            max_partitions: pass_cap,
+            ..crate::partition_archive::ArchivePassLimits::default()
+        });
+    archiver.trading_window_now = Arc::new(|| true);
+    (archiver, qlog)
+}
+
+/// Places an object (the export's ordered copy) at `partition`'s canonical
+/// key of `ticks`.
+fn place_export_object(objects: &StubObjects, partition: &str) {
+    objects.lock().expect("o").insert(
+        stub_key(&canonical_archive_key("ticks", partition)),
+        (64, Some("ZXhwb3J0LW9yZGVyZWQtY29weQ==".to_string())),
+    );
+}
+
+/// The partitions a pass sent a DROP for.
+fn dropped_partitions(qlog: &Arc<Mutex<Vec<SeenRequest>>>) -> Vec<String> {
+    qlog.lock()
+        .expect("q")
+        .iter()
+        .filter(|r| r.target.contains("DROP PARTITION"))
+        .map(|r| {
+            if r.target.contains(PART_LATER) {
+                PART_LATER.to_string()
+            } else {
+                PART.to_string()
+            }
+        })
+        .collect()
+}
+
+/// Regression (2026-11-15, Quote 60 open limit): an in-session pressure pass
+/// takes the hour with NOTHING at its canonical key before an older hour the
+/// export already placed, so freeing space writes no second copy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_regression_in_session_pressure_prefers_an_unexported_hour() {
+    let objects: StubObjects = Arc::new(Mutex::new(HashMap::new()));
+    place_export_object(&objects, PART);
+    let (mut archiver, qlog) = in_session_pressure_archiver(&objects).await;
+    let summary = archiver.run_archive_pass().await;
+    assert_eq!(summary.dropped, 1, "{summary:?}");
+    assert_eq!(dropped_partitions(&qlog), vec![PART_LATER.to_string()]);
+    assert!(!has_sidecar(&objects), "no second copy: {:?}", objects);
+    assert!(
+        objects
+            .lock()
+            .expect("o")
+            .contains_key(&stub_key(&canonical_archive_key("ticks", PART_LATER))),
+        "the unexported hour went to its canonical key"
+    );
+}
+
+/// With every candidate already exported the in-session pressure pass still
+/// frees space: it takes the oldest, at the cost of one content-addressed
+/// copy (the remaining unavoidable case).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_in_session_pressure_with_only_exported_hours_still_frees_space() {
+    let objects: StubObjects = Arc::new(Mutex::new(HashMap::new()));
+    place_export_object(&objects, PART);
+    place_export_object(&objects, PART_LATER);
+    let (mut archiver, qlog) = in_session_pressure_archiver(&objects).await;
+    let summary = archiver.run_archive_pass().await;
+    assert_eq!(summary.dropped, 1, "{summary:?}");
+    assert_eq!(dropped_partitions(&qlog), vec![PART.to_string()]);
+    assert!(has_sidecar(&objects), "the unavoidable copy");
+}
+
+/// Regression (2026-11-15 review): the not-yet-exported hour is chosen
+/// BEFORE the per-run cap. With a cap of one, cutting first kept only the
+/// oldest hour (already exported) and the pass wrote a second copy of it
+/// while the newer, unexported hour was on the box.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_regression_unexported_hour_survives_the_per_run_cap() {
+    let objects: StubObjects = Arc::new(Mutex::new(HashMap::new()));
+    place_export_object(&objects, PART);
+    let (mut archiver, qlog) = pressure_archiver(&objects, 1, None).await;
+    let summary = archiver.run_archive_pass().await;
+    assert_eq!(summary.dropped, 1, "{summary:?}");
+    assert_eq!(dropped_partitions(&qlog), vec![PART_LATER.to_string()]);
+    assert!(!has_sidecar(&objects), "no second copy: {:?}", objects);
+}
+
+/// Regression (2026-11-15 review): an uncapped pressure pass inside the
+/// no-sort window (08:30 to 08:45, or before a weekend Muhurat gate) stops
+/// taking exported hours once an unexported one was dropped; the exported
+/// hour is left for a later pass (held by the gate) instead of being copied
+/// a second time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_regression_uncapped_pressure_pass_skips_exported_after_a_fresh_drop() {
+    let objects: StubObjects = Arc::new(Mutex::new(HashMap::new()));
+    place_export_object(&objects, PART);
+    let (mut archiver, qlog) = pressure_archiver(&objects, 200, None).await;
+    let summary = archiver.run_archive_pass().await;
+    assert_eq!(summary.dropped, 1, "{summary:?}");
+    assert_eq!(summary.held_by_gate, 1, "{summary:?}");
+    assert_eq!(dropped_partitions(&qlog), vec![PART_LATER.to_string()]);
+    assert!(!has_sidecar(&objects), "no second copy: {:?}", objects);
 }
