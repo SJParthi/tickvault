@@ -681,9 +681,9 @@ are UNTOUCHED. `dry_run` stays `true`; §28 stays frozen.
 
 Zero Groww order-side request fires until the operator's dated live-orders
 enable aligns all four gates. Each gate is independently BUILD-FAILURE-ratcheted
-by `crates/common/tests/groww_order_lattice_guard.rs`.
+by `crates/common/tests/groww_order_lattice_guard.rs`. (⚠ CORRECTED 2026-11-15: `groww_order_lattice_guard.rs` was deleted 2026-08-21 with the Groww order side; NOT ENFORCED)
 
-| # | Gate | Mechanism | Default | Ratchet (all in `crates/common/tests/groww_order_lattice_guard.rs`) |
+| # | Gate | Mechanism | Default | Ratchet (all in `crates/common/tests/groww_order_lattice_guard.rs`; ⚠ CORRECTED 2026-11-15: that file was deleted 2026-08-21 with the Groww order side, NOT ENFORCED) |
 |---|---|---|---|---|
 | 1 | Config default-OFF | `[groww_orders]` (`GrowwOrdersConfig`) — every key `#[serde(default)] = false`; read-only GETs run only per-area-true + market-hours; `live_fire_requested` inert without Gate 3 | all OFF | `test_gate1_groww_orders_config_defaults_all_off`, `test_gate1_base_toml_groww_orders_keys_all_false` |
 | 2 | Non-default cargo feature | `groww_orders = []` in BOTH `crates/common/Cargo.toml` + `crates/trading/Cargo.toml`; the `crates/trading/src/oms/groww/` subtree compiles ONLY under it; never in a `default = [...]` set | feature OFF | `test_gate2_groww_orders_feature_present_and_never_default` |

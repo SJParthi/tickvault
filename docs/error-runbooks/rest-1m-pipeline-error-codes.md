@@ -992,7 +992,7 @@ fire passes through — spot-1m fires + ladder re-polls + the 15:33:30 sweep
 warmup/probe. Routing choke points: `spot_1m_rest_boot::spot_1m_fetch_once`
 and `option_chain_1m_boot::chain_fetch_once` (every enumerated caller
 funnels through them; ratchet
-`crates/app/tests/dhan_data_api_limiter_wiring_guard.rs`). `acquire().await`
+`crates/app/tests/dhan_data_api_limiter_wiring_guard.rs` (⚠ CORRECTED 2026-11-15: that guard was deleted 2026-09-17 with the per-minute price pulls; NOT ENFORCED)). `acquire().await`
 semantics — overflow spills into later seconds, nothing errors or drops.
 The chain's 1-unique-per-3s per-underlying min-gap stays layered on top,
 unchanged. Config: `[dhan_data_api] target_rps = 3` (serde default 3; legal
@@ -1054,7 +1054,7 @@ operator's mandated burst. **This limiter REMAINS the pacing authority for
 every LEGACY per-minute path enumerated above** (spot-1m fires + ladder +
 sweep + probes, option-chain fires + expirylist). Contract + slot tables:
 `cadence-error-codes.md` §0b/§3b (the composition-contract sentence is
-source-scan-ratcheted by `cadence_composition_contract_guard.rs`).
+source-scan-ratcheted by `cadence_composition_contract_guard.rs`; ⚠ CORRECTED 2026-11-15: that guard was deleted with the cadence module on 2026-09-16, so the sentence is NOT ENFORCED).
 
 ## §2g. 2026-07-14 — moneyness audit column + RAM-first classification
 

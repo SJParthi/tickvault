@@ -4,7 +4,7 @@ paths:
   - "crates/storage/src/shadow_persistence.rs"
   - "crates/storage/src/seal_writer_loop.rs"
   - "crates/app/tests/seal_drop_paging_wiring_guard.rs"
-  - "crates/storage/tests/wave_6_aggregator_alert_guard.rs"
+  - "crates/storage/tests/wave_6_aggregator_alert_guard.rs"  # ⚠ CORRECTED 2026-11-15: deleted 2026-05-20 with Grafana; NOT ENFORCED
   - "crates/trading/src/aggregator/multi_tf.rs"
   - "crates/app/src/groww_bridge.rs"
   - "crates/app/src/main.rs"
@@ -13,7 +13,7 @@ paths:
   - "crates/trading/src/aggregator/boundary_timer.rs"
   - "crates/trading/src/candles/multi_tf_aggregator.rs"
   - "crates/trading/src/candles/aggregator_cell.rs"
-  - "crates/app/tests/aggregation_task_wiring_guard.rs"
+  - "crates/app/tests/aggregation_task_wiring_guard.rs"  # ⚠ CORRECTED 2026-11-15: deleted 2026-07-18 with the 21-timeframe tick aggregator; NOT ENFORCED
   - "crates/storage/src/ws_frame_spill.rs"
 ---
 
@@ -186,7 +186,7 @@ All 4 alerts:
 - Wrapped in `increase()` per Rule 12
 
 Family completeness is meta-ratcheted by 3 tests in
-`crates/storage/tests/wave_6_aggregator_alert_guard.rs` (item 1.4p,
+`crates/storage/tests/wave_6_aggregator_alert_guard.rs` (⚠ CORRECTED 2026-11-15: this guard file was deleted 2026-05-20 with Grafana; NOT ENFORCED) (item 1.4p,
 merged #591). Future deletion of any single alert OR severity
 downgrade OR market-hours-gate removal fails the build.
 

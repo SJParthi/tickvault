@@ -35,7 +35,7 @@ nothing ever turns into a scan.
 | O(1) claim | Mechanism (real code) | Verified | Build-failing guard |
 |---|---|---|---|
 | **O(1) uniqueness** | composite key `(security_id, exchange_segment)` (I-P1-11); `feed` added for per-feed rows. `InstrumentRegistry.by_composite: HashMap<(SecurityId, ExchangeSegment), _>` (`crates/common/src/instrument_registry.rs`) | ✅ TRUE | `dedup_segment_meta_guard::every_dedup_key_with_security_id_must_include_segment` + `per_feed_market_data_dedup_keys_must_include_feed`; banned-pattern scanner cat-5 (no `HashSet<u32>` on instrument paths) |
-| **O(1) deduplication** | QuestDB `DEDUP UPSERT KEYS(...)` = **amortized O(1) hash upsert** at the DB; in-RAM a bounded ring prevented loss *(the tick ring + its constant retired 2026-07-18 with the dead tick chain — the live bounded ring is the 200,000-seal `SEAL_BUFFER_CAPACITY` ring)*. **Caveat: dedup is QuestDB-side, NOT in-memory** — duplicates may briefly coexist in the ring and collapse at DB write (correct by design). `capture_seq` is the replay-stable tiebreaker. | ✅ TRUE (DB) / ⚠️ by-design (no in-RAM dedup) | the 3 `dedup_segment_meta_guard` tests + `chaos_index_same_value_burst_preserved.rs` |
+| **O(1) deduplication** | QuestDB `DEDUP UPSERT KEYS(...)` = **amortized O(1) hash upsert** at the DB; in-RAM a bounded ring prevented loss *(the tick ring + its constant retired 2026-07-18 with the dead tick chain — the live bounded ring is the 200,000-seal `SEAL_BUFFER_CAPACITY` ring)*. **Caveat: dedup is QuestDB-side, NOT in-memory** — duplicates may briefly coexist in the ring and collapse at DB write (correct by design). `capture_seq` is the replay-stable tiebreaker. | ✅ TRUE (DB) / ⚠️ by-design (no in-RAM dedup) | the 3 `dedup_segment_meta_guard` tests + `chaos_index_same_value_burst_preserved.rs` (⚠ CORRECTED 2026-11-15: no such file exists, so it guards nothing; the same-value same-second case is pinned only by the `tick_persistence.rs` unit test `n_ticks_in_one_second_with_distinct_capture_seq_produce_distinct_rows`) |
 | **O(1) mapping** | instrument registry = **std `HashMap`, immutable, `Arc`-shared** (built once at boot, O(1) `get_with_segment`). ISIN→security_id constituent map built ONCE then O(1)/lookup (`constituent_resolver.rs`). **NOTE: the registry is std HashMap, NOT papaya** — papaya is reserved for future dynamic structures; the immutable Arc-shared registry needs no MVCC. | ✅ TRUE | `dhat_instrument_registry.rs` (zero-alloc `get` ×1000) + Criterion `registry_get=50ns` |
 | **O(1) latency** | binary parse = fixed-offset `from_le_bytes` (no loop/alloc, `crates/core/src/parser/*.rs`); bounded SPSC (`rtrb`) + bounded broadcast (no unbounded channels); `feed` stamped as `&'static str`/`Copy` enum (`Feed::as_str` const fn) — zero-alloc | ✅ TRUE | `dhat_ws_reader_zero_alloc.rs` (0 allocs/1000 iters) + Criterion budgets `dispatch_frame=10ns`/`pipeline=100ns` + `bench-gate.sh` 5% gate |
 
@@ -69,13 +69,13 @@ feeds watch — keying by feed would duplicate the universe, breaking I-P1-11).
 
 | Extreme scenario | What catches it (O(1), correct) | Ratchet test |
 |---|---|---|
-| Same `security_id` across segments (Dhan reuses ids) | composite key includes `segment` (I-P1-11) | `dedup_regression_nse_bse_1333_collision` + registry `test_iter_returns_both_colliding_segments` |
+| Same `security_id` across segments (Dhan reuses ids) | composite key includes `segment` (I-P1-11) | `dedup_regression_nse_bse_1333_collision` (⚠ CORRECTED 2026-11-15: no such test exists; NOT ENFORCED, only the registry test holds) + registry `test_iter_returns_both_colliding_segments` |
 | Dhan tick **and** Groww tick, same instrument+second | `feed` in the DEDUP key → both kept | `per_feed_market_data_dedup_keys_must_include_feed` |
-| Identical value twice (volume-0 index `45→45`) | `capture_seq` tiebreaker → both kept | `chaos_index_same_value_burst_preserved` |
-| Replay / reconnect re-sends a frame | same `capture_seq` (read from WAL) → collapses (idempotent) | `dedup_identical_content_replay_idempotent` |
+| Identical value twice (volume-0 index `45→45`) | `capture_seq` tiebreaker → both kept | `chaos_index_same_value_burst_preserved` (⚠ CORRECTED 2026-11-15: no such file or test exists; the real pin is the `tick_persistence.rs` unit test `n_ticks_in_one_second_with_distinct_capture_seq_produce_distinct_rows`) |
+| Replay / reconnect re-sends a frame | same `capture_seq` (read from WAL) → collapses (idempotent) | `dedup_identical_content_replay_idempotent` (⚠ CORRECTED 2026-11-15: no such test exists; the nearest real pin is the `tick_persistence.rs` unit test `constant_capture_seq_collapses_a_whole_second_into_one_row`, which checks that one key collapses, not a replay) |
 | Add a 3rd feed tomorrow | `Feed::ALL` + exhaustive `match` (no `_` arm) → **compile error** at every site that forgot it | `feed.rs::test_index_is_dense_and_in_lockstep_with_all` |
 | QuestDB down / disk full | ring → NDJSON spill → DLQ absorbs (never a blocking scan) | `chaos_ws_frame_spill_saturation`, `chaos_seal_disk_full_dlq_capture` |
-| WS disconnect / feed toggled OFF | `SubscribeRxGuard` preserves subs; `wait_until_feed_enabled` parks dormant + reconnects | `chaos_cascade_triple_failure`, `ws_sleep_resilience` |
+| WS disconnect / feed toggled OFF | `SubscribeRxGuard` preserves subs; `wait_until_feed_enabled` (⚠ CORRECTED 2026-11-15: no such function exists in the tree) parks dormant + reconnects | `chaos_cascade_triple_failure`, `ws_sleep_resilience` |
 
 ---
 
@@ -112,7 +112,7 @@ the target, not a current literal.
 | Property | How |
 |---|---|
 | **Common runtime** | same `Feed` enum + same DEDUP keys Mac-dev = AWS-prod; one code path |
-| **Dynamic** | feeds flip ON/OFF live (one atomic) — no redeploy (`wait_until_feed_enabled` + the Groww bridge) |
+| **Dynamic** | feeds flip ON/OFF live (one atomic) — no redeploy (`wait_until_feed_enabled`, ⚠ CORRECTED 2026-11-15: no such function exists in the tree, + the Groww bridge) |
 | **Scalable** | adding instruments/feeds adds fixed-size rows/slots, never converts a get into a scan; bounded channels + ring; space grows **O(N×F) bounded**, measured against the 8 GiB host budget before go-live |
 
 ---
