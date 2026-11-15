@@ -451,6 +451,7 @@ fn atm_distance_fraction_at(candidate: &DepthCandidate, spot: f64) -> f64 {
 fn consensus_spot_by_underlying(
     candidates: &[DepthCandidate],
 ) -> std::collections::HashMap<String, f64> {
+    // APPROVED: not an instrument key — the inner key is a spot price's f64 bit pattern.
     let mut tally: std::collections::HashMap<String, std::collections::HashMap<u64, (usize, f64)>> =
         std::collections::HashMap::new();
     for c in candidates {

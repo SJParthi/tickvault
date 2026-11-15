@@ -330,6 +330,7 @@ pub fn select_live_universe(
     //   says the swap fires "when the master yields indices"; counting
     //   insertions asked a different question.
     let mut master_index_ids: Vec<SecurityId> = Vec::new();
+    // APPROVED: single-segment context — only IDX_I rows reach this set (filtered below).
     let mut master_index_seen: std::collections::HashSet<SecurityId> =
         std::collections::HashSet::new();
     let mut master_index_names: std::collections::HashSet<String> =

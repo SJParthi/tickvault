@@ -110,8 +110,8 @@ use tickvault_common::sanitize::capture_rest_error_body;
 
 use crate::partition_manager::{
     DAY_PARTITIONED_TABLES, HOUR_PARTITIONED_TABLES, RETENTION_EXEMPT_TABLES,
-    build_closed_hour_list_sql, build_detach_list_sql, build_partition_size_sql,
-    is_valid_partition_name, parse_partition_rows, parse_partition_sizes,
+    build_closed_hour_list_sql, build_detach_list_sql, build_ist_day_list_sql,
+    build_partition_size_sql, is_valid_partition_name, parse_partition_rows, parse_partition_sizes,
     select_partitions_to_detach,
 };
 use crate::s3_cold::{
@@ -581,6 +581,20 @@ pub(crate) fn retention_class(table: &str) -> RetentionClass {
     }
 }
 
+/// The day-granular ARCHIVE list query for `table` (audit 2026-11-15,
+/// live-4). The IST-stamped market-data classes (`Intraday`, `Depth`) compare
+/// against `now()` shifted into IST ([`build_ist_day_list_sql`]); every other
+/// class keeps the UTC form ([`build_detach_list_sql`]). Only the archive
+/// worklist calls this; the retention detach is unchanged. Pure, O(1).
+fn archive_day_list_sql(table: &str, hot_days: u32) -> String {
+    match retention_class(table) {
+        RetentionClass::Intraday | RetentionClass::Depth => build_ist_day_list_sql(table, hot_days),
+        RetentionClass::MarketData | RetentionClass::Standard => {
+            build_detach_list_sql(table, hot_days)
+        }
+    }
+}
+
 /// Clamps a configured hot window to the [`MIN_HOT_DAYS`] floor — today's
 /// and yesterday's partitions are untouchable even under `hot_days = 0`.
 /// Takes the FLOOR as a parameter since 2026-08-19, when the floor became
@@ -608,6 +622,18 @@ pub(crate) fn effective_hot_days(configured_days: u32, floor: u32) -> u32 {
 /// - Today's partition has `minTimestamp >= today 00:00`, which is ALWAYS
 ///   later than `now() - 24h`. It can never be selected — safe by
 ///   construction, not by scheduling luck.
+///
+/// ⚠ CORRECTED 2026-11-15 (audit live-4): the first bullet was false for the
+/// IST-stamped tables. Their `minTimestamp` is IST stored as Z while `now()`
+/// is UTC, so the UTC cutoff sat 5.5 hours behind: on D+1 the hours from
+/// 11:00 IST of D became eligible only at about 16:30 IST, the box stop, and
+/// the daily leg latched at 16:21 without them. The archive worklist now uses
+/// `build_ist_day_list_sql` for `Intraday` and `Depth` (`archive_day_list_sql`),
+/// so each hour of D is eligible 24 hours after its first row: every
+/// session hour of D (09:00 to the 15:00 hour) by 16:00 IST of D+1, before
+/// the daily leg latches. Today's partitions still never are
+/// (`minTimestamp >= today 00:00 IST > now_ist - 24h`). The retention detach
+/// keeps the UTC form.
 ///
 /// So the general floor of 2 was not protecting anything here; it was simply
 /// retaining a second day of the two heaviest tables on the box.
@@ -3870,7 +3896,7 @@ impl PartitionArchiver {
                 build_closed_hour_list_sql(table, hours)
             }
             HourWindowDecision::DeferredToDays | HourWindowDecision::DaysByClass => {
-                build_detach_list_sql(table, hot_days)
+                archive_day_list_sql(table, hot_days)
             }
         };
         let response = self
@@ -5328,6 +5354,57 @@ mod tests {
             zero.contains("dateadd('d', -0, now())"),
             "sanity: the 0 form is what the floor exists to prevent reaching"
         );
+    }
+
+    // Regression: audit 2026-11-15 (live-4) — the archive day list compared
+    // IST-stamped partitions with UTC now(), so ticks hours 11:00-15:00 of D
+    // reached S3 only on D+2.
+    #[test]
+    fn test_regression_live4_archive_day_list_sql_selects_all_of_yesterday_and_none_of_today() {
+        let ist = i64::from(tickvault_common::constants::IST_UTC_OFFSET_SECONDS);
+        let shift = format!("dateadd('s', {ist}, now())");
+        // Model of the server-side filter: `minTimestamp < cutoff`, with the
+        // cutoff read from the SQL (IST-shifted or not). Stamps are IST as Z.
+        let eligible = |sql: &str, now_utc: i64, min_ts: i64| {
+            let shifted = sql.contains(&shift);
+            assert!(sql.contains("dateadd('d', -1, "), "{sql}");
+            let cutoff = now_utc + if shifted { ist } else { 0 } - 86_400;
+            min_ts < cutoff
+        };
+        let day = 86_400_i64;
+        let hour = 3_600_i64;
+        for table in ["ticks", "tick_quotes", "market_depth", "market_depth_book"] {
+            let sql = archive_day_list_sql(table, 1);
+            assert_eq!(
+                sql,
+                crate::partition_manager::build_ist_day_list_sql(table, 1),
+                "{table}: IST-stamped class uses the IST frame"
+            );
+            for (h, m) in [(15_i64, 44_i64), (16, 21)] {
+                // D+1 at h:m IST, as UTC seconds in the IST-as-Z frame.
+                let now_utc = day + h * hour + m * 60 - ist;
+                for d_hour in 9..=15 {
+                    assert!(
+                        eligible(&sql, now_utc, d_hour * hour),
+                        "{table} at {h}:{m}: hour T{d_hour} of D must be eligible"
+                    );
+                }
+                for today_hour in 0..=h {
+                    assert!(
+                        !eligible(&sql, now_utc, day + today_hour * hour),
+                        "{table} at {h}:{m}: hour T{today_hour} of D+1 must stay"
+                    );
+                }
+            }
+        }
+        // Tables whose class is not IST-stamped keep the UTC form.
+        for table in ["ws_event_audit", "candles_1m"] {
+            assert_eq!(
+                archive_day_list_sql(table, 2),
+                crate::partition_manager::build_detach_list_sql(table, 2),
+                "{table}"
+            );
+        }
     }
 
     #[test]

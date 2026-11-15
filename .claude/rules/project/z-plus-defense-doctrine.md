@@ -139,6 +139,17 @@ Every new Claude Code / Cowork session automatically inherits via SessionStart h
 
 **If ANY step fails → fix underlying issue. NEVER bypass.**
 
+> **⚠ CORRECTED 2026-11-15 (audit repo-3) — the table above is not what
+> runs.** `.claude/settings.json` wires only TWO SessionStart hooks:
+> `session-sanity.sh` (branch and uncommitted check, auto-save snapshots,
+> the last 10 errors from the newest `errors.jsonl` file, and the error
+> summary glance) and `session-auto-health.sh` (`scripts/doctor.sh`,
+> `scripts/validate-automation.sh` and `scripts/mcp-doctor.sh` in the background;
+> results go to a log file under `data/logs/`). `session-context-brief.sh`
+> exists but nothing runs it. A command hook cannot call an MCP tool, so
+> `run_doctor` and `summary_snapshot` do not run at start: the session must
+> call them itself. The old text is kept as history.
+
 ---
 
 ## 📊 The "Common Runtime, Dynamic, Scalable, Incremental" 4-Word Test

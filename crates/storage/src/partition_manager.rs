@@ -764,6 +764,32 @@ pub(crate) fn build_closed_hour_list_sql(table: &str, cutoff_hours: u32) -> Stri
     )
 }
 
+/// Day-granular ARCHIVE list for a table whose `ts` is IST stored as Z.
+///
+/// Added 2026-11-15 (audit live-4). The same query as
+/// [`build_detach_list_sql`] with `now()` shifted into the IST frame, as
+/// [`build_closed_hour_list_sql`] does: `minTimestamp < now_ist − N d`. The
+/// UTC form compared IST stamps with UTC `now()`, so for `ticks` (N = 1) the
+/// hours from 11:00 IST of day D became eligible only at about 16:30 IST of
+/// D+1, the box stop, and reached S3 on D+2.
+///
+/// Safe at N = 1: today's partitions have `minTimestamp` at or after today
+/// 00:00 IST, which is always later than `now_ist − 24 h`, so they are never
+/// selected. Used ONLY by the archive worklist for the IST-stamped market-data
+/// classes (`Intraday`, `Depth`); the retention detach keeps
+/// [`build_detach_list_sql`] unchanged.
+///
+/// `table` is the same trusted-constant class as the day builder.
+pub(crate) fn build_ist_day_list_sql(table: &str, cutoff_days: u32) -> String {
+    format!(
+        "SELECT name, active FROM table_partitions('{}') \
+         WHERE minTimestamp < dateadd('d', -{}, dateadd('s', {}, now()))",
+        table,
+        cutoff_days,
+        tickvault_common::constants::IST_UTC_OFFSET_SECONDS
+    )
+}
+
 /// Validates a QuestDB partition name before it is interpolated into a
 /// `DETACH PARTITION LIST '<name>'` DDL statement.
 ///
@@ -1242,6 +1268,25 @@ mod tests {
             row("2026-01-02'; DROP TABLE ticks--", false),
         ];
         assert_eq!(select_partitions_to_detach(&rows), vec!["2026-01-01"]);
+    }
+
+    // Audit 2026-11-15 (live-4): the archive-only IST day list differs from
+    // the retention detach list ONLY by the IST shift of now(); the detach
+    // list itself stays UTC.
+    #[test]
+    fn test_build_ist_day_list_sql_differs_from_the_detach_list_only_by_the_ist_shift() {
+        let ist = build_ist_day_list_sql("ticks", 1);
+        let utc = build_detach_list_sql("ticks", 1);
+        let shift = format!(
+            "dateadd('s', {}, now())",
+            tickvault_common::constants::IST_UTC_OFFSET_SECONDS
+        );
+        assert!(ist.contains(&format!("dateadd('d', -1, {shift})")), "{ist}");
+        assert_eq!(ist.replace(&shift, "now()"), utc);
+        assert!(
+            !utc.contains("dateadd('s'"),
+            "retention detach stays UTC: {utc}"
+        );
     }
 
     #[test]
