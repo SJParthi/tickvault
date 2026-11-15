@@ -2231,6 +2231,17 @@ pub fn spot_paise_by_symbol(
     out
 }
 
+/// Whether a failed read of today's contract artifact is the expected
+/// pre-rider kind (2026-11-15 audit, live-6): the file is MISSING (not found)
+/// at a time the rider has not built it yet (`absence_expected`). A file that
+/// exists but cannot be read or parsed is never expected. Pure, O(1).
+fn contract_artifact_error_is_expected(err: &anyhow::Error, absence_expected: bool) -> bool {
+    absence_expected
+        && err
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+}
+
 /// Loads today's contract universe: artifact from disk, prices from QuestDB.
 ///
 /// Returns an EMPTY selection on any failure, having said which one. An empty
@@ -2255,14 +2266,34 @@ pub async fn load_contract_universe(
     let contracts = match read_contract_artifact(date_ist) {
         Ok(c) => c,
         Err(err) => {
-            tracing::error!(
-                code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
-                %err,
-                date_ist,
-                path = %contract_artifact_path(date_ist).display(),
-                "contract universe: today's contract artifact is unreadable — the lane will \
-                 carry its spot universe only. No futures, no option contracts."
+            // Live-6 (2026-11-15): before the rider builds today's file (or on
+            // a non-trading day) a MISSING file is expected and logged at
+            // WARN, like the live universe's pre-rider line. Any other
+            // failure, or a boot at or after the rider hour, stays ERROR.
+            let absence_expected = crate::dhan_live_universe::day_artifact_absence_expected_at(
+                crate::dhan_feed_stack::ist_second_of_day_now(),
             );
+            if contract_artifact_error_is_expected(&err, absence_expected) {
+                tracing::warn!(
+                    code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+                    source = crate::dhan_live_universe::PRE_RIDER_BOOT_SOURCE,
+                    %err,
+                    date_ist,
+                    path = %contract_artifact_path(date_ist).display(),
+                    "contract universe: today's contract artifact does not exist yet \
+                     (non-trading day, or before the daily rider's build hour) — the lane \
+                     carries its spot universe until it does. Expected for this boot."
+                );
+            } else {
+                tracing::error!(
+                    code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+                    %err,
+                    date_ist,
+                    path = %contract_artifact_path(date_ist).display(),
+                    "contract universe: today's contract artifact is unreadable — the lane will \
+                     carry its spot universe only. No futures, no option contracts."
+                );
+            }
             // Bumped HERE rather than through `record_contract_verdict`: this
             // path returns a default selection, which carries none of the
             // information needed to classify what went wrong.
@@ -2618,6 +2649,29 @@ mod tests {
             out.get(&(52_175, nse)).map(|s| &**s),
             Some("NIFTY-25Sep2026-24500-CE")
         );
+    }
+
+    /// 2026-11-15 audit (live-6): an off-hours boot (00:26 IST, Saturday
+    /// 14:23) logged today's not-yet-built contract artifact as a coded ERROR
+    /// on every attach attempt. A missing file at a time the rider has not
+    /// built it is expected; a file that exists but fails to read or parse,
+    /// or any failure after the rider hour on a trading day, is not. Bites:
+    /// dropping the `NotFound` check passes the parse-error case.
+    #[test]
+    fn test_regression_contract_artifact_error_is_expected_only_for_a_missing_file() {
+        let missing =
+            read_contract_artifact_on_this_thread("1999-01-01").expect_err("no artifact for 1999");
+        assert!(super::contract_artifact_error_is_expected(&missing, true));
+        assert!(!super::contract_artifact_error_is_expected(&missing, false));
+        let unparsable =
+            anyhow::Error::from(serde_json::from_str::<Vec<u8>>("{").expect_err("bad json"));
+        assert!(!super::contract_artifact_error_is_expected(
+            &unparsable,
+            true
+        ));
+        let denied =
+            anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        assert!(!super::contract_artifact_error_is_expected(&denied, true));
     }
 
     /// Regression (2026-10-28, HAVELLS-23Nov2026-1260-CE written with a NULL

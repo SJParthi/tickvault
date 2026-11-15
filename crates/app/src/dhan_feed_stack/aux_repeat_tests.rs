@@ -368,12 +368,13 @@ fn test_no_trade_today_row_labels_by_receipt_cutover() {
     assert_eq!(new.writer.aux_rows_appended(), 1);
 }
 
-/// The three process-wide inputs of the production gap epoch, read apart.
-fn epoch_inputs() -> [u64; 3] {
+/// The four process-wide inputs of the production gap epoch, read apart.
+fn epoch_inputs() -> [u64; 4] {
     [
         tickvault_core::websocket::pool_supervisor::live_shed::main_feed_live_shed_total(),
         tickvault_storage::tick_conservation_ledger::ledger().rows_not_landed(),
         tickvault_storage::candle_contract_labels::candle_contract_labels_generation(),
+        tickvault_storage::wal_frame_fate::lost_high_seq(),
     ]
 }
 
@@ -383,7 +384,7 @@ fn epoch_inputs() -> [u64; 3] {
 /// a run in which one of them moved could pass with `own` removed from
 /// `gap_epoch`; a quiet run cannot, so reverting the term fails the test.
 /// `None` when no quiet run happened in 50 tries.
-fn quiet_run(own: usize, mut scenario: impl FnMut() -> (u64, [u64; 3], [u64; 3])) -> Option<u64> {
+fn quiet_run(own: usize, mut scenario: impl FnMut() -> (u64, [u64; 4], [u64; 4])) -> Option<u64> {
     for _ in 0..50 {
         let before = epoch_inputs();
         let (rows, own_before, own_after) = scenario();
@@ -392,7 +393,7 @@ fn quiet_run(own: usize, mut scenario: impl FnMut() -> (u64, [u64; 3], [u64; 3])
             own_after[own] > own_before[own],
             "the scenario must move its own input across its two drains"
         );
-        let others_still = (0..3).filter(|&i| i != own).all(|i| before[i] == after[i]);
+        let others_still = (0..4).filter(|&i| i != own).all(|i| before[i] == after[i]);
         if others_still {
             return Some(rows);
         }
@@ -418,6 +419,32 @@ fn test_production_filter_writes_the_repeat_after_a_row_did_not_land() {
         rows,
         Some(2),
         "the first repeat after a row did not land is written"
+    );
+}
+
+/// 2026-11-15 audit fix (fix2252-2): a frame is "WAL-backed" once its record is
+/// QUEUED, so a record the WAL writer then loses (a full disk, a failed write
+/// or flush) leaves a skipped repeat in no store. The writer's lost
+/// high-water mark is in the gap epoch, so the first repeat after a WAL loss
+/// is written. Raising the mark by one sequence stands in for the loss; it
+/// stays far below any real frame sequence, so no rescue deferral elsewhere
+/// in this process changes.
+#[test]
+fn test_production_filter_writes_the_repeat_after_a_wal_record_loss() {
+    let rows = quiet_run(3, || {
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
+        let _ = drain(&mut ingest, 1, ticker(2, 66_422, 142.5, YESTERDAY), at(0));
+        let own_before = epoch_inputs();
+        let lost = tickvault_storage::wal_frame_fate::lost_high_seq();
+        tickvault_storage::wal_frame_fate::note_lost_high(lost.saturating_add(1));
+        let own_after = epoch_inputs();
+        let _ = drain(&mut ingest, 2, ticker(2, 66_422, 142.5, YESTERDAY), at(1));
+        (ingest.writer.aux_rows_appended(), own_before, own_after)
+    });
+    assert_eq!(
+        rows,
+        Some(2),
+        "the first repeat after a WAL record loss is written"
     );
 }
 

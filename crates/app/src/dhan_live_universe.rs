@@ -37,7 +37,7 @@
 //! lane exposes — the connection count would simply be lower, and nobody reads
 //! a connection count expecting it to carry an error.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 use tickvault_common::types::{ExchangeSegment, SecurityId};
 use tickvault_core::websocket::pool_supervisor::SubscribeInstrument;
@@ -1164,6 +1164,47 @@ pub const fn collapse_is_expected_for_this_boot(
 /// alarm's metric filter cannot match it.
 pub const PRE_RIDER_BOOT_SOURCE: &str = "pre_rider_boot";
 
+/// The daily rider's build hour (IST seconds of day) as the boot's resolve
+/// read it from config; `u32::MAX` until then, which reads "not expected", so
+/// an artifact missing before any resolve still logs at ERROR (2026-11-15
+/// audit, live-6).
+static RIDER_TARGET_IST_SECS: AtomicU32 = AtomicU32::new(u32::MAX);
+
+/// Whether a day artifact the rider builds may legitimately be absent at
+/// `now_ist_secs` today: a non-trading day, or before the rider's build hour,
+/// the [`collapse_is_expected_for_this_boot`] rule judged at this moment. The
+/// trading day comes from the installed calendar (none installed: a trading
+/// day, so the line stays at ERROR). Used by the contract attach, whose
+/// artifact the same rider writes (2026-11-15 audit, live-6). O(1).
+#[must_use]
+pub(crate) fn day_artifact_absence_expected_at(now_ist_secs: u32) -> bool {
+    let trading_day = tickvault_common::market_hours::installed_calendar_session_day(
+        chrono::Utc::now()
+            .with_timezone(&tickvault_common::trading_calendar::ist_offset())
+            .date_naive(),
+    )
+    .is_none_or(|day| day.trading);
+    day_artifact_absence_expected(
+        RIDER_TARGET_IST_SECS.load(Ordering::Relaxed),
+        trading_day,
+        now_ist_secs,
+    )
+}
+
+/// [`day_artifact_absence_expected_at`] over explicit inputs; `u32::MAX` as
+/// the rider hour (none recorded) is never expected. Pure, O(1).
+const fn day_artifact_absence_expected(rider_target: u32, trading_day: bool, now: u32) -> bool {
+    rider_target != u32::MAX && collapse_is_expected_for_this_boot(trading_day, now, rider_target)
+}
+
+/// Whether a narrowing artifact's failure is the expected pre-rider kind: the
+/// boot's verdict says today's lists cannot exist yet AND the file could not
+/// be read (a missing file). A file that exists and fails to parse is a
+/// producer bug and stays at ERROR. Pure, O(1).
+const fn narrowing_failure_is_expected(collapse_expected: bool, failure: &ArtifactFailure) -> bool {
+    collapse_expected && matches!(failure, ArtifactFailure::Unreadable(_))
+}
+
 /// Resolve the session's subscription set, reading the master only when the
 /// operator has turned that on.
 ///
@@ -1185,6 +1226,9 @@ pub fn resolve_live_universe(
     capacity: usize,
     collapse_expected: bool,
 ) -> Vec<SubscribeInstrument> {
+    // Live-6 (2026-11-15): the contract attach judges its own missing day
+    // artifact by the same rider hour.
+    RIDER_TARGET_IST_SECS.store(cfg.target_secs_of_day_ist, Ordering::Relaxed);
     // Seed every fallback reason before the decision is made.
     //
     // This counter carries a LIVE CloudWatch alarm, and it is the one that
@@ -1252,23 +1296,39 @@ pub fn resolve_live_universe(
                     "reason" => failure.ntm_reason()
                 )
                 .increment(1);
-                // COLLAPSE-ALARM-EXEMPT: this is a WIDENING, not a collapse.
-                // The NTM narrowing was asked for and could not be applied, so
-                // the session falls THROUGH to the full master-sourced set —
-                // strictly more instruments than requested, never fewer. The
-                // collapse alarm exists to page when the universe drops to the
-                // 4 index SIDs; firing it here would page on a session that is
-                // subscribing ~4,600 instruments instead of ~870, which is a
-                // config observation, not an outage. The unpaged
-                // `NARROWING_FALLBACK_COUNTER` carries this event (D3c-1).
-                tracing::error!(
-                    code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
-                    detail = failure.detail(),
-                    path = %ntm_path.display(),
-                    "live universe: the NTM spot set (NSE indices + Nifty Total Market) was \
-                     REQUESTED but today's NTM artifact is unusable — falling through. This \
-                     session subscribes MORE than was asked for, never less."
-                );
+                if narrowing_failure_is_expected(collapse_expected, &failure) {
+                    // Live-6 (2026-11-15): before the rider builds today's lists
+                    // the file cannot exist yet; same label and level as the
+                    // expected mapping-artifact arm.
+                    tracing::warn!(
+                        code = tickvault_common::error_code::ErrorCode::WsGapConnectionState
+                            .code_str(),
+                        source = PRE_RIDER_BOOT_SOURCE,
+                        detail = failure.detail(),
+                        path = %ntm_path.display(),
+                        "live universe: today's NTM spot artifact does not exist yet \
+                         (non-trading day, or before the daily rider's build hour) \
+                         — falling through. Expected for this boot."
+                    );
+                } else {
+                    // COLLAPSE-ALARM-EXEMPT: this is a WIDENING, not a collapse.
+                    // The NTM narrowing was asked for and could not be applied, so
+                    // the session falls THROUGH to the full master-sourced set —
+                    // strictly more instruments than requested, never fewer. The
+                    // collapse alarm exists to page when the universe drops to the
+                    // 4 index SIDs; firing it here would page on a session that is
+                    // subscribing ~4,600 instruments instead of ~870, which is a
+                    // config observation, not an outage. The unpaged
+                    // `NARROWING_FALLBACK_COUNTER` carries this event (D3c-1).
+                    tracing::error!(
+                        code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+                        detail = failure.detail(),
+                        path = %ntm_path.display(),
+                        "live universe: the NTM spot set (NSE indices + Nifty Total Market) was \
+                         REQUESTED but today's NTM artifact is unusable — falling through. This \
+                         session subscribes MORE than was asked for, never less."
+                    );
+                }
             }
         }
     }
@@ -1286,19 +1346,34 @@ pub fn resolve_live_universe(
                     "reason" => failure.fno_reason()
                 )
                 .increment(1);
-                // COLLAPSE-ALARM-EXEMPT: same shape as the NTM arm above — a
-                // WIDENING. The narrowed indices+F&O-underlyings set was asked
-                // for and is unavailable, so the session falls through to the
-                // full master. More than requested, never less; not a collapse.
-                tracing::error!(
-                    code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
-                    detail = failure.detail(),
-                    path = %fno_path.display(),
-                    "live universe: the narrowed spot set (indices + F&O underlyings) was \
-                     REQUESTED but today's F&O artifact is unusable — falling through to the \
-                     full master-sourced set. This session subscribes MORE than was asked \
-                     for, never less."
-                );
+                if narrowing_failure_is_expected(collapse_expected, &failure) {
+                    // Live-6 (2026-11-15): same as the NTM arm's expected half.
+                    tracing::warn!(
+                        code = tickvault_common::error_code::ErrorCode::WsGapConnectionState
+                            .code_str(),
+                        source = PRE_RIDER_BOOT_SOURCE,
+                        detail = failure.detail(),
+                        path = %fno_path.display(),
+                        "live universe: today's F&O underlyings artifact does not exist yet \
+                         (non-trading day, or before the daily rider's build hour) \
+                         — falling through to the full master-sourced set. Expected for \
+                         this boot."
+                    );
+                } else {
+                    // COLLAPSE-ALARM-EXEMPT: same shape as the NTM arm above — a
+                    // WIDENING. The narrowed indices+F&O-underlyings set was asked
+                    // for and is unavailable, so the session falls through to the
+                    // full master. More than requested, never less; not a collapse.
+                    tracing::error!(
+                        code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+                        detail = failure.detail(),
+                        path = %fno_path.display(),
+                        "live universe: the narrowed spot set (indices + F&O underlyings) was \
+                         REQUESTED but today's F&O artifact is unusable — falling through to the \
+                         full master-sourced set. This session subscribes MORE than was asked \
+                         for, never less."
+                    );
+                }
             }
         }
     }
@@ -3652,6 +3727,69 @@ mod tests {
             !tf.contains(super::EARLIER_ARTIFACT_SOURCE),
             "the collapse alarm must not match a session running on an earlier list"
         );
+
+        // 2026-11-15 audit (live-6): both narrowing arms (NTM, F&O) have an
+        // expected half too, gated on the boot verdict, quiet like the rest.
+        let gate = concat!(
+            "if narrowing_failure_is_",
+            "expected(collapse_expected, &failure) {"
+        );
+        let halves: Vec<&str> = src
+            .match_indices(gate)
+            .map(|(at, _)| {
+                let rest = &src[at..];
+                &rest[..rest
+                    .find("} else {")
+                    .expect("each expected half has a paging half")]
+            })
+            .collect();
+        assert_eq!(halves.len(), 2, "the NTM and the F&O arm are both gated");
+        for half in halves {
+            assert!(half.contains("source = PRE_RIDER_BOOT_SOURCE"));
+            assert!(half.contains(concat!("tracing::war", "n!(")));
+            assert!(!half.contains(concat!("tracing::err", "or!(")));
+        }
+    }
+
+    /// 2026-11-15 audit (live-6): a pre-rider boot logged the expected
+    /// missing NTM list as a coded ERROR. Only a file that could not be READ
+    /// on a boot whose verdict says today's lists cannot exist yet is
+    /// expected; a parse failure (the rider wrote something wrong) and any
+    /// boot at or after the rider hour stay at ERROR. Bites: returning
+    /// `collapse_expected` alone passes the `Unparseable` case.
+    #[test]
+    fn test_narrowing_failure_is_expected_only_for_a_missing_file_on_a_pre_rider_boot() {
+        let missing = super::ArtifactFailure::Unreadable("No such file".to_string());
+        let garbage = super::ArtifactFailure::Unparseable("bad json".to_string());
+        assert!(super::narrowing_failure_is_expected(true, &missing));
+        assert!(!super::narrowing_failure_is_expected(true, &garbage));
+        assert!(!super::narrowing_failure_is_expected(false, &missing));
+        assert!(!super::narrowing_failure_is_expected(false, &garbage));
+    }
+
+    /// 2026-11-15 audit (live-6): the contract attach's verdict. With no rider
+    /// hour recorded yet it is never expected (the line stays at ERROR);
+    /// once recorded, before the rider hour it is expected whatever the
+    /// calendar says, and at or after it only on a non-trading day.
+    #[test]
+    fn test_day_artifact_absence_expected_at_follows_the_rider_hour() {
+        const RIDER: u32 = 7 * 3_600;
+        let expected = super::day_artifact_absence_expected;
+        assert!(
+            !expected(u32::MAX, false, 0),
+            "no rider hour: stays at ERROR"
+        );
+        assert!(expected(RIDER, true, RIDER - 1), "before the rider hour");
+        assert!(
+            !expected(RIDER, true, RIDER),
+            "a trading day at the rider hour"
+        );
+        assert!(
+            expected(RIDER, false, RIDER),
+            "a weekend or holiday, any hour"
+        );
+        // The wrapper never panics, whatever hour a resolve recorded.
+        let _ = super::day_artifact_absence_expected_at(0);
     }
 
     /// The wait and the resolve must be judged by the SAME verdict, computed

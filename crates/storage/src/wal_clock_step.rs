@@ -105,6 +105,15 @@
 //!   while the counter is ahead (30 s of sequence, about 200 s of wall at
 //!   r = 0.15) leaves the sequences of that stretch above the top until its
 //!   next batch, unless a segment rotation records them first.
+//! - The follow is for the lead that began at a step recorded in this
+//!   process (2026-11-15 audit, live-3). A lead with no recorded step behind
+//!   it (a window carried over from the last process, or a burst lead after
+//!   the counter had met the wall) is recorded as a new, logged step. It
+//!   still joins the one window, so every hour between the old step and the
+//!   new lead is judged against both and is still held as `clock_stepped`,
+//!   exactly as before. The change is visibility only: the lead is now in
+//!   the log ("wall clock step recorded") instead of raising the top
+//!   silently. Stopping that hold needs more than one span per window.
 //!
 //! # Complexity
 //!
@@ -281,6 +290,10 @@ pub(crate) struct ClockStepLog {
     /// A window is recorded (kept with `window` under its lock), so the tick
     /// writer reads the clock and the frame counter only while one exists.
     active: AtomicBool,
+    /// The frame counter's lead over the wall began at a step recorded here
+    /// ([`Self::note`]), so [`Self::follow_counter_lead`] may raise the top.
+    /// Never set by [`Self::bind`]; cleared once the counter meets the wall.
+    following: AtomicBool,
 }
 
 impl ClockStepLog {
@@ -293,6 +306,7 @@ impl ClockStepLog {
             paths: OnceLock::new(),
             persist_failing: AtomicBool::new(false),
             active: AtomicBool::new(false),
+            following: AtomicBool::new(false),
         }
     }
 
@@ -327,10 +341,36 @@ impl ClockStepLog {
     /// is kept (lowered to `now_nanos` at most). No window or the counter
     /// not ahead: nothing. O(1); the lock only when the top moves, about once
     /// per 30 s of counter advance, so the file is rewritten as rarely.
+    ///
+    /// Only the lead that began at a step this log recorded is followed
+    /// (2026-11-15 audit, live-3). A lead with no step behind it (a window
+    /// carried over from the last process, or a lead that started after the
+    /// counter had met the wall: a burst above about 7,600 frames a second)
+    /// is recorded as a NEW step through [`Self::note`], so it is logged
+    /// ("wall clock step recorded") instead of raising the top with no log.
+    /// This is visibility only. The new step still joins the one window
+    /// (`union` keeps a single span), so the window still runs from the old
+    /// step to the new lead, and every hour-path partition in between is
+    /// still held as `clock_stepped`, exactly as before. On 12 to 13 Nov a
+    /// 1.76 s step at 16:11 IST was stretched by the next morning's open
+    /// burst with no log; the same day now holds the same hours, with one
+    /// log line naming the new lead. Not joining a burst lead at all was not
+    /// taken: a counter ahead of the wall is the case the window protects,
+    /// and dropping it would keep less. The follow ends when the counter is
+    /// at or behind the wall.
     pub(crate) fn follow_counter_lead(&self, now_nanos: u64, frame_seq: u64) {
-        if !self.active.load(Ordering::Acquire)
-            || frame_seq.saturating_sub(now_nanos) <= CLOCK_STEP_MIN_NANOS
-        {
+        if !self.active.load(Ordering::Acquire) {
+            return;
+        }
+        let lead = frame_seq.saturating_sub(now_nanos);
+        if lead == 0 {
+            self.following.store(false, Ordering::Release);
+        }
+        if lead <= CLOCK_STEP_MIN_NANOS {
+            return;
+        }
+        if !self.following.load(Ordering::Acquire) {
+            self.note(now_nanos, now_nanos, lead);
             return;
         }
         let mut window = self.window.lock().unwrap_or_else(PoisonError::into_inner);
@@ -352,6 +392,7 @@ impl ClockStepLog {
             return;
         };
         let window = self.widen(Some((lo, hi)));
+        self.following.store(true, Ordering::Release);
         info!(
             step_ms = magnitude_nanos / 1_000_000,
             window_lo_nanos = lo,
@@ -672,6 +713,63 @@ mod tests {
         assert!(log.retire_if_settled(now, true));
         log.follow_counter_lead(hms(12, 1, 0), hms(12, 30, 0));
         assert_eq!(log.window(), None);
+    }
+
+    /// 2026-11-15 audit (live-3): a 1.76 s step recorded on day 1 at 16:11 was
+    /// carried over by the next day's process, and the open burst pushed the
+    /// frame counter 2 s ahead of the wall. The follow raised the window's top
+    /// to the next morning with no log. Now a carried-over window plus a
+    /// counter ahead records a NEW step (logged, `following` set) through
+    /// `note`. This makes the lead visible; it does not shrink the hold: the
+    /// result is still one span from the old step's low end to the new
+    /// step's top, so the hours in between stay held (asserted below).
+    /// Bites: with the `following` check removed, the top goes to
+    /// `counter + 2 margins` with no `note`, so no log line.
+    #[test]
+    fn test_regression_follow_counter_lead_records_a_burst_lead_on_a_carried_window_as_a_new_step()
+    {
+        let day = 86_400 * SEC;
+        let at = |d: u64, h: u64, m: u64| d * day + (h * 60 + m) * 60 * SEC;
+        let dir = temp_dir("follow-carried");
+        let first = ClockStepLog::new();
+        first.bind(&dir, 0);
+        first.note(at(1, 16, 11), at(1, 16, 11), 1_760_000_000);
+        let old = first.window().expect("the step");
+        first.persist_if_dirty();
+
+        let restarted = ClockStepLog::new();
+        restarted.bind(&dir, at(2, 8, 30));
+        assert_eq!(restarted.window(), Some(old), "carried over");
+        assert!(
+            !restarted.following.load(Ordering::Acquire),
+            "bind never follows"
+        );
+        let wall = at(2, 9, 15);
+        let counter = wall + 2 * SEC;
+        restarted.follow_counter_lead(wall, counter);
+        let expected = union(Some(old), step_window(wall, wall, 2 * SEC));
+        assert_eq!(restarted.window(), expected, "a new step, not a raised top");
+        // Honest limit: still one span, so an hour between the two steps
+        // (day 1 23:00) is still inside the window and still held.
+        assert!(window_overlaps(
+            restarted.window(),
+            at(1, 23, 0),
+            at(1, 23, 59)
+        ));
+        assert_ne!(
+            restarted.window().map(|(_, hi)| hi),
+            Some(counter + 2 * CLOCK_STEP_MARGIN_NANOS),
+            "the follow did not raise the carried window's top"
+        );
+        assert!(
+            restarted.following.load(Ordering::Acquire),
+            "the new lead is followed"
+        );
+        // The counter meets the wall: the follow ends, and a later lead is
+        // another new step.
+        restarted.follow_counter_lead(at(2, 10, 0), at(2, 10, 0));
+        assert!(!restarted.following.load(Ordering::Acquire));
+        drop(std::fs::remove_dir_all(&dir));
     }
 
     #[test]

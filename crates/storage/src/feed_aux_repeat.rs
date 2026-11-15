@@ -11,7 +11,11 @@
 //! rows, 99.69% identical to the same contract's previous row. The owner
 //! chose "Skip exact repeats (Recommended)": store a row only when something
 //! in it changed. Every packet is still in the raw frame log (the WAL, copied
-//! to S3), so nothing received is lost.
+//! to S3), so nothing received is lost, inside the limit below. *(⚠ CORRECTED
+//! 2026-11-15 audit: "nothing received is lost" held only while the WAL writes
+//! every record it was handed. A frame counts as WAL-backed once its record is
+//! QUEUED; a record the writer then loses takes the packet's own receipt time
+//! and sequence with it. See the WAL-loss limit under "Honest limits".)*
 //!
 //! # The rule
 //!
@@ -83,8 +87,8 @@
 //!
 //! # Complexity and space
 //!
-//! O(1) average per packet: one call of the epoch function (three
-//! atomic loads in production), one hash probe in [`AuxRepeatFilter::check`],
+//! O(1) average per packet: one call of the epoch function (four
+//! atomic loads in production since 2026-11-15, three before), one hash probe in [`AuxRepeatFilter::check`],
 //! and at most one probe and one insert in [`AuxRepeatFilter::note_written`].
 //! The map is pre-sized at [`FEED_AUX_REPEAT_MAX_TRACKED`] (25,000, the same
 //! figure as every per-instrument map on this universe) and never grows past
@@ -102,6 +106,18 @@
 //! next row, so each contract's first row is written again per segment and
 //! per gap (up to tracked keys × segments rows for a replayed session, against
 //! about 10,000 for a live day). Never fewer rows.
+//!
+//! **Honest limit, WAL loss (2026-11-15 audit):** "WAL-backed" means the
+//! frame's record was QUEUED for the WAL writer, not written. The production
+//! gap epoch includes the writer's lost high-water mark
+//! (`wal_frame_fate::lost_high_seq`), so once a loss is counted every next row
+//! is written and a long full-disk episode stops skipping. But a repeat
+//! skipped between the moment its record was queued and the moment the
+//! writer's failure is counted, or one whose record was still queued at a
+//! crash or kill, is in no store: its values remain in the contract's earlier
+//! stored row, and its own `ts`, `received_at` and `capture_seq` are gone. That
+//! loss is visible only through the WAL-loss pages (`WS-SPILL-01`,
+//! `WS-SPILL-02`); no counter names the skipped rows.
 
 use std::collections::HashMap;
 
@@ -116,7 +132,12 @@ pub const FEED_AUX_REPEAT_MAX_TRACKED: usize = 25_000;
 /// the WAL and the raw frame log), never paged. Only rows of WAL-backed frames
 /// are skipped: a frame the WAL refused is judged with
 /// [`AuxRepeatFilter::check_always_write`] and never counted here (2026-11-14
-/// audit fix).
+/// audit fix). *(⚠ CORRECTED 2026-11-15 audit: WAL-backed means the record
+/// was queued, not written. If the WAL writer then fails that record
+/// (`WS-SPILL-01`, paged), a skipped repeat has no copy of its own receipt
+/// time or sequence anywhere; its values remain in the contract's previous
+/// stored row. The production gap epoch moves on such a loss, so only repeats
+/// skipped before the loss is counted are affected.)*
 pub const FEED_AUX_REPEAT_SKIPPED_COUNTER: &str = "tv_feed_aux_repeat_skipped_total";
 
 /// Rows written for a key the full map could not track. Local `/metrics`

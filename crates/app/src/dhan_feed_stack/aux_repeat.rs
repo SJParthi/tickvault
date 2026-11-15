@@ -12,7 +12,11 @@
 //! row per contract after a gap is written. A contract the main feed carries
 //! on two sockets (the backup copy) is never skipped (`carried_twice`), and
 //! neither is a row of a frame the WAL refused (`frame_wal_unbacked`, 2026-11-14
-//! audit fix): the skip rests on the WAL keeping every packet.
+//! audit fix): the skip rests on the WAL keeping every packet. "WAL-backed"
+//! means the record was queued, not yet written, so a WAL-writer loss moves
+//! the gap epoch too (2026-11-15 audit fix); a repeat skipped before that loss
+//! is counted keeps its values in the earlier stored row but loses its own
+//! receipt time and sequence (honest limit in `feed_aux_repeat`).
 
 use tickvault_common::tick_types::ParsedTick;
 use tickvault_core::websocket::pool_supervisor::live_shed::main_feed_live_shed_total;
@@ -20,6 +24,7 @@ use tickvault_storage::candle_contract_labels::candle_contract_labels_generation
 use tickvault_storage::feed_aux_persistence::{AuxPacketRow, wrong_day_kind};
 use tickvault_storage::feed_aux_repeat::{AuxRepeatFilter, AuxRepeatVerdict};
 use tickvault_storage::tick_conservation_ledger::ledger;
+use tickvault_storage::wal_frame_fate::lost_high_seq;
 
 use super::LiveIngest;
 
@@ -28,13 +33,18 @@ use super::LiveIngest;
 /// rows that did not reach QuestDB (failed flush, rescue or spill), and the
 /// contract-name table's publish generation (a row's `contract` name is read
 /// from that table when it is staged, so after a publish the next row is
-/// written with the new name). All three only grow, so the sum moves whenever
-/// any does, and every row remembered before the move stops arming a skip.
-/// Three atomic loads, O(1), no allocation.
+/// written with the new name), and the WAL writer's lost high-water mark
+/// (2026-11-15 audit fix: "WAL-backed" means the record was QUEUED, not
+/// written, so while the writer is losing records, a full disk or a failed
+/// write or flush, every next row is written instead of skipped against the
+/// WAL copy that no longer exists). All four only grow, so the sum moves
+/// whenever any does, and every row remembered before the move stops arming a
+/// skip. Four atomic loads, O(1), no allocation.
 pub(super) fn gap_epoch() -> u64 {
     main_feed_live_shed_total()
         .wrapping_add(ledger().rows_not_landed())
         .wrapping_add(candle_contract_labels_generation())
+        .wrapping_add(lost_high_seq())
 }
 
 /// The drain's filter, reading [`gap_epoch`]. Pre-sizes the map once, at
