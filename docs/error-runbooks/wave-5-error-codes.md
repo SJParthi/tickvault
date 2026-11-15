@@ -5,7 +5,7 @@ paths:
   - "crates/app/src/depth_dynamic_pipeline_v2.rs"
   - "crates/core/src/instrument/subscription_planner.rs"
   - "crates/app/src/main.rs"
-  - "crates/core/src/pipeline/volume_monotonicity_guard.rs"
+  - "crates/core/src/pipeline/volume_monotonicity_guard.rs"  # ⚠ CORRECTED 2026-11-15: deleted 2026-07-17 with the dead Dhan tick chain; NOT ENFORCED
   - "crates/core/src/parser/quote.rs"
   - "crates/app/src/boot_smoke_test.rs"
   - "crates/core/src/instrument/phase2_readiness_check.rs"

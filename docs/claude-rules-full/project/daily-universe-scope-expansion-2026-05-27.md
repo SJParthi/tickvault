@@ -1646,10 +1646,10 @@ The CSV download client in `crates/core/src/instrument/csv_downloader.rs` (Sub-P
 
 **Ratchets (Sub-PR #3):**
 
-- `crates/core/tests/csv_downloader_redirect_guard.rs::test_csv_downloader_client_has_no_redirect_policy`
-- `crates/core/tests/csv_downloader_body_cap_guard.rs::test_csv_download_aborts_at_body_size_limit`
-- `crates/core/tests/csv_downloader_content_type_guard.rs::test_csv_download_rejects_html_response`
-- `crates/storage/tests/daily_universe_scope_guard.rs::daily_universe_csv_hardening_constants_pinned`
+- `crates/core/tests/csv_downloader_redirect_guard.rs::test_csv_downloader_client_has_no_redirect_policy` (⚠ CORRECTED 2026-11-15: this guard file is NOT BUILT; see the note below)
+- `crates/core/tests/csv_downloader_body_cap_guard.rs::test_csv_download_aborts_at_body_size_limit` (⚠ CORRECTED 2026-11-15: this guard file is NOT BUILT; see the note below)
+- `crates/core/tests/csv_downloader_content_type_guard.rs::test_csv_download_rejects_html_response` (⚠ CORRECTED 2026-11-15: this guard file is NOT BUILT; see the note below)
+- `crates/storage/tests/daily_universe_scope_guard.rs::daily_universe_csv_hardening_constants_pinned` (⚠ CORRECTED 2026-11-15: the file exists, this test is NOT BUILT; see the note below)
 
 > **⚠ CORRECTED 2026-11-15 (audit repo-4) — none of the four ratchets above
 > exists, and neither does `csv_downloader.rs`.** The hardening is real and
@@ -1694,9 +1694,9 @@ This catches the case where EventBridge fails to fire the cron OR the EC2 instan
 
 **Ratchets (Sub-PR #2):**
 
-- `crates/app/tests/boot_step_timeout_guard.rs::test_each_boot_step_has_a_deadline_constant`
-- `crates/app/tests/boot_step_timeout_guard.rs::test_step_6_auth_deadline_is_60s`
-- `deploy/aws/cloudwatch-alarms/boot-heartbeat-alarm.tf` + `crates/storage/tests/cloudwatch_boot_heartbeat_guard.rs::test_cloudwatch_boot_heartbeat_alarm_exists`
+- `crates/app/tests/boot_step_timeout_guard.rs::test_each_boot_step_has_a_deadline_constant` (⚠ CORRECTED 2026-11-15: NOT BUILT; the deadlines are pinned by `crates/storage/tests/boot_step_timeout_constants_guard.rs`, see the note below)
+- `crates/app/tests/boot_step_timeout_guard.rs::test_step_6_auth_deadline_is_60s` (⚠ CORRECTED 2026-11-15: NOT BUILT; the deadlines are pinned by `crates/storage/tests/boot_step_timeout_constants_guard.rs`, see the note below)
+- `deploy/aws/cloudwatch-alarms/boot-heartbeat-alarm.tf` + `crates/storage/tests/cloudwatch_boot_heartbeat_guard.rs::test_cloudwatch_boot_heartbeat_alarm_exists` (⚠ CORRECTED 2026-11-15: both NOT BUILT at these paths; the alarm is `deploy/aws/terraform/boot-heartbeat-alarm.tf`, see the note below)
 
 > **⚠ CORRECTED 2026-11-15 (audit repo-4) — these three citations name files
 > that do not exist.** The real ones:
@@ -1746,7 +1746,7 @@ ORDER BY ts DESC LIMIT 1;
 
 **Ratchet (Sub-PR #9):**
 
-- `crates/storage/tests/lifecycle_audit_pit_query_guard.rs::test_point_in_time_query_returns_state_at_date`
+- `crates/storage/tests/lifecycle_audit_pit_query_guard.rs::test_point_in_time_query_returns_state_at_date` (⚠ CORRECTED 2026-11-15: NOT BUILT; see the note below)
 
 > **⚠ CORRECTED 2026-11-15 (audit repo-4):** `lifecycle_audit_pit_query_guard.rs`
 > is NOT BUILT, and no test pins the point-in-time query. Since Quote 44

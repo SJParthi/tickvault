@@ -4,7 +4,7 @@ paths:
   - "crates/trading/src/oms/groww/smart_orders.rs"
   - "crates/trading/src/oms/groww/executor.rs"
   - "crates/trading/src/oms/groww/api_client.rs"
-  - "crates/trading/tests/groww_smart_orders_off_guard.rs"
+  - "crates/trading/tests/groww_smart_orders_off_guard.rs"  # ⚠ CORRECTED 2026-11-15: deleted 2026-08-21 with the Groww order side; NOT ENFORCED
   - "crates/common/src/config.rs"
 ---
 
@@ -56,7 +56,7 @@ paths:
 > `reconcile_smart_orders` + the spawnable `run_smart_order_reconcile_loop`.
 > What remains DELIBERATELY unwired: no boot orchestrator spawns the loop
 > and no strategy path calls the surface — the no-production-caller ratchet
-> `crates/trading/tests/groww_smart_orders_off_guard.rs` pins ZERO callers
+> `crates/trading/tests/groww_smart_orders_off_guard.rs` (⚠ CORRECTED 2026-11-15: that guard was deleted 2026-08-21 with the Groww order side; NOT ENFORCED) pins ZERO callers
 > outside `oms/groww/` until a future wiring PR updates it deliberately.
 > Every mutation stays behind the §39.2 4-gate lattice
 > (`GROWW_ORDER_LIVE_FIRE = false`; `smart_orders_write` default OFF;
@@ -292,7 +292,7 @@ unresolved place, `tv_groww_oco_implausible_ack_id_total`); log lines
 route ids through the `log_safe_id` sanitize choke point. No order
 fire is possible: Gates 1–4 all closed (`dry_run` stays true; paper mode
 returns deterministic `PAPER-<reference_id>` ids with zero HTTP — ratcheted by
-`groww_orders_transport_guard.rs`'s gate-6 scan, which now includes
+`groww_orders_transport_guard.rs` (⚠ CORRECTED 2026-11-15: that guard was deleted 2026-08-21 with the Groww order side; NOT ENFORCED)'s gate-6 scan, which now includes
 `smart_orders.rs`).
 
 ## §7. Trigger / auto-load
@@ -302,7 +302,7 @@ This rule activates when editing:
 - `crates/trading/src/oms/groww/smart_orders.rs`
 - `crates/trading/src/oms/groww/executor.rs` (the smart driver block)
 - `crates/trading/src/oms/groww/api_client.rs` (`SmartOrderTransport`)
-- `crates/trading/tests/groww_smart_orders_off_guard.rs`
+- `crates/trading/tests/groww_smart_orders_off_guard.rs` (⚠ CORRECTED 2026-11-15: deleted 2026-08-21 with the Groww order side; NOT ENFORCED)
 - `crates/common/src/config.rs` (`GrowwOrdersConfig` smart-order fields)
 - Any file containing `GROWW-OCO-01`, `GROWW-OCO-02`, `GROWW-OCO-03`,
   `GROWW-OCO-04`, `GROWW-OCO-05`, `GrowwOco01PlacementFailed`,
