@@ -3337,6 +3337,40 @@ impl PartitionArchiver {
             return PartitionStep::Done;
         };
 
+        // 0a. ONE COPIER AT A TIME (2026-11-15 audit, exportflow-4). This
+        //     path takes no quiesce lock on a day-path partition, so outside
+        //     the session the daily export could copy the same partition at
+        //     the same time; whichever uploaded second found other bytes at
+        //     the canonical key and wrote a second full copy, kept forever.
+        //     While the export holds the partition it is KEPT for a later
+        //     pass (not a failure), which then reuses the export's object.
+        //     Held for the whole copy, verify and drop.
+        let _copy_claim = if daily_export::export_order_by(table).is_some() {
+            let quiesce = self
+                .quiesce
+                .unwrap_or_else(crate::archive_quiesce::process_archive_quiesce);
+            match quiesce.try_claim_copy(crate::archive_quiesce::Copier::Archive, table, partition)
+            {
+                Some(claim) => Some(claim),
+                None => {
+                    metrics::counter!(
+                        "tv_partition_archive_skipped_total",
+                        "reason" => "export_copying"
+                    )
+                    .increment(1);
+                    info!(
+                        table,
+                        partition,
+                        "partition archive: the daily export is copying this partition — \
+                         KEPT for a later pass, which reuses its object (not a failure)"
+                    );
+                    return PartitionStep::Held;
+                }
+            }
+        } else {
+            None
+        };
+
         // 0b. WAL-APPLIED GATE, before the export (2026-10-02). The run-start
         //     probe only refuses SUSPENDED tables. A table that is merely
         //     BEHIND holds acknowledged rows the export and both recounts

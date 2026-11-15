@@ -455,12 +455,20 @@ fn the_supervisor_model_matches_drain_hold_rs() {
         "crate::evening_drain::load_state_for_evening(evening_path,chrono::Utc::now().timestamp(),)"
     ), "the recovery model must use the real state path and current clock");
     // Owner Quote 60: the evening replay's pending value is STORED where the
-    // Brutex export reads it (2026-11-14 third review).
+    // Brutex export reads it (2026-11-14 third review), and only AFTER the
+    // stall verdict, which it reads (2026-11-15 audit, fix2252-1: a stalled
+    // evening makes no restart, so no replay comes).
+    let store_needle =
+        "EVENING_REPLAY_PENDING.store(evening_replay_value(evening_step,work.wal_backlog,stalled),";
+    let store_at = compact
+        .find(store_needle)
+        .expect("the supervisor must publish the pending evening replay with the stall verdict");
+    let stalled_at = compact
+        .find("letstalled=stall_releases_hold(")
+        .expect("the stall verdict");
     assert!(
-        compact.contains(
-            "EVENING_REPLAY_PENDING.store(evening_replay_value(evening_step,work.wal_backlog),"
-        ),
-        "the supervisor must publish the pending evening replay"
+        stalled_at < store_at,
+        "the pending replay is published after the stall verdict it reads"
     );
     // 2026-11-14 evening audit: every store is marked published right after
     // it (inside and outside the hold window), and the export's read also

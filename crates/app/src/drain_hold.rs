@@ -636,12 +636,20 @@ pub fn stall_releases_hold(stalled: bool, work: &DayWork) -> bool {
 static EVENING_REPLAY_PENDING: AtomicBool = AtomicBool::new(false);
 
 /// [`EVENING_REPLAY_PENDING`]'s value for one evaluation. Pure, O(1).
+///
+/// `stalled` is the stall rule's verdict this minute
+/// ([`stall_releases_hold`]). A stalled evening makes no restart (the
+/// supervisor's `restart_now` needs `!stalled`), so no replay comes tonight
+/// and the flag is `false` (2026-11-15 audit, fix2252-1: a `Wait` caused by
+/// stuck other work kept the flag `true` while the stall rule released the
+/// box, so a forced Brutex day waited for a replay that never came).
 #[must_use]
 pub fn evening_replay_value(
     step: crate::evening_drain::EveningStep,
     wal_backlog: Option<u64>,
+    stalled: bool,
 ) -> bool {
-    step.holds() && wal_backlog.is_some_and(|n| n > 0)
+    !stalled && step.holds() && wal_backlog.is_some_and(|n| n > 0)
 }
 
 /// Set once the supervisor has stored [`EVENING_REPLAY_PENDING`] in this
@@ -812,11 +820,6 @@ pub fn spawn_drain_hold_supervisor(environment: String) -> tokio::task::JoinHand
                 }
             }
             work.wal_holding = evening_step.holds();
-            EVENING_REPLAY_PENDING.store(
-                evening_replay_value(evening_step, work.wal_backlog),
-                Ordering::Relaxed,
-            );
-            EVENING_REPLAY_PUBLISHED.store(true, Ordering::Release);
             #[allow(clippy::cast_precision_loss)] // APPROVED: a bucket count, far below 2^53
             let floor_blocked = work.floor_blocked_buckets() as f64;
             metrics::gauge!(FLOOR_BLOCKED_BUCKETS_GAUGE).set(floor_blocked);
@@ -836,6 +839,13 @@ pub fn spawn_drain_hold_supervisor(environment: String) -> tokio::task::JoinHand
                 ),
                 &work,
             );
+            // Published after the stall verdict (2026-11-15 audit,
+            // fix2252-1): a stalled evening makes no restart, so no replay.
+            EVENING_REPLAY_PENDING.store(
+                evening_replay_value(evening_step, work.wal_backlog, stalled),
+                Ordering::Relaxed,
+            );
+            EVENING_REPLAY_PUBLISHED.store(true, Ordering::Release);
             let done = work.is_done();
             let restart_now =
                 evening_step == crate::evening_drain::EveningStep::Restart && !stalled;
@@ -1095,12 +1105,65 @@ mod tests {
     #[test]
     fn test_evening_replay_value_needs_a_holding_step_and_a_backlog() {
         use crate::evening_drain::EveningStep;
-        assert!(evening_replay_value(EveningStep::Wait, Some(3)));
-        assert!(evening_replay_value(EveningStep::Restart, Some(1)));
-        assert!(!evening_replay_value(EveningStep::Wait, Some(0)));
-        assert!(!evening_replay_value(EveningStep::Wait, None));
-        assert!(!evening_replay_value(EveningStep::Idle, Some(3)));
-        assert!(!evening_replay_value(EveningStep::GaveUp, Some(3)));
+        assert!(evening_replay_value(EveningStep::Wait, Some(3), false));
+        assert!(evening_replay_value(EveningStep::Restart, Some(1), false));
+        assert!(!evening_replay_value(EveningStep::Wait, Some(0), false));
+        assert!(!evening_replay_value(EveningStep::Wait, None, false));
+        assert!(!evening_replay_value(EveningStep::Idle, Some(3), false));
+        assert!(!evening_replay_value(EveningStep::GaveUp, Some(3), false));
+    }
+
+    /// Regression (2026-11-15 audit, fix2252-1, MEDIUM): an evening that
+    /// waits on stuck other work (`other_done` false) and has stalled makes
+    /// no restart, so the published flag reads "no replay" and a forced
+    /// Brutex day that is not at its last chance runs. Before, the flag stayed
+    /// `true` on every `Wait`, the stall rule released the box, and the day
+    /// was never tried that night.
+    #[test]
+    fn test_evening_replay_value_is_false_when_the_evening_stalled() {
+        use crate::brutex_export_boot as bx;
+        use crate::evening_drain::EveningStep;
+        let state = crate::evening_drain::EveningState::default();
+        let step = crate::evening_drain::evening_step(
+            &state,
+            739_000,
+            false,
+            true,
+            Some(30),
+            1_800_000_000,
+            19 * 3_600,
+        );
+        assert_eq!(
+            step,
+            EveningStep::Wait,
+            "stuck other work: the evening waits"
+        );
+        assert!(
+            evening_replay_value(step, Some(30), false),
+            "not stalled yet: the restart may still come"
+        );
+        let stalled = stall_releases_hold(true, &done_work());
+        let pending = evening_replay_value(step, Some(30), stalled);
+        assert!(!pending, "stalled: no restart, so no replay tonight");
+        let gates = bx::Gates {
+            seal_applied: None,
+            candles_final: None,
+            repair: None,
+            repair_running: false,
+            arrival_hours_open: None,
+            wal_backlog: Some(30),
+            evening_replay_pending: pending,
+            depth_pass_floor_blocked: false,
+        };
+        let reasons = bx::compose_reasons(Vec::new(), gates);
+        // A forced day four days back, not at its last chance.
+        let blocked = bx::blocks_even_forced(&reasons, false, false);
+        assert!(!blocked, "reasons {reasons:?} must not hold the forced day");
+        let st = bx::DayState::default();
+        assert_eq!(
+            bx::past_day_step(st, 0, bx::ready(&reasons), true, blocked),
+            bx::DayStep::Run
+        );
     }
 
     /// Regression (2026-11-14 evening audit, MEDIUM): the flag starts

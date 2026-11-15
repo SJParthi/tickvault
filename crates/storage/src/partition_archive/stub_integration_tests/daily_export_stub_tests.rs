@@ -623,6 +623,51 @@ async fn test_export_waits_for_the_archive_quiesce_lock() {
     ));
 }
 
+/// Regression (2026-11-15 audit, exportflow-4, MEDIUM): the exact-gate
+/// archiver (no quiesce lock on a day-path partition) and the export never
+/// copy one partition at once. While the archive copies it, the export
+/// uploads nothing and the attempt fails after its bounded wait; while the
+/// export copies it, the archive keeps it and uploads nothing; once free,
+/// each proceeds. Before, both copied it and the second upload became a
+/// second full copy in S3, kept forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_export_and_exact_gate_archive_never_copy_one_partition_at_once() {
+    use crate::archive_quiesce::{ArchiveQuiesce, Copier};
+    let lock: &'static ArchiveQuiesce = Box::leak(Box::new(ArchiveQuiesce::new()));
+    // (a) The archive is copying: the export waits, then gives up.
+    let objects: StubObjects = Arc::new(Mutex::new(HashMap::new()));
+    let (archiver, log) = setup(NO_AUDIT, three_rows(), Arc::clone(&objects), true).await;
+    let archiving = lock
+        .try_claim_copy(Copier::Archive, "ticks", PART)
+        .expect("archive claim");
+    let mut ex = DailyExporter::with_quiesce(archiver, lock, std::time::Duration::from_millis(300));
+    let err = run(&mut ex, vec![], false)
+        .await
+        .expect_err("the archive is copying the partition");
+    assert!(format!("{err:#}").contains("kept copying"), "{err:#}");
+    assert!(puts(&log).is_empty(), "nothing uploaded: {:?}", puts(&log));
+    drop(archiving);
+    assert!(matches!(
+        run(&mut ex, vec![], false).await.expect("free"),
+        ExportOutcome::Sealed(_)
+    ));
+    // (b) The export is copying: the archive keeps the partition.
+    let objects: StubObjects = Arc::new(Mutex::new(HashMap::new()));
+    let (archiver, log) = setup(NO_AUDIT, three_rows(), Arc::clone(&objects), true).await;
+    let mut archiver =
+        archiver.with_test_snapshot_gate(lock, Arc::new(|_, _| InFlightVerdict::Clear));
+    let exporting = lock
+        .try_claim_copy(Copier::Export, "ticks", PART)
+        .expect("export claim");
+    let summary = archiver.run_archive_pass().await;
+    assert_eq!(summary.verified, 0, "kept while the export copies it");
+    assert_eq!(summary.dropped, 0);
+    assert!(puts(&log).is_empty(), "nothing uploaded: {:?}", puts(&log));
+    drop(exporting);
+    let summary = archiver.run_archive_pass().await;
+    assert_eq!(summary.verified, 1, "archived once the export let go");
+}
+
 /// Regression (2026-11-14 review, HIGH/MEDIUM): `keep_going` turning false
 /// (the trading-day window closing) stops the attempt before the next
 /// table: nothing sealed, nothing failed.

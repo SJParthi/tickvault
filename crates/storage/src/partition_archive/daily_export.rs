@@ -27,6 +27,17 @@
 //! table, so a partition the archiver copied and dropped before or between
 //! listings is still in the manifest; every archived copy of a partition is
 //! listed, not only the last ([`ManifestTable::rows_may_overlap`]).
+//! ⚠ CHANGED 2026-11-15 (audit exportflow-4): the exact-gate archiver and the
+//! export no longer copy one partition of an export table at the same time.
+//! Each claims the partition first ([`crate::archive_quiesce::ArchiveQuiesce::try_claim_copy`],
+//! O(1) per partition, cold): the archiver only tries, and KEEPS a partition
+//! the export holds for a later pass, which reuses the export's object; the
+//! export waits (bounded like the lock) for the archiver's copy, verify and
+//! drop to end, then finds the partition gone (covered by the archive's
+//! verified copy) or still there. **Honest limit:** a partition the archiver
+//! copied but KEPT (a failed recount or drop) holds its unordered object at
+//! the canonical key, so the export's ordered copy of it still goes to a
+//! content-addressed key (a second copy, as before this change).
 //!
 //! `tick_quotes` and `feed_aux_packets` are stamped with ARRIVAL time, and
 //! the main feed stays connected after the close, so their hours keep taking
@@ -98,7 +109,7 @@ use super::{
     is_table_absent_response, partition_range_bounds, read_body_capped, remove_temp_file,
     sidecar_archive_key, wal_apply_verdict,
 };
-use crate::archive_quiesce::ArchiveQuiesce;
+use crate::archive_quiesce::{ArchiveQuiesce, Copier};
 use crate::s3_cold::{ExistingObject, S3Cold, base64_encode, classify_existing, hex_encode};
 
 /// Folder under [`ARCHIVE_S3_PREFIX`] that holds each day's manifest and DONE.
@@ -1820,6 +1831,32 @@ impl DailyExporter {
             self.quiesce_wait.min(l.saturating_sub(worst))
         });
         let quiesce: &'static ArchiveQuiesce = self.quiesce;
+        // One copier at a time (2026-11-15 audit, exportflow-4): the
+        // exact-gate archiver copies a day-path partition without the quiesce
+        // lock, so it claims the partition instead; wait (bounded, like the
+        // lock) for its copy, verify and drop to end. Claimed BEFORE the
+        // lock, so an archiver holding the exclusive side never waits on this
+        // claim (it only tries, and keeps the partition). Held until the
+        // placement ends.
+        let Some(copy_claim) = quiesce
+            .claim_copy(Copier::Export, table, partition, wait)
+            .await
+        else {
+            if wait < self.quiesce_wait {
+                return Ok(PartitionStep::Stop(StopReason::Window));
+            }
+            anyhow::bail!(
+                "{table}/{partition}: the archive kept copying this partition for {} s",
+                wait.as_secs()
+            );
+        };
+        let left = (opts.time_left)();
+        if left.is_some_and(|l| l < worst) {
+            return Ok(PartitionStep::Stop(StopReason::Window));
+        }
+        let wait = left.map_or(self.quiesce_wait, |l| {
+            self.quiesce_wait.min(l.saturating_sub(worst))
+        });
         let Some(guard) = quiesce.shared(wait).await else {
             if wait < self.quiesce_wait {
                 // The wait was cut by the clock: the window is closing.
@@ -1857,6 +1894,7 @@ impl DailyExporter {
         }
         let placed = self.export_partition(table, partition, order_by).await;
         drop(guard);
+        drop(copy_claim);
         match placed {
             Ok(placed) => Ok(PartitionStep::Placed(Box::new(placed))),
             // The exact-gate archiver (`process_one`) drops WITHOUT the

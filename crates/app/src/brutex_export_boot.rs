@@ -73,6 +73,13 @@
 //!
 //! The export itself is `tickvault_storage::partition_archive::daily_export`.
 //! Cold path: one poll a minute; never the frame drain.
+//!
+//! ⚠ CHANGED 2026-11-15 (audit): while the session day is pending in a poll
+//! (it waits on its gates or a backoff), no past day STARTS in that poll
+//! unless it is at its last chance ([`yield_to_session_day`], exportflow-1);
+//! a pending evening replay reads false once the drain hold's stall rule
+//! gives up (fix2252-1); and after midnight the session day reads the end of
+//! its contract name repair that a predecessor persisted (exportflow-2).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -302,7 +309,12 @@ pub fn ready(reasons: &[String]) -> bool {
 /// drain's deadline, so this hold ends the same night (2026-11-14 evening
 /// audit: shed frames of a forced day replayed after its export landed in an
 /// already-exported partition, a second copy, rows missing from Brutex's
-/// manifest). Pure, O(reasons).
+/// manifest). Corrected 2026-11-15 (audit fix2252-1): the evening drain also
+/// waits while OTHER work is stuck (a spill that never drains, apply lag that
+/// never idles), and then no replay comes. The drain hold publishes "no
+/// replay" once its one-hour stall rule gives up
+/// ([`crate::drain_hold::evening_replay_value`]), so a forced day waits at
+/// most that hour, not until the box stops. Pure, O(reasons).
 #[must_use]
 pub fn blocks_even_forced(reasons: &[String], after_midnight: bool, last_chance: bool) -> bool {
     reasons.iter().any(|r| {
@@ -544,9 +556,32 @@ pub fn past_day_step(
     }
 }
 
+/// A past day's `step` while the session day (inside its horizon) is still
+/// pending this poll (`session_day_pending`: it waits for its gates or a
+/// backoff, its DONE check failed, or its run did not seal): a past day
+/// does not START then, so a catch-up backlog never runs ahead of today's
+/// export, except a day at its `last_chance` ([`last_window_chance`]),
+/// which would otherwise leave the window with no DONE (2026-11-15 audit,
+/// exportflow-1: every forced past day ran inside the poll in which the
+/// session day waited, and the session day could pass its 20:45 horizon
+/// behind them). Pure, O(1).
+#[must_use]
+pub fn yield_to_session_day(
+    step: DayStep,
+    session_day_pending: bool,
+    last_chance: bool,
+) -> DayStep {
+    if step == DayStep::Run && session_day_pending && !last_chance {
+        DayStep::Wait
+    } else {
+        step
+    }
+}
+
 /// The days visited for `session_day`: the session day FIRST (so a catch-up
-/// backlog never runs ahead of today's export or leaves the drain hold
-/// unaware of it), then the earlier days of the window, oldest first. A
+/// backlog never runs ahead of today's export, [`yield_to_session_day`], or
+/// leaves the drain hold unaware of it), then the earlier days of the
+/// window, oldest first. A
 /// forced past day waits while a WAL replay is pending, except a day at its
 /// last chance ([`last_window_chance`]), so a late replayed
 /// row of a forced day lands before its export, not after it (2026-11-14
@@ -711,8 +746,11 @@ fn common_gates(day: NaiveDate) -> Gates {
 /// contract-name repair, the WAL backlog and the skipped depth. `ssecs`:
 /// seconds since the session day's midnight (past 86,400 after it). On the
 /// session date a pending repair is a hard gate; after midnight this process
-/// can no longer run that day's repair, so it waits (soft) for the next run
-/// that reaches the day.
+/// can no longer run that day's repair, so it reads the end a process that
+/// ran it persisted (2026-11-15 audit, exportflow-2), and with none waits
+/// (soft) for the next run that reaches the day. Remaining delay: a restart
+/// after midnight whose predecessor had not ended that repair exports the
+/// day the next evening.
 async fn today_reasons(
     exporter: &DailyExporter,
     exec_url: &str,
@@ -738,7 +776,7 @@ async fn today_reasons(
             target,
         )),
         repair: Some((
-            crate::contract_name_repair_boot::repair_state_for(day),
+            crate::contract_name_repair_boot::repair_state_for(day, !same_date),
             same_date,
         )),
         arrival_hours_open: same_date.then(|| {
@@ -906,7 +944,13 @@ async fn run_export_loop(
             } else {
                 let last_chance = last_window_chance(day, session_day);
                 let blocked = blocks_even_forced(&reasons, ssecs >= SECS_PER_DAY, last_chance);
-                past_day_step(*state, now_unix, ready(&reasons), forced, blocked)
+                // While the session day waits, a past day not at its last
+                // chance does not start (2026-11-15 audit, exportflow-1).
+                yield_to_session_day(
+                    past_day_step(*state, now_unix, ready(&reasons), forced, blocked),
+                    session_pending,
+                    last_chance,
+                )
             };
             match step {
                 DayStep::NotDue => {}
@@ -1233,8 +1277,44 @@ mod tests {
         assert_eq!(export_floor_bytes(total, 100), after_close);
     }
 
+    /// Regression (2026-11-15 audit, exportflow-1, HIGH): while the session
+    /// day waits on a hard gate in this poll, a forced past day not at its
+    /// last chance does not start; one at its last chance still runs, and
+    /// once the session day no longer waits the past day runs.
+    #[test]
+    fn test_yield_to_session_day_keeps_past_days_behind_a_waiting_session_day() {
+        let open = EXPORT_OPEN_SECS_IST;
+        let session = session_day_step(
+            open + 600,
+            open,
+            DayState::default(),
+            0,
+            &reasons(&["candles_not_final"]),
+        );
+        assert_eq!(session, DayStep::Wait);
+        let session_pending = session == DayStep::Wait;
+        let past = past_day_step(DayState::default(), 0, false, true, false);
+        assert_eq!(past, DayStep::Run, "a forced past day is run-eligible");
+        assert_eq!(
+            yield_to_session_day(past, session_pending, false),
+            DayStep::Wait,
+            "not exported in the poll in which the session day waits"
+        );
+        assert_eq!(
+            yield_to_session_day(past, session_pending, true),
+            DayStep::Run,
+            "a day at its last chance still runs"
+        );
+        assert_eq!(yield_to_session_day(past, false, false), DayStep::Run);
+        for step in [DayStep::NotDue, DayStep::Wait, DayStep::GiveUp] {
+            assert_eq!(yield_to_session_day(step, true, false), step);
+        }
+    }
+
     /// Regression (2026-11-14 review, HIGH x2): the session day is visited
-    /// FIRST, so a catch-up backlog never runs ahead of it.
+    /// FIRST. Corrected 2026-11-15 (audit exportflow-1): visiting it first
+    /// alone did not keep a catch-up backlog behind it; the loop also passes
+    /// the session day's pending state to [`yield_to_session_day`].
     #[test]
     fn test_visit_order_is_session_day_first_then_oldest_first() {
         let d = NaiveDate::from_ymd_opt(2026, 11, 14).expect("date");
@@ -1692,6 +1772,16 @@ mod tests {
         ] {
             assert!(body.contains(want), "run_export_loop lost `{want}`");
         }
+        // 2026-11-15 audit, exportflow-1: a past day yields to a session
+        // day still pending in this poll. Behaviour:
+        // `test_yield_to_session_day_keeps_past_days_behind_a_waiting_session_day`.
+        let compact: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            compact.contains(
+                "yield_to_session_day(past_day_step(*state,now_unix,ready(&reasons),forced,blocked),session_pending,last_chance,)"
+            ),
+            "a past day must yield to a pending session day"
+        );
         // 2026-11-14 third review: the pending flag (which holds the box)
         // is set true only for a run, never before the Run arm.
         let run_arm = body.find("DayStep::Run =>").expect("run arm");
@@ -1738,7 +1828,13 @@ mod tests {
             .nth(1)
             .and_then(|rest| rest.split("/// Reports, once per process").next())
             .expect("today_reasons and past_reasons");
-        for want in ["arrival_close_secs(", "repair_covered_state(day)"] {
+        // 2026-11-15 audit, exportflow-2: after the session day's midnight
+        // the repair state also reads the persisted end of that day.
+        for want in [
+            "arrival_close_secs(",
+            "repair_covered_state(day)",
+            "repair_state_for(day, !same_date)",
+        ] {
             assert!(today.contains(want), "readiness lost `{want}`");
         }
     }
