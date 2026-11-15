@@ -5394,6 +5394,8 @@ editing `ws-spill-01` / `ws-spill-02` to exclude these sources.
 
 **REJECT (§2.19):** a page for fewer quiet instruments than the 1% floor; dropping the never-ticked page; removing or narrowing the gauges or the `warn!` record; a new page, alarm, filter or EMF name; changing the floor without a fresh dated owner quote.
 
+**Note (2026-11-15, 15 Nov audit finding live-1, a fix that only narrows a false page; no new page):** the session gate for this page (and the dead-class report beside it) ended at the 15:40 IST capture end, not the 15:30 continuous close. Every trading day at about 15:31 the option contracts stop together, about 525 instruments read quiet with `never_ticked = 0`, they clear the 1% floor, and the page fired for a market that closed normally. The gate now ends at 15:30:00 IST (`CONTINUOUS_SESSION_END_SECS_OF_DAY_IST`, checked at compile time to be no later than the capture end); capture, both gauges, the floor, the cooldown and the alarm are unchanged. Honest limit: an instrument that goes quiet in the last 60 to 90 s before 15:30 is not paged that day (it is still on the gauges). The Muhurat evening gate still ends at its capture end (unchanged). REJECT: ending the gate after 15:30 on a regular day, or using this note to narrow any other page.
+
 ## §2.21 — 2026-11-11: the Quote 53 alarm review removes pages from these families (no new page)
 
 **Owner, 2026-11-11 (operator Quote 53, recorded in `daily-universe-scope-expansion-2026-05-27.md`):** on the card "which of these may I do from December?" the owner ticked "Cut alarms 93 → ~30 (Recommended)", "Trim CloudWatch metrics (Recommended)", "Cheaper S3 class for old raw frames (Recommended)" and "Delete the CloudWatch dashboard". Quote 53 requires a removed alarm in a family recorded here to have this file's dated edit in the same change; this section is that edit. Every removal has its row (what it watched, what still covers it) in `docs/audits/2026-11-alarm-review.md`.
@@ -5535,3 +5537,47 @@ a trend is fair); it excludes segments this start's own boot fold will pin.
 No new alarm, page, metric filter, EMF name or `ok_actions`. The writer's own counters (`tv_live_order_events_*`) stay on the box's local `/metrics`.
 
 **REJECT (§2.22-a):** a separate page, alarm, filter or EMF name for this table; paging a refused (validated-out) row; moving this table out of the audit spill tier without a fresh dated quote.
+
+## §2.23 — 2026-11-15: below 90% the disk-pressure stall page (`STORAGE-GAP-05`) needs a pass that freed nothing, and a stall pages only at or above high water (no new page)
+
+**Why (audit 2026-11-15, finding live-2).** The disk-pressure episode paged the
+Critical `STORAGE-GAP-05` after five limited in-session passes that did not move
+the whole-number used%. Each of those passes freed one partition. On 12 Nov the
+episode started at 15:34 at 75% and paged at 15:40:58; it ended by itself at
+16:01 at 57%. On 13 Nov it paged at 14:18:52 at 72%, below the 75% high water;
+at 16:06 the post-close pass freed 18 partitions. The page says "nothing further
+will be deleted" and "grow the gp3 volume". Both were false here, and Quote 51
+forbids growing the volume. This only narrows a false page.
+
+| Case | Before | After (2026-11-15) |
+|---|---|---|
+| A limited pass that freed at least one partition, used below 90% | counted toward the five-pass stall | progress: resets the stall |
+| A limited pass that freed at least one partition, used 90% or more | counted | counted (unchanged, PR DP review M1) |
+| A stand-aside at 90%+ in session | counted | counted (unchanged) |
+| Stall set, used below high water (75%) | page | no page; the episode keeps passing |
+| Stall set, used at or above high water | page | page (unchanged) |
+| A pass that freed nothing outside the session, or passes used up | page | page (unchanged) |
+
+Unchanged: the page text, `apply_action`, the one-page-per-episode latch, the
+re-arm, and every other `STORAGE-GAP-05` path. No alarm, filter, EMF name or
+`ok_actions` added. Code: `disk_pressure::decide_pressure_action` and
+`disk_pressure_boot::gated_stall_after_pass`; tests
+`test_regression_live2_gated_stall_below_high_water_does_not_escalate` and
+`test_regression_live2_gated_stall_after_pass_counts_progress_only_at_emergency`.
+
+**Honest limit.** Between high water (75%) and 90%, in session, a limited pass
+that frees one partition a minute while the disk fills faster does not page
+through the stall. What still covers it: the stall page itself once used reaches
+90% (gated passes count again there, as PR DP review M1 set), the CloudWatch
+`disk-used-high` alarm (over 90%), `spill-dir-free-low` (20 GiB or less), and
+the after-close unlimited pass at 15:40. This narrows only the false page seen on
+12 and 13 Nov (75% and 72%).
+
+*Corrected 2026-11-15 (review of this section, same day):* the first draft of
+§2.23 reset the stall on every pass that freed a partition, at any used%. That
+removed the 90%+ page PR DP review M1 added, not only the false one, so the
+90% floor above was restored before merge.
+
+**REJECT (§2.23):** counting a pass that freed a partition toward the stall
+below 90% used; not counting it at 90% or more; paging a stall below high water; removing the page for a pass that freed
+nothing; changing the page text under §2.23.

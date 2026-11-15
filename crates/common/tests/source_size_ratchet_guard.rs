@@ -32,7 +32,10 @@ const NEW_FILE_CEILING: usize = 10_000;
 const PINS: &[(&str, usize)] = &[
     // 2026-10-14 (ITEM 57): lowered 14 (the file is 14 lines below main) after
     // `contract_attach_tests` moved out and ITEM 57 code moved in.
-    ("crates/app/src/dhan_feed_stack.rs", 33_752),
+    // 2026-11-15 (15 Nov audit live-5): lowered 33,752 -> 33,737 after
+    // `wal_replay_pace_until`'s logic and its test moved to
+    // `dhan_feed_stack/replay_pace.rs` (the file is 15 lines shorter).
+    ("crates/app/src/dhan_feed_stack.rs", 33_737),
     // 2026-11-07: lowered 7,002 -> 6,958 after the STAGE-C confirm decision
     // moved to `boot_wal_confirm` (main.rs 7,202 -> 7,158 lines).
     ("crates/app/src/main.rs", 6_958),

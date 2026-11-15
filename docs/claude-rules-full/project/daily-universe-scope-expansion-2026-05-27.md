@@ -1651,6 +1651,21 @@ The CSV download client in `crates/core/src/instrument/csv_downloader.rs` (Sub-P
 - `crates/core/tests/csv_downloader_content_type_guard.rs::test_csv_download_rejects_html_response`
 - `crates/storage/tests/daily_universe_scope_guard.rs::daily_universe_csv_hardening_constants_pinned`
 
+> **⚠ CORRECTED 2026-11-15 (audit repo-4) — none of the four ratchets above
+> exists, and neither does `csv_downloader.rs`.** The hardening is real and
+> lives in `crates/core/src/instrument/master_download.rs` (`Policy::none()`,
+> the body cap checked during the read, the Content-Type allowlist). What
+> pins it today:
+>
+> - the three `csv_downloader_*_guard.rs` files: NOT BUILT;
+> - `daily_universe_csv_hardening_constants_pinned`: NOT BUILT; the 50 MiB
+>   cap is pinned by `boot_step_timeout_constants_guard.rs::max_csv_body_bytes_pinned_at_50mb`;
+> - Content-Type: the `master_download.rs` unit tests
+>   `test_content_type_is_allowed_rejects_html_and_json` and its neighbours;
+> - the redirect policy and the during-read body cap: no dedicated test
+>   (only `test_build_hardened_csv_client_builds`). A regression there fails
+>   nothing.
+
 ---
 
 ## §19. Boot-step deadlines + EC2 cron heartbeat (Sub-PR #2 must implement)
@@ -1682,6 +1697,20 @@ This catches the case where EventBridge fails to fire the cron OR the EC2 instan
 - `crates/app/tests/boot_step_timeout_guard.rs::test_each_boot_step_has_a_deadline_constant`
 - `crates/app/tests/boot_step_timeout_guard.rs::test_step_6_auth_deadline_is_60s`
 - `deploy/aws/cloudwatch-alarms/boot-heartbeat-alarm.tf` + `crates/storage/tests/cloudwatch_boot_heartbeat_guard.rs::test_cloudwatch_boot_heartbeat_alarm_exists`
+
+> **⚠ CORRECTED 2026-11-15 (audit repo-4) — these three citations name files
+> that do not exist.** The real ones:
+>
+> - the boot-step deadlines: `crates/storage/tests/boot_step_timeout_constants_guard.rs`
+>   (`boot_step_auth_timeout_pinned_at_60s`, `boot_step_ip_whitelist_timeout_pinned_at_30s`,
+>   `boot_step_questdb_ddl_timeout_pinned_at_60s`); `crates/app/tests/boot_step_timeout_guard.rs` is NOT BUILT;
+> - the alarm: `deploy/aws/terraform/boot-heartbeat-alarm.tf` (not
+>   `deploy/aws/cloudwatch-alarms/`), pinned by
+>   `crates/common/tests/aws_alarm_semantics_guard.rs`
+>   (`test_boot_heartbeat_alarm_contract_unchanged`) and
+>   `crates/app/tests/boot_completed_metric_guard.rs`
+>   (`test_alarm_is_repointed_onto_the_dedicated_metric`);
+>   `cloudwatch_boot_heartbeat_guard.rs` is NOT BUILT.
 
 ---
 
@@ -1718,6 +1747,11 @@ ORDER BY ts DESC LIMIT 1;
 **Ratchet (Sub-PR #9):**
 
 - `crates/storage/tests/lifecycle_audit_pit_query_guard.rs::test_point_in_time_query_returns_state_at_date`
+
+> **⚠ CORRECTED 2026-11-15 (audit repo-4):** `lifecycle_audit_pit_query_guard.rs`
+> is NOT BUILT, and no test pins the point-in-time query. Since Quote 44
+> (2026-10-28) nothing writes `instrument_lifecycle_audit`; the point-in-time
+> record from 2026-10-28 on is the daily instrument snapshot files in S3.
 
 ---
 
@@ -3738,6 +3772,8 @@ Owner wrote (2026-11-14), verbatim, typos kept: "yes build the daily export and 
 **⚠ CHANGED 2026-11-14 (second hostile review of the branch, before merge).** (1) The session day also never runs while tonight's evening WAL drain still has shed frames of the session to replay, nor while the after-close depth pass can still write skipped depth (marks, and the pass not stopped at its disk floor for an hour); frames no replay will reach tonight, floor-blocked depth, an archive-audit table still applying and a name repair that ended with failures are named in the manifest (`complete` false) without waiting. (2) Each partition starts only with the after-close depth pass's disk floor plus the partition's size free and 30 minutes left before 08:30 on a session day; otherwise the attempt stops (not a failure; 15 minutes later for disk), before the quiesce lock. (3) A past day not ready runs anyway, its reasons in the manifest, once 2 days old (the oldest-day-only rule lost days whose last chance fell on a weekend), and a session day that leaves the 7-day window with no DONE is logged once PER PROCESS (`source = "brutex_daily_export_left_window"`, log-only like the others; each boot of the following 7 days, evening-drain restarts included, logs it again, so about 7 to 28 identical lines, not one). (4) Every verified archiver copy of an export-table partition gets an amend record, a reuse of the canonical object included. (5) Outside disk pressure a failed ordered archiver export keeps the partition (no unordered second copy). (6) **OPEN OWNER DECISION, not accepted by any quote** (corrected by the third review: this said "accepted trade", but no dated owner quote accepts a second copy, and Quote 60 was approved on the promise that the build makes none): a disk-pressure archive pass inside 08:30 to 15:40 never sorts, so an hour it moves whose ordered object already exists goes up a second time as a content-addressed copy (`tv_partition_archive_export_unordered_in_session_total`, local only). Once the export has run about 15 days, every hour moved under pressure during the session is such a copy. Not fixed in code: the alternatives are a sort on QuestDB during capture or a reuse judged on row count alone (unsafe: an upsert can change values at the same count). Until the owner decides, read the counter. None of this adds a page, an alarm or a filter.
 
 **⚠ CHANGED 2026-11-14 (third hostile review of the branch, before merge).** (1) `tick_quotes` and `feed_aux_packets` are stamped with ARRIVAL time and the main feed stays connected after the close, so on the session day the export now leaves out every hour of those two tables still able to take rows (from the start of the hour that ended less than 2 minutes before the run) and names it in the manifest (`open_from_ist`, `open_partitions_left_out`); the session day never runs before the close's own hour has ended plus 2 minutes (16:02 on a normal day). A left-out hour reaches S3 through the archive, as one object, with an amend record. (2) The archiver's exact-gate path drops `ticks` (always) and `tick_quotes`, `feed_aux_packets` and the candle tables (outside pressure) WITHOUT the quiesce lock; a partition it drops mid-export is now recorded as dropped (listed from its verified copy), not a failed attempt. (3) Each partition also needs the disk-pressure line free (the room below `pressure_high_water_pct`, 25% of the volume at 75%), so the export never starts a partition while the pressure archiver needs the lock *(⚠ CORRECTED 2026-11-14 evening audit: the free space is checked before AND right after taking the lock; a writer working beside the export can still cross the pressure line during one partition, delaying the pressure pass by at most that partition, and the next partition then stops for disk)*. (4) A failed HeadObject on the canonical key makes the archiver sort (it may exist), instead of reading "absent" and writing a second copy. (5) With the switch off, amend records continue for days that have a DONE. (6) A loop panic books its run as a failed attempt and clears the running flag (release builds abort on panic, so this covers debug builds). (7) A catch-up day (and the session day after midnight) waits while a name-repair run can rewrite it and, until the session day's midnight, for the repair still to come tonight, even when forced. (8) Each manifest object says whether it is ordered (`ordered_by_dedup_key`; an archiver copy made before the export is not known to be), and each table records its CSV header (`columns`). (9) **OPEN OWNER DECISION, not accepted by any quote:** byte reuse holds only while the export tables' columns and QuestDB's CSV formatting stay the same. A column added by the usual boot-time `ALTER TABLE … ADD COLUMN IF NOT EXISTS`, or a QuestDB upgrade that renders a value differently, makes every partition exported and not yet archived (about 15 days of hour tables, 90 days of candles) go up a second time as a content-addressed copy, kept forever. Such a change needs the owner's decision on that cost first; the manifest's `columns` shows which header each day was exported with. None of this adds a page, an alarm or a filter: until a noise-lock row adds one, the owner learns of a missed or incomplete export only from the app logs (or Brutex finding no DONE).
+
+**⚠ CHANGED 2026-11-15 (audit of the merged export, fixes fix2252-1, exportflow-1, exportflow-2, exportflow-4).** No change to what Quote 60 authorizes; four fixes to how it runs. (1) While the session day is pending in a poll (waiting on its gates or a backoff), no past day STARTS in that poll unless it is at its last chance, so a catch-up backlog no longer runs ahead of today's export. (2) "A WAL replay still to come" now reads false once the drain hold's one-hour stall rule gives up: an evening that waits on stuck other work makes no restart, so a forced past day waits at most that hour instead of until the box stops. (3) The end of each day's contract name repair is written to a daily marker, so a process started after that day's midnight (an evening-drain restart) reads it instead of waiting about 15 hours. Only the latest end counts: a same-date rerun first clears the earlier end (the day waits while it runs), each end removes the other kind, this process's own end beats any marker, and both kinds together (a removal failed) read as failed, never clean. Remaining delay: a restart after midnight whose predecessor had not ended that day's repair still exports the day the next evening. (4) Outside the session the exact-gate archiver and the export no longer copy one partition at the same time (each claims it first; the archiver keeps a partition the export holds, the export waits, bounded, for the archiver), so that case no longer writes a second full copy. Limit: a partition the archiver copied but kept (failed recount or drop) still gets a content-addressed second copy from the export. No page, alarm, filter or EMF name.
 
 ##### What violates Quote 60 (REJECT)
 - Any delete, overwrite, `DROP`, expiration or lifecycle rule on an export object, a manifest, a counts file or DONE, or the export writing a `partition_archive_audit` row.

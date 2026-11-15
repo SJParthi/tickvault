@@ -71,6 +71,12 @@
 //! ⚠ CHANGED 2026-11-11 (PR AA-G review): only a flush with rows pending
 //! takes it (an empty flush commits nothing), and the pass's book writer
 //! also takes it around its in-append pin-cut commit.
+//! ⚠ CHANGED 2026-11-15 (audit exportflow-4): the same struct also keeps a
+//! small registry of partitions being copied to S3 ([`Copier`],
+//! [`ArchiveQuiesce::try_claim_copy`]), so the exact-gate archiver (which
+//! takes no lock on a day-path partition) and the daily export never copy
+//! one partition at once. One `std` lock per claim and per release, never
+//! held across an await; O(entries), at most one entry per copier at work.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -143,6 +149,10 @@ pub struct ArchiveQuiesce {
     /// partition ([`Self::hold_writers`] refuses at once), so a replay
     /// waits behind at most the one partition already being copied.
     replay_intents: AtomicUsize,
+    /// Partitions being copied to S3 right now by the exact-gate archiver
+    /// or the daily export (2026-11-15 audit, exportflow-4), one entry per
+    /// copier at work ([`Self::try_claim_copy`], [`Self::claim_copy`]).
+    copies: std::sync::Mutex<Vec<(String, String, Copier)>>,
 }
 
 /// A registered old-hour replay ([`ArchiveQuiesce::intend_replay`]). While
@@ -159,6 +169,46 @@ impl Drop for ReplayIntent<'_> {
     }
 }
 
+/// Who is copying a partition to S3 (2026-11-15 audit, exportflow-4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Copier {
+    /// The partition archiver's exact-gate path (`process_one`), which takes
+    /// no quiesce lock on a day-path partition.
+    Archive,
+    /// The daily Brutex export.
+    Export,
+}
+
+/// [`COPY_CLAIM_POLL`] in milliseconds.
+pub const COPY_CLAIM_POLL_MILLIS: u64 = 250;
+
+/// How often [`ArchiveQuiesce::claim_copy`] looks again while the other
+/// copier holds the partition. Cold path.
+pub const COPY_CLAIM_POLL: Duration = Duration::from_millis(COPY_CLAIM_POLL_MILLIS);
+
+/// A partition being copied ([`ArchiveQuiesce::try_claim_copy`]). Dropping
+/// it lets the other copier in. O(entries) to drop, entries at most one per
+/// copier at work.
+#[derive(Debug)]
+pub struct CopyClaim<'q> {
+    quiesce: &'q ArchiveQuiesce,
+    table: String,
+    partition: String,
+    copier: Copier,
+}
+
+impl Drop for CopyClaim<'_> {
+    fn drop(&mut self) {
+        let mut copies = self.quiesce.lock_copies();
+        if let Some(at) = copies
+            .iter()
+            .position(|(t, p, c)| *c == self.copier && t == &self.table && p == &self.partition)
+        {
+            copies.swap_remove(at);
+        }
+    }
+}
+
 impl Default for ArchiveQuiesce {
     fn default() -> Self {
         Self::new()
@@ -172,6 +222,7 @@ impl ArchiveQuiesce {
         Self {
             lock: RwLock::const_new(()),
             replay_intents: AtomicUsize::new(0),
+            copies: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -210,6 +261,67 @@ impl ArchiveQuiesce {
     #[must_use]
     pub fn replay_registered(&self) -> bool {
         self.replay_intents.load(Ordering::Acquire) > 0
+    }
+
+    /// The copy registry, whatever an earlier panic left in it.
+    fn lock_copies(&self) -> std::sync::MutexGuard<'_, Vec<(String, String, Copier)>> {
+        self.copies
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Claims `table`/`partition` for `copier` without waiting (2026-11-15
+    /// audit, exportflow-4): `None` while the OTHER copier is copying it.
+    /// Two copiers of the same kind never refuse each other. Outside the
+    /// session the exact-gate archiver (no quiesce lock on a day-path
+    /// partition) and the daily export could copy one old partition at the
+    /// same time; the one that uploaded second found different bytes at the
+    /// canonical key and wrote a second full copy, kept forever. One short
+    /// `std` lock, never held across an await; O(entries), entries at most
+    /// one per copier at work (a handful). Cold path, once per partition.
+    #[must_use]
+    pub fn try_claim_copy(
+        &self,
+        copier: Copier,
+        table: &str,
+        partition: &str,
+    ) -> Option<CopyClaim<'_>> {
+        let mut copies = self.lock_copies();
+        if copies
+            .iter()
+            .any(|(t, p, c)| *c != copier && t == table && p == partition)
+        {
+            return None;
+        }
+        copies.push((table.to_string(), partition.to_string(), copier));
+        Some(CopyClaim {
+            quiesce: self,
+            table: table.to_string(),
+            partition: partition.to_string(),
+            copier,
+        })
+    }
+
+    /// [`Self::try_claim_copy`], looking again every [`COPY_CLAIM_POLL`] for
+    /// at most `wait`. `None` when the other copier still holds it then.
+    pub async fn claim_copy(
+        &self,
+        copier: Copier,
+        table: &str,
+        partition: &str,
+        wait: Duration,
+    ) -> Option<CopyClaim<'_>> {
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            if let Some(claim) = self.try_claim_copy(copier, table, partition) {
+                return Some(claim);
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            tokio::time::sleep(COPY_CLAIM_POLL.min(deadline - now)).await;
+        }
     }
 
     /// A writer's side, waiting at most `wait`. `None` on timeout (an
@@ -720,5 +832,73 @@ mod tests {
         for writer in QuiesceWriter::ALL {
             note_quiesce_held(writer);
         }
+    }
+
+    /// Regression (2026-11-15 audit, exportflow-4, MEDIUM): the archiver and
+    /// the export never hold one partition at once; two of the same kind do
+    /// not refuse each other; dropping a claim lets the other copier in.
+    #[test]
+    fn test_try_claim_copy_refuses_only_the_other_copier() {
+        let q = ArchiveQuiesce::new();
+        let archive = q
+            .try_claim_copy(Copier::Archive, "ticks", "2026-11-12T11")
+            .expect("free");
+        assert!(
+            q.try_claim_copy(Copier::Export, "ticks", "2026-11-12T11")
+                .is_none(),
+            "the export must not copy what the archive is copying"
+        );
+        let second = q
+            .try_claim_copy(Copier::Archive, "ticks", "2026-11-12T11")
+            .expect("two archive legs never refuse each other");
+        let other = q
+            .try_claim_copy(Copier::Export, "ticks", "2026-11-12T12")
+            .expect("another partition is free");
+        assert!(
+            q.try_claim_copy(Copier::Archive, "ticks", "2026-11-12T12")
+                .is_none()
+        );
+        assert!(
+            q.try_claim_copy(Copier::Export, "tick_quotes", "2026-11-12T11")
+                .is_some(),
+            "another table is free"
+        );
+        drop(archive);
+        assert!(
+            q.try_claim_copy(Copier::Export, "ticks", "2026-11-12T11")
+                .is_none(),
+            "one archive claim is still held"
+        );
+        drop(second);
+        assert!(
+            q.try_claim_copy(Copier::Export, "ticks", "2026-11-12T11")
+                .is_some()
+        );
+        drop(other);
+        assert!(q.lock_copies().is_empty(), "every claim released");
+    }
+
+    /// `claim_copy` waits for the other copier, bounded.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_claim_copy_waits_for_the_other_copier_and_times_out() {
+        let q: &'static ArchiveQuiesce = Box::leak(Box::new(ArchiveQuiesce::new()));
+        let held = q
+            .try_claim_copy(Copier::Archive, "ticks", "P")
+            .expect("free");
+        assert!(
+            q.claim_copy(Copier::Export, "ticks", "P", Duration::from_millis(600))
+                .await
+                .is_none(),
+            "times out while held"
+        );
+        let waiter = tokio::spawn(async move {
+            q.claim_copy(Copier::Export, "ticks", "P", Duration::from_secs(20))
+                .await
+                .is_some()
+        });
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(!waiter.is_finished(), "still waiting while held");
+        drop(held);
+        assert!(waiter.await.expect("join"), "claimed once released");
     }
 }

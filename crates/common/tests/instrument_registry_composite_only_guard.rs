@@ -112,6 +112,9 @@ fn collision_reporting_survived_the_deletion() {
     // I-P1-11 operator signal: `cross_segment_collisions()` feeds the
     // `tv_instrument_registry_cross_segment_collisions` gauge surfaced by
     // /health and `make doctor`, and `collision_pairs` names WHICH ids clashed.
+    // ⚠ CORRECTED 2026-11-15 (audit repo-2): no production code emits that
+    // gauge, and /health and `make doctor` do not read it; both getters have
+    // test callers only. This test still pins that the counting survives.
     let src = std::fs::read_to_string(registry_src())
         .unwrap_or_else(|e| panic!("cannot read instrument_registry.rs: {e}"));
     let code = strip_comment_lines(&src);
