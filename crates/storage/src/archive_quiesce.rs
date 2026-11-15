@@ -179,9 +179,12 @@ pub enum Copier {
     Export,
 }
 
+/// [`COPY_CLAIM_POLL`] in milliseconds.
+pub const COPY_CLAIM_POLL_MILLIS: u64 = 250;
+
 /// How often [`ArchiveQuiesce::claim_copy`] looks again while the other
 /// copier holds the partition. Cold path.
-pub const COPY_CLAIM_POLL: Duration = Duration::from_millis(250);
+pub const COPY_CLAIM_POLL: Duration = Duration::from_millis(COPY_CLAIM_POLL_MILLIS);
 
 /// A partition being copied ([`ArchiveQuiesce::try_claim_copy`]). Dropping
 /// it lets the other copier in. O(entries) to drop, entries at most one per
