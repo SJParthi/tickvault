@@ -38,6 +38,21 @@
 //! copied but KEPT (a failed recount or drop) holds its unordered object at
 //! the canonical key, so the export's ordered copy of it still goes to a
 //! content-addressed key (a second copy, as before this change).
+//! ⚠ CHANGED 2026-11-15: each ordered export (this one, and the archiver's)
+//! runs as consecutive `ts` slices of the partition (10 minutes of an hour,
+//! 1 hour of a day; `super::sliced_export`), each its own request with its
+//! own 600 s timeout, the CSV header written once. Every DEDUP key here
+//! starts with `ts`, so the bytes, SHA-256 and row count equal the single
+//! ordered query's. The 600 s limit is now per slice; a whole partition's
+//! export stops at 1,800 s, so [`EXPORT_PARTITION_WORST_SECS`] is 70 minutes.
+//! The same day, a disk-pressure archive pass inside 08:30 to the ingest end
+//! classifies every candidate before the per-run cap, fills the cap with
+//! partitions that have nothing at their canonical key, and skips an
+//! exported one once an unexported one was dropped in that pass. So a second
+//! copy happens only when no unexported candidate of that pass was dropped
+//! before it: every candidate was already exported, or the others were held,
+//! failed or had their table's WAL behind (the owner decision on that copy
+//! stays open).
 //!
 //! `tick_quotes` and `feed_aux_packets` are stamped with ARRIVAL time, and
 //! the main feed stays connected after the close, so their hours keep taking
@@ -105,9 +120,9 @@ use super::snapshot_gate::{WalSnapshotVerdict, wait_for_snapshot};
 use super::{
     ARCHIVE_MIN_FREE_BYTES, ARCHIVE_S3_PREFIX, ArchiveSpaceVerdict, ExportedCsv,
     PARTITION_ARCHIVE_AUDIT_TABLE, PartitionArchiver, WalApplyVerdict, archive_space_verdict,
-    build_export_sql_ordered, canonical_archive_key, deferred_depth_marks_waiting,
-    is_table_absent_response, partition_range_bounds, read_body_capped, remove_temp_file,
-    sidecar_archive_key, wal_apply_verdict,
+    canonical_archive_key, deferred_depth_marks_waiting, is_table_absent_response,
+    partition_range_bounds, read_body_capped, remove_temp_file, sidecar_archive_key,
+    wal_apply_verdict,
 };
 use crate::archive_quiesce::{ArchiveQuiesce, Copier};
 use crate::s3_cold::{ExistingObject, S3Cold, base64_encode, classify_existing, hex_encode};
@@ -158,14 +173,20 @@ pub const MUHURAT_END_GRACE_SECS: u32 = 360;
 /// begin: a generous bound for a multi-GB depth hour, seconds.
 const EXPORT_PARTITION_TAIL_SECS: u64 = 600;
 
-/// The longest one partition can run once started: two ordered exports at
-/// the export client's own timeout (`ARCHIVE_EXPORT_TIMEOUT_SECS`, 600 s
-/// each, with one retry on a recount mismatch) plus
-/// [`EXPORT_PARTITION_TAIL_SECS`]. A partition never starts, and a lock wait
-/// never runs, unless this much time is left before 08:30 on a session day
-/// (2026-11-14 review): 30 minutes.
+/// The longest one partition can run once started: two ordered exports
+/// (one retry on a recount mismatch) plus [`EXPORT_PARTITION_TAIL_SECS`]. A
+/// partition never starts, and a lock wait never runs, unless this much time
+/// is left before 08:30 on a session day (2026-11-14 review).
+/// ⚠ CHANGED 2026-11-15: an ordered export is now `ts` slices (10 minutes of
+/// an hour, 1 hour of a day), each its own request with the export client's
+/// own 600 s timeout, and the whole sliced export stops at
+/// `sliced_export::ORDERED_EXPORT_TOTAL_TIMEOUT_SECS` (1,800 s). So the worst
+/// case per partition is 2 × 1,800 + 600 = 4,200 s (70 minutes), up from
+/// 30 minutes: a partition starts only with 70 minutes left before 08:30,
+/// and a pressure pass waiting on the export can wait that long for one
+/// partition.
 pub const EXPORT_PARTITION_WORST_SECS: u64 =
-    2 * super::ARCHIVE_EXPORT_TIMEOUT_SECS + EXPORT_PARTITION_TAIL_SECS;
+    2 * super::sliced_export::ORDERED_EXPORT_TOTAL_TIMEOUT_SECS + EXPORT_PARTITION_TAIL_SECS;
 
 /// Objects this process placed for the export (uploaded or reused), for the
 /// drain hold's progress rule. One relaxed add per object.
@@ -1933,14 +1954,18 @@ impl DailyExporter {
             archive_space_verdict(free, ARCHIVE_MIN_FREE_BYTES) != ArchiveSpaceVerdict::Wedged,
             "temp_space: less than the archive floor free for {table}/{partition}"
         );
-        let sql = build_export_sql_ordered(table, &start, &end, Some(order_by));
         let path = self
             .archiver
             .temp_dir
             .join(format!("{table}-{partition}.csv.gz"));
         let mut exported: Option<ExportedCsv> = None;
         for _ in 0..2 {
-            let e = self.archiver.export_query_csv(&sql, path.clone()).await?;
+            // 2026-11-15: in `ts` slices, each its own request with its own
+            // timeout, joined into the bytes the single ordered query gave.
+            let e = self
+                .archiver
+                .export_ordered_csv(table, partition, order_by, path.clone())
+                .await?;
             let recount = self.archiver.recount_rows(table, &start, &end).await;
             if recount.as_ref().is_some_and(|r| r.rows == e.rows) {
                 exported = Some(e);
@@ -2099,6 +2124,7 @@ impl DailyExporter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::partition_archive::build_export_sql_ordered;
 
     fn day() -> NaiveDate {
         NaiveDate::from_ymd_opt(2026, 11, 13).expect("date")
@@ -2840,7 +2866,7 @@ mod tests {
             muhurat_end_secs: None,
         };
         assert_eq!(secs_until_forbidden(closed, 8 * 3600), None);
-        assert_eq!(EXPORT_PARTITION_WORST_SECS, 1_800);
+        assert_eq!(EXPORT_PARTITION_WORST_SECS, 4_200);
         assert!(
             secs_until_forbidden(trading, 8 * 3600)
                 .is_some_and(|s| u64::from(s) <= EXPORT_PARTITION_WORST_SECS)
