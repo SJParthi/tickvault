@@ -1651,6 +1651,21 @@ The CSV download client in `crates/core/src/instrument/csv_downloader.rs` (Sub-P
 - `crates/core/tests/csv_downloader_content_type_guard.rs::test_csv_download_rejects_html_response`
 - `crates/storage/tests/daily_universe_scope_guard.rs::daily_universe_csv_hardening_constants_pinned`
 
+> **⚠ CORRECTED 2026-11-15 (audit repo-4) — none of the four ratchets above
+> exists, and neither does `csv_downloader.rs`.** The hardening is real and
+> lives in `crates/core/src/instrument/master_download.rs` (`Policy::none()`,
+> the body cap checked during the read, the Content-Type allowlist). What
+> pins it today:
+>
+> - the three `csv_downloader_*_guard.rs` files: NOT BUILT;
+> - `daily_universe_csv_hardening_constants_pinned`: NOT BUILT; the 50 MiB
+>   cap is pinned by `boot_step_timeout_constants_guard.rs::max_csv_body_bytes_pinned_at_50mb`;
+> - Content-Type: the `master_download.rs` unit tests
+>   `test_content_type_is_allowed_rejects_html_and_json` and its neighbours;
+> - the redirect policy and the during-read body cap: no dedicated test
+>   (only `test_build_hardened_csv_client_builds`). A regression there fails
+>   nothing.
+
 ---
 
 ## §19. Boot-step deadlines + EC2 cron heartbeat (Sub-PR #2 must implement)
@@ -1682,6 +1697,20 @@ This catches the case where EventBridge fails to fire the cron OR the EC2 instan
 - `crates/app/tests/boot_step_timeout_guard.rs::test_each_boot_step_has_a_deadline_constant`
 - `crates/app/tests/boot_step_timeout_guard.rs::test_step_6_auth_deadline_is_60s`
 - `deploy/aws/cloudwatch-alarms/boot-heartbeat-alarm.tf` + `crates/storage/tests/cloudwatch_boot_heartbeat_guard.rs::test_cloudwatch_boot_heartbeat_alarm_exists`
+
+> **⚠ CORRECTED 2026-11-15 (audit repo-4) — these three citations name files
+> that do not exist.** The real ones:
+>
+> - the boot-step deadlines: `crates/storage/tests/boot_step_timeout_constants_guard.rs`
+>   (`boot_step_auth_timeout_pinned_at_60s`, `boot_step_ip_whitelist_timeout_pinned_at_30s`,
+>   `boot_step_questdb_ddl_timeout_pinned_at_60s`); `crates/app/tests/boot_step_timeout_guard.rs` is NOT BUILT;
+> - the alarm: `deploy/aws/terraform/boot-heartbeat-alarm.tf` (not
+>   `deploy/aws/cloudwatch-alarms/`), pinned by
+>   `crates/common/tests/aws_alarm_semantics_guard.rs`
+>   (`test_boot_heartbeat_alarm_contract_unchanged`) and
+>   `crates/app/tests/boot_completed_metric_guard.rs`
+>   (`test_alarm_is_repointed_onto_the_dedicated_metric`);
+>   `cloudwatch_boot_heartbeat_guard.rs` is NOT BUILT.
 
 ---
 
@@ -1718,6 +1747,11 @@ ORDER BY ts DESC LIMIT 1;
 **Ratchet (Sub-PR #9):**
 
 - `crates/storage/tests/lifecycle_audit_pit_query_guard.rs::test_point_in_time_query_returns_state_at_date`
+
+> **⚠ CORRECTED 2026-11-15 (audit repo-4):** `lifecycle_audit_pit_query_guard.rs`
+> is NOT BUILT, and no test pins the point-in-time query. Since Quote 44
+> (2026-10-28) nothing writes `instrument_lifecycle_audit`; the point-in-time
+> record from 2026-10-28 on is the daily instrument snapshot files in S3.
 
 ---
 

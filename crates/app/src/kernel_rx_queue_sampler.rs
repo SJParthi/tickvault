@@ -425,6 +425,7 @@ impl BacklogLatch {
 
 /// Reusable state for reading `/proc` once a second without reallocating.
 struct ProcReader {
+    // APPROVED: not an instrument key — socket inode numbers from /proc.
     inodes: HashSet<u64>,
     table: String,
     /// The last `/proc/net/netstat` reading; all `None` when unreadable.

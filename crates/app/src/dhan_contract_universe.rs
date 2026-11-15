@@ -1242,6 +1242,7 @@ pub(crate) const MIN_LEGS_FOR_A_REAL_EXPIRY: usize = 4;
 ///
 /// Returns `None` when no expiry qualifies. `usize` is the number skipped.
 fn nearest_expiry(contracts: &[Contract<'_>]) -> (Option<u32>, usize) {
+    // APPROVED: not an instrument key — the key is an expiry date YYYYMMDD.
     let mut legs: HashMap<u32, usize> = HashMap::new();
     for c in contracts {
         *legs.entry(c.expiry_ymd).or_insert(0) += 1;

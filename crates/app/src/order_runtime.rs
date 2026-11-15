@@ -898,11 +898,13 @@ struct BookState {
     /// bounded ~30-contract selection per minute; 2026-07-17 truth-sync of
     /// the stale "~770-sid watch universe" live-bridge bound), so the map
     /// stays trivially small and is cleared at the daily reset.
+    // APPROVED: bare id on purpose — the I-P1-11 tripwire: the first segment seen per sid, to detect a second.
     tripwire: HashMap<u64, u8>,
     /// HP-3/E3 edge latch: sids whose divergence has already fired the
     /// coded `error!` this episode (cleared at the daily reset). The
     /// counter keeps counting per event; the LOG fires once per sid per
     /// day (audit-findings Rule 4 — edge-triggered alerts only).
+    // APPROVED: bare id on purpose — the I-P1-11 tripwire latch: one entry per sid seen on two segments.
     tripwire_reported: HashSet<u64>,
     /// HP-2: composite `(security_id, segment)` → pending PAPER order ids —
     /// the O(1) per-mark filler index. Composite since audit M7 (2026-10-04):

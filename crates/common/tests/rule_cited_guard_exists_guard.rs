@@ -28,6 +28,15 @@
 //! guard names written without the `_guard.rs` / `-guard.sh` shape are not
 //! checked; the exemption words are matched on the line, so a line that says
 //! CORRECTED about something else also passes.
+//!
+//! ⚠ CORRECTED 2026-11-15 (audit repo-4): the scan scope was not stated. It
+//! reads ONLY `.claude/rules/project/*.md` (many are summary stubs) and
+//! `CLAUDE.md`. It does NOT read `docs/claude-rules-full/project/*.md`, where
+//! the binding REJECT lists and ratchet tables live since 2026-09-26,
+//! `.claude/rules/dhan/*.md` or `docs/error-runbooks/*.md`, so a dead citation
+//! there passes. The dead ratchet citations the audit found in the
+//! daily-universe full text (§18, §19, §25) were corrected by hand the same
+//! day; nothing here keeps them correct.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};

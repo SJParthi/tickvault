@@ -275,6 +275,10 @@ pub struct EpisodeState {
     /// one-partition in-session passes are not keeping up, so the episode
     /// escalates as an ungated one would. Without it, an in-session episode
     /// at 90%+ refunded every pass and could never escalate.
+    ///
+    /// Audit 2026-11-15 (live-2): below 90% used a gated pass that freed a
+    /// partition resets it instead of counting; at 90%+ gated passes still
+    /// count, as above. A stall escalates only at or above high water.
     pub gated_stalled: bool,
     /// PR AA step 4: the episode was opened by the projected-fill trigger
     /// below high water and has not read at or above high water since. Such
@@ -448,9 +452,14 @@ pub fn decide_pressure_action(
             //
             // PR DP review M1: refunded in-session passes that did not lower
             // the volume escalate too, and so do exhausted passes.
-            let stuck = ep.last_pass_dropped == Some(0)
-                || ep.gated_stalled
-                || ep.passes_used >= cfg.pressure_max_passes;
+            //
+            // Audit 2026-11-15 (live-2): a stall alone pages only at or above
+            // high water. On 13 Nov it paged at 72% (below the 75% high
+            // water) with "nothing further will be deleted", which was false;
+            // below high water such an episode keeps passing, without a page.
+            let out_of_reclaim =
+                ep.last_pass_dropped == Some(0) || ep.passes_used >= cfg.pressure_max_passes;
+            let stuck = out_of_reclaim || ep.gated_stalled;
             if stuck {
                 // PR AA step 4: only a used-space episode at or above low
                 // water pages, as before. An episode the projection opened
@@ -459,6 +468,9 @@ pub fn decide_pressure_action(
                 // projection can over-read (the opening burst), and the page
                 // would be new. The cooldown then spaces the next try.
                 if used >= cfg.pressure_low_water_pct && !ep.projected_only {
+                    if !out_of_reclaim && used < cfg.pressure_high_water_pct {
+                        return PressureAction::ContinuePass;
+                    }
                     return PressureAction::Escalate;
                 }
                 return PressureAction::EndEpisode;
@@ -1646,6 +1658,39 @@ mod dp_gate_and_rearm_tests {
         assert_eq!(
             decide_pressure_action(PressureProbe::used(92), &state, &c, 0),
             PressureAction::Escalate
+        );
+    }
+
+    // Regression: audit 2026-11-15 (live-2) — on 13 Nov a stalled episode
+    // paged STORAGE-GAP-05 at 72%, below the 75% high water.
+    #[test]
+    fn test_regression_live2_gated_stall_below_high_water_does_not_escalate() {
+        let c = cfg();
+        let state = PressureState {
+            episode: Some(EpisodeState {
+                passes_used: 1,
+                last_pass_dropped: Some(1),
+                gated_stalled: true,
+                ..EpisodeState::default()
+            }),
+            last_episode_end_secs: None,
+        };
+        for used in [c.pressure_low_water_pct, 72, c.pressure_high_water_pct - 1] {
+            assert_eq!(
+                decide_pressure_action(PressureProbe::used(used), &state, &c, 0),
+                PressureAction::ContinuePass,
+                "used {used}: below high water a stall keeps passing, no page"
+            );
+        }
+        assert_eq!(
+            decide_pressure_action(
+                PressureProbe::used(c.pressure_high_water_pct),
+                &state,
+                &c,
+                0
+            ),
+            PressureAction::Escalate,
+            "at high water a stall still escalates"
         );
     }
     #[test]

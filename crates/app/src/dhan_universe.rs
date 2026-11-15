@@ -497,6 +497,7 @@ fn fno_underlying_mappings(
     }
 
     // Pass 2 — resolve those symbols to their NSE cash-equity security_id.
+    // APPROVED: single-segment context — only NSE EQ-series cash-equity rows (NSE_EQ) reach this set.
     let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let mut out = Vec::new();
     for row in master {
@@ -558,6 +559,7 @@ fn nse_index_mappings(
 ) -> Vec<MappingEntry> {
     use tickvault_core::instrument::master_csv::InstrumentClass;
 
+    // APPROVED: single-segment context — only NSE index rows (IDX_I) reach this set; see the doc above.
     let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let mut out = Vec::new();
     for row in master {

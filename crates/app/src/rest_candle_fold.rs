@@ -1251,6 +1251,7 @@ pub fn apply_bar_batch(
     // emission order is unchanged. `HashSet::new()` does not allocate until
     // the first repair, so a repair-free batch pays nothing.
     let mut dirty: Vec<u32> = Vec::new();
+    // APPROVED: not an instrument key — fold slot indices (a bijection with the composite key).
     let mut dirty_seen: HashSet<u32> = HashSet::new();
     for bar in batch {
         let Some(slot_idx) =

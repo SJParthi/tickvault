@@ -53,6 +53,22 @@ paths:
   idempotency — it is seeded from wall-clock nanos.
 - Regression-pinned by `chaos_index_same_value_burst_preserved.rs` (the
   `45→75→45` test + replay-twice idempotency) + `test_dedup_key_is_capture_seq_after_flip`.
+- **⚠ CORRECTED 2026-11-15 (audit repo-5)** — six names above match nothing
+  in the tree: `ensure_tick_table_dedup_keys`, `ticks_table_is_populated`,
+  `tv_ticks_dedup_drop_blocked_total`, `chaos_index_same_value_burst_preserved.rs`,
+  `test_dedup_key_is_capture_seq_after_flip`, and the DROP-recovery path itself.
+  What is real: the key flip is the in-place
+  `ALTER TABLE ticks DEDUP ENABLE UPSERT KEYS({DEDUP_KEY_TICKS})` run by
+  `tick_persistence::ensure_ticks_table` / `ensure_ticks_tables_verdict`.
+  `tick_persistence.rs` has no DROP path, so the honest protection is that no
+  code there drops `ticks`; the boot reset (`fresh_start_reset::ResetAction`)
+  drops a table only when QuestDB reports it empty and otherwise RENAMES it to
+  `<name>_pre_reset_<yyyymmdd>`. The key is pinned by the `tick_persistence.rs`
+  unit tests `tick_dedup_key_matches_questdb_init_script`,
+  `tick_dedup_key_has_ts_first_segment_capture_seq_and_feed`,
+  `n_ticks_in_one_second_with_distinct_capture_seq_produce_distinct_rows` and
+  `constant_capture_seq_collapses_a_whole_second_into_one_row`. The old text is
+  kept as history.
 - Bounded ring buffer for O(1) lookup; log duplicates at WARN.
 
 ## Per-Feed Identity in DEDUP keys (operator 2026-06-23)

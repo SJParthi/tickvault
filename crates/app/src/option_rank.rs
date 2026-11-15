@@ -428,6 +428,7 @@ pub struct GainerWalk {
     /// probes at the number of underlyings (~210) whatever the day looks like.
     /// Sized for the measured F&O underlying count; a larger day grows it
     /// once, and `reset` keeps the grown capacity.
+    // APPROVED: single-segment context — stock options only, so every underlying id is NSE_EQ.
     memo: HashMap<u64, GainerVerdict>,
     pos: usize,
     limit: usize,
