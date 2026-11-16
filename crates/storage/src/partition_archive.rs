@@ -6529,6 +6529,8 @@ mod stub_integration_tests {
     mod daily_export_stub_tests;
     // 2026-11-15: the sliced ordered export is byte-identical to one query.
     mod sliced_export_stub_tests;
+    // 2026-11-16: every cold PutObject is unsigned-payload + SHA-256 checksum.
+    mod unsigned_payload_stub_tests;
 
     /// One parsed stub request (method + decoded target + lowercased headers).
     #[derive(Clone, Debug)]

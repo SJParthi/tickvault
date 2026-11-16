@@ -49,6 +49,11 @@
 //! Never on the frame drain: its own tokio task; the file reads, query-body
 //! parse and JSON encoding run on the blocking pool. Cold path.
 //!
+//! ⚠ CHANGED 2026-11-16: the PutObject is sent with an unsigned payload
+//! (`customize().disable_payload_signing()`), so the SDK no longer hashes the
+//! ~quarter-MiB body with SHA-256 inside `send()` on a main-runtime worker.
+//! The SDK CRC32 checksum header still goes with it and S3 checks it.
+//!
 //! # Cost (Assumed, not billed yet)
 //!
 //! One heartbeat GET every 5 s while the box runs (~5,800 a box-day, ~$0.05 a
@@ -327,6 +332,11 @@ impl UniverseStore for S3UniverseStore {
             .expected_bucket_owner(&self.owner)
             .content_type("application/json")
             .body(aws_sdk_s3::primitives::ByteStream::from(body))
+            // Unsigned payload (2026-11-16): no SHA-256 of the body inside
+            // `send()` on a main-runtime worker. The SDK still adds a CRC32
+            // checksum header that S3 checks, and the transport is TLS.
+            .customize()
+            .disable_payload_signing()
             .send();
         match tokio::time::timeout(Duration::from_secs(PUT_TIMEOUT_SECS), request).await {
             Ok(Ok(_)) => Ok(()),
