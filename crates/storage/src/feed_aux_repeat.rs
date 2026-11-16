@@ -90,6 +90,14 @@
 //! O(1) average per packet: one call of the epoch function (four
 //! atomic loads in production since 2026-11-15, three before), one hash probe in [`AuxRepeatFilter::check`],
 //! and at most one probe and one insert in [`AuxRepeatFilter::note_written`].
+//! *(⚠ CHANGED 2026-11-16: the map hashes with `ahash` instead of the
+//! standard SipHash hasher, as `BackupDedup` and `PrevCloseStore` already do
+//! (plan ITEM DT). Same O(1) average; a cheaper hash per probe on a key of
+//! two integers is Assumed from that precedent, not measured for this map.
+//! No iteration order is ever read; the decisions are
+//! identical, pinned against a frozen copy of the SipHash filter by
+//! `proptest_ahash_filter_decides_exactly_as_the_siphash_filter`. Values are
+//! still compared column by column, never by a fingerprint (Quote 61).)*
 //! The map is pre-sized at [`FEED_AUX_REPEAT_MAX_TRACKED`] (25,000, the same
 //! figure as every per-instrument map on this universe) and never grows past
 //! it, so no packet allocates. Past the cap a NEW key is written and not
@@ -209,9 +217,26 @@ pub enum AuxRepeatVerdict {
     Skip,
 }
 
+/// This filter's own tallies (2026-11-16): what it skipped, what it wrote
+/// untracked, and how many keys it remembers. Kept beside the process-wide
+/// counters so a bench or test can prove the path ran without a metrics
+/// recorder. `Copy`, read in O(1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AuxRepeatCounts {
+    /// Rows skipped as exact repeats (also on [`FEED_AUX_REPEAT_SKIPPED_COUNTER`]).
+    pub skipped: u64,
+    /// New keys written untracked past the cap (also on
+    /// [`FEED_AUX_REPEAT_UNTRACKED_COUNTER`]).
+    pub untracked: u64,
+    /// Keys remembered now (at most [`FEED_AUX_REPEAT_MAX_TRACKED`]).
+    pub tracked: usize,
+}
+
 /// The last written values per composite key. See the module docs.
 pub struct AuxRepeatFilter {
-    last: HashMap<(u64, u8), AuxRowValues>,
+    /// Keyed with `ahash` (2026-11-16; was the std SipHash hasher). The map
+    /// is only probed by key; nothing reads its iteration order.
+    last: HashMap<(u64, u8), AuxRowValues, ahash::RandomState>,
     day: i64,
     gap_epoch: fn() -> u64,
     /// Gaps the caller marked by hand ([`Self::mark_gap`]): added to the gap
@@ -219,6 +244,9 @@ pub struct AuxRepeatFilter {
     local_gaps: u64,
     skipped: metrics::Counter,
     untracked: metrics::Counter,
+    /// The same two events as plain integers ([`Self::counts`], 2026-11-16).
+    skipped_rows: u64,
+    untracked_rows: u64,
 }
 
 impl AuxRepeatFilter {
@@ -232,12 +260,28 @@ impl AuxRepeatFilter {
         skipped.increment(0);
         untracked.increment(0);
         Self {
-            last: HashMap::with_capacity(FEED_AUX_REPEAT_MAX_TRACKED),
+            last: HashMap::with_capacity_and_hasher(
+                FEED_AUX_REPEAT_MAX_TRACKED,
+                ahash::RandomState::new(),
+            ),
             day: i64::MIN,
             gap_epoch,
             local_gaps: 0,
             skipped,
             untracked,
+            skipped_rows: 0,
+            untracked_rows: 0,
+        }
+    }
+
+    /// This filter's tallies since it was built (a [`Self::clear`] or a day
+    /// roll forgets keys, never these counts). O(1), no allocation.
+    #[must_use]
+    pub fn counts(&self) -> AuxRepeatCounts {
+        AuxRepeatCounts {
+            skipped: self.skipped_rows,
+            untracked: self.untracked_rows,
+            tracked: self.last.len(),
         }
     }
 
@@ -289,6 +333,7 @@ impl AuxRepeatFilter {
             Some(prev) if prev.never_skip => values.never_skip = true,
             Some(prev) if !write_always && *prev == values => {
                 self.skipped.increment(1);
+                self.skipped_rows = self.skipped_rows.saturating_add(1);
                 return AuxRepeatVerdict::Skip;
             }
             _ => values.never_skip = pin,
@@ -307,6 +352,7 @@ impl AuxRepeatFilter {
             self.last.insert(key, values);
         } else {
             self.untracked.increment(1);
+            self.untracked_rows = self.untracked_rows.saturating_add(1);
         }
     }
 
@@ -330,3 +376,7 @@ impl AuxRepeatFilter {
 #[cfg(test)]
 #[path = "feed_aux_repeat_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "feed_aux_repeat_oracle_tests.rs"]
+mod oracle_tests;
