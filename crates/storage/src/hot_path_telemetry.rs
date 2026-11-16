@@ -828,6 +828,9 @@ fn step_p99_latch(latched: &mut bool, over: Option<bool>) -> bool {
 /// What one stage's window produced.
 struct WindowOutcome {
     window: [u64; STAGE_BUCKETS],
+    /// This window's sample sum, nanoseconds (current cumulative minus the
+    /// last read). 2026-11-16: feeds the minute table's `mean_ns`.
+    sum_nanos: u64,
     strict: Option<StrictSampleCounts>,
     quantiles: Option<StageQuantiles>,
     over_budget: u64,
@@ -842,6 +845,8 @@ struct QuantileWindows {
     prev_buckets: [[u64; STAGE_BUCKETS]; STAGE_COUNT],
     prev_raw_buckets: [[u64; RAW_STAGE_BUCKETS]; STAGE_COUNT],
     prev_over_budget: [u64; STAGE_COUNT],
+    /// The cumulative sample sum last read, per stage (2026-11-16, `mean_ns`).
+    prev_sum_nanos: [u64; STAGE_COUNT],
     p99_over: [bool; STAGE_COUNT],
 }
 
@@ -851,6 +856,7 @@ impl QuantileWindows {
             prev_buckets: [[0; STAGE_BUCKETS]; STAGE_COUNT],
             prev_raw_buckets: [[0; RAW_STAGE_BUCKETS]; STAGE_COUNT],
             prev_over_budget: [0; STAGE_COUNT],
+            prev_sum_nanos: [0; STAGE_COUNT],
             p99_over: [false; STAGE_COUNT],
         }
     }
@@ -875,6 +881,13 @@ impl QuantileWindows {
         self.prev_raw_buckets[i] = snap.raw_buckets;
         let over_budget = snap.over_budget.saturating_sub(self.prev_over_budget[i]);
         self.prev_over_budget[i] = snap.over_budget;
+        // 2026-11-16 (`mean_ns`): the window's sum, by the same difference as
+        // the buckets. `sum_nanos` is read after the buckets, so a sample
+        // recorded between the two reads can sit in this window's sum and the
+        // next window's count; over a minute the windows telescope, so the
+        // error is at most the samples racing the two reads at its edges.
+        let sum_nanos = snap.sum_nanos.saturating_sub(self.prev_sum_nanos[i]);
+        self.prev_sum_nanos[i] = snap.sum_nanos;
         let quantiles = stage_quantiles(&window);
         let verdict = quantiles
             .filter(|q| q.samples >= P99_WARN_MIN_SAMPLES)
@@ -882,6 +895,7 @@ impl QuantileWindows {
         let starts_p99_episode = step_p99_latch(&mut self.p99_over[i], verdict);
         WindowOutcome {
             window,
+            sum_nanos,
             strict,
             quantiles,
             over_budget,
@@ -966,6 +980,12 @@ pub struct SecondWindow {
     pub stage_strict: [Option<StrictSampleCounts>; STAGE_COUNT],
     /// Per stage, the largest sample of the window, nanoseconds.
     pub stage_max_nanos: [u64; STAGE_COUNT],
+    /// Per stage, the sum of the window's samples, nanoseconds (2026-11-16,
+    /// the minute table's `mean_ns`). Same unit as `stage_buckets`: a
+    /// weighted record of `weight` samples of `nanos` adds `weight` to the
+    /// buckets and `nanos × weight` here, so sum / bucket total is the mean
+    /// of the samples the buckets count.
+    pub stage_sum_nanos: [u64; STAGE_COUNT],
     /// The fine `receipt_to_fold` window, per-bucket counts.
     pub receipt_to_fold_fine: [u64; FINE_BUCKETS],
 }
@@ -980,6 +1000,7 @@ impl SecondWindow {
             // The publisher replaces every slot, including measured zeros.
             stage_strict: [None; STAGE_COUNT],
             stage_max_nanos: [0; STAGE_COUNT],
+            stage_sum_nanos: [0; STAGE_COUNT],
             receipt_to_fold_fine: [0; FINE_BUCKETS],
         }
     }
@@ -1224,6 +1245,7 @@ pub fn publish_once(handles: &mut TelemetryHandles, now: Instant) -> StallReadin
         handles.last_second.stage_max_nanos[*stage as usize] = max;
         let outcome = handles.windows.advance(*stage, &snap);
         handles.last_second.stage_buckets[*stage as usize] = outcome.window;
+        handles.last_second.stage_sum_nanos[*stage as usize] = outcome.sum_nanos;
         handles.last_second.stage_strict[*stage as usize] = outcome.strict;
         if *stage == Stage::ReceiptToFold {
             // Read the fine histogram right after this stage's max swap and
@@ -1558,6 +1580,30 @@ pub async fn run_runtime_probe(task: HotTask, stage: Stage, iterations: u64) {
 
 #[cfg(test)]
 mod strict_tests;
+
+/// Test-only helpers other modules' tests use (2026-11-16).
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::{QuantileWindows, SecondWindow, Stage, StageStats};
+
+    /// One `SecondWindow` holding `stage`'s window after `frames` weighted
+    /// records (`(per-tick nanos, ticks)` each), built through a LOCAL stage
+    /// record and the real window difference, so it never touches the
+    /// process-wide statics other tests record into.
+    pub(crate) fn weighted_window(stage: Stage, frames: &[(u64, u64)]) -> SecondWindow {
+        let stats = StageStats::new();
+        for (nanos, weight) in frames {
+            stats.record_weighted(stage, *nanos, *weight);
+        }
+        let outcome = QuantileWindows::new().advance(stage, &stats.snapshot());
+        let mut second = SecondWindow::empty();
+        let i = stage as usize;
+        second.stage_buckets[i] = outcome.window;
+        second.stage_sum_nanos[i] = outcome.sum_nanos;
+        second.stage_strict[i] = outcome.strict;
+        second
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -2477,5 +2523,35 @@ mod tests {
             .observe(Instant::now(), true, &readings)
             .expect("a paged stage still pages");
         assert_eq!(line.signal, "drain_main_frame");
+    }
+
+    /// 2026-11-16 (`mean_ns`): a weighted stage's window sum and bucket count
+    /// divide to the mean of the samples recorded. `drain_main_tick` records
+    /// a frame's per-tick average `weight` times
+    /// ([`record_stage_nanos_weighted`]), so the sum must grow by
+    /// `nanos × weight` exactly as the buckets grow by `weight`; a sum that
+    /// grew by `nanos` once would read the mean `weight` times too low.
+    #[test]
+    fn test_weighted_stage_window_sum_and_count_give_the_true_mean() {
+        let stats = StageStats::new();
+        let mut windows = QuantileWindows::new();
+        // Frame 1: 4 ticks at 900 ns each. Frame 2: 1 tick at 2,500 ns.
+        stats.record_weighted(Stage::DrainMainTick, 900, 4);
+        stats.record_weighted(Stage::DrainMainTick, 2_500, 1);
+        let first = windows.advance(Stage::DrainMainTick, &stats.snapshot());
+        let count: u64 = first.window.iter().sum();
+        assert_eq!(count, 5);
+        assert_eq!(first.sum_nanos, 900 * 4 + 2_500);
+        assert_eq!(first.sum_nanos / count, 1_220);
+        // The next window holds only what was recorded after the first read.
+        stats.record_weighted(Stage::DrainMainTick, 1_000, 3);
+        stats.record_weighted(Stage::DrainMainTick, 7, 0);
+        let second = windows.advance(Stage::DrainMainTick, &stats.snapshot());
+        assert_eq!(second.window.iter().sum::<u64>(), 3);
+        assert_eq!(second.sum_nanos, 3_000);
+        // An empty window sums to zero, never the cumulative total.
+        let third = windows.advance(Stage::DrainMainTick, &stats.snapshot());
+        assert_eq!(third.window.iter().sum::<u64>(), 0);
+        assert_eq!(third.sum_nanos, 0);
     }
 }
