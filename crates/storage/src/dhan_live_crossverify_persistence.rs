@@ -70,7 +70,11 @@
 //!     attempt_at TIMESTAMP, run_complete BOOLEAN,
 //!     missing_minutes_would_page BOOLEAN,
 //!     planned_instrument_minutes LONG, covered_instrument_minutes LONG,
-//!     coverage_known BOOLEAN
+//!     coverage_known BOOLEAN,
+//!     cells_boundary_consistent LONG, cells_close_within_bar LONG,
+//!     cells_unexplained LONG, cells_unexplained_open LONG,
+//!     cells_unexplained_high LONG, cells_unexplained_low LONG,
+//!     cells_unexplained_close LONG, index_missing_rest_closing LONG
 //! ) timestamp(ts) PARTITION BY DAY
 //! DEDUP UPSERT KEYS(ts, trading_date_ist, feed, outcome)
 //!
@@ -113,6 +117,17 @@
 //! archive and to keep a `clean` day at `partial`; they never touch `diverged`.
 //! The two minute counts mean something only when `coverage_known` is true: a
 //! row with it false may still carry the record's counts (review round 2).
+//!
+//! ## 2026-11-16 (`no-rest-except-live-feed-2026-06-27.md` §12.15.17)
+//!
+//! The daily table gains eight LONG columns, through the same self-heal and
+//! outside the DEDUP key: `cells_boundary_consistent` and `cells_unexplained`
+//! (a SHADOW split of `cells_diverged`; the two always add up to it),
+//! `cells_close_within_bar` (the close part of the consistent count, a bound,
+//! not proof), `cells_unexplained_{open,high,low,close}`, and
+//! `index_missing_rest_closing` (the `missing_rest` index minutes from 15:30
+//! IST, for which Dhan publishes no bars). Nothing reads them to decide the
+//! verdict, the marker or a page; `cells_diverged` is unchanged.
 
 use anyhow::{Context, Result};
 use questdb::ingress::{Buffer, ProtocolVersion, Sender, TimestampNanos};
@@ -524,6 +539,30 @@ pub struct DhanLiveXverifyDailyRow {
     /// unfinished widen/unsaved set. This is not continuous delivery evidence.
     /// Outside the DEDUP key.
     pub coverage_known: bool,
+    /// SHADOW (§12.15.17, 2026-11-16): diverged cells whose vendor value fits
+    /// a known vendor shape (a minute started at our previous existing bar's
+    /// close, or a close inside our own bar). Includes
+    /// `cells_close_within_bar`. Read by no verdict or page; outside the DEDUP
+    /// key. `cells_boundary_consistent + cells_unexplained == cells_diverged`.
+    pub cells_boundary_consistent: i64,
+    /// SHADOW: of `cells_boundary_consistent`, the close cells inside our own
+    /// `[low, high]`. A bound, not proof. Outside the DEDUP key.
+    pub cells_close_within_bar: i64,
+    /// SHADOW: diverged cells no known vendor shape explains. Outside the
+    /// DEDUP key.
+    pub cells_unexplained: i64,
+    /// SHADOW: unexplained open cells. Outside the DEDUP key.
+    pub cells_unexplained_open: i64,
+    /// SHADOW: unexplained high cells. Outside the DEDUP key.
+    pub cells_unexplained_high: i64,
+    /// SHADOW: unexplained low cells. Outside the DEDUP key.
+    pub cells_unexplained_low: i64,
+    /// SHADOW: unexplained close cells. Outside the DEDUP key.
+    pub cells_unexplained_close: i64,
+    /// Of `missing_rest`, the index minutes from 15:30 IST to the session end
+    /// (Dhan publishes no closing-session index bars). Counted beside
+    /// `missing_rest`, never instead of it. Outside the DEDUP key.
+    pub index_missing_rest_closing: i64,
 }
 
 /// One minute of the vendor's own tape, exactly as fetched.
@@ -608,7 +647,15 @@ pub fn dhan_live_xverify_daily_create_ddl() -> String {
             missing_minutes_would_page BOOLEAN, \
             planned_instrument_minutes LONG, \
             covered_instrument_minutes LONG, \
-            coverage_known BOOLEAN\
+            coverage_known BOOLEAN, \
+            cells_boundary_consistent LONG, \
+            cells_close_within_bar LONG, \
+            cells_unexplained LONG, \
+            cells_unexplained_open LONG, \
+            cells_unexplained_high LONG, \
+            cells_unexplained_low LONG, \
+            cells_unexplained_close LONG, \
+            index_missing_rest_closing LONG\
         ) timestamp(ts) PARTITION BY DAY \
         DEDUP UPSERT KEYS({DEDUP_KEY_DHAN_LIVE_XVERIFY_DAILY});"
     )
@@ -703,6 +750,15 @@ const DAILY_COLUMNS: &[(&str, &str)] = &[
     ("planned_instrument_minutes", "LONG"),
     ("covered_instrument_minutes", "LONG"),
     ("coverage_known", "BOOLEAN"),
+    // §12.15.17 (2026-11-16): the shadow split of the diverged cells.
+    ("cells_boundary_consistent", "LONG"),
+    ("cells_close_within_bar", "LONG"),
+    ("cells_unexplained", "LONG"),
+    ("cells_unexplained_open", "LONG"),
+    ("cells_unexplained_high", "LONG"),
+    ("cells_unexplained_low", "LONG"),
+    ("cells_unexplained_close", "LONG"),
+    ("index_missing_rest_closing", "LONG"),
 ];
 
 /// The full ordered DDL statement list (CREATE → per-column `ALTER ADD COLUMN
@@ -1166,6 +1222,22 @@ impl DhanLiveXverifyAuditWriter {
             .context("covered_instrument_minutes")?
             .column_bool("coverage_known", r.coverage_known)
             .context("coverage_known")?
+            .column_i64("cells_boundary_consistent", r.cells_boundary_consistent)
+            .context("cells_boundary_consistent")?
+            .column_i64("cells_close_within_bar", r.cells_close_within_bar)
+            .context("cells_close_within_bar")?
+            .column_i64("cells_unexplained", r.cells_unexplained)
+            .context("cells_unexplained")?
+            .column_i64("cells_unexplained_open", r.cells_unexplained_open)
+            .context("cells_unexplained_open")?
+            .column_i64("cells_unexplained_high", r.cells_unexplained_high)
+            .context("cells_unexplained_high")?
+            .column_i64("cells_unexplained_low", r.cells_unexplained_low)
+            .context("cells_unexplained_low")?
+            .column_i64("cells_unexplained_close", r.cells_unexplained_close)
+            .context("cells_unexplained_close")?
+            .column_i64("index_missing_rest_closing", r.index_missing_rest_closing)
+            .context("index_missing_rest_closing")?
             .at(TimestampNanos::new(r.run_ts_ist_nanos))
             .context("designated timestamp")?;
         self.pending = self.pending.saturating_add(1);
@@ -1580,6 +1652,14 @@ mod tests {
             planned_instrument_minutes: 1_540,
             covered_instrument_minutes: 1_155,
             coverage_known: true,
+            cells_boundary_consistent: 1,
+            cells_close_within_bar: 0,
+            cells_unexplained: 1,
+            cells_unexplained_open: 0,
+            cells_unexplained_high: 1,
+            cells_unexplained_low: 0,
+            cells_unexplained_close: 0,
+            index_missing_rest_closing: 0,
         }
     }
 
@@ -2148,6 +2228,72 @@ mod tests {
         assert!(fields.contains("planned_instrument_minutes=770i"), "{line}");
         assert!(fields.contains("covered_instrument_minutes=396i"), "{line}");
         assert!(fields.contains("coverage_known=f"), "{line}");
+    }
+
+    /// §12.15.17 (2026-11-16): the shadow split columns self-heal onto an old
+    /// daily table as LONG, reach the wire as integer fields (never tags), and
+    /// stay out of every DEDUP key. In the key they would split one attempt's
+    /// verdict row into one row per distinct count.
+    #[test]
+    fn shadow_split_columns_self_heal_reach_the_wire_and_stay_out_of_dedup() {
+        let cols = [
+            "cells_boundary_consistent",
+            "cells_close_within_bar",
+            "cells_unexplained",
+            "cells_unexplained_open",
+            "cells_unexplained_high",
+            "cells_unexplained_low",
+            "cells_unexplained_close",
+            "index_missing_rest_closing",
+        ];
+        let ddl = dhan_live_xverify_daily_create_ddl();
+        let words: Vec<&str> = ddl.split_whitespace().collect();
+        for col in cols {
+            let alter = format!(
+                "ALTER TABLE {DHAN_LIVE_XVERIFY_DAILY_TABLE} ADD COLUMN IF NOT EXISTS {col} LONG;"
+            );
+            assert!(
+                dhan_live_xverify_ddl_statements().contains(&alter),
+                "missing self-heal: {alter}"
+            );
+            assert!(DAILY_COLUMNS.contains(&(col, "LONG")));
+            assert!(
+                words
+                    .windows(2)
+                    .any(|w| w[0] == col && w[1].trim_end_matches([',', ')', '\\']) == "LONG"),
+                "the CREATE must declare {col} LONG"
+            );
+            assert!(!DEDUP_KEY_DHAN_LIVE_XVERIFY_DAILY.contains(col));
+            assert!(!dhan_live_xverify_cell_audit_create_ddl().contains(col));
+        }
+        let mut row = sample_daily();
+        row.cells_boundary_consistent = 115_756;
+        row.cells_close_within_bar = 11_978;
+        row.cells_unexplained = 71_244;
+        row.cells_unexplained_open = 7_359;
+        row.cells_unexplained_high = 30_001;
+        row.cells_unexplained_low = 33_862;
+        row.cells_unexplained_close = 22;
+        row.index_missing_rest_closing = 40;
+        let mut w = DhanLiveXverifyAuditWriter::for_test();
+        w.append_daily(&row).expect("append");
+        let line = w.buffer_utf8();
+        let (tags, fields) = line.split_at(line.find(' ').expect("tags then fields"));
+        for col in cols {
+            assert!(!tags.contains(col), "{line}");
+        }
+        for want in [
+            "cells_boundary_consistent=115756i",
+            "cells_close_within_bar=11978i",
+            "cells_unexplained=71244i",
+            "cells_unexplained_open=7359i",
+            "cells_unexplained_high=30001i",
+            "cells_unexplained_low=33862i",
+            "cells_unexplained_close=22i",
+            "index_missing_rest_closing=40i",
+        ] {
+            assert!(fields.contains(want), "{want} not on the wire: {line}");
+        }
     }
 
     #[test]
