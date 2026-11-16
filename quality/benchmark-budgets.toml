@@ -125,6 +125,16 @@ order_gate_mark_forward  = 100          # <100ns — hot-path-grade mark gate
 # file order, and feed_drain_main_feed also matches those names. The Full p99
 # tail gate in the bench reads the same key.
 feed_drain_main_feed_full = 2500        # <2.5us per tick — matches feed_drain/main_feed_full_frame_4 and feed_drain/main_feed_full_frame_4_own (Full packets, both encoders) and feed_drain/main_feed_full_frame_4_own_nodepth (PF-4b 2026-11-06: same frames, no inline depth)
+# 2026-11-16: the wrong-day (`no_trade_today`, Quote 61) path, which the
+# Quote and Full frames never reach (every one of their packets folds). Four
+# previous-day Ticker packets a frame with the repeat filter full at its
+# 25,000-contract cap, in two cases: every packet a skipped repeat, and every
+# packet written (three changed values, one new contract past the cap). Same
+# 1 us per tick as the Quote frames. It sits ABOVE feed_drain_main_feed
+# because bench-gate.sh takes the FIRST matching key in file order and
+# feed_drain_main_feed is a substring of both bench ids (pinned by
+# benchmark_budget_reaches_a_bench_guard.rs).
+feed_drain_main_feed_frame_4_wrong_day = 1000  # <1us per tick — matches feed_drain/main_feed_frame_4_wrong_day_skip and feed_drain/main_feed_frame_4_wrong_day_written
 feed_drain_main_feed     = 1000         # <1us per tick — matches feed_drain/main_feed_frame_4_quotes
 feed_drain_depth         = 1000         # <1us per level — matches feed_drain/depth20_frame_4x20 and feed_drain/depth200_packet. Was 1500 until 2026-10-30 (plan ITEM DT, depth row stage): pre-checked ILP names on every depth row took the x86 dev container from 531 to 366 ns per level (depth-20 frame, 42.5 to 29.3 us per 80 levels) and from 638 to 437 ns per level (depth-200 packet, 127.6 to 87.5 us per 200 levels), byte-identical rows.
 candles_consume_tick     = 1000         # <1us per tick — the per-tick candle fold over every timeframe (plan ITEM DT, 2026-10-30). Matches candles/consume_tick_hit_20k, candles/consume_tick_hit_500 (500-tick batches, divided below) and candles/consume_tick_live_mix_2k (one tick per element); the bench also holds the live-mix p99 to this key. Measured on the x86 dev container: see the PR that added it (plan ITEM DT-FOLD) for the hit and live-mix figures.
@@ -198,6 +208,7 @@ pipeline_burst_100_ticker = 100   # 100 ticker packets per iter
 feed_drain_main_feed_frame_4_quotes = 4    # 4 Quote packets per frame (audit PROOF-9)
 feed_drain_main_feed_full_frame_4   = 4    # 4 Full packets per frame (ITEM DT step 0, 2026-10-29; renamed from main_feed_frame_4_full 2026-11-06)
 feed_drain_main_feed_full_frame_4_own = 4  # identical four-Full frame, existing Own tick encoder comparison
+feed_drain_main_feed_frame_4_wrong_day = 4 # 4 previous-day Ticker packets per frame, both cases (2026-11-16)
 feed_drain_depth20_frame_4x20       = 80   # 4 packets x 20 levels per frame
 feed_drain_depth200_packet          = 200  # 200 levels per packet
 backup_dedup_admit_tick_pair        = 2    # two packets per iter: the first copy and its byte-identical second copy (plan ITEM DT, 2026-10-30)

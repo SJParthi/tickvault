@@ -1728,6 +1728,7 @@ mod tests {
             strict_version: None,
             strict_samples: None,
             strict_samples_at_or_above_1000ns: None,
+            mean_ns: None,
         })
     }
 

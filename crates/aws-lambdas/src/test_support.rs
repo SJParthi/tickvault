@@ -359,6 +359,10 @@ pub(crate) struct Fleet {
     pub ssm: std::collections::HashMap<String, String>,
     /// Month-to-date spend for `DescribeBudget`, as the API's decimal string.
     pub spend_usd: &'static str,
+    /// `Budget.LastUpdatedTime` for `DescribeBudget` as the API sends it
+    /// (epoch seconds, a JSON number); `None` leaves the field out
+    /// (2026-11-16).
+    pub budget_last_updated: Option<&'static str>,
     /// Operation names (`StopInstances`, `Publish`, `AmazonSSM.PutParameter`,
     /// ...) that fail.
     pub fail: Vec<&'static str>,
@@ -372,6 +376,7 @@ impl Default for Fleet {
             public_ip: Some("203.0.113.7"),
             ssm: std::collections::HashMap::new(),
             spend_usd: "12.34",
+            budget_last_updated: None,
             fail: Vec::new(),
         }
     }
@@ -441,8 +446,11 @@ impl Fleet {
             "AWSBudgetServiceGateway.DescribeBudget" => LoopbackResponse::json(
                 200,
                 format!(
-                    r#"{{"Budget":{{"BudgetName":"tv","BudgetType":"COST","TimeUnit":"MONTHLY","CalculatedSpend":{{"ActualSpend":{{"Amount":"{}","Unit":"USD"}}}}}}}}"#,
-                    self.spend_usd
+                    r#"{{"Budget":{{"BudgetName":"tv","BudgetType":"COST","TimeUnit":"MONTHLY","CalculatedSpend":{{"ActualSpend":{{"Amount":"{}","Unit":"USD"}}}}{}}}}}"#,
+                    self.spend_usd,
+                    self.budget_last_updated
+                        .map(|v| format!(r#","LastUpdatedTime":{v}"#))
+                        .unwrap_or_default()
                 ),
             ),
             "DescribeInstances" => {

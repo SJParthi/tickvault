@@ -2763,6 +2763,52 @@ Calendar scope remains the existing normal-day09:15–15:40 comparison window an
 
 The new supervisor and the worker can reach the final page together. A shared cold-path process lock now covers their actual paged-marker read, report and marker write. When persistence succeeds, the second caller observes the marker and does not page again. A failed marker write retains the existing loud retry behavior; it does not install an in-memory suppression flag. The lock is acquired within the existing off-worker boundary, but the caller can still wait on disk. This is not a cross-process transaction or a guarantee against lost markers, read/write errors, process crashes or repeated pages after persistence failure. The existing single-instance boundary and persisted marker retain their separate roles.
 
+### §12.15.17 (2026-11-16) — shadow split of diverged cells (no verdict change)
+
+**Authority and provenance.** A coordinator-assigned fix from the 16 Nov
+audit, recorded HERE before the code ships, per the rule-file-first law. No
+new owner quote is claimed: like §12.15.11 it is a stored measurement only,
+and it changes nothing a verdict, marker or page reads. Changing any of those
+from it needs a fresh dated owner quote recorded in this file first.
+
+**The gap (measured on the box, 16 Nov 2026).** The daily check reports about
+187,000 diverged cells a day, and the daily row could not say which of them
+are a known vendor shape. Dhan often starts a minute at the previous minute's
+last price and files packets by its own clock. Of 123,115 diverged `open`
+cells, 115,756 had Dhan's open equal to our previous existing bar's close; of
+the `high` cells, 23,605 equalled `max(our high, previous close)`; of the
+`low` cells, 22,435 equalled `min(our low, previous close)`; and 11,978 of
+12,000 `close` cells lay inside our own `[low, high]`. Index (`IDX_I`) bars
+are also absent from Dhan's tape from 15:30 IST, so those minutes land in
+`missing_rest`.
+
+| Aspect | Locked value |
+|---|---|
+| Classifier | `classify_boundary(field, our bar, our previous EXISTING bar of the same instrument, Dhan value, tolerance)`: `open` consistent at our open or our previous close; `high` at our high or `max(our high, previous close)`; `low` at our low or `min(our low, previous close)`; `close` at our close or inside our own `[low, high]` (`WithinBar`: a bound, not proof the two closes are one trade). Integer paise, the comparator's tolerance. An absent previous bar, or any non-finite price on either bar, explains nothing |
+| Previous bar | the last live bar of the same `(security_id, segment)` in the comparison's key order: a minute we hold no bar for is skipped, another instrument's bar is never taken. One local, no allocation, O(1) per cell inside the existing walk |
+| Columns | on `dhan_live_crossverify_daily`, LONG, through the existing `ALTER ADD COLUMN IF NOT EXISTS` self-heal, OUTSIDE the DEDUP key: `cells_boundary_consistent`, `cells_close_within_bar` (part of the consistent count), `cells_unexplained`, `cells_unexplained_{open,high,low,close}`, `index_missing_rest_closing` |
+| Invariant | `cells_boundary_consistent + cells_unexplained == cells_diverged`; the per-field unexplained counts add up to `cells_unexplained` (randomized test) |
+| Index closing count | `missing_rest` minutes on `IDX_I` from 15:30 IST to the session end. Counted BESIDE `missing_rest`, which is unchanged |
+| Log | the "Dhan 1-minute cross-verification finished" line carries the same eight counts |
+| Unchanged | `cells_diverged`, `missing_rest`, the outcome (`decide_outcome`), `is_catastrophic_divergence`, the day marker, the S3 hold, every page, alarm, metric filter and EMF name |
+
+**Measuring query:**
+`SELECT trading_date_ist, outcome, cells_diverged, cells_boundary_consistent, cells_close_within_bar, cells_unexplained, cells_unexplained_open, cells_unexplained_high, cells_unexplained_low, cells_unexplained_close, index_missing_rest_closing, attempt_at FROM dhan_live_crossverify_daily WHERE trading_date_ist > dateadd('d', -30, now()) ORDER BY trading_date_ist, attempt_at`.
+
+**⚠ Honest limits (Rule 11).**
+- "Consistent" means the vendor value fits a known vendor shape, not that
+  our capture is right: our previous close could itself be wrong and still
+  explain Dhan's open.
+- `WithinBar` is a bound: any price our bar traded through satisfies it.
+- The previous bar is our previous EXISTING bar; when we missed one or more
+  minutes, Dhan's previous close may be a price we never captured, and the
+  cell reads unexplained (keeps more unexplained, never fewer).
+- The first minute of an instrument's day has no previous bar, so a diverged
+  09:15 `open`, `high` or `low` is always unexplained.
+- Rows written before this change carry no value in the new columns.
+
+**What a PR that violates §12.15.17 looks like (REJECT):** using the split to change `cells_diverged`, the verdict, `is_catastrophic_divergence`, the marker, the S3 hold or any page or alarm without a fresh dated owner quote recorded here first; putting any of the columns in a DEDUP key; counting a NaN, infinite or absent neighbour as consistent; taking another instrument's bar as the previous bar; dropping `index_missing_rest_closing` minutes from `missing_rest` or excusing them from the verdict.
+
 ## §12.16 — 2026-11-13: order host TLS pre-warm, connect-only, default OFF
 
 ### §12.16.0 The verbatim owner decision (AskUserQuestion card, 2026-11-13)

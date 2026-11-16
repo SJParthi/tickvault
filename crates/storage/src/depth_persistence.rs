@@ -3104,7 +3104,14 @@ impl DepthWriter {
         {
             self.staged = spare;
         }
-        self.staged.reserve_presize();
+        // 2026-11-16: count the fresh reserve (no spare, or a smaller one).
+        if self.staged.reserve_presize() {
+            self.flush_counters.stage_presize_fresh.increment(1);
+            self.flush_counters.stage_presize_fresh_count = self
+                .flush_counters
+                .stage_presize_fresh_count
+                .saturating_add(1);
+        }
     }
 
     /// PF-4b: the name table the running instrument's cached name came
@@ -4607,6 +4614,14 @@ struct DepthFlushCounters {
     stage_grow: metrics::Counter,
     /// PF-4b: a ninth name table cut a staged batch early (local only).
     stage_pin_cut: metrics::Counter,
+    /// Hand-offs that found no staged spare waiting (or a smaller one) and
+    /// reserved and touched a fresh pre-sized batch on the drain
+    /// (2026-11-16, `tv_depth_stage_presize_fresh_total`, local `/metrics`
+    /// only). One relaxed add on that branch only.
+    stage_presize_fresh: metrics::Counter,
+    /// The same count kept on the writer, so a test can read it without a
+    /// recorder.
+    stage_presize_fresh_count: u64,
 }
 
 impl DepthFlushCounters {
@@ -4637,6 +4652,13 @@ impl DepthFlushCounters {
             rows_dropped: metrics::counter!("tv_depth_rows_dropped_total", "feed" => feed),
             stage_grow: metrics::counter!("tv_depth_stage_grow_total", "feed" => feed),
             stage_pin_cut: metrics::counter!("tv_depth_stage_pin_cut_total", "feed" => feed),
+            // 2026-11-16: registered at 0 when the writer is built (boot).
+            stage_presize_fresh: {
+                let c = metrics::counter!("tv_depth_stage_presize_fresh_total", "feed" => feed);
+                c.increment(0);
+                c
+            },
+            stage_presize_fresh_count: 0,
         }
     }
 }
@@ -8947,10 +8969,18 @@ mod tests {
                     .expect("lane has room");
             }
             let handed = w.staged.as_ptr_for_test();
+            let fresh_before = w.flush_counters.stage_presize_fresh_count;
             w.append_book_row(&book_row(&p[..5], &q[..5], &o[..5], 1))
                 .expect("append");
             w.flush().expect("hand off");
             let case = format!("spare {spare:?}");
+            // 2026-11-16: the fresh-reserve count moves only when no spare of
+            // the pre-size was waiting.
+            assert_eq!(
+                w.flush_counters.stage_presize_fresh_count - fresh_before,
+                u64::from(!kept),
+                "{case}: fresh reserve counted only without a pre-sized spare"
+            );
             assert!(w.staged.is_empty(), "{case}");
             assert_ne!(w.staged.as_ptr_for_test(), handed, "{case}: a new batch");
             let (rows, values) = w.staged.capacities_for_test();

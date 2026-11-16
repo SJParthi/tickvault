@@ -1101,6 +1101,161 @@ pub struct DivergenceProfile {
     pub extremes_live_outside: i64,
     /// Missing-live minutes on an index (each one is real, see the verdict).
     pub missing_live_index: i64,
+
+    // ---- SHADOW split of the diverged cells (§12.15.17, 2026-11-16) ------
+    //
+    // A measurement only: none of these feeds `cells_diverged`, the outcome,
+    // the marker or any page. `boundary_consistent + unexplained` always
+    // equals `open + high + low + close` (every diverged cell is classified
+    // exactly once by [`classify_boundary`]).
+    /// Diverged cells whose vendor value fits a known vendor shape
+    /// ([`classify_boundary`] returned anything but `Unexplained`): a minute
+    /// started at our previous existing bar's close, or a close inside our
+    /// own bar. Includes [`Self::close_within_bar`].
+    pub boundary_consistent: i64,
+    /// Of `boundary_consistent`, the `close` cells whose vendor value lies
+    /// inside our own `[low, high]`. A BOUND, not proof: it says the vendor's
+    /// close is a price our own bar traded through, not that the two closes
+    /// are the same trade.
+    pub close_within_bar: i64,
+    /// Diverged cells no known vendor shape explains.
+    pub unexplained: i64,
+    /// Unexplained `open` cells.
+    pub unexplained_open: i64,
+    /// Unexplained `high` cells.
+    pub unexplained_high: i64,
+    /// Unexplained `low` cells.
+    pub unexplained_low: i64,
+    /// Unexplained `close` cells.
+    pub unexplained_close: i64,
+    /// Of `missing_rest`, the index (`IDX_I`) minutes from 15:30 IST to the
+    /// session end. Dhan publishes no closing-session index bars, so these are
+    /// expected. Counted beside `missing_rest`, never instead of it.
+    pub index_missing_rest_closing: i64,
+}
+
+/// 15:30:00 IST as seconds-of-day: the start of the closing session, from
+/// which Dhan publishes no index (`IDX_I`) minute bars (measured on the box
+/// 16 Nov 2026). Used only to count those `missing_rest` minutes apart.
+pub const INDEX_CLOSING_SESSION_START_SECS_OF_DAY_IST: i64 = 15 * 3600 + 30 * 60;
+
+/// How one diverged cell's vendor value relates to our own bars (§12.15.17,
+/// a SHADOW measurement: it never changes `cells_diverged` or the verdict).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CellClass {
+    /// The vendor value equals ours within the tolerance. Never reached for a
+    /// diverged cell; returned so the function is total.
+    OwnValue,
+    /// open/high/low: the vendor value is what Dhan prints when it starts the
+    /// minute at the previous minute's last price: open equals our previous
+    /// existing bar's close, high equals `max(our high, previous close)`, low
+    /// equals `min(our low, previous close)`.
+    PrevCloseCarry,
+    /// close: the vendor value lies inside our own `[low, high]`. A bound, not
+    /// proof that both sides closed on the same trade.
+    WithinBar,
+    /// No known vendor shape explains the value.
+    Unexplained,
+}
+
+impl CellClass {
+    /// `true` for every class except [`CellClass::Unexplained`]. Pure, O(1).
+    #[must_use]
+    pub const fn is_consistent(self) -> bool {
+        !matches!(self, Self::Unexplained)
+    }
+}
+
+/// `true` when every rupee field of `b` is finite. A bar built through
+/// [`PaiseBar::from_rupees`] always is; one built by hand may not be, and a
+/// non-finite neighbour is never taken as evidence.
+fn bar_is_finite(b: &PaiseBar) -> bool {
+    b.open_r.is_finite() && b.high_r.is_finite() && b.low_r.is_finite() && b.close_r.is_finite()
+}
+
+/// Whether two paise values agree within `tolerance_paise`, the same test
+/// the comparator uses (`|a - b| <= tolerance`). A negative tolerance reads
+/// as 0. Overflow-free (`abs_diff`). Pure, O(1).
+fn within_tolerance(a: i64, b: i64, tolerance_paise: i64) -> bool {
+    a.abs_diff(b) <= u64::try_from(tolerance_paise).unwrap_or(0)
+}
+
+/// Classify one cell's vendor value against our own bar and the instrument's
+/// previous EXISTING live bar (§12.15.17, a SHADOW measurement).
+///
+/// * `open`: consistent when the vendor value equals our open, or our
+///   previous bar's close.
+/// * `high`: our high, or `max(our high, previous close)`.
+/// * `low`: our low, or `min(our low, previous close)`.
+/// * `close`: our close, or anywhere inside our own `[low, high]`
+///   (`WithinBar`, a bound, not proof).
+///
+/// "Equals" is integer paise within `tolerance_paise`, as the comparator.
+/// An absent previous bar, or one with a non-finite price, explains nothing;
+/// an own bar with a non-finite price is `Unexplained`. An unknown field name
+/// is `Unexplained`. Pure, O(1), no allocation.
+#[must_use]
+pub fn classify_boundary(
+    field: &str,
+    live: &PaiseBar,
+    prev_live: Option<&PaiseBar>,
+    rest_paise: i64,
+    tolerance_paise: i64,
+) -> CellClass {
+    if !bar_is_finite(live) {
+        return CellClass::Unexplained;
+    }
+    let prev_close = prev_live
+        .filter(|p| bar_is_finite(p))
+        .map(|p| p.close_paise);
+    let near = |v: i64| within_tolerance(rest_paise, v, tolerance_paise);
+    let (own, carried) = match field {
+        "open" => (live.open_paise, prev_close),
+        "high" => (live.high_paise, prev_close.map(|c| c.max(live.high_paise))),
+        "low" => (live.low_paise, prev_close.map(|c| c.min(live.low_paise))),
+        "close" => {
+            if near(live.close_paise) {
+                return CellClass::OwnValue;
+            }
+            let tol = tolerance_paise.max(0);
+            let inside = rest_paise >= live.low_paise.saturating_sub(tol)
+                && rest_paise <= live.high_paise.saturating_add(tol);
+            return if inside {
+                CellClass::WithinBar
+            } else {
+                CellClass::Unexplained
+            };
+        }
+        _ => return CellClass::Unexplained,
+    };
+    if near(own) {
+        CellClass::OwnValue
+    } else if carried.is_some_and(near) {
+        CellClass::PrevCloseCarry
+    } else {
+        CellClass::Unexplained
+    }
+}
+
+impl DivergenceProfile {
+    /// Counts one diverged cell's [`CellClass`] (§12.15.17). Pure, O(1).
+    fn record_class(&mut self, field: &str, class: CellClass) {
+        if class.is_consistent() {
+            self.boundary_consistent = self.boundary_consistent.saturating_add(1);
+            if class == CellClass::WithinBar {
+                self.close_within_bar = self.close_within_bar.saturating_add(1);
+            }
+            return;
+        }
+        self.unexplained = self.unexplained.saturating_add(1);
+        let slot = match field {
+            "open" => &mut self.unexplained_open,
+            "high" => &mut self.unexplained_high,
+            "low" => &mut self.unexplained_low,
+            _ => &mut self.unexplained_close,
+        };
+        *slot = slot.saturating_add(1);
+    }
 }
 
 impl DivergenceProfile {
@@ -1288,11 +1443,24 @@ pub fn compare_day_in_scope(
         .saturating_add(SESSION_OPEN_SECS_OF_DAY_IST.saturating_mul(NANOS_PER_SEC));
 
     let all_keys: BTreeSet<&Key> = live_map.keys().chain(rest_map.keys()).collect();
+    // §12.15.17 shadow: the last live bar seen in key order. Keys iterate per
+    // instrument in minute order, so while it belongs to the same instrument
+    // it is that instrument's previous EXISTING live bar (a minute we hold no
+    // bar for is skipped, not treated as a break). One local, no allocation,
+    // O(1) per key.
+    let mut prev_live: Option<&SideBar> = None;
+    let mut index_missing_rest_closing: i64 = 0;
+    let closing_session_start = day_start_ist_nanos
+        .saturating_add(INDEX_CLOSING_SESSION_START_SECS_OF_DAY_IST.saturating_mul(NANOS_PER_SEC));
 
     for key in all_keys {
         let (security_id, segment, minute) = (key.0, key.1.clone(), key.2);
+        let prev_bar = prev_live
+            .filter(|p| p.security_id == key.0 && p.segment == key.1)
+            .map(|p| &p.bar);
         match (live_map.get(key), rest_map.get(key)) {
             (Some(l), Some(r)) => {
+                prev_live = Some(l);
                 minutes_compared = minutes_compared.saturating_add(1);
                 for ((field, l_paise, l_r), (_, r_paise, r_r)) in
                     l.bar.fields().iter().zip(r.bar.fields().iter())
@@ -1306,6 +1474,12 @@ pub fn compare_day_in_scope(
                     if diff > tolerance_paise {
                         cells_diverged = cells_diverged.saturating_add(1);
                         divergence_profile.record(field, *l_paise, *r_paise);
+                        // §12.15.17: SHADOW only, never touches the counts
+                        // the verdict reads.
+                        divergence_profile.record_class(
+                            field,
+                            classify_boundary(field, &l.bar, prev_bar, *r_paise, tolerance_paise),
+                        );
                         findings.push(DhanLiveXverifyCellFinding {
                             run_ts_ist_nanos,
                             trading_date_ist_nanos: day_start_ist_nanos,
@@ -1450,7 +1624,13 @@ pub fn compare_day_in_scope(
                 });
             }
             (Some(l), None) => {
+                prev_live = Some(l);
                 missing_rest = missing_rest.saturating_add(1);
+                // §12.15.17: Dhan publishes no closing-session index bars;
+                // counted apart, `missing_rest` unchanged.
+                if segment == INDEX_SEGMENT && minute >= closing_session_start {
+                    index_missing_rest_closing = index_missing_rest_closing.saturating_add(1);
+                }
                 findings.push(DhanLiveXverifyCellFinding {
                     run_ts_ist_nanos,
                     trading_date_ist_nanos: day_start_ist_nanos,
@@ -1571,6 +1751,7 @@ pub fn compare_day_in_scope(
         volume_capture_min_pct,
         divergence_profile: DivergenceProfile {
             missing_live_index,
+            index_missing_rest_closing,
             ..divergence_profile
         },
     }
@@ -1747,6 +1928,14 @@ pub fn daily_row(
         planned_instrument_minutes: attempt.coverage.planned_instrument_minutes,
         covered_instrument_minutes: attempt.coverage.covered_instrument_minutes,
         coverage_known: attempt.coverage.known,
+        cells_boundary_consistent: cmp.divergence_profile.boundary_consistent,
+        cells_close_within_bar: cmp.divergence_profile.close_within_bar,
+        cells_unexplained: cmp.divergence_profile.unexplained,
+        cells_unexplained_open: cmp.divergence_profile.unexplained_open,
+        cells_unexplained_high: cmp.divergence_profile.unexplained_high,
+        cells_unexplained_low: cmp.divergence_profile.unexplained_low,
+        cells_unexplained_close: cmp.divergence_profile.unexplained_close,
+        index_missing_rest_closing: cmp.divergence_profile.index_missing_rest_closing,
     }
 }
 
@@ -6533,6 +6722,384 @@ mod tests {
                 err.msg, REST_BODY_OVER_CAP_MSG,
                 "content_length={content_length}"
             );
+        }
+    }
+
+    // =======================================================================
+    // §12.15.17 (2026-11-16): the SHADOW split of the diverged cells
+    // =======================================================================
+
+    const EQ: &str = "NSE_EQ";
+
+    fn rupees(r: f64) -> i64 {
+        to_paise(r).expect("finite")
+    }
+
+    /// The live case that started this (ADANIENT, 16 Nov): Dhan starts the
+    /// 09:16 minute at our 09:15 close, 2685.90. Its open and low differ from
+    /// ours and both are consistent; `cells_diverged` and the verdict are
+    /// exactly what they were.
+    #[test]
+    fn shadow_split_adanient_open_at_the_previous_close_is_consistent() {
+        let b0915 = bar(2680.0, 2690.0, 2678.0, 2685.9);
+        let ours_0916 = bar(2687.0, 2689.0, 2686.0, 2688.0);
+        let dhan_0916 = bar(2685.9, 2689.0, 2685.9, 2688.0);
+        let live = [
+            side_in(25, EQ, OPEN, b0915),
+            side_in(25, EQ, OPEN + 60, ours_0916),
+        ];
+        let rest = [
+            side_in(25, EQ, OPEN, b0915),
+            side_in(25, EQ, OPEN + 60, dhan_0916),
+        ];
+        let cmp = compare_day(&live, &rest, DAY_START_NANOS, RUN_TS, 0, false);
+        assert_eq!(cmp.cells_diverged, 2, "open and low differ");
+        assert_eq!(cmp.outcome, DhanLiveXverifyOutcome::Diverged, "unchanged");
+        let p = cmp.divergence_profile;
+        assert_eq!(p.boundary_consistent, 2, "{p:?}");
+        assert_eq!(p.unexplained, 0, "{p:?}");
+        assert_eq!(p.close_within_bar, 0);
+        // The direct call agrees.
+        assert_eq!(
+            classify_boundary("open", &ours_0916, Some(&b0915), rupees(2685.9), 0),
+            CellClass::PrevCloseCarry
+        );
+    }
+
+    /// Only `Unexplained` is not consistent.
+    #[test]
+    fn test_is_consistent_is_false_only_for_unexplained() {
+        for (class, want) in [
+            (CellClass::OwnValue, true),
+            (CellClass::PrevCloseCarry, true),
+            (CellClass::WithinBar, true),
+            (CellClass::Unexplained, false),
+        ] {
+            assert_eq!(class.is_consistent(), want, "{class:?}");
+        }
+    }
+
+    /// A value that is neither our open nor the previous close is unexplained,
+    /// and so is the same value with no previous bar at all.
+    #[test]
+    fn test_classify_boundary_value_outside_both_is_unexplained() {
+        let prev = bar(2680.0, 2690.0, 2678.0, 2685.9);
+        let ours = bar(2687.0, 2689.0, 2686.0, 2688.0);
+        assert_eq!(
+            classify_boundary("open", &ours, Some(&prev), rupees(2684.0), 0),
+            CellClass::Unexplained
+        );
+        assert_eq!(
+            classify_boundary("open", &ours, None, rupees(2685.9), 0),
+            CellClass::Unexplained,
+            "an absent previous bar explains nothing"
+        );
+        assert_eq!(
+            classify_boundary("open", &ours, Some(&prev), rupees(2687.0), 0),
+            CellClass::OwnValue
+        );
+        assert_eq!(
+            classify_boundary("volume", &ours, Some(&prev), rupees(2687.0), 0),
+            CellClass::Unexplained
+        );
+        let live = [
+            side_in(25, EQ, OPEN, prev),
+            side_in(25, EQ, OPEN + 60, ours),
+        ];
+        let rest = [
+            side_in(25, EQ, OPEN, prev),
+            side_in(25, EQ, OPEN + 60, bar(2684.0, 2689.0, 2686.0, 2688.0)),
+        ];
+        let p = compare_day(&live, &rest, DAY_START_NANOS, RUN_TS, 0, false).divergence_profile;
+        assert_eq!((p.unexplained, p.unexplained_open), (1, 1), "{p:?}");
+        assert_eq!(p.boundary_consistent, 0);
+    }
+
+    /// high: consistent only at our high or `max(our high, previous close)`;
+    /// low at our low or `min(our low, previous close)`.
+    #[test]
+    fn shadow_split_high_above_both_is_unexplained_and_the_carry_is_consistent() {
+        let ours = bar(2687.0, 2689.0, 2686.0, 2688.0);
+        let prev_below = bar(2680.0, 2690.0, 2678.0, 2685.9);
+        assert_eq!(
+            classify_boundary("high", &ours, Some(&prev_below), rupees(2695.0), 0),
+            CellClass::Unexplained,
+            "above both our high and the previous close"
+        );
+        assert_eq!(
+            classify_boundary("high", &ours, Some(&prev_below), rupees(2685.9), 0),
+            CellClass::Unexplained,
+            "the previous close below our high is not the carried high"
+        );
+        let prev_above = bar(2690.0, 2693.0, 2689.5, 2692.0);
+        assert_eq!(
+            classify_boundary("high", &ours, Some(&prev_above), rupees(2692.0), 0),
+            CellClass::PrevCloseCarry
+        );
+        assert_eq!(
+            classify_boundary("low", &ours, Some(&prev_below), rupees(2685.9), 0),
+            CellClass::PrevCloseCarry
+        );
+        assert_eq!(
+            classify_boundary("low", &ours, Some(&prev_above), rupees(2692.0), 0),
+            CellClass::Unexplained,
+            "the previous close above our low is not the carried low"
+        );
+        assert_eq!(
+            classify_boundary("low", &ours, Some(&prev_below), rupees(2670.0), 0),
+            CellClass::Unexplained
+        );
+        // Within the comparator's tolerance counts as equal, beyond it does not.
+        assert_eq!(
+            classify_boundary("high", &ours, Some(&prev_above), rupees(2692.03), 5),
+            CellClass::PrevCloseCarry
+        );
+        assert_eq!(
+            classify_boundary("high", &ours, Some(&prev_above), rupees(2692.06), 5),
+            CellClass::Unexplained
+        );
+        let live = [
+            side_in(25, EQ, OPEN, prev_below),
+            side_in(25, EQ, OPEN + 60, ours),
+        ];
+        let rest = [
+            side_in(25, EQ, OPEN, prev_below),
+            side_in(25, EQ, OPEN + 60, bar(2687.0, 2695.0, 2686.0, 2688.0)),
+        ];
+        let p = compare_day(&live, &rest, DAY_START_NANOS, RUN_TS, 0, false).divergence_profile;
+        assert_eq!((p.unexplained, p.unexplained_high), (1, 1), "{p:?}");
+    }
+
+    /// close: a value inside our own `[low, high]` is `WithinBar` (a bound),
+    /// outside it is unexplained.
+    #[test]
+    fn shadow_split_close_inside_our_bar_is_within_bar_outside_is_unexplained() {
+        let ours = bar(2687.0, 2689.0, 2686.0, 2688.0);
+        assert_eq!(
+            classify_boundary("close", &ours, None, rupees(2686.5), 0),
+            CellClass::WithinBar
+        );
+        assert_eq!(
+            classify_boundary("close", &ours, None, rupees(2689.5), 0),
+            CellClass::Unexplained
+        );
+        let live = [side_in(25, EQ, OPEN, ours)];
+        let rest = [side_in(25, EQ, OPEN, bar(2687.0, 2689.0, 2686.0, 2686.5))];
+        let p = compare_day(&live, &rest, DAY_START_NANOS, RUN_TS, 0, false).divergence_profile;
+        assert_eq!((p.boundary_consistent, p.close_within_bar), (1, 1), "{p:?}");
+    }
+
+    /// The previous bar is the instrument's previous EXISTING live bar: a
+    /// minute we hold nothing for is skipped, and another instrument's bar is
+    /// never taken.
+    #[test]
+    fn shadow_split_previous_bar_skips_a_gap_minute_and_never_crosses_instruments() {
+        let b0915 = bar(2680.0, 2690.0, 2678.0, 2685.9);
+        let ours_0917 = bar(2687.0, 2689.0, 2686.0, 2688.0);
+        // 09:16: Dhan has a bar, we do not (a gap on our side).
+        let dhan_0916 = bar(2686.0, 2687.0, 2685.0, 2686.5);
+        let live = [
+            side_in(25, EQ, OPEN, b0915),
+            side_in(25, EQ, OPEN + 120, ours_0917),
+            // A second instrument whose first bar opens at sid 25's last close.
+            side_in(26, EQ, OPEN, bar(500.0, 501.0, 499.0, 500.5)),
+        ];
+        let rest = [
+            side_in(25, EQ, OPEN, b0915),
+            side_in(25, EQ, OPEN + 60, dhan_0916),
+            side_in(25, EQ, OPEN + 120, bar(2685.9, 2689.0, 2686.0, 2688.0)),
+            side_in(26, EQ, OPEN, bar(2688.0, 501.0, 499.0, 500.5)),
+        ];
+        let cmp = compare_day(&live, &rest, DAY_START_NANOS, RUN_TS, 0, false);
+        assert_eq!(cmp.cells_diverged, 2, "sid 25 open at 09:17, sid 26 open");
+        let p = cmp.divergence_profile;
+        assert_eq!(p.boundary_consistent, 1, "09:17 open = 09:15 close: {p:?}");
+        assert_eq!(
+            (p.unexplained, p.unexplained_open),
+            (1, 1),
+            "sid 26's first minute has no previous bar of its own: {p:?}"
+        );
+    }
+
+    /// I-P1-11: the same `security_id` in another segment is another
+    /// instrument. Keys sort `IDX_I` before `NSE_EQ`, so sid 25's index bar is
+    /// walked right before sid 25's first equity minute; it must never be
+    /// taken as that minute's previous bar.
+    #[test]
+    fn shadow_split_previous_bar_never_crosses_segments_of_one_security_id() {
+        let idx_0915 = bar(2680.0, 2690.0, 2678.0, 2685.9);
+        let ours_eq_0915 = bar(2687.0, 2689.0, 2686.0, 2688.0);
+        let live = [
+            side_in(25, INDEX_SEGMENT, OPEN, idx_0915),
+            side_in(25, EQ, OPEN, ours_eq_0915),
+        ];
+        let rest = [
+            side_in(25, INDEX_SEGMENT, OPEN, idx_0915),
+            // Dhan's equity open equals the INDEX bar's close.
+            side_in(25, EQ, OPEN, bar(2685.9, 2689.0, 2686.0, 2688.0)),
+        ];
+        let cmp = compare_day(&live, &rest, DAY_START_NANOS, RUN_TS, 0, false);
+        assert_eq!(cmp.cells_diverged, 1, "the equity open only");
+        let p = cmp.divergence_profile;
+        assert_eq!(
+            (p.boundary_consistent, p.unexplained, p.unexplained_open),
+            (0, 1, 1),
+            "another segment's bar is not this instrument's previous bar: {p:?}"
+        );
+    }
+
+    /// A non-finite neighbour (or own bar) is never evidence.
+    #[test]
+    fn shadow_split_non_finite_neighbour_is_never_consistent() {
+        let ours = bar(2687.0, 2689.0, 2686.0, 2688.0);
+        let mut nan_prev = bar(2680.0, 2690.0, 2678.0, 2685.9);
+        nan_prev.close_r = f64::NAN;
+        assert_eq!(
+            classify_boundary("open", &ours, Some(&nan_prev), rupees(2685.9), 0),
+            CellClass::Unexplained
+        );
+        let mut inf_prev = bar(2680.0, 2690.0, 2678.0, 2685.9);
+        inf_prev.high_r = f64::INFINITY;
+        assert_eq!(
+            classify_boundary("low", &ours, Some(&inf_prev), rupees(2685.9), 0),
+            CellClass::Unexplained
+        );
+        let mut nan_own = ours;
+        nan_own.low_r = f64::NAN;
+        assert_eq!(
+            classify_boundary("close", &nan_own, None, rupees(2686.5), 0),
+            CellClass::Unexplained
+        );
+    }
+
+    /// Dhan publishes no index bars from 15:30: those `missing_rest` minutes
+    /// are counted apart, and `missing_rest` itself is unchanged.
+    #[test]
+    fn shadow_split_counts_index_missing_rest_in_the_closing_session_apart() {
+        let b = bar(100.0, 101.0, 99.0, 100.5);
+        let closing = INDEX_CLOSING_SESSION_START_SECS_OF_DAY_IST;
+        let live = [
+            side(13, closing - 60, b),
+            side(13, closing, b),
+            side(13, closing + 9 * 60, b),
+            side_in(25, EQ, closing + 5 * 60, b),
+        ];
+        let cmp = compare_day(&live, &[], DAY_START_NANOS, RUN_TS, 0, false);
+        assert_eq!(cmp.missing_rest, 4, "unchanged");
+        assert_eq!(
+            cmp.divergence_profile.index_missing_rest_closing, 2,
+            "15:30 and 15:39 on the index only"
+        );
+        let row = daily_row(&cmp, DAY_START_NANOS, RUN_TS, 0, TEST_ATTEMPT);
+        assert_eq!(row.index_missing_rest_closing, 2);
+        assert_eq!(row.missing_rest, 4);
+    }
+
+    /// The daily row carries every shadow count.
+    #[test]
+    fn shadow_split_reaches_the_daily_row() {
+        let b0915 = bar(2680.0, 2690.0, 2678.0, 2685.9);
+        let live = [
+            side_in(25, EQ, OPEN, b0915),
+            side_in(25, EQ, OPEN + 60, bar(2687.0, 2689.0, 2686.0, 2688.0)),
+        ];
+        let rest = [
+            side_in(25, EQ, OPEN, b0915),
+            side_in(25, EQ, OPEN + 60, bar(2685.9, 2695.0, 2670.0, 2686.5)),
+        ];
+        let cmp = compare_day(&live, &rest, DAY_START_NANOS, RUN_TS, 0, false);
+        let row = daily_row(&cmp, DAY_START_NANOS, RUN_TS, 0, TEST_ATTEMPT);
+        assert_eq!(row.cells_diverged, 4);
+        assert_eq!(
+            row.cells_boundary_consistent, 2,
+            "open carry + close in bar"
+        );
+        assert_eq!(row.cells_close_within_bar, 1);
+        assert_eq!(row.cells_unexplained, 2);
+        assert_eq!(
+            (
+                row.cells_unexplained_open,
+                row.cells_unexplained_high,
+                row.cells_unexplained_low,
+                row.cells_unexplained_close
+            ),
+            (0, 1, 1, 0)
+        );
+    }
+
+    /// Strategy for one minute of one instrument: whether each side has a bar,
+    /// and the bar's open, close and wicks in whole rupees (a small range, so
+    /// a carried previous close happens often).
+    fn shadow_slot() -> impl proptest::strategy::Strategy<Value = (u8, [i32; 4], [i32; 4])> {
+        let prices = [0i32..5, 0i32..5, 0i32..3, 0i32..3];
+        (0u8..4, prices.clone(), prices)
+    }
+
+    fn shadow_bar(p: [i32; 4]) -> PaiseBar {
+        let (o, c) = (100.0 + f64::from(p[0]), 100.0 + f64::from(p[1]));
+        bar(o, o.max(c) + f64::from(p[2]), o.min(c) - f64::from(p[3]), c)
+    }
+
+    proptest::proptest! {
+        /// Every diverged cell is classified exactly once, and the counts the
+        /// verdict reads are exactly what an independent field-by-field count
+        /// says, i.e. what they were before the classifier existed.
+        #[test]
+        fn proptest_shadow_split_adds_up_and_never_changes_cells_diverged(
+            slots in proptest::collection::vec(shadow_slot(), 0..40),
+            tol in 0i64..150,
+        ) {
+            let mut live = Vec::new();
+            let mut rest = Vec::new();
+            let mut expected_diverged = 0i64;
+            for (i, (shape, lp, rp)) in slots.iter().enumerate() {
+                let sid = 1 + i64::try_from(i % 2).unwrap_or(0);
+                let secs = OPEN + i64::try_from(i / 2).unwrap_or(0) * 60;
+                let (lb, rb) = (shadow_bar(*lp), shadow_bar(*rp));
+                if *shape != 1 {
+                    live.push(side_in(sid, EQ, secs, lb));
+                }
+                if *shape != 2 {
+                    rest.push(side_in(sid, EQ, secs, rb));
+                }
+                if *shape != 1 && *shape != 2 {
+                    for (a, b) in [
+                        (lb.open_paise, rb.open_paise),
+                        (lb.high_paise, rb.high_paise),
+                        (lb.low_paise, rb.low_paise),
+                        (lb.close_paise, rb.close_paise),
+                    ] {
+                        if a.abs_diff(b) > u64::try_from(tol).unwrap_or(0) {
+                            expected_diverged += 1;
+                        }
+                    }
+                }
+            }
+            let cmp = compare_day(&live, &rest, DAY_START_NANOS, RUN_TS, tol, false);
+            let p = cmp.divergence_profile;
+            proptest::prop_assert_eq!(cmp.cells_diverged, expected_diverged);
+            proptest::prop_assert_eq!(p.boundary_consistent + p.unexplained, cmp.cells_diverged);
+            proptest::prop_assert_eq!(
+                p.unexplained_open + p.unexplained_high + p.unexplained_low + p.unexplained_close,
+                p.unexplained
+            );
+            proptest::prop_assert!(p.close_within_bar <= p.boundary_consistent);
+            proptest::prop_assert!(p.close_within_bar <= p.close);
+            // The verdict is the one the independent count gives.
+            let expected_outcome = decide_outcome(
+                &VerdictCounts {
+                    minutes_compared: cmp.minutes_compared,
+                    rows_seen: !live.is_empty() || !rest.is_empty(),
+                    cells_diverged: expected_diverged,
+                    missing_live_traded: cmp.missing_live_traded,
+                    missing_live_index: p.missing_live_index,
+                    missing_rest: cmp.missing_rest,
+                    late_excused: cmp.late_excused,
+                    missing_live_unjudged: cmp.missing_live_unjudged,
+                },
+                strict_inputs(false),
+            );
+            proptest::prop_assert_eq!(cmp.outcome, expected_outcome);
         }
     }
 }

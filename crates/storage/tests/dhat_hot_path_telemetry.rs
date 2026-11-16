@@ -21,8 +21,8 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
 use std::time::Instant;
 
 use tickvault_storage::hot_path_telemetry::{
-    ALL_STAGES, HotTask, RollingMax, STAGE_BUCKETS, Stage, beat_at, record_stage_nanos,
-    record_stage_nanos_weighted, stage_quantiles,
+    ALL_STAGES, DRAIN_ARM_STAGES, HotTask, RollingMax, STAGE_BUCKETS, Stage, StageTimer, beat_at,
+    record_stage_nanos, record_stage_nanos_weighted, stage_quantiles, stage_snapshot,
 };
 
 mod dhat_support;
@@ -68,6 +68,35 @@ fn dhat_record_stage_nanos_and_stage_quantiles_are_zero_allocation() {
         (0, 0),
         "record_stage_nanos / beat_at allocated on the frame path"
     );
+
+    // 2026-11-16: the frame drain's non-frame arms time themselves with a
+    // `StageTimer` (two clock reads, the stage's atomics on drop). Every arm
+    // stage records, and none of it allocates.
+    let arm_before = DRAIN_ARM_STAGES.map(|s| stage_snapshot(s).count);
+    let (a_bytes, a_blocks) = dhat_support::measure_with_phantom_retry(
+        BUDGET_BYTES,
+        BUDGET_BLOCKS,
+        || {},
+        || {
+            for i in 0..10_000_usize {
+                let arm = StageTimer::start(DRAIN_ARM_STAGES[i % DRAIN_ARM_STAGES.len()]);
+                beat_at(HotTask::FrameDrain, arm.started_at());
+                drop(arm);
+            }
+        },
+    );
+    assert_eq!(
+        (a_bytes, a_blocks),
+        (0, 0),
+        "StageTimer allocated on the frame drain"
+    );
+    for (stage, before) in DRAIN_ARM_STAGES.iter().zip(arm_before) {
+        assert!(
+            stage_snapshot(*stage).count > before,
+            "{} recorded nothing",
+            stage.as_str()
+        );
+    }
 
     // The publisher-thread quantile maths, in its own window.
     let mut window = [0u64; STAGE_BUCKETS];

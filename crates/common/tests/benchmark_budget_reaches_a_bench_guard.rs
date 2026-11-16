@@ -176,6 +176,52 @@ fn every_latency_budget_reaches_at_least_one_benchmark() {
     );
 }
 
+/// The budget key `bench-gate.sh` would pick for `bench`: the FIRST
+/// `[budgets]` key in file order that matches it.
+fn first_budget_key<'a>(bench: &str, budgets: &'a [String]) -> Option<&'a str> {
+    budgets
+        .iter()
+        .find(|k| matches(bench, k))
+        .map(String::as_str)
+}
+
+/// 2026-11-16: the feed-drain frame kinds each resolve to their OWN key.
+/// `feed_drain_main_feed` is a substring of every main-feed bench id, so a
+/// more specific key must sit above it in the TOML or it never applies.
+#[test]
+fn feed_drain_benches_take_their_own_budget_key_first() {
+    let (budgets, _) = budget_keys();
+    let ids = normalised_bench_ids();
+    for (bench, key) in [
+        (
+            "feed_drain_main_feed_frame_4_wrong_day_skip",
+            "feed_drain_main_feed_frame_4_wrong_day",
+        ),
+        (
+            "feed_drain_main_feed_frame_4_wrong_day_written",
+            "feed_drain_main_feed_frame_4_wrong_day",
+        ),
+        (
+            "feed_drain_main_feed_frame_4_quotes",
+            "feed_drain_main_feed",
+        ),
+        (
+            "feed_drain_main_feed_full_frame_4",
+            "feed_drain_main_feed_full",
+        ),
+    ] {
+        assert!(
+            ids.iter().any(|b| b == bench),
+            "no benchmark `{bench}` found under crates/*/benches"
+        );
+        assert_eq!(
+            first_budget_key(bench, &budgets),
+            Some(key),
+            "`{bench}` must be gated by `{key}`, the first matching key in file order"
+        );
+    }
+}
+
 #[test]
 fn claude_md_states_the_real_budget_key_count() {
     let (budgets, elements) = budget_keys();

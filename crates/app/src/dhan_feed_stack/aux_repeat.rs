@@ -107,6 +107,22 @@ impl LiveIngest {
                 .is_some_and(|r| r.dedup_mut().holds(key.0, key.1))
     }
 
+    /// The repeat filter's tallies on this ingest: skipped repeats, untracked
+    /// writes past the 25,000-key cap, keys remembered (2026-11-16). The
+    /// `feed_drain` bench reads it to prove its wrong-day flavours took the
+    /// path. O(1), no allocation.
+    #[must_use]
+    pub fn aux_repeat_counts(&self) -> tickvault_storage::feed_aux_repeat::AuxRepeatCounts {
+        self.aux_repeat.counts()
+    }
+
+    /// `feed_aux_packets` rows this ingest's tick writer has appended over its
+    /// life (2026-11-16, read by the `feed_drain` bench). O(1).
+    #[must_use]
+    pub const fn aux_rows_appended(&self) -> u64 {
+        self.writer.aux_rows_appended()
+    }
+
     /// Marks a WAL replay gap (frames before this one were not re-read): on
     /// the candle fold (plan item 47, no volume baseline carries across) and
     /// on the aux repeat filter (Quote 61 review, 2026-11-14: live may have

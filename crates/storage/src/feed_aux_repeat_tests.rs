@@ -339,3 +339,33 @@ fn test_check_always_write_writes_a_repeat_and_does_not_pin_the_key() {
     assert!(always(&mut g, &base(DAY_10AM + 1)));
     assert!(feed(&mut g, KEY, &base(DAY_10AM + 2)), "the pin stays");
 }
+
+/// 2026-11-16: the filter's own tallies follow every skip and every
+/// untracked write, and survive a `clear` (only the keys are forgotten).
+#[test]
+fn test_counts_tally_skips_untracked_writes_and_tracked_keys() {
+    let mut f = filter();
+    assert_eq!(f.counts(), AuxRepeatCounts::default());
+    assert!(feed(&mut f, KEY, &base(DAY_10AM)));
+    assert!(!feed(&mut f, KEY, &base(DAY_10AM + 1)));
+    assert!(!feed(&mut f, KEY, &base(DAY_10AM + 2)));
+    assert_eq!(
+        f.counts(),
+        AuxRepeatCounts {
+            skipped: 2,
+            untracked: 0,
+            tracked: 1
+        }
+    );
+    for id in 1..FEED_AUX_REPEAT_MAX_TRACKED as u64 {
+        assert!(feed(&mut f, (id, 2), &base(DAY_10AM)));
+    }
+    assert!(feed(&mut f, (u64::MAX, 2), &base(DAY_10AM)));
+    assert!(feed(&mut f, (u64::MAX, 2), &base(DAY_10AM + 1)));
+    let full = f.counts();
+    assert_eq!(full.untracked, 2);
+    assert_eq!(full.tracked, FEED_AUX_REPEAT_MAX_TRACKED);
+    f.clear();
+    assert_eq!(f.counts().tracked, 0);
+    assert_eq!((f.counts().skipped, f.counts().untracked), (2, 2));
+}

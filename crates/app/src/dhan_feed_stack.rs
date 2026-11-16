@@ -154,6 +154,7 @@ use tickvault_storage::depth_persistence::{
     DepthRow, DepthWriter, MAX_DEPTH_BOOK_LEVELS, depth_segment_label,
 };
 use tickvault_storage::feed_aux_persistence::{AuxPacketKind, AuxPacketRow, aux_price};
+use tickvault_storage::hot_path_telemetry::{Stage as HotPathStage, StageTimer};
 use tickvault_storage::tick_persistence::TickWriter;
 use tickvault_storage::ws_frame_spill::{WalEndpoint, WsFrameSpill, WsType};
 use tickvault_trading::candles::multi_tf_aggregator::AGGREGATOR_MAX_SLOTS;
@@ -7781,10 +7782,13 @@ async fn run_frame_drain(
             // instrument sit unflushed below the size threshold waiting for a
             // next tick which, at the close, never comes.
             _ = flush_timer.tick() => {
+                // 2026-11-16: every non-frame arm times itself (one stage per arm).
+                let arm = StageTimer::start(HotPathStage::DrainArmFlush);
                 // Beats with no frames too, so an idle drain reads fresh and a
                 // wedged one reads stale within one publish interval.
-                tickvault_storage::hot_path_telemetry::beat(
+                tickvault_storage::hot_path_telemetry::beat_at(
                     tickvault_storage::hot_path_telemetry::HotTask::FrameDrain,
+                    arm.started_at(),
                 );
                 flush_ticks_and_record(&mut ingest, &feed_health);
                 // ITEM 57b: depth on every `DEPTH_TIMER_FLUSH_EVERY_TICKS`th
@@ -7815,6 +7819,7 @@ async fn run_frame_drain(
             // O(1). The slots are visited from the idle arm below, a bounded
             // step at a time, and the sweep's totals are reported there.
             _ = catchup_timer.tick() => {
+                let _arm = StageTimer::start(HotPathStage::DrainArmCatchup);
                 // A real clock reading for the cutoff cap, so the cap keeps
                 // moving in a quiet market (the top-volume timers that did
                 // this until 2026-10-22 are gone, plan item 62).
@@ -7839,6 +7844,7 @@ async fn run_frame_drain(
             // behind ~22,000 hash inserts. The arm takes no batch while the
             // pre-sized queue is full, so the bounded channel holds the rest.
             maybe_seed = seed_rx.recv(), if !seed_closed && ingest.seed_queue_has_room() => {
+                let _arm = StageTimer::start(HotPathStage::DrainArmSeed);
                 if let Some(batch) = maybe_seed {
                     let now_millis = u64::try_from(
                         chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0).max(0) / 1_000_000,
@@ -7858,6 +7864,7 @@ async fn run_frame_drain(
                 }
             }
             _ = silence_timer.tick() => {
+                let _arm = StageTimer::start(HotPathStage::DrainArmSilence);
                 // Daily rollover for the ranking state, checked on the 30s arm
                 // rather than given a timer of its own: it is a cheap integer
                 // compare, and a whole tokio timer to fire once a day would be
@@ -8400,6 +8407,7 @@ async fn run_frame_drain(
             // idle work — the baseline rolls and the catch-up seal too — one
             // bounded step per call, in the priority `step_idle_work` states.
             () = tokio::task::coop::consume_budget(), if ingest.idle_work_pending() => {
+                let _arm = StageTimer::start(HotPathStage::DrainArmIdle);
                 let step = ingest.step_idle_work();
                 if let Some((requested, added)) = step.seed_done {
                     log_seed_batch_done(&ingest, requested, added);
@@ -26491,9 +26499,10 @@ mod tests {
         );
     }
 
-    // B3 (2026-11-13) drain_frame_post tests live in
-    // `dhan_feed_stack/tests/b3_post_frame_tests.rs` (size pin).
+    // B3 (2026-11-13) drain_frame_post tests and the 2026-11-16 drain arm
+    // stage tests live in `dhan_feed_stack/tests/` (size pin).
     mod b3_post_frame_tests;
+    mod drain_arm_timing_tests;
 
     /// The drain must exit on the shutdown signal **while the ring is still
     /// open** — the exit path that did not exist until 2026-08-14.
