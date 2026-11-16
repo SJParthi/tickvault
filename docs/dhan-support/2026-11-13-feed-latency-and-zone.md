@@ -125,6 +125,7 @@ This rules out the account, the token, the network and our server.
 3. **Is an exchange-to-socket delay of 0.75 s median and 1.7 s p99 expected for the Live Market Feed, and which stage takes most of that time** — the exchange broadcast, your own aggregation or update interval, or your fan-out to clients?
 4. **Would running our client from one specific availability zone in ap-south-1 measurably reduce the delivery delay or the connection setup time?** If so, which zone (by zone ID)?
 5. **Does any Live Market Feed packet carry an exchange timestamp finer than whole seconds?** That would let us measure the delay without the 1-second rounding described above.
+6. **GIFT Nifty sends no Live Market Feed packets.** *(Added 2026-11-16.)* We subscribe `GIFTNIFTY`, SecurityId `5024`, segment `IDX_I` (from your instrument master), on the main Live Market Feed every trading day. On every trading day from 2026-11-02 to 2026-11-16 we received **zero** packets for it, while every other index on the same socket (117 of them) produced a live bar in every minute. On the same days, `POST /v2/charts/intraday` with interval `"1"` returns a full day of 1-minute bars for SecurityId `5024`. Is GIFT Nifty available on the Live Market Feed? If it is, which segment and SecurityId should we subscribe? If not, please confirm so we stop subscribing it.
 
 ---
 
