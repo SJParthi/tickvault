@@ -11,6 +11,23 @@
 //! Cold path only — every call here is a network round trip or a pure helper
 //! on a fixed-size digest. Nothing here runs on the frame drain or the WAL
 //! writer thread.
+//!
+//! ⚠ CHANGED 2026-11-16: every PutObject here is sent with an unsigned
+//! payload (`x-amz-content-sha256: UNSIGNED-PAYLOAD`, through
+//! `customize().disable_payload_signing()`). For an in-memory body the SDK
+//! otherwise hashed the whole body (SHA-256) inside `send()`, on a runtime
+//! worker, in one poll, so a ~64 MiB WAL segment held that worker and every
+//! timer on the main runtime waited (Assumed the cause of the measured
+//! `main_runtime_lag` spikes of 10 to 114 ms after the close; not re-measured
+//! yet). Integrity is unchanged: the request still
+//! carries the precomputed `x-amz-checksum-sha256`, which S3 checks against
+//! the body it received (a mismatch is refused), the transport is TLS, and
+//! every read-back check a caller made before (`head`, comparing length and
+//! checksum) is unchanged. Not every caller reads back: the daily export's
+//! small records (amend, counts, manifest, DONE) rely on the S3 checksum
+//! check alone, as they did before. A file body (`put_if_absent_path`) was
+//! already sent unsigned by the SDK (a streamed body cannot be hashed before
+//! signing); the explicit call there only makes that visible.
 
 use std::io::Write;
 use std::path::Path;
@@ -263,6 +280,10 @@ impl S3Cold {
             .if_none_match("*")
             .checksum_sha256(sha256_b64)
             .body(body)
+            // Unsigned payload: no SHA-256 of the body on a runtime worker;
+            // S3 still checks `x-amz-checksum-sha256` (see module header).
+            .customize()
+            .disable_payload_signing()
             .send()
             .await
             .context("S3 conditional PutObject (If-None-Match + checksum_sha256) failed")?;
@@ -289,7 +310,12 @@ impl S3Cold {
         for (k, v) in metadata {
             req = req.metadata(*k, v.as_str());
         }
-        req.send()
+        // Unsigned payload: the SDK would otherwise SHA-256 the whole in-memory
+        // body inside `send()`, on a runtime worker (64 MiB segments stalled
+        // main-runtime timers). S3 still checks `x-amz-checksum-sha256`.
+        req.customize()
+            .disable_payload_signing()
+            .send()
             .await
             .map_err(|e| anyhow::anyhow!("{}", aws_sdk_s3::error::DisplayErrorContext(&e)))
             .context("S3 conditional PutObject (If-None-Match + checksum_sha256) failed")?;

@@ -44,6 +44,13 @@
 //! session). The read, gzip and hashing run in `spawn_blocking` — never on
 //! the frame drain or the WAL writer thread. Cold path throughout.
 //!
+//! ⚠ CHANGED 2026-11-16: the S3 SDK also hashed the body. With an in-memory
+//! body it signed the request over a SHA-256 of the whole gzip inside
+//! `send()`, on a main-runtime worker, in one poll (Assumed the cause of the
+//! 10 to 114 ms main-runtime lag spikes measured 15:40 to 15:57 IST). The
+//! upload now sends an unsigned payload (`s3_cold`); the precomputed
+//! `x-amz-checksum-sha256` and the HeadObject check are unchanged.
+//!
 //! Each file's S3 calls run under one time budget (60 s plus one second per
 //! MiB of gzip, audit SUP-5, 2026-10-11). Past it the file is a counted
 //! failure with no marker, retried on the next pass, so a hung connection
