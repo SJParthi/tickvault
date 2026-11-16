@@ -51,8 +51,9 @@
 //! exported one once an unexported one was dropped in that pass. So a second
 //! copy happens only when no unexported candidate of that pass was dropped
 //! before it: every candidate was already exported, or the others were held,
-//! failed or had their table's WAL behind (the owner decision on that copy
-//! stays open).
+//! failed or had their table's WAL behind. The owner accepted that copy on
+//! 2026-11-16 (Quote 62), with a weekly size check and a re-ask past 20 GB a
+//! month.
 //!
 //! `tick_quotes` and `feed_aux_packets` are stamped with ARRIVAL time, and
 //! the main feed stays connected after the close, so their hours keep taking
