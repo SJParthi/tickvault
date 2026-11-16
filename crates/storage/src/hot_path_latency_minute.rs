@@ -82,7 +82,9 @@
 //!
 //! 9 rows a minute (one per stage, `ALL_STAGES`; 8 until B3 added
 //! `drain_frame_post` on 2026-11-13), ~4,300 rows a day at the box's ~8
-//! hours. QuestDB only;
+//! hours. ⚠ CHANGED 2026-11-16: 14 rows a minute (the five `drain_arm_*`
+//! stages, one per non-frame arm of the frame drain), ~6,700 rows a day.
+//! QuestDB only;
 //! nothing goes to `/metrics` except one drop counter.
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -698,7 +700,8 @@ impl HotPathLatencyMinuteWriter {
     }
 
     /// Appends one row. Cold path: one per stage a minute (`ALL_STAGES`, eight
-    /// since PR DP-6, nine since B3 added `drain_frame_post`), on the writer thread.
+    /// since PR DP-6, nine since B3 added `drain_frame_post`, 14 since the
+    /// `drain_arm_*` stages on 2026-11-16), on the writer thread.
     ///
     /// # Errors
     /// Propagates ILP buffer errors.
@@ -1303,6 +1306,27 @@ mod tests {
         assert!(!over_1024ns_is_meaningful(Stage::MainRuntimeLag));
         assert!(!over_1024ns_is_meaningful(Stage::ReaderRuntimeLag));
         assert!(!over_1024ns_is_meaningful(Stage::ReceiptToFold));
+    }
+
+    // Regression: 2026-11-16: the drain's non-frame arms were timed
+    // nowhere, so a 2.8 ms ring wait could not be named. Each arm stage gets
+    // its own row every minute, with its samples and maximum.
+    #[test]
+    fn test_regression_every_minute_has_one_row_per_drain_arm_stage() {
+        use crate::hot_path_telemetry::DRAIN_ARM_STAGES;
+        for (n, stage) in DRAIN_ARM_STAGES.into_iter().enumerate() {
+            let mut acc = MinuteAccumulator::new();
+            let mut w = window_with(stage, 2_000, 120);
+            w.stage_buckets[stage as usize][bucket_index(2_800_000)] += 1;
+            w.stage_max_nanos[stage as usize] = 2_800_000;
+            let _ = acc.absorb(minute(0), &w);
+            let rows = acc.rows().expect("rows");
+            assert_eq!(rows.len(), ALL_STAGES.len());
+            let row = row_of(&rows, stage);
+            assert_eq!(row.samples, 121, "stage #{n} {}", stage.as_str());
+            assert_eq!(row.max_ns, 2_800_000);
+            assert!(row.stage.as_str().starts_with("drain_arm_"));
+        }
     }
 
     // Regression: 2026-11-13 (B3): the frame arm's post-fold hand-offs were

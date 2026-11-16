@@ -209,19 +209,23 @@ impl StagedBatch {
     #[must_use]
     pub(crate) fn presized() -> Self {
         let mut batch = Self::new();
-        batch.reserve_presize();
+        let _fresh = batch.reserve_presize();
         batch
     }
 
     /// Reserves to the pre-size and touches the new pages, when smaller. One
     /// allocation at most; a batch already that big costs one compare.
-    pub(crate) fn reserve_presize(&mut self) {
+    /// Returns `true` when it reserved (2026-11-16: the writer counts a
+    /// fresh reserve on the drain's hand-off, `tv_tick_stage_presize_fresh_total`).
+    pub(crate) fn reserve_presize(&mut self) -> bool {
         if self.rows.capacity() < TICK_STAGED_ROWS_PRESIZE {
             let have = self.rows.len();
             self.rows
                 .reserve_exact(TICK_STAGED_ROWS_PRESIZE.saturating_sub(have));
             prefault(&mut self.rows);
+            return true;
         }
+        false
     }
 
     /// Rows staged (refused ones included).

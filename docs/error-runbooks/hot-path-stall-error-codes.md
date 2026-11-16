@@ -54,6 +54,25 @@ every second), and `tv_hot_path_stage_max_ns_75s` keeps the largest
 finished step for 75 s and then also reads 0. A 0 there means "nothing
 finished", never "the step was instant".
 
+**⚠ CHANGED 2026-11-16 (the drain's other arms are now timed).** On 16 Nov
+`ring_dwell` and `receipt_to_fold` read over 2 ms in most minutes while
+`drain_main_frame` and `drain_frame_post` stayed under 0.4 ms, so frames were
+waiting behind drain work no stage timed. Five more stages, measurement only
+and never paged, 1 ms budget (over-budget count and p99 warn only), one per
+non-frame arm of the drain, each recorded once per firing from the arm's
+start to its end: `drain_arm_flush` (the 500 ms flush arm: tick and depth
+hand-offs, a spare-less reserve and page touch, the gauge publish),
+`drain_arm_catchup` (the 5 s catch-up timer arm, O(1)), `drain_arm_seed`
+(the seed receive arm, O(1)), `drain_arm_silence` (the 30 s silence arm:
+the O(tracked) silence scan and its logging) and `drain_arm_idle` (one idle
+step: a catch-up seal step or a seed step). A frame that arrives while an
+arm runs waits for the whole arm, so the arm's time is also in that frame's
+`ring_dwell`; do not add them. Still untimed: the shutdown arm (once per
+process) and the ring-tail arms that only end the loop. Two counters show
+where a hand-off had no spare batch and reserved a fresh one on the drain:
+`tv_tick_stage_presize_fresh_total` and `tv_depth_stage_presize_fresh_total`
+(local `/metrics` only).
+
 **Log-only line, same code.** When a stage's p99 over the last second passes
 its budget, the first second of that episode writes one `warn!` with
 `code = HOT-PATH-STALL-01`, `source = "stage_p99_over_budget"` and fields
