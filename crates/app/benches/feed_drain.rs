@@ -24,6 +24,19 @@
 //!   - `feed_drain/main_feed_full_frame_4_own_nodepth` (PF-4b, 2026-11-06):
 //!     the same Full bytes with no inline depth, so the depth share of the
 //!     Full drain is a measurement (budget: the Full key it matches).
+//!   - `feed_drain/main_feed_frame_4_wrong_day_skip` and
+//!     `feed_drain/main_feed_frame_4_wrong_day_written` (2026-11-16): four
+//!     Ticker packets (NSE_FNO) whose last trade is from the previous IST day,
+//!     so every packet takes the `no_trade_today` path (PR #2250, Quote 61)
+//!     instead of the fold. The repeat filter is first filled to its
+//!     25,000-key cap through the same drain (untimed). `skip`: every packet
+//!     repeats its contract's remembered row and is skipped. `written`: three
+//!     packets change their contract's value (written, updated in place) and
+//!     one is a NEW contract past the cap (written, untracked). The counts
+//!     are asserted before the timing, so neither case can pass without the
+//!     path running. Budget per tick: `feed_drain_main_feed_frame_4_wrong_day`
+//!     (1 µs, above `feed_drain_main_feed` in the TOML: bench-gate takes the
+//!     first matching key).
 //!   - `feed_drain/depth20_frame_4x20`: one frame stacking four depth-20
 //!     packets (80 levels). Budget per level.
 //!   - `feed_drain/depth200_packet`: one depth-200 packet (200 levels).
@@ -245,6 +258,136 @@ fn depth200_frame(n: u64) -> CapturedFrame {
         DhanEndpointType::Depth200,
         1_000 + n,
     )
+}
+
+/// First security id of the wrong-day contracts (2026-11-16 benches). Far
+/// above every id the other workloads use.
+const WRONG_DAY_BASE_ID: u32 = 900_000;
+/// Contracts the repeat filter is filled with: its whole cap.
+const WRONG_DAY_TRACKED: u32 = 25_000;
+/// Ticker packets per untimed fill frame.
+const WRONG_DAY_FILL_PER_FRAME: u32 = 100;
+/// A trade time from the previous IST day, so the day rule refuses the fold
+/// and writes the packet to `feed_aux_packets` as `no_trade_today`.
+const WRONG_DAY_LTT: u32 = SESSION_EPOCH_SECS - 86_400;
+/// The price every contract is filled with (the `skip` frames repeat it).
+const WRONG_DAY_FILL_LTP: f32 = 100.0;
+
+/// One 16-byte Ticker packet on NSE_FNO (segment 2).
+fn fno_ticker_packet(security_id: u32, ltp: f32, ltt: u32) -> [u8; 16] {
+    let mut p = [0u8; 16];
+    p[0] = 2; // Ticker
+    p[1..3].copy_from_slice(&16u16.to_le_bytes());
+    p[3] = 2; // NSE_FNO
+    p[4..8].copy_from_slice(&security_id.to_le_bytes());
+    p[8..12].copy_from_slice(&ltp.to_le_bytes());
+    p[12..16].copy_from_slice(&ltt.to_le_bytes());
+    p
+}
+
+/// A main-feed frame of wrong-day Ticker packets, received at the session
+/// receipt instant (the same day the drain is told).
+fn wrong_day_frame(packets: impl Iterator<Item = (u32, f32)>, seq: u64) -> CapturedFrame {
+    let mut bytes = Vec::with_capacity(16 * WRONG_DAY_FILL_PER_FRAME as usize);
+    for (id, ltp) in packets {
+        bytes.extend_from_slice(&fno_ticker_packet(id, ltp, WRONG_DAY_LTT));
+    }
+    let mut frame = captured(bytes, DhanEndpointType::MainFeed, seq);
+    frame.received_at_nanos = SESSION_RECEIPT_NANOS;
+    frame
+}
+
+/// The untimed fill: every one of the 25,000 contracts once, at the fill
+/// price, 100 packets a frame.
+fn wrong_day_fill_frames() -> Vec<CapturedFrame> {
+    (0..WRONG_DAY_TRACKED / WRONG_DAY_FILL_PER_FRAME)
+        .map(|f| {
+            let first = WRONG_DAY_BASE_ID + f * WRONG_DAY_FILL_PER_FRAME;
+            wrong_day_frame(
+                (first..first + WRONG_DAY_FILL_PER_FRAME).map(|id| (id, WRONG_DAY_FILL_LTP)),
+                u64::from(f),
+            )
+        })
+        .collect()
+}
+
+/// The `n`-th tracked contract (wraps over the 25,000).
+fn tracked_id(n: u64) -> u32 {
+    WRONG_DAY_BASE_ID + u32::try_from(n % u64::from(WRONG_DAY_TRACKED)).unwrap_or(0)
+}
+
+/// `skip`: four tracked contracts at their remembered price.
+fn wrong_day_skip_frame(n: u64) -> CapturedFrame {
+    wrong_day_frame(
+        (0..4u64).map(|j| (tracked_id(n * 4 + j), WRONG_DAY_FILL_LTP)),
+        1_000 + n,
+    )
+}
+
+/// `written`: three tracked contracts at a new price (no contract repeats
+/// inside one pool, so each differs from its remembered row) and one new
+/// contract past the cap.
+fn wrong_day_written_frame(n: u64) -> CapturedFrame {
+    let new_price = 200.0 + (n % 97) as f32 * 0.05;
+    let fresh = WRONG_DAY_BASE_ID + WRONG_DAY_TRACKED + u32::try_from(n).unwrap_or(0);
+    wrong_day_frame(
+        (0..3u64)
+            .map(|j| (tracked_id(n * 3 + j), new_price))
+            .chain(std::iter::once((fresh, new_price))),
+        1_000 + n,
+    )
+}
+
+/// A fresh ingest whose repeat filter holds all 25,000 contracts, filled
+/// through the real drain (untimed).
+fn wrong_day_filled_ingest(fill: &[CapturedFrame]) -> LiveIngest {
+    let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
+    for (i, frame) in (0u64..).zip(fill) {
+        let _ = drain_main_feed_frame(&mut ingest, frame, SESSION_RECEIPT_NANOS, i, counters());
+    }
+    ingest
+}
+
+/// Untimed non-vacuity for the two wrong-day workloads: the fill tracked the
+/// whole cap, nothing folded, and each case moved the counts it claims.
+fn assert_wrong_day_frames(
+    fill: &[CapturedFrame],
+    skip: &[CapturedFrame],
+    written: &[CapturedFrame],
+) {
+    let tracked = usize::try_from(WRONG_DAY_TRACKED).unwrap_or(usize::MAX);
+    let packets = TICKS_PER_MAIN_FRAME * FRAME_POOL;
+    for (case, frames) in [("skip", skip), ("written", written)] {
+        let mut ingest = wrong_day_filled_ingest(fill);
+        let filled = ingest.aux_repeat_counts();
+        assert_eq!(filled.tracked, tracked, "the fill must reach the cap");
+        assert_eq!((filled.skipped, filled.untracked), (0, 0));
+        let rows_before = ingest.aux_rows_appended();
+        assert_eq!(rows_before, u64::from(WRONG_DAY_TRACKED));
+        for (i, frame) in (0u64..).zip(frames) {
+            let out = drain_main_feed_frame(
+                &mut ingest,
+                frame,
+                SESSION_RECEIPT_NANOS,
+                1_000 + i,
+                counters(),
+            );
+            assert_eq!(out.folded, 0, "a wrong-day packet never folds");
+            assert_eq!(out.tick_packets, TICKS_PER_MAIN_FRAME);
+            assert_eq!((out.unparseable, out.abandoned_bytes), (0, 0));
+        }
+        let after = ingest.aux_repeat_counts();
+        let written_rows = ingest.aux_rows_appended() - rows_before;
+        if case == "skip" {
+            assert_eq!(after.skipped, packets, "every skip packet is a repeat");
+            assert_eq!((written_rows, after.untracked), (0, 0));
+        } else {
+            assert_eq!(written_rows, packets, "every written packet is a row");
+            assert_eq!(after.skipped, 0);
+            assert_eq!(after.untracked, FRAME_POOL, "one new contract a frame");
+        }
+        assert_eq!(after.tracked, tracked, "the map never grows past the cap");
+    }
 }
 
 /// Times `iters` drain calls, rebuilding the ingest every `FRAME_POOL`
@@ -521,6 +664,55 @@ fn bench_feed_drain(c: &mut Criterion) {
                         8,
                     )
                 },
+                |ingest, frame, i| {
+                    black_box(drain_main_feed_frame(
+                        ingest,
+                        black_box(frame),
+                        SESSION_RECEIPT_NANOS,
+                        1_000 + i,
+                        drain_counters,
+                    ));
+                },
+            )
+        });
+    });
+
+    // 2026-11-16: the wrong-day (`no_trade_today`) path with the repeat
+    // filter full. `skip` keeps one filled ingest for every iteration (a
+    // skipped packet stages nothing, so nothing grows); `written` rebuilds
+    // and refills it every pool, outside the timer.
+    let fill = wrong_day_fill_frames();
+    let skip_frames: Vec<CapturedFrame> = (0..FRAME_POOL).map(wrong_day_skip_frame).collect();
+    let written_frames: Vec<CapturedFrame> = (0..FRAME_POOL).map(wrong_day_written_frame).collect();
+    assert_wrong_day_frames(&fill, &skip_frames, &written_frames);
+    let mut skip_ingest = wrong_day_filled_ingest(&fill);
+    c.bench_function("feed_drain/main_feed_frame_4_wrong_day_skip", |b| {
+        b.iter_custom(|iters| {
+            let start = Instant::now();
+            for i in 0..iters {
+                let k = usize::try_from(i % FRAME_POOL).unwrap_or(0);
+                black_box(drain_main_feed_frame(
+                    &mut skip_ingest,
+                    black_box(&skip_frames[k]),
+                    SESSION_RECEIPT_NANOS,
+                    1_000 + i,
+                    drain_counters,
+                ));
+            }
+            start.elapsed()
+        });
+    });
+    assert_eq!(
+        skip_ingest.aux_rows_appended(),
+        u64::from(WRONG_DAY_TRACKED),
+        "the timed skip loop wrote no row"
+    );
+    c.bench_function("feed_drain/main_feed_frame_4_wrong_day_written", |b| {
+        b.iter_custom(|iters| {
+            run_timed(
+                iters,
+                &written_frames,
+                || wrong_day_filled_ingest(&fill),
                 |ingest, frame, i| {
                     black_box(drain_main_feed_frame(
                         ingest,

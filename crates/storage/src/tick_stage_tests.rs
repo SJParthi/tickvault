@@ -282,13 +282,16 @@ fn test_len_is_empty_and_capacity_track_the_rows_and_reserve_presize_only_grows(
     let mut b = StagedBatch::new();
     assert!(b.is_empty());
     assert_eq!(b.len(), 0);
-    b.reserve_presize();
+    assert!(b.reserve_presize(), "an empty batch reserves");
     assert!(b.capacity() >= TICK_STAGED_ROWS_PRESIZE);
     let cap = b.capacity();
     b.push(StagedRow::Refused { capture_seq: 1 });
     assert_eq!(b.len(), 1);
     assert!(!b.is_empty());
-    b.reserve_presize();
+    assert!(
+        !b.reserve_presize(),
+        "a pre-sized batch does not reserve again"
+    );
     assert_eq!(
         b.capacity(),
         cap,

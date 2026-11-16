@@ -410,6 +410,13 @@ pub(crate) const fn stage_label(stage: Stage) -> &'static str {
         Stage::MetricsUpkeep => "Metrics housekeeping run (diagnostic)",
         Stage::DrainMainTick => "Processing one main-feed tick (average within its frame)",
         Stage::DrainFramePost => "Work after a frame (hand-offs and upkeep)",
+        // 2026-11-16: one per non-frame arm of the frame drain; a queued
+        // frame waits for the whole arm.
+        Stage::DrainArmFlush => "Feed processor: 500 ms hand-off run (diagnostic)",
+        Stage::DrainArmCatchup => "Feed processor: 5 s candle sweep start (diagnostic)",
+        Stage::DrainArmSeed => "Feed processor: new-contract intake (diagnostic)",
+        Stage::DrainArmSilence => "Feed processor: 30 s silent-contract check (diagnostic)",
+        Stage::DrainArmIdle => "Feed processor: one idle-time step (diagnostic)",
     }
 }
 
@@ -487,7 +494,7 @@ fn speed_section(
     Section {
         title: "Operational stall budgets — since process start",
         note: "These colours compare p99 bucket bounds with broad stall budgets, not \
-               the strict one-microsecond target. Runtime delays and metrics upkeep are diagnostics. \
+               the strict one-microsecond target. Runtime delays, metrics upkeep and the feed processor's timer and idle runs are diagnostics. \
                Receipt-to-fold overlaps earlier frame stages, and later frames' ring dwell \
                and receipt-to-fold include the time an earlier frame spent in work after a \
                frame (drain_frame_post); durations must not be added. \
@@ -522,6 +529,12 @@ fn strict_target_section(stages: &[StageFigures; ALL_STAGES.len()]) -> Section {
             Stage::DrainMainTick => "main-feed tick; the frame's decode/fold/append time over its ticks (per-tick average within each frame)",
             Stage::DrainFramePost => "received frame, all endpoints; the frame arm's work after the fold (size-trigger and depth hand-offs, upkeep), plus a depth frame's own handling; not in this frame's other stages; later frames' ring_dwell and receipt_to_fold include the wait it causes; do not add them",
             Stage::MainRuntimeLag | Stage::ReaderRuntimeLag | Stage::MetricsUpkeep => return None,
+            // 2026-11-16: a drain arm is not a per-tick step; diagnostic only.
+            Stage::DrainArmFlush
+            | Stage::DrainArmCatchup
+            | Stage::DrainArmSeed
+            | Stage::DrainArmSilence
+            | Stage::DrainArmIdle => return None,
         };
         let (bound, recorded_failure) = if stage_samples_valid(fig) {
             match stage_quantiles(&fig.buckets).map(|q| q.p99) {

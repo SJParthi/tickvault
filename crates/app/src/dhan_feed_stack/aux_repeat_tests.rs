@@ -713,3 +713,21 @@ fn test_append_no_trade_today_writes_an_exact_repeat_from_an_unbacked_frame() {
         "a later WAL-backed repeat is skipped: the flag is per frame"
     );
 }
+
+/// 2026-11-16: the two read-outs the `feed_drain` bench asserts on follow the
+/// drain: a written first row, a skipped repeat, the writer's aux row count.
+#[test]
+fn test_aux_repeat_counts_and_aux_rows_appended_follow_the_drain() {
+    let mut ingest = ingest();
+    assert_eq!(ingest.aux_rows_appended(), 0);
+    assert_eq!(ingest.aux_repeat_counts().tracked, 0);
+    let _ = drain(&mut ingest, 1, ticker(2, 66_422, 142.5, YESTERDAY), at(0));
+    let _ = drain(&mut ingest, 2, ticker(2, 66_422, 142.5, YESTERDAY), at(1));
+    let _ = drain(&mut ingest, 3, ticker(2, 66_422, 142.5, YESTERDAY), at(2));
+    assert_eq!(ingest.aux_rows_appended(), 1);
+    let counts = ingest.aux_repeat_counts();
+    assert_eq!(
+        (counts.skipped, counts.untracked, counts.tracked),
+        (2, 0, 1)
+    );
+}

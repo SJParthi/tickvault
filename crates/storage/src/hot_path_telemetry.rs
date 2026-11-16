@@ -64,7 +64,7 @@
 //! | [`record_stage_nanos`] | O(1): fixed threshold classification, one bin increment, sum/max and optional stall atomics |
 //! | [`beat_at`] / [`busy_begin_at`] / [`busy_end_at`] | O(1): one `Instant` subtraction, one or two relaxed stores |
 //! | [`record_receipt_to_fold_nanos`] | O(1): the stage record plus one more relaxed add into the fine histogram |
-//! | [`publish_once`] | O(stages × buckets + tasks): 9 × 29 raw bins projected to 28 historical bins, plus 6 tasks and 58 fine bins; fixed arrays on the publisher thread, no allocation |
+//! | [`publish_once`] | O(stages × buckets + tasks): 14 × 29 raw bins (9 until the drain arm stages, 2026-11-16) projected to 28 historical bins, plus 6 tasks and 58 fine bins; fixed arrays on the publisher thread, no allocation |
 //! | [`stage_quantiles`] / [`fine_quantiles`] | O(buckets) = O(28) / O(58), on the publisher thread only, never on the frame path |
 //! | [`RollingMax::push`] | O(window) = O(75) per stage, once a second, on the publisher thread only; a fixed array, no allocation |
 //!
@@ -222,10 +222,39 @@ pub enum Stage {
     /// arm's hand-offs (every 500 ms) are NOT in it; a stall there shows
     /// as the next frames' `ring_dwell`.
     DrainFramePost = 8,
+    /// The frame drain's 500 ms FLUSH arm, start to end (2026-11-16, the
+    /// 16 Nov finding: ring dwell and receipt-to-fold read over 2 ms in 292
+    /// of 376 minutes while every timed frame stage stayed under 0.4 ms, so
+    /// frames waited behind something the drain did that no stage timed).
+    /// It covers the tick hand-off (`flush_ticks_and_record`, including a
+    /// fresh staged batch's reserve and page touch when no spare came back),
+    /// the depth hand-off or park retry, and the fold-depth gauges. Every
+    /// frame that arrives while it runs waits in the ring for its full
+    /// length, so this time is also inside those frames' `ring_dwell`; do
+    /// not add the two. Recorded once per firing ([`StageTimer`]); never
+    /// paged.
+    DrainArmFlush = 9,
+    /// The drain's catch-up seal TIMER arm (every 5 s): one wall-clock read
+    /// and the O(1) start of a sliced sweep. The sweep's steps are in
+    /// [`Stage::DrainArmIdle`]. Never paged.
+    DrainArmCatchup = 10,
+    /// The drain's late-attach SEED arm: one receive, one O(1) queue move
+    /// and, when a batch finishes there, its log line. The seeding itself
+    /// runs in [`Stage::DrainArmIdle`]. Never paged.
+    DrainArmSeed = 11,
+    /// The drain's 30 s SILENCE arm: the O(n) silence scan over tracked
+    /// instruments, the subscribe-reconcile note, the refusal deltas and
+    /// any logging the scan triggers. Never paged.
+    DrainArmSilence = 12,
+    /// One step of the drain's IDLE arm (the sliced catch-up seal and seed
+    /// steps, plus the log lines a finished step writes). It runs only when
+    /// no frame is ready, so a frame waits for at most one step. Never
+    /// paged.
+    DrainArmIdle = 13,
 }
 
 /// Every stage, in index order.
-pub const ALL_STAGES: [Stage; 9] = [
+pub const ALL_STAGES: [Stage; 14] = [
     Stage::SocketToWal,
     Stage::RingDwell,
     Stage::MainRuntimeLag,
@@ -235,6 +264,21 @@ pub const ALL_STAGES: [Stage; 9] = [
     Stage::MetricsUpkeep,
     Stage::DrainMainTick,
     Stage::DrainFramePost,
+    Stage::DrainArmFlush,
+    Stage::DrainArmCatchup,
+    Stage::DrainArmSeed,
+    Stage::DrainArmSilence,
+    Stage::DrainArmIdle,
+];
+
+/// The stages that time one non-frame arm of the frame drain (2026-11-16),
+/// one per arm kind. Every one sits past `PAGED_STAGE_COUNT`.
+pub const DRAIN_ARM_STAGES: [Stage; 5] = [
+    Stage::DrainArmFlush,
+    Stage::DrainArmCatchup,
+    Stage::DrainArmSeed,
+    Stage::DrainArmSilence,
+    Stage::DrainArmIdle,
 ];
 
 const STAGE_COUNT: usize = ALL_STAGES.len();
@@ -251,6 +295,11 @@ const _: () = assert!(Stage::ReceiptToFold as usize >= PAGED_STAGE_COUNT);
 const _: () = assert!(Stage::MetricsUpkeep as usize >= PAGED_STAGE_COUNT);
 const _: () = assert!(Stage::DrainMainTick as usize >= PAGED_STAGE_COUNT);
 const _: () = assert!(Stage::DrainFramePost as usize >= PAGED_STAGE_COUNT);
+const _: () = assert!(Stage::DrainArmFlush as usize >= PAGED_STAGE_COUNT);
+const _: () = assert!(Stage::DrainArmCatchup as usize >= PAGED_STAGE_COUNT);
+const _: () = assert!(Stage::DrainArmSeed as usize >= PAGED_STAGE_COUNT);
+const _: () = assert!(Stage::DrainArmSilence as usize >= PAGED_STAGE_COUNT);
+const _: () = assert!(Stage::DrainArmIdle as usize >= PAGED_STAGE_COUNT);
 
 impl Stage {
     /// The `stage` label value.
@@ -266,6 +315,11 @@ impl Stage {
             Self::MetricsUpkeep => "metrics_upkeep",
             Self::DrainMainTick => "drain_main_tick",
             Self::DrainFramePost => "drain_frame_post",
+            Self::DrainArmFlush => "drain_arm_flush",
+            Self::DrainArmCatchup => "drain_arm_catchup",
+            Self::DrainArmSeed => "drain_arm_seed",
+            Self::DrainArmSilence => "drain_arm_silence",
+            Self::DrainArmIdle => "drain_arm_idle",
         }
     }
 
@@ -298,7 +352,55 @@ impl Stage {
             // B3: the post-frame work holds the next frame like the frame's
             // own work does, so the same 1 ms budget; never paged.
             Self::DrainFramePost => 1_000_000,
+            // 2026-11-16: an arm holds every queued frame for its whole
+            // length, so the same 1 ms as the frame stages; never paged.
+            Self::DrainArmFlush
+            | Self::DrainArmCatchup
+            | Self::DrainArmSeed
+            | Self::DrainArmSilence
+            | Self::DrainArmIdle => 1_000_000,
         }
+    }
+
+    /// True for a stage that the stall page (`HOT-PATH-STALL-01`) reads.
+    #[must_use]
+    pub const fn is_paged(self) -> bool {
+        (self as usize) < PAGED_STAGE_COUNT
+    }
+}
+
+/// Times one block and records it as `stage` when dropped (2026-11-16, the
+/// frame drain's non-frame arms). Two clock reads (one at [`Self::start`],
+/// one at drop) and the stage's four relaxed atomics; no allocation, no
+/// lock. Dropped on every path out of the block, a `break` included.
+#[must_use = "the timer records when it is dropped; bind it to a named variable such as `_arm` (a bare `_` drops it at once)"]
+pub struct StageTimer {
+    stage: Stage,
+    start: Instant,
+}
+
+impl StageTimer {
+    /// Starts timing `stage` now.
+    #[inline]
+    pub fn start(stage: Stage) -> Self {
+        Self {
+            stage,
+            start: Instant::now(),
+        }
+    }
+
+    /// The instant the timer started, for a caller that wants the same
+    /// reading for a heartbeat (saves a clock read).
+    #[must_use]
+    pub const fn started_at(&self) -> Instant {
+        self.start
+    }
+}
+
+impl Drop for StageTimer {
+    #[inline]
+    fn drop(&mut self) {
+        record_stage(self.stage, self.start.elapsed());
     }
 }
 
@@ -828,6 +930,9 @@ fn step_p99_latch(latched: &mut bool, over: Option<bool>) -> bool {
 /// What one stage's window produced.
 struct WindowOutcome {
     window: [u64; STAGE_BUCKETS],
+    /// This window's sample sum, nanoseconds (current cumulative minus the
+    /// last read). 2026-11-16: feeds the minute table's `mean_ns`.
+    sum_nanos: u64,
     strict: Option<StrictSampleCounts>,
     quantiles: Option<StageQuantiles>,
     over_budget: u64,
@@ -842,6 +947,8 @@ struct QuantileWindows {
     prev_buckets: [[u64; STAGE_BUCKETS]; STAGE_COUNT],
     prev_raw_buckets: [[u64; RAW_STAGE_BUCKETS]; STAGE_COUNT],
     prev_over_budget: [u64; STAGE_COUNT],
+    /// The cumulative sample sum last read, per stage (2026-11-16, `mean_ns`).
+    prev_sum_nanos: [u64; STAGE_COUNT],
     p99_over: [bool; STAGE_COUNT],
 }
 
@@ -851,6 +958,7 @@ impl QuantileWindows {
             prev_buckets: [[0; STAGE_BUCKETS]; STAGE_COUNT],
             prev_raw_buckets: [[0; RAW_STAGE_BUCKETS]; STAGE_COUNT],
             prev_over_budget: [0; STAGE_COUNT],
+            prev_sum_nanos: [0; STAGE_COUNT],
             p99_over: [false; STAGE_COUNT],
         }
     }
@@ -875,6 +983,13 @@ impl QuantileWindows {
         self.prev_raw_buckets[i] = snap.raw_buckets;
         let over_budget = snap.over_budget.saturating_sub(self.prev_over_budget[i]);
         self.prev_over_budget[i] = snap.over_budget;
+        // 2026-11-16 (`mean_ns`): the window's sum, by the same difference as
+        // the buckets. `sum_nanos` is read after the buckets, so a sample
+        // recorded between the two reads can sit in this window's sum and the
+        // next window's count; over a minute the windows telescope, so the
+        // error is at most the samples racing the two reads at its edges.
+        let sum_nanos = snap.sum_nanos.saturating_sub(self.prev_sum_nanos[i]);
+        self.prev_sum_nanos[i] = snap.sum_nanos;
         let quantiles = stage_quantiles(&window);
         let verdict = quantiles
             .filter(|q| q.samples >= P99_WARN_MIN_SAMPLES)
@@ -882,6 +997,7 @@ impl QuantileWindows {
         let starts_p99_episode = step_p99_latch(&mut self.p99_over[i], verdict);
         WindowOutcome {
             window,
+            sum_nanos,
             strict,
             quantiles,
             over_budget,
@@ -966,6 +1082,12 @@ pub struct SecondWindow {
     pub stage_strict: [Option<StrictSampleCounts>; STAGE_COUNT],
     /// Per stage, the largest sample of the window, nanoseconds.
     pub stage_max_nanos: [u64; STAGE_COUNT],
+    /// Per stage, the sum of the window's samples, nanoseconds (2026-11-16,
+    /// the minute table's `mean_ns`). Same unit as `stage_buckets`: a
+    /// weighted record of `weight` samples of `nanos` adds `weight` to the
+    /// buckets and `nanos × weight` here, so sum / bucket total is the mean
+    /// of the samples the buckets count.
+    pub stage_sum_nanos: [u64; STAGE_COUNT],
     /// The fine `receipt_to_fold` window, per-bucket counts.
     pub receipt_to_fold_fine: [u64; FINE_BUCKETS],
 }
@@ -980,6 +1102,7 @@ impl SecondWindow {
             // The publisher replaces every slot, including measured zeros.
             stage_strict: [None; STAGE_COUNT],
             stage_max_nanos: [0; STAGE_COUNT],
+            stage_sum_nanos: [0; STAGE_COUNT],
             receipt_to_fold_fine: [0; FINE_BUCKETS],
         }
     }
@@ -1224,6 +1347,7 @@ pub fn publish_once(handles: &mut TelemetryHandles, now: Instant) -> StallReadin
         handles.last_second.stage_max_nanos[*stage as usize] = max;
         let outcome = handles.windows.advance(*stage, &snap);
         handles.last_second.stage_buckets[*stage as usize] = outcome.window;
+        handles.last_second.stage_sum_nanos[*stage as usize] = outcome.sum_nanos;
         handles.last_second.stage_strict[*stage as usize] = outcome.strict;
         if *stage == Stage::ReceiptToFold {
             // Read the fine histogram right after this stage's max swap and
@@ -1467,7 +1591,8 @@ fn signal_secs(readings: &StallReadings, i: usize) -> Option<f64> {
         Some(age) => *age,
         None => {
             let stage = i - WATCHED_TASKS.len();
-            if stage >= PAGED_STAGE_COUNT {
+            // `Stage::is_paged` is the one definition of the paged set.
+            if !ALL_STAGES.get(stage).is_some_and(|s| s.is_paged()) {
                 return None;
             }
             readings
@@ -1558,6 +1683,30 @@ pub async fn run_runtime_probe(task: HotTask, stage: Stage, iterations: u64) {
 
 #[cfg(test)]
 mod strict_tests;
+
+/// Test-only helpers other modules' tests use (2026-11-16).
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::{QuantileWindows, SecondWindow, Stage, StageStats};
+
+    /// One `SecondWindow` holding `stage`'s window after `frames` weighted
+    /// records (`(per-tick nanos, ticks)` each), built through a LOCAL stage
+    /// record and the real window difference, so it never touches the
+    /// process-wide statics other tests record into.
+    pub(crate) fn weighted_window(stage: Stage, frames: &[(u64, u64)]) -> SecondWindow {
+        let stats = StageStats::new();
+        for (nanos, weight) in frames {
+            stats.record_weighted(stage, *nanos, *weight);
+        }
+        let outcome = QuantileWindows::new().advance(stage, &stats.snapshot());
+        let mut second = SecondWindow::empty();
+        let i = stage as usize;
+        second.stage_buckets[i] = outcome.window;
+        second.stage_sum_nanos[i] = outcome.sum_nanos;
+        second.stage_strict[i] = outcome.strict;
+        second
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1685,8 +1834,9 @@ mod tests {
     #[test]
     fn test_regression_b3_drain_frame_post_is_a_recorded_never_paged_stage() {
         assert_eq!(Stage::DrainFramePost.as_str(), "drain_frame_post");
-        assert_eq!(*ALL_STAGES.last().expect("stages"), Stage::DrainFramePost);
-        assert_eq!(ALL_STAGES.len(), 9);
+        // 2026-11-16: no longer the last stage; the drain arm stages follow it.
+        assert_eq!(ALL_STAGES[8], Stage::DrainFramePost);
+        assert_eq!(ALL_STAGES.len(), 14);
         assert!(
             Stage::DrainFramePost as usize >= PAGED_STAGE_COUNT,
             "never paged"
@@ -1700,6 +1850,64 @@ mod tests {
         assert_eq!(after.count - before.count, 3);
         assert_eq!(after.over_budget - before.over_budget, 1);
         assert_eq!(after.buckets[0] - before.buckets[0], 1);
+    }
+
+    // Regression: 2026-11-16: frames waited in the ring over 2 ms in most
+    // minutes while every timed frame stage stayed under 0.4 ms; the drain's
+    // non-frame arms were timed nowhere. One stage per arm kind, each with
+    // its own label, a 1 ms budget, and none of them paged.
+    #[test]
+    fn test_regression_drain_arm_stages_are_named_and_never_paged() {
+        let expected = [
+            (Stage::DrainArmFlush, "drain_arm_flush"),
+            (Stage::DrainArmCatchup, "drain_arm_catchup"),
+            (Stage::DrainArmSeed, "drain_arm_seed"),
+            (Stage::DrainArmSilence, "drain_arm_silence"),
+            (Stage::DrainArmIdle, "drain_arm_idle"),
+        ];
+        assert_eq!(DRAIN_ARM_STAGES.len(), expected.len());
+        for ((stage, name), arm) in expected.iter().zip(DRAIN_ARM_STAGES) {
+            assert_eq!(*stage, arm);
+            assert_eq!(stage.as_str(), *name);
+            assert!(ALL_STAGES.contains(stage), "{name} is in ALL_STAGES");
+            assert!(!stage.is_paged(), "{name} must never page");
+            assert!(*stage as usize >= PAGED_STAGE_COUNT);
+            assert_eq!(stage.stall_budget_nanos(), 1_000_000);
+        }
+        // The paged set is unchanged: exactly the first five stages.
+        let paged: Vec<Stage> = ALL_STAGES.into_iter().filter(|s| s.is_paged()).collect();
+        assert_eq!(
+            paged,
+            [
+                Stage::SocketToWal,
+                Stage::RingDwell,
+                Stage::MainRuntimeLag,
+                Stage::ReaderRuntimeLag,
+                Stage::DrainMainFrame,
+            ]
+        );
+    }
+
+    // `StageTimer` records exactly one sample into its own stage when it is
+    // dropped, on a `break` too. `DrainArmCatchup` is recorded only here in
+    // this binary.
+    #[test]
+    fn test_stage_timer_records_one_sample_on_drop() {
+        let before = stage_snapshot(Stage::DrainArmCatchup);
+        let other_before = stage_snapshot(Stage::DrainArmSilence);
+        {
+            let timer = StageTimer::start(Stage::DrainArmCatchup);
+            assert!(timer.started_at() <= Instant::now());
+            assert_eq!(stage_snapshot(Stage::DrainArmCatchup), before, "not yet");
+        }
+        #[allow(clippy::never_loop)]
+        loop {
+            let _arm = StageTimer::start(Stage::DrainArmCatchup);
+            break;
+        }
+        let after = stage_snapshot(Stage::DrainArmCatchup);
+        assert_eq!(after.count - before.count, 2);
+        assert_eq!(stage_snapshot(Stage::DrainArmSilence), other_before);
     }
 
     #[test]
@@ -2464,12 +2672,20 @@ mod tests {
         let mut readings = quiet();
         readings.stage_max_nanos[Stage::ReceiptToFold as usize] = 5_000_000_000;
         readings.stage_max_nanos[Stage::MetricsUpkeep as usize] = 5_000_000_000;
+        // 2026-11-16: the drain arm stages never page either.
+        for stage in DRAIN_ARM_STAGES {
+            readings.stage_max_nanos[stage as usize] = 5_000_000_000;
+        }
         let mut alarm = StallAlarm::new();
         assert_eq!(alarm.observe(Instant::now(), true, &readings), None);
         for i in 0..SIGNAL_COUNT {
             let (label, _) = signal_label(i);
             assert_ne!(label, "receipt_to_fold");
             assert_ne!(label, "metrics_upkeep");
+            assert!(
+                !label.starts_with("drain_arm_"),
+                "{label} must never be a signal"
+            );
         }
         // The five paged stages still page.
         readings.stage_max_nanos[Stage::DrainMainFrame as usize] = 5_000_000_000;
@@ -2477,5 +2693,35 @@ mod tests {
             .observe(Instant::now(), true, &readings)
             .expect("a paged stage still pages");
         assert_eq!(line.signal, "drain_main_frame");
+    }
+
+    /// 2026-11-16 (`mean_ns`): a weighted stage's window sum and bucket count
+    /// divide to the mean of the samples recorded. `drain_main_tick` records
+    /// a frame's per-tick average `weight` times
+    /// ([`record_stage_nanos_weighted`]), so the sum must grow by
+    /// `nanos × weight` exactly as the buckets grow by `weight`; a sum that
+    /// grew by `nanos` once would read the mean `weight` times too low.
+    #[test]
+    fn test_weighted_stage_window_sum_and_count_give_the_true_mean() {
+        let stats = StageStats::new();
+        let mut windows = QuantileWindows::new();
+        // Frame 1: 4 ticks at 900 ns each. Frame 2: 1 tick at 2,500 ns.
+        stats.record_weighted(Stage::DrainMainTick, 900, 4);
+        stats.record_weighted(Stage::DrainMainTick, 2_500, 1);
+        let first = windows.advance(Stage::DrainMainTick, &stats.snapshot());
+        let count: u64 = first.window.iter().sum();
+        assert_eq!(count, 5);
+        assert_eq!(first.sum_nanos, 900 * 4 + 2_500);
+        assert_eq!(first.sum_nanos / count, 1_220);
+        // The next window holds only what was recorded after the first read.
+        stats.record_weighted(Stage::DrainMainTick, 1_000, 3);
+        stats.record_weighted(Stage::DrainMainTick, 7, 0);
+        let second = windows.advance(Stage::DrainMainTick, &stats.snapshot());
+        assert_eq!(second.window.iter().sum::<u64>(), 3);
+        assert_eq!(second.sum_nanos, 3_000);
+        // An empty window sums to zero, never the cumulative total.
+        let third = windows.advance(Stage::DrainMainTick, &stats.snapshot());
+        assert_eq!(third.window.iter().sum::<u64>(), 0);
+        assert_eq!(third.sum_nanos, 0);
     }
 }
