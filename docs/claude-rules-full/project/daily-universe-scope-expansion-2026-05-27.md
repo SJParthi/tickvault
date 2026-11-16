@@ -3817,3 +3817,24 @@ Measured before the card (read-only, S3 and the code at main `9a29d13`): 3,212,5
 - Skipping a row of a contract the main feed carries on two sockets, or one that was carried on two sockets earlier the same IST day or replay pass.
 - A page, alarm, metric filter or EMF name for the skip counters.
 - Recording Quote 61 here without the matching dated note in `websocket-connection-scope-lock.md` (its 2026-09-29 ZERO LOSS section forbids a new drop disposition without a quote THERE).
+
+#### Quote 62 (2026-11-16) — SECOND S3 COPIES FROM IN-SESSION DISK-PRESSURE ARCHIVING ARE ACCEPTED, WITH A WEEKLY SIZE CHECK (owner, preserve EXACTLY)
+
+Owner, 2026-11-16, after the Quote 60 card "One decision waiting for you: extra copies in S3" (options: (1) allow it and check the size weekly, asking again past 20 GB in a month (recommended); (2) sort during trading; (3) switch the export off): "Ok whatever is recommended do it dude okay?" and "See whatever is recommended do it dude oaky?". Option (1) is taken.
+
+**What Quote 62 changes, and nothing else:**
+
+| Item | Locked value |
+|---|---|
+| Accepted | The full content-addressed second copy (`<partition>.sha-<64 hex>.csv.gz`) written when a disk-pressure pass inside 08:30 IST to the ingest end moves an hour whose ordered export object already sits at the canonical key (counted on `tv_partition_archive_export_unordered_in_session_total`). Since 2026-11-15 the pass frees not-yet-exported hours first, so this happens only when no unexported candidate of that pass was dropped before it. |
+| Watch | Once a week a read-only check sums the `.sha-` objects added to `tv-prod-cold/questdb-partitions/` that month and reports the size to the owner. |
+| Re-ask | Past 20 GB of such copies in one calendar month, the owner is asked again before anything else is decided. Nothing is deleted or changed automatically. |
+| Not covered | Copies made because a column was added to an export table or QuestDB renders a value differently (the schema/QuestDB-change row in `aws-budget.md`): still an open owner decision before any such change. |
+| Cost | Assumed: worst case about 9 GB a trading day once the export has run about 15 days; S3 Standard about $0.025 per GB-month, so 20 GB is about $0.50 a month for each month it is kept (kept forever). |
+
+##### What violates Quote 62 (REJECT)
+- Treating a schema- or QuestDB-change copy as accepted under Quote 62.
+- Deleting, expiring or overwriting any second copy (Quote 27 binds), or adding a lifecycle rule for them.
+- Sorting an export during 08:30 to the ingest end to avoid copies, or switching the export off, without a fresh dated quote.
+- Letting the month's copies pass 20 GB without asking the owner again, or dropping the weekly check.
+- A page, alarm, metric filter or EMF name for the copies under Quote 62.
