@@ -192,7 +192,7 @@ impl DepthStagedBatch {
     #[must_use]
     pub(crate) fn presized() -> Self {
         let mut batch = Self::new();
-        batch.reserve_presize();
+        let _fresh = batch.reserve_presize();
         batch
     }
 
@@ -207,19 +207,26 @@ impl DepthStagedBatch {
     }
 
     /// Reserves to the pre-size and touches the new pages, when smaller.
-    pub(crate) fn reserve_presize(&mut self) {
+    /// Returns `true` when either part reserved (2026-11-16: the writer
+    /// counts a fresh reserve on the drain's hand-off,
+    /// `tv_depth_stage_presize_fresh_total`).
+    pub(crate) fn reserve_presize(&mut self) -> bool {
+        let mut fresh = false;
         if self.rows.capacity() < DEPTH_STAGED_ROWS_PRESIZE {
             let have = self.rows.len();
             self.rows
                 .reserve_exact(DEPTH_STAGED_ROWS_PRESIZE.saturating_sub(have));
             prefault(&mut self.rows, StagedBookRow::FILLER);
+            fresh = true;
         }
         if self.values.capacity() < DEPTH_STAGED_VALUES_PRESIZE {
             let have = self.values.len();
             self.values
                 .reserve_exact(DEPTH_STAGED_VALUES_PRESIZE.saturating_sub(have));
             prefault(&mut self.values, 0.0);
+            fresh = true;
         }
+        fresh
     }
 
     /// Rows staged (refused ones included).

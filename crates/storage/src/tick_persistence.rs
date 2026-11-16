@@ -4079,7 +4079,15 @@ impl TickWriter {
         // regrow from zero inside the frames that stage it. Reserve and touch
         // the pre-size here instead: one allocation on this flush arm, none
         // per tick. A spare at least that big costs one compare.
-        self.staged.reserve_presize();
+        // 2026-11-16: count the fresh reserve, so a ring wait can be traced
+        // to a spare-less hand-off on the drain.
+        if self.staged.reserve_presize() {
+            self.flush_counters.stage_presize_fresh.increment(1);
+            self.flush_counters.stage_presize_fresh_count = self
+                .flush_counters
+                .stage_presize_fresh_count
+                .saturating_add(1);
+        }
     }
 
     /// Rescue the buffered rows to the spill tier instead of losing them.
@@ -4914,6 +4922,14 @@ struct TickFlushCounters {
     /// Batches handed off early because a ninth contract-name table arrived
     /// inside them (PF-4). Expected to stay at zero.
     stage_pin_cut: metrics::Counter,
+    /// Hand-offs that found no spare batch waiting (or a smaller one) and
+    /// reserved and touched a fresh pre-sized batch on the drain
+    /// (2026-11-16, `tv_tick_stage_presize_fresh_total`, local `/metrics`
+    /// only). One relaxed add on that branch only.
+    stage_presize_fresh: metrics::Counter,
+    /// The same count kept on the writer, so a test can read it without a
+    /// recorder.
+    stage_presize_fresh_count: u64,
 }
 
 impl TickFlushCounters {
@@ -4953,6 +4969,14 @@ impl TickFlushCounters {
                 c.increment(0);
                 c
             },
+            // Registered at 0 when the writer is built (boot), so "never
+            // reserved fresh" reads 0 rather than absent.
+            stage_presize_fresh: {
+                let c = metrics::counter!("tv_tick_stage_presize_fresh_total", "feed" => feed);
+                c.increment(0);
+                c
+            },
+            stage_presize_fresh_count: 0,
         }
     }
 }
@@ -7644,6 +7668,46 @@ mod tests {
                 "{encoder:?}: the next batch starts pre-sized"
             );
         }
+    }
+
+    // Regression: 2026-11-16: a ring wait could not be traced to a
+    // spare-less hand-off, which reserves and touches a fresh 4.5 MiB batch
+    // on the drain. The fresh-reserve count moves only when no spare (of
+    // the pre-size) is waiting.
+    #[test]
+    fn test_regression_fresh_reserve_is_counted_only_when_no_spare_waits() {
+        let (mut producer, sink, _rx) = TickWriter::for_test(Feed::Dhan).split_for_offload();
+        let start = producer.flush_counters.stage_presize_fresh_count;
+        // No spare waiting: the hand-off reserves fresh.
+        producer
+            .append_tick_with_seq(&sample_tick(), 1)
+            .expect("append");
+        producer.flush().expect("hand off");
+        assert_eq!(
+            producer.flush_counters.stage_presize_fresh_count,
+            start + 1,
+            "no spare waited, so the hand-off reserved a fresh batch"
+        );
+        // A pre-sized spare waiting: the hand-off takes it, no reserve.
+        sink.return_spare_buffer(&mut spent_batch(
+            crate::tick_stage::TICK_STAGED_ROWS_PRESIZE,
+        ));
+        producer
+            .append_tick_with_seq(&sample_tick(), 2)
+            .expect("append");
+        producer.flush().expect("hand off");
+        assert_eq!(
+            producer.flush_counters.stage_presize_fresh_count,
+            start + 1,
+            "a waiting pre-sized spare must not count as a fresh reserve"
+        );
+        // A spare smaller than the pre-size is grown, which is a reserve.
+        sink.return_spare_buffer(&mut spent_batch(512));
+        producer
+            .append_tick_with_seq(&sample_tick(), 3)
+            .expect("append");
+        producer.flush().expect("hand off");
+        assert_eq!(producer.flush_counters.stage_presize_fresh_count, start + 2);
     }
 
     #[test]
