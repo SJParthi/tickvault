@@ -333,6 +333,17 @@ pub trait EventsApi {
 #[allow(async_fn_in_trait)] // APPROVED: handler is generic over the trait (no dyn); futures awaited inline.
 pub trait BudgetsApi {
     async fn actual_spend_usd(&self) -> Result<f64, String>;
+
+    /// The spend plus the budget's `LastUpdatedTime` (2026-11-16). The
+    /// default carries no stamp (age unknown); the live SDK leg overrides it.
+    async fn spend_reading(&self) -> Result<crate::budget_spend::SpendReading, String> {
+        self.actual_spend_usd()
+            .await
+            .map(|actual_usd| crate::budget_spend::SpendReading {
+                actual_usd,
+                last_updated_unix_secs: None,
+            })
+    }
 }
 
 /// SSM surface for the change-only ping state (get + put).
@@ -396,7 +407,86 @@ pub async fn mtd_usd<B: BudgetsApi>(
     line_usd: f64,
     now_utc: DateTime<Utc>,
 ) -> Option<f64> {
-    let reading = match budgets.actual_spend_usd().await {
+    mtd_reading(budgets, line_usd, now_utc).await.0
+}
+
+/// How old the Budgets figure behind a stop decision is, and a labelled
+/// estimate of spend now (2026-11-16). LOGGING ONLY: no stop decision reads
+/// either field (pinned by
+/// `test_mtd_reading_stop_decision_is_unchanged_by_the_freshness_fields`).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct BudgetFreshness {
+    /// Seconds since the budget's `LastUpdatedTime`; `None` when unknown
+    /// (no stamp, a failed read, or a future-dated stamp).
+    pub age_secs: Option<f64>,
+    /// `budget_spend::estimated_spend_now_usd` of the raw reading; an
+    /// ESTIMATE, never a reading.
+    pub estimated_spend_now_usd: Option<f64>,
+}
+
+impl BudgetFreshness {
+    /// Age in hours, for the log line and the result JSON.
+    pub fn age_hours(&self) -> Option<f64> {
+        self.age_secs.map(|s| s / 3600.0)
+    }
+
+    /// Returns `result` with `budget_data_age_hours` and
+    /// `estimated_spend_now_usd` added (JSON `null` when unknown). A
+    /// non-object is returned as is.
+    pub fn annotated(&self, mut result: Value) -> Value {
+        if let Some(obj) = result.as_object_mut() {
+            obj.insert("budget_data_age_hours".to_string(), json!(self.age_hours()));
+            obj.insert(
+                "estimated_spend_now_usd".to_string(),
+                json!(self.estimated_spend_now_usd),
+            );
+        }
+        result
+    }
+}
+
+/// [`mtd_usd`] plus the freshness of the figure (2026-11-16). The spend half
+/// is exactly what `mtd_usd` returns; the freshness half is logged and never
+/// decides a stop. One coded `warn!` (`LAMBDA-AWS-01`) per call when the
+/// figure is over 48 hours old. No alarm, metric filter or page reads that
+/// code from this Lambda's log group (checked in `deploy/aws/terraform`,
+/// 2026-11-16: only the log export to S3 reads it).
+pub async fn mtd_reading<B: BudgetsApi>(
+    budgets: &B,
+    line_usd: f64,
+    now_utc: DateTime<Utc>,
+) -> (Option<f64>, BudgetFreshness) {
+    let raw = budgets.spend_reading().await;
+    let freshness = match &raw {
+        Ok(r) => {
+            let age_secs = crate::budget_spend::data_age_secs(r.last_updated_unix_secs, now_utc);
+            let estimated_spend_now_usd = if r.actual_usd.is_finite() && r.actual_usd >= 0.0 {
+                crate::budget_spend::estimated_spend_now_usd(
+                    r.actual_usd,
+                    r.last_updated_unix_secs,
+                    now_utc,
+                )
+            } else {
+                None
+            };
+            BudgetFreshness {
+                age_secs,
+                estimated_spend_now_usd,
+            }
+        }
+        Err(_) => BudgetFreshness::default(),
+    };
+    if crate::budget_spend::data_is_stale(freshness.age_secs) {
+        warn!(
+            code = "LAMBDA-AWS-01",
+            budget_data_age_hours = freshness.age_hours(),
+            estimated_spend_now_usd = freshness.estimated_spend_now_usd,
+            line_usd,
+            source = crate::budget_spend::SPEND_SOURCE,
+            "AWS Budgets month-to-date spend is over 48 hours old; the stop decision uses it as is (estimate logged, not acted on)"
+        );
+    }
+    let reading = match raw.map(|r| r.actual_usd) {
         Ok(v) if !v.is_finite() => {
             error!(
                 code = "LAMBDA-AWS-01",
@@ -415,7 +505,10 @@ pub async fn mtd_usd<B: BudgetsApi>(
             None
         }
     };
-    crate::budget_spend::trusted_spend_for_line(reading, line_usd, now_utc)
+    (
+        crate::budget_spend::trusted_spend_for_line(reading, line_usd, now_utc),
+        freshness,
+    )
 }
 
 /// Legacy `classify_in_window_action` — pure decision for the in-window arm
@@ -992,7 +1085,9 @@ pub async fn run_guard<E: Ec2Api, N: SnsApi, V: EventsApi, B: BudgetsApi, P: Ssm
             ..env.clone()
         };
         let env = &effective_env;
-        let usd = mtd_usd(budgets, env.budget_kill_usd, now_utc).await;
+        // 2026-11-16: `freshness` (data age + labelled estimate) is logged
+        // and added to the result only; `action` reads `usd` alone.
+        let (usd, freshness) = mtd_reading(budgets, env.budget_kill_usd, now_utc).await;
         let action = classify_in_window_action(usd, env.budget_kill_usd);
         if action == "breach_stop" {
             // breach_stop implies usd is Some; 0.0 fallback is unreachable.
@@ -1006,7 +1101,8 @@ pub async fn run_guard<E: Ec2Api, N: SnsApi, V: EventsApi, B: BudgetsApi, P: Ssm
                 &state,
                 now_utc,
             )
-            .await;
+            .await
+            .map(|out| freshness.annotated(out));
         }
 
         // 2026-07-09 (operator escalation — Telegram noise N2): the running
@@ -1039,8 +1135,15 @@ pub async fn run_guard<E: Ec2Api, N: SnsApi, V: EventsApi, B: BudgetsApi, P: Ssm
             state_saved = save_ping_state(ssm, &env.ping_state_param, &new_state).await;
         }
         let bucket = new_state.get("bucket").and_then(Value::as_i64).unwrap_or(0);
-        info!(action, reason, bucket, "in-window budget check");
-        return Ok(json!({
+        info!(
+            action,
+            reason,
+            bucket,
+            budget_data_age_hours = freshness.age_hours(),
+            estimated_spend_now_usd = freshness.estimated_spend_now_usd,
+            "in-window budget check (estimated_spend_now_usd is an estimate, not acted on)"
+        );
+        let out = json!({
             "ok": true,
             "noop": true,
             "in_window": true,
@@ -1048,7 +1151,8 @@ pub async fn run_guard<E: Ec2Api, N: SnsApi, V: EventsApi, B: BudgetsApi, P: Ssm
             "budget_action": action,
             "ping_reason": reason,
             "state_saved": state_saved,
-        }));
+        });
+        return Ok(freshness.annotated(out));
     }
 
     // Running OUTSIDE the up-window. Before force-stopping, honour the two
@@ -1092,7 +1196,7 @@ pub async fn run_guard<E: Ec2Api, N: SnsApi, V: EventsApi, B: BudgetsApi, P: Ssm
             ),
             ..env.clone()
         };
-        let usd = mtd_usd(budgets, effective_env.budget_kill_usd, now_utc).await;
+        let (usd, freshness) = mtd_reading(budgets, effective_env.budget_kill_usd, now_utc).await;
         let action = classify_in_window_action(usd, effective_env.budget_kill_usd);
         if action == "breach_stop" {
             // breach_stop implies usd is Some; 0.0 fallback is unreachable.
@@ -1106,17 +1210,21 @@ pub async fn run_guard<E: Ec2Api, N: SnsApi, V: EventsApi, B: BudgetsApi, P: Ssm
                 &state,
                 now_utc,
             )
-            .await;
+            .await
+            .map(|out| freshness.annotated(out));
         }
         info!(
             until_unix,
             budget_action = action,
+            budget_data_age_hours = freshness.age_hours(),
+            estimated_spend_now_usd = freshness.estimated_spend_now_usd,
             "out-of-window guard — drain hold active, budget not breached; leaving the box alone"
         );
-        return Ok(json!({
+        let out = json!({
             "ok": true, "noop": true, "state": state, "skipped": "drain_hold",
             "budget_action": action
-        }));
+        });
+        return Ok(freshness.annotated(out));
     }
     // 1c. The pre-open slot, Mon-Fri 08:00-08:30 IST (audit B2 follow-up,
     //     2026-11-13). The start watchdog's curfew treats it as operating
@@ -1142,7 +1250,7 @@ pub async fn run_guard<E: Ec2Api, N: SnsApi, V: EventsApi, B: BudgetsApi, P: Ssm
             ),
             ..env.clone()
         };
-        let usd = mtd_usd(budgets, effective_env.budget_kill_usd, now_utc).await;
+        let (usd, freshness) = mtd_reading(budgets, effective_env.budget_kill_usd, now_utc).await;
         let action = classify_in_window_action(usd, effective_env.budget_kill_usd);
         if action == "breach_stop" {
             return execute_breach_stop(
@@ -1155,16 +1263,20 @@ pub async fn run_guard<E: Ec2Api, N: SnsApi, V: EventsApi, B: BudgetsApi, P: Ssm
                 &state,
                 now_utc,
             )
-            .await;
+            .await
+            .map(|out| freshness.annotated(out));
         }
         info!(
             budget_action = action,
+            budget_data_age_hours = freshness.age_hours(),
+            estimated_spend_now_usd = freshness.estimated_spend_now_usd,
             "out-of-window guard: curfew operating hours (pre-open); leaving the box alone"
         );
-        return Ok(json!({
+        let out = json!({
             "ok": true, "noop": true, "state": state, "skipped": "pre_open",
             "budget_action": action
-        }));
+        });
+        return Ok(freshness.annotated(out));
     }
     // 2. Launch grace: a box started minutes ago is a deliberate manual
     //    start still being used, not a 16:30 stop that failed. The same
@@ -1318,6 +1430,11 @@ impl BudgetsApi for SdkBudgets {
     async fn actual_spend_usd(&self) -> Result<f64, String> {
         let coords = self.coords.as_ref().map_err(Clone::clone)?;
         crate::budget_spend::describe_actual_spend(&self.client, coords).await
+    }
+
+    async fn spend_reading(&self) -> Result<crate::budget_spend::SpendReading, String> {
+        let coords = self.coords.as_ref().map_err(Clone::clone)?;
+        crate::budget_spend::describe_spend_reading(&self.client, coords).await
     }
 }
 
@@ -3583,6 +3700,308 @@ aws events enable-rule --name tv-prod-daily-start\n"
         assert_eq!(out["noop"], json!(false));
         assert_eq!(ec2.stopped.borrow().len(), 1);
     }
+
+    // --- Budget data age (2026-11-16) ------------------------------------
+    //
+    // The Budgets figure lagged the bill by ~2 days on 16 Nov 2026
+    // (LastUpdatedTime 14 Nov 06:29 UTC). The guard now logs its age and an
+    // estimate; neither may change a stop decision.
+    mod budget_freshness {
+        use super::*;
+        use std::sync::{Arc, Mutex};
+
+        /// Budgets fake that also reports a `LastUpdatedTime`.
+        struct FakeStampedBudgets {
+            amount: Option<f64>,
+            last_updated: Option<f64>,
+        }
+
+        impl BudgetsApi for FakeStampedBudgets {
+            async fn actual_spend_usd(&self) -> Result<f64, String> {
+                self.amount
+                    .ok_or_else(|| "budgets:DescribeBudget throttled".to_string())
+            }
+            async fn spend_reading(&self) -> Result<crate::budget_spend::SpendReading, String> {
+                Ok(crate::budget_spend::SpendReading {
+                    actual_usd: self.actual_spend_usd().await?,
+                    last_updated_unix_secs: self.last_updated,
+                })
+            }
+        }
+
+        /// 14 Nov 2026 06:29 UTC (the stamp read live on 16 Nov).
+        fn stamp_14_nov() -> f64 {
+            // APPROVED: exact small i64 → f64.
+            #[allow(clippy::cast_precision_loss)]
+            let s = utc(2026, 11, 14, 6, 29).timestamp() as f64;
+            s
+        }
+
+        /// Tuesday 17 Nov 2026 10:00 IST: in the up-window.
+        fn tue_17_nov() -> DateTime<Utc> {
+            utc(2026, 11, 17, 4, 30)
+        }
+
+        #[derive(Clone, Default)]
+        struct Captured(Arc<Mutex<Vec<u8>>>);
+
+        impl std::io::Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .map_err(|_| std::io::Error::other("poisoned"))?
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl Captured {
+            fn text(&self) -> String {
+                String::from_utf8_lossy(&self.0.lock().expect("lock")).into_owned()
+            }
+        }
+
+        async fn run_in_window_capturing(budgets: &FakeStampedBudgets) -> (Value, String) {
+            let captured = Captured::default();
+            let writer = captured.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::INFO)
+                .with_writer(move || writer.clone())
+                .finish();
+            let _guard = tracing::subscriber::set_default(subscriber);
+            let (ec2, sns, events, ssm) = (
+                FakeEc2::new("running"),
+                FakeSns::default(),
+                FakeEvents::new(),
+                FakeSsm::empty(),
+            );
+            let out = run_guard(
+                &test_env(),
+                &ec2,
+                &sns,
+                &events,
+                budgets,
+                &ssm,
+                tue_17_nov(),
+            )
+            .await
+            .expect("run_guard ok");
+            (out, captured.text())
+        }
+
+        #[tokio::test]
+        async fn test_in_window_result_carries_budget_data_age_and_estimate() {
+            let budgets = FakeStampedBudgets {
+                amount: Some(40.0),
+                last_updated: Some(stamp_14_nov()),
+            };
+            let (out, log) = run_in_window_capturing(&budgets).await;
+            assert_eq!(out["budget_action"], json!("below_budget"));
+            let age_h = out["budget_data_age_hours"].as_f64().expect("age known");
+            // 14 Nov 06:29 → 17 Nov 04:30 UTC = 69 h 61 m = 70 h 1 m.
+            assert!((age_h - (70.0 + 1.0 / 60.0)).abs() < 1e-6, "{age_h}");
+            let est = out["estimated_spend_now_usd"].as_f64().expect("estimate");
+            let want = crate::budget_spend::estimated_spend_now_usd(
+                40.0,
+                Some(stamp_14_nov()),
+                tue_17_nov(),
+            )
+            .expect("estimate");
+            assert!((est - want).abs() < 1e-9 && est > 40.0, "{est} vs {want}");
+            // The decision log line carries both fields.
+            assert!(log.contains("in-window budget check"), "{log}");
+            assert!(log.contains("budget_data_age_hours="), "{log}");
+            assert!(log.contains("estimated_spend_now_usd="), "{log}");
+        }
+
+        #[test]
+        fn test_budget_freshness_age_hours_and_annotated() {
+            let f = BudgetFreshness {
+                age_secs: Some(7_200.0),
+                estimated_spend_now_usd: Some(61.5),
+            };
+            assert_eq!(f.age_hours(), Some(2.0));
+            let out = f.annotated(json!({"ok": true}));
+            assert_eq!(out["ok"], json!(true));
+            assert_eq!(out["budget_data_age_hours"], json!(2.0));
+            assert_eq!(out["estimated_spend_now_usd"], json!(61.5));
+            let unknown = BudgetFreshness::default();
+            assert_eq!(unknown.age_hours(), None);
+            let out = unknown.annotated(json!({"ok": true}));
+            assert_eq!(out["budget_data_age_hours"], Value::Null);
+            assert!(
+                out.as_object()
+                    .expect("object")
+                    .contains_key("estimated_spend_now_usd")
+            );
+            // A non-object result is returned untouched.
+            assert_eq!(f.annotated(json!("x")), json!("x"));
+        }
+
+        #[tokio::test]
+        async fn test_unstamped_reading_reports_unknown_age_as_null() {
+            let budgets = FakeStampedBudgets {
+                amount: Some(40.0),
+                last_updated: None,
+            };
+            let (out, log) = run_in_window_capturing(&budgets).await;
+            assert_eq!(out["budget_action"], json!("below_budget"));
+            assert_eq!(out["budget_data_age_hours"], Value::Null);
+            assert_eq!(out["estimated_spend_now_usd"], Value::Null);
+            assert!(!log.contains("LAMBDA-AWS-01"), "{log}");
+        }
+
+        #[tokio::test]
+        async fn test_stale_reading_warns_once_per_run_with_the_existing_code() {
+            // 70 h old: one coded warning.
+            let stale = FakeStampedBudgets {
+                amount: Some(40.0),
+                last_updated: Some(stamp_14_nov()),
+            };
+            let (_, log) = run_in_window_capturing(&stale).await;
+            assert_eq!(log.matches("LAMBDA-AWS-01").count(), 1, "{log}");
+            assert!(log.contains("over 48 hours old"), "{log}");
+            assert!(log.contains("WARN"), "{log}");
+            // 1 h old: no warning.
+            #[allow(clippy::cast_precision_loss)]
+            let fresh_stamp = (tue_17_nov() - Duration::hours(1)).timestamp() as f64;
+            let fresh = FakeStampedBudgets {
+                amount: Some(40.0),
+                last_updated: Some(fresh_stamp),
+            };
+            let (out, log) = run_in_window_capturing(&fresh).await;
+            assert_eq!(log.matches("LAMBDA-AWS-01").count(), 0, "{log}");
+            let age_h = out["budget_data_age_hours"].as_f64().expect("age");
+            assert!((age_h - 1.0).abs() < 1e-9, "{age_h}");
+        }
+
+        #[tokio::test]
+        async fn test_breach_result_also_carries_the_freshness_fields() {
+            let budgets = FakeStampedBudgets {
+                amount: Some(80.0),
+                last_updated: Some(stamp_14_nov()),
+            };
+            let (out, _) = run_in_window_capturing(&budgets).await;
+            assert_eq!(out["breach"], json!(true));
+            assert!(out["budget_data_age_hours"].as_f64().is_some(), "{out}");
+            assert!(out["estimated_spend_now_usd"].as_f64().is_some(), "{out}");
+        }
+
+        /// The stop decision before 2026-11-16, re-derived from first
+        /// principles: refuse non-finite and negative readings, distrust a
+        /// reading at or above the line on UTC days 1 and 2, then compare.
+        fn decision_before(amount: Option<f64>, line: f64, now: DateTime<Utc>) -> &'static str {
+            let reading = amount.filter(|v| v.is_finite() && *v >= 0.0);
+            let trusted = crate::budget_spend::trusted_spend_for_line(reading, line, now);
+            classify_in_window_action(trusted, line)
+        }
+
+        /// Exhaustive sweep (no proptest dependency in this crate): spend ×
+        /// line × stamp × day. The decision with any stamp equals the
+        /// decision with none, and both equal the pre-2026-11-16 rule.
+        #[tokio::test]
+        async fn test_mtd_reading_stop_decision_is_unchanged_by_the_freshness_fields() {
+            let spends = [
+                None,
+                Some(0.0),
+                Some(1.0),
+                Some(54.99),
+                Some(55.0),
+                Some(55.01),
+                Some(61.99),
+                Some(62.0),
+                Some(62.01),
+                Some(139.99),
+                Some(140.0),
+                Some(500.0),
+                Some(-1.0),
+                Some(f64::NAN),
+                Some(f64::INFINITY),
+            ];
+            let lines = [55.0, 62.0, 75.0, 140.0];
+            let days = [
+                utc(2026, 11, 1, 4, 30),
+                utc(2026, 11, 2, 4, 30),
+                utc(2026, 11, 3, 4, 30),
+                tue_17_nov(),
+                utc(2026, 12, 15, 4, 30),
+            ];
+            let mut cases = 0_u32;
+            for now in days {
+                #[allow(clippy::cast_precision_loss)]
+                let now_s = now.timestamp() as f64;
+                let stamps = [
+                    None,
+                    Some(now_s),
+                    Some(now_s - 3600.0),
+                    Some(now_s - 48.0 * 3600.0),
+                    Some(now_s - 72.0 * 3600.0),
+                    Some(now_s + 3600.0),
+                    Some(now_s - 40.0 * 86_400.0),
+                    Some(f64::NAN),
+                ];
+                for &line in &lines {
+                    for &amount in &spends {
+                        let want = decision_before(amount, line, now);
+                        for &stamp in &stamps {
+                            let budgets = FakeStampedBudgets {
+                                amount,
+                                last_updated: stamp,
+                            };
+                            let (usd, _) = mtd_reading(&budgets, line, now).await;
+                            assert_eq!(
+                                classify_in_window_action(usd, line),
+                                want,
+                                "amount={amount:?} line={line} stamp={stamp:?} now={now}"
+                            );
+                            cases += 1;
+                        }
+                    }
+                }
+            }
+            assert_eq!(cases, 5 * 4 * 15 * 8);
+            // End to end through run_guard (in-window, effective line 55): the
+            // breach stop fires on the same spends with and without a stamp.
+            for &amount in &spends {
+                let mut seen = Vec::new();
+                for stamp in [None, Some(stamp_14_nov())] {
+                    let budgets = FakeStampedBudgets {
+                        amount,
+                        last_updated: stamp,
+                    };
+                    let (ec2, sns, events, ssm) = (
+                        FakeEc2::new("running"),
+                        FakeSns::default(),
+                        FakeEvents::new(),
+                        FakeSsm::empty(),
+                    );
+                    let out = run_guard(
+                        &test_env(),
+                        &ec2,
+                        &sns,
+                        &events,
+                        &budgets,
+                        &ssm,
+                        tue_17_nov(),
+                    )
+                    .await
+                    .expect("run_guard ok");
+                    seen.push((
+                        out["breach"].clone(),
+                        out["budget_action"].clone(),
+                        ec2.stopped.borrow().len(),
+                        events.disabled.borrow().len(),
+                        sns.published.borrow().len(),
+                    ));
+                }
+                assert_eq!(seen[0], seen[1], "amount={amount:?}");
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3755,6 +4174,41 @@ mod sdk_loopback_tests {
             missing.actual_spend_usd().await,
             Err("BUDGET_NAME env var is missing or empty".to_string())
         );
+    }
+
+    /// 2026-11-16: the real SDK deserializer reads `Budget.LastUpdatedTime`
+    /// (epoch seconds, a JSON float) into the spend reading; a reply without
+    /// it reads as unknown (`None`), never a guess.
+    #[tokio::test]
+    async fn test_sdk_budgets_describe_spend_reading_reads_last_updated_time() {
+        let (config, _) = config_for(Fleet {
+            spend_usd: "157.18",
+            budget_last_updated: Some("1794637740.25"),
+            ..Fleet::default()
+        })
+        .await;
+        let budgets = SdkBudgets {
+            client: aws_sdk_budgets::Client::new(&config),
+            coords: Ok(coords()),
+        };
+        let reading = budgets.spend_reading().await.expect("reading");
+        assert_eq!(reading.actual_usd, 157.18);
+        let stamp = reading.last_updated_unix_secs.expect("LastUpdatedTime");
+        assert!((stamp - 1_794_637_740.25).abs() < 1e-3, "{stamp}");
+
+        let (config, _) = config_for(Fleet::default()).await;
+        let unstamped = SdkBudgets {
+            client: aws_sdk_budgets::Client::new(&config),
+            coords: Ok(coords()),
+        };
+        let reading = unstamped.spend_reading().await.expect("reading");
+        assert_eq!(reading.last_updated_unix_secs, None);
+
+        let missing = SdkBudgets {
+            client: aws_sdk_budgets::Client::new(&config),
+            coords: Err("BUDGET_NAME env var is missing or empty".to_string()),
+        };
+        assert!(missing.spend_reading().await.is_err());
     }
 
     #[tokio::test]
