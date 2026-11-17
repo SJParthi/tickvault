@@ -2062,6 +2062,19 @@ impl LiveIngest {
         self
     }
 
+    /// Attaches the expected-vs-first-seen subscription book (plan item 3b)
+    /// that the 30 s silence arm judges on every scan (2026-11-17: a builder,
+    /// so the production site and the DHAT gate attach it the same way).
+    /// O(1).
+    #[must_use]
+    pub fn with_subscribe_reconcile(
+        mut self,
+        book: Arc<crate::subscribe_reconcile::SubscribeReconcile>,
+    ) -> Self {
+        self.subscribe_reconcile = Some(book);
+        self
+    }
+
     /// Replaces the candle fold with one pre-sized for `capacity` instruments
     /// (clamped to [`AGGREGATOR_MAX_SLOTS`]) — plan item DT-A6, 2026-10-28.
     ///
@@ -4070,61 +4083,67 @@ impl LiveIngest {
             .subscribe_reconcile
             .as_ref()
             .map(|book| book.sweep_at(reconcile_now));
-        self.detector.scan_silence(now_millis, |report| {
-            if let Some(sweep) = reconcile.as_mut() {
-                sweep.note(&report);
-            }
-            // CLASS ROLLUP — folded here, BEFORE the alarm filter below, and
-            // deliberately not behind `counts_toward_alarm()`.
-            //
-            // That filter is `!sparse && (Exceeded | NeverTicked)`, so it
-            // drops HEALTHY instruments. Reusing it as the class denominator
-            // would leave a denominator of "only the troubled ones", making
-            // `never == eligible` true the moment any instrument in a segment
-            // had never ticked — the detector would fire on a healthy lane
-            // every sweep. The rollup therefore does its own classification
-            // from the raw report, and rides this sweep rather than adding a
-            // second O(n) pass over the universe.
-            classes.observe(
-                report.key.1,
-                report.sparse,
-                report.verdict == SilenceVerdict::NeverTicked,
-                report.silent_millis > report.expected_millis,
-            );
-            if !report.counts_toward_alarm() {
-                return;
-            }
-            // `NeverTicked` is returned by `classify_silence` the instant an
-            // instrument is seeded, with NO elapsed-time condition — it means
-            // "has never ticked", full stop. Counting it raw would report
-            // every instrument in the book as silent for the whole window
-            // between subscribing and the first tick, which is a false alarm
-            // on every single boot. `silent_millis` is time-since-seeding for
-            // this verdict, so requiring it to clear the same quiet ceiling
-            // the other verdicts are judged against gives the subscribe a
-            // fair chance to produce something first.
-            //
-            // Found by a test, not by review: the first version asserted a
-            // freshly-seeded instrument reports nothing and it reported (1,1).
-            if report.silent_millis <= report.expected_millis {
-                return;
-            }
-            silent = silent.saturating_add(1);
-            if report.verdict == SilenceVerdict::NeverTicked {
-                never = never.saturating_add(1);
-            }
-            named = rank_silent(
-                worst,
-                named,
-                SilentInstrument {
-                    security_id: report.key.0,
-                    segment: report.key.1,
-                    silent_millis: report.silent_millis,
-                    expected_millis: report.expected_millis,
-                    never_ticked: report.verdict == SilenceVerdict::NeverTicked,
-                },
-            );
-        });
+        // 2026-11-17: the scan hands out each report's detector slot, so the
+        // reconcile judges it from a dense per-slot cell instead of a hash
+        // probe per report (`ReconcileSweep::note_at_slot`; it falls back to
+        // the probe whenever the cell cannot be trusted). The probe was ~85%
+        // of this arm's measured 2.3 ms at 20,000 instruments.
+        self.detector
+            .scan_silence_slots(now_millis, |slot, report| {
+                if let Some(sweep) = reconcile.as_mut() {
+                    sweep.note_at_slot(slot, &report);
+                }
+                // CLASS ROLLUP — folded here, BEFORE the alarm filter below, and
+                // deliberately not behind `counts_toward_alarm()`.
+                //
+                // That filter is `!sparse && (Exceeded | NeverTicked)`, so it
+                // drops HEALTHY instruments. Reusing it as the class denominator
+                // would leave a denominator of "only the troubled ones", making
+                // `never == eligible` true the moment any instrument in a segment
+                // had never ticked — the detector would fire on a healthy lane
+                // every sweep. The rollup therefore does its own classification
+                // from the raw report, and rides this sweep rather than adding a
+                // second O(n) pass over the universe.
+                classes.observe(
+                    report.key.1,
+                    report.sparse,
+                    report.verdict == SilenceVerdict::NeverTicked,
+                    report.silent_millis > report.expected_millis,
+                );
+                if !report.counts_toward_alarm() {
+                    return;
+                }
+                // `NeverTicked` is returned by `classify_silence` the instant an
+                // instrument is seeded, with NO elapsed-time condition — it means
+                // "has never ticked", full stop. Counting it raw would report
+                // every instrument in the book as silent for the whole window
+                // between subscribing and the first tick, which is a false alarm
+                // on every single boot. `silent_millis` is time-since-seeding for
+                // this verdict, so requiring it to clear the same quiet ceiling
+                // the other verdicts are judged against gives the subscribe a
+                // fair chance to produce something first.
+                //
+                // Found by a test, not by review: the first version asserted a
+                // freshly-seeded instrument reports nothing and it reported (1,1).
+                if report.silent_millis <= report.expected_millis {
+                    return;
+                }
+                silent = silent.saturating_add(1);
+                if report.verdict == SilenceVerdict::NeverTicked {
+                    never = never.saturating_add(1);
+                }
+                named = rank_silent(
+                    worst,
+                    named,
+                    SilentInstrument {
+                        security_id: report.key.0,
+                        segment: report.key.1,
+                        silent_millis: report.silent_millis,
+                        expected_millis: report.expected_millis,
+                        never_ticked: report.verdict == SilenceVerdict::NeverTicked,
+                    },
+                );
+            });
         if let Some(sweep) = reconcile {
             sweep.finish_now();
         }
@@ -17835,8 +17854,8 @@ async fn run_dhan_feed_stack(mut params: DhanFeedStackParams) {
     // after boot never move the slot table or rehash its index inside a
     // frame. Address space only; see `with_fold_capacity` for the bytes.
     .with_fold_capacity(AGGREGATOR_MAX_SLOTS)
-    .with_inline_depth(DepthIngest::new(&params.questdb, depth_book_since));
-    ingest.subscribe_reconcile = Some(Arc::clone(&subscribe_reconcile));
+    .with_inline_depth(DepthIngest::new(&params.questdb, depth_book_since))
+    .with_subscribe_reconcile(Arc::clone(&subscribe_reconcile));
     // LF-6b: the live paper fill chain's tap, only when the boot built the
     // chain (an approved strategy engine exists); never today.
     if let Some(link) = crate::live_fill::take_tap_sender() {
@@ -19452,6 +19471,11 @@ mod subscribe_reconcile_tests;
 #[cfg(test)]
 #[path = "dhan_feed_stack/silence_arm_cost.rs"]
 mod silence_arm_cost;
+
+// The silence arm's slot-cell path against a frozen copy of the arm before it.
+#[cfg(test)]
+#[path = "dhan_feed_stack/silence_slot_oracle_tests.rs"]
+mod silence_slot_oracle_tests;
 
 #[cfg(test)]
 mod tests {

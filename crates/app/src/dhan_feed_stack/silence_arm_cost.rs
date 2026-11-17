@@ -33,6 +33,7 @@ mod tests {
         black_box(acc);
     }
 
+    #[allow(clippy::print_stdout)] // APPROVED: #[ignore]d measurement harness run with --nocapture; the printed figures are its only output.
     fn stats(name: &str, mut v: Vec<Duration>) {
         v.sort();
         let us = |d: Duration| d.as_secs_f64() * 1e6;
@@ -70,6 +71,7 @@ mod tests {
 
     #[test]
     #[ignore = "wall-clock measurement harness"]
+    #[allow(clippy::print_stdout)] // APPROVED: #[ignore]d measurement harness run with --nocapture; the printed figures are its only output.
     fn silence_arm_cost_at_the_authorized_ceiling() {
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
         let _ = metrics::set_global_recorder(recorder);
@@ -129,6 +131,10 @@ mod tests {
         // Collected reports for the reconcile-only phase.
         let mut reports = Vec::with_capacity(20_000);
         ingest.detector.scan_silence(now_ms, |r| reports.push(r));
+        let mut slotted = Vec::with_capacity(20_000);
+        ingest
+            .detector
+            .scan_silence_slots(now_ms, |slot, r| slotted.push((slot, r)));
         let mut verdicts = std::collections::HashMap::new();
         for r in &reports {
             *verdicts.entry(format!("{:?}", r.verdict)).or_insert(0u32) += 1;
@@ -145,6 +151,7 @@ mod tests {
             let mut p2b = Vec::new();
             let mut p2c = Vec::new();
             let mut p2d = Vec::new();
+            let mut p2e = Vec::new();
             let mut p3 = Vec::new();
             let mut whole = Vec::new();
             for _ in 0..ROUNDS {
@@ -187,6 +194,21 @@ mod tests {
                 }
                 black_box(sweep.finish_now());
                 p2c.push(t.elapsed());
+
+                // (2e) reconcile alone through the slot cells (2026-11-17),
+                // over the same reports with their detector slots; the cells
+                // were filled by the earlier rounds, so this is the steady
+                // state the arm runs in.
+                if cold {
+                    flush(&mut flushbuf);
+                }
+                let t = Instant::now();
+                let mut sweep = book.sweep();
+                for (slot, r) in &slotted {
+                    sweep.note_at_slot(*slot, r);
+                }
+                black_box(sweep.finish_now());
+                p2e.push(t.elapsed());
 
                 // (2d) bare hash probes into a std HashMap of the same keys.
                 // (measures only the hash + probe cost, no Expected work)
@@ -269,6 +291,10 @@ mod tests {
                 p2d,
             );
             stats(
+                &format!("{tag} (2e) reconcile sweep+note_at_slot x20k+finish"),
+                p2e,
+            );
+            stats(
                 &format!("{tag} (3) rest of arm (gauges/publish/checks)"),
                 p3,
             );
@@ -303,6 +329,7 @@ mod hash_probe {
 
     #[test]
     #[ignore = "wall-clock measurement harness"]
+    #[allow(clippy::print_stdout)] // APPROVED: #[ignore]d measurement harness run with --nocapture; the printed figures are its only output.
     fn probe_cost_std_vs_ahash_vs_dense() {
         let keys: Vec<(u64, ExchangeSegment)> = {
             let mut x: u64 = 0x9E37_79B9;

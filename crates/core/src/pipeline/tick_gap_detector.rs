@@ -2085,7 +2085,7 @@ mod tests {
         ) {
             let mut d = TickGapDetector::with_capacity(8, DetectorConfig::live_lane());
             let segments = [ExchangeSegment::IdxI, ExchangeSegment::NseEquity, ExchangeSegment::NseFno];
-            let mut check = |d: &TickGapDetector, now: u64| -> Result<(), TestCaseError> {
+            let check = |d: &TickGapDetector, now: u64| -> Result<(), TestCaseError> {
                 let mut plain = Vec::new();
                 d.scan_silence(now, |r| plain.push(r));
                 let mut slotted = Vec::new();
