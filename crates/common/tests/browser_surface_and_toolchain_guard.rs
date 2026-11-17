@@ -1249,9 +1249,11 @@ const JS_BYTE_BUDGET: &[(&str, usize)] = &[
     // 34,627 → 34,696 the same day (PR MV combined review): a generation stamp
     // on each reply so an older filter's rows never render under a newer one;
     // still under the 34,714 §0.18 approved.
+    // 34,696 → 35,000 on 2026-11-17: the key is remembered in this browser for
+    // 30 days (owner card "Remember 30 days"), rust-only-forever-lock §0.20.
     (
         "crates/aws-lambdas/src/operator_control_console.html",
-        34_696,
+        35_000,
     ),
 ];
 

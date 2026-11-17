@@ -1435,3 +1435,32 @@ the row's ceiling; adding a schedule or push trigger; any delete beyond the
 four Quote 56 ids; keeping the workflow after the run.
 
 **ENDED 2026-11-11.** The workflow ran twice that evening: `dry` (run 43068890684) and `apply` (run 43069827741), both OK; all four ids were deleted and verified gone. The workflow, its budget row, the Rust tool and the role are deleted in the follow-up PR, so this exception authorizes nothing further.
+
+## §0.20. 2026-11-17 — the operator portal remembers its key for 30 days (owner-approved)
+
+The owner, 2026-11-17 (verbatim, typos preserved): "why the fuck whenevr i
+click tickvault opertaor portal from tleegram why the fuck it si askign em the
+access key ... form telegram when we click the lin kit shdou len evr evr fuckigna
+sk em the key", then the card "Remember 30 days (Recommended)": "Paste once per
+device; Telegram links open straight in for 30 days, then it asks once again. A
+'Lock' button still forgets it at once. The key still never goes inside a link."
+
+Cause: since audit L4 (2026-10-04) the portal kept the key per TAB
+(`sessionStorage`), so every link opened from Telegram (a new tab) asked again,
+while the lock screen still said "saved on THIS device only". The page now
+keeps the key in this browser's `localStorage` under `tv_key` with an expiry
+30 days after it was pasted; an expired or unreadable record is removed; Lock
+removes it; a 401 (wrong or rotated key) locks. The server answers 503, not
+401, when it cannot read its own secret, so a read failure never makes the
+browser forget a correct key. The key never goes into a link or a message
+(audit PR36a, 2026-09-27, unchanged).
+
+Measured by the guard after implementation: this portal's JS_BYTE_BUDGET row
+moves **34,696 → 35,000 UTF-8 bytes** (+304). JavaScript lines stay within the
+unchanged 350-line ceiling; one script tag; inline handler occurrences
+unchanged at 21.
+
+Scope is this key-remembering change only. REJECT: putting the key in any link
+or message; remembering it longer than 30 days without a fresh dated quote;
+removing Lock; reading a `tv_token` copy an older build left; any other budget
+increase under this section.
