@@ -901,10 +901,33 @@ impl TickGapDetector {
     where
         F: FnMut(SilenceReport),
     {
-        for state in self.slots.iter().take(self.next_slot as usize) {
+        self.scan_silence_slots(now_millis, |_slot, report| sink(report));
+    }
+
+    /// [`Self::scan_silence`], also handing the sink each report's slot index
+    /// in this detector's dense slot table (2026-11-17).
+    ///
+    /// The slot lets a caller keep its own per-instrument state in a dense
+    /// array indexed by slot instead of a hash probe per report: the drain's
+    /// subscribe reconcile does this (`ReconcileSweep::note_at_slot`). A slot
+    /// is stable while the instrument stays tracked and is reassigned only by
+    /// [`Self::reset_session`], so a caller MUST check the report's key
+    /// against what it cached at that slot before trusting the cache.
+    ///
+    /// Same loop, same reports, same order as `scan_silence` (which wraps
+    /// this): **O(n) in tracked instruments**, zero allocation, one extra
+    /// `u32` per report.
+    pub fn scan_silence_slots<F>(&self, now_millis: u64, mut sink: F)
+    where
+        F: FnMut(u32, SilenceReport),
+    {
+        for (slot, state) in self.slots.iter().take(self.next_slot as usize).enumerate() {
             if !state.used {
                 continue;
             }
+            // `next_slot` is a `u32`, so every index taken here fits; the
+            // saturating fallback can never be reached.
+            let slot = u32::try_from(slot).unwrap_or(u32::MAX);
             let silent_millis = now_millis.saturating_sub(state.last_seen_millis);
             // Plan PR AL-5: an NSE_FNO cadence is floored before it is
             // judged, and a freshly seeded instrument is not judged at all.
@@ -937,17 +960,20 @@ impl TickGapDetector {
             let alarm_sparse = sparse
                 || (state.last_ltt.is_some()
                     && judged_cadence >= self.config.sparse_baseline_millis);
-            sink(SilenceReport {
-                key: state.key,
-                silent_millis,
-                expected_millis,
-                baseline_millis: state.interval_ewma_millis,
-                samples: state.samples,
-                verdict: classified,
-                sparse,
-                warming_up,
-                alarm_sparse,
-            });
+            sink(
+                slot,
+                SilenceReport {
+                    key: state.key,
+                    silent_millis,
+                    expected_millis,
+                    baseline_millis: state.interval_ewma_millis,
+                    samples: state.samples,
+                    verdict: classified,
+                    sparse,
+                    warming_up,
+                    alarm_sparse,
+                },
+            );
         }
     }
 
@@ -2042,6 +2068,57 @@ mod tests {
             let mut n = 0usize;
             d.scan_silence(u64::MAX, |_| n += 1);
             prop_assert_eq!(n, d.tracked_instruments());
+        }
+
+        /// `scan_silence_slots` (2026-11-17) hands out exactly the reports
+        /// `scan_silence` does, in the same order, and each with the slot the
+        /// detector's own index holds for that key. Exercised across a session
+        /// reset (which reassigns slots), seeds, refusals past capacity and the
+        /// same id in two segments.
+        #[test]
+        fn proptest_scan_silence_slots_equals_scan_silence(
+            ops in prop::collection::vec(
+                (0u8..4, 0u64..12, 0u8..3, any::<u32>(), 0u32..10_000, 0u64..5_000_000),
+                0..300,
+            ),
+            now in 0u64..6_000_000,
+        ) {
+            let mut d = TickGapDetector::with_capacity(8, DetectorConfig::live_lane());
+            let segments = [ExchangeSegment::IdxI, ExchangeSegment::NseEquity, ExchangeSegment::NseFno];
+            let mut check = |d: &TickGapDetector, now: u64| -> Result<(), TestCaseError> {
+                let mut plain = Vec::new();
+                d.scan_silence(now, |r| plain.push(r));
+                let mut slotted = Vec::new();
+                d.scan_silence_slots(now, |slot, r| slotted.push((slot, r)));
+                prop_assert_eq!(plain.len(), slotted.len());
+                let mut previous: Option<u32> = None;
+                for (p, (slot, s)) in plain.iter().zip(slotted.iter()) {
+                    prop_assert_eq!(p, s);
+                    prop_assert_eq!(d.index.get(&s.key).copied(), Some(*slot));
+                    prop_assert!(previous.is_none_or(|prev| prev < *slot));
+                    prop_assert!((*slot as usize) < d.capacity());
+                    previous = Some(*slot);
+                }
+                Ok(())
+            };
+            for (op, sid, seg, ltt, vol, millis) in ops {
+                let key = (sid, segments[usize::from(seg)]);
+                match op {
+                    0 => {
+                        let _ = d.seed(key, millis);
+                    }
+                    1 | 2 => {
+                        let _ = d.observe(obs(key, ltt, vol, vol, millis));
+                    }
+                    _ => {
+                        check(&d, now)?;
+                        if sid % 4 == 0 {
+                            d.reset_session();
+                        }
+                    }
+                }
+            }
+            check(&d, now)?;
         }
     }
 

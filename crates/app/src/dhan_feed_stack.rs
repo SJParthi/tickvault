@@ -19448,6 +19448,11 @@ const IN_SESSION_1000_IST_MILLIS: u64 = (4 * 3_600 + 30 * 60) * 1_000;
 #[path = "dhan_feed_stack/subscribe_reconcile_tests.rs"]
 mod subscribe_reconcile_tests;
 
+// The 30 s silence arm's wall-clock harness (2026-11-17), `#[ignore]`d.
+#[cfg(test)]
+#[path = "dhan_feed_stack/silence_arm_cost.rs"]
+mod silence_arm_cost;
+
 #[cfg(test)]
 mod tests {
     /// 2026-09-26 audit fix PR1: both sequence-refusal arms are per TICK; each
