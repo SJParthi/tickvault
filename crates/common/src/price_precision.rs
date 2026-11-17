@@ -50,6 +50,52 @@ const DECIMAL_SCALES: [f64; 10] = [1.0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 
 /// as `123456790`), and the text path handles it.
 const ARITHMETIC_PATH_MAX_MAGNITUDE: f32 = 16_777_216.0;
 
+/// Magnitude bound of the two-decimal fast path in [`f32_to_f64_clean`]:
+/// 2^17. Below it the spacing of `f32` values is at most 2^-7
+/// (0.0078125), less than 0.01, so at most one multiple of 0.01 rounds
+/// to any given `f32` (the proof is in [`f32_to_f64_clean`]'s docs).
+/// At 2^17 and above the spacing is 2^-6 (0.015625) or more, two
+/// multiples of 0.01 can round to the same `f32`, and the fast path
+/// could return a different one than the search, so it is not tried.
+const TWO_DECIMAL_FAST_PATH_MAX_MAGNITUDE: f32 = 131_072.0;
+
+// The fast path sits inside the arithmetic path's range.
+const _: () = assert!(TWO_DECIMAL_FAST_PATH_MAX_MAGNITUDE < ARITHMETIC_PATH_MAX_MAGNITUDE);
+
+/// The scale the fast path tries first: `10^2`, two decimal places, the
+/// precision of exchange prices. Exact in `f64`, and the third entry of
+/// [`DECIMAL_SCALES`].
+const TWO_DECIMAL_SCALE: f64 = 1e2;
+
+/// One step of [`f32_to_f64_clean`]'s search at `scale`: take the
+/// nearest integer `m` to `widened · scale`, then its other neighbour,
+/// and return the first `m / scale` that narrows back to `v`. The fast
+/// path and the loop both call this, so they test the same candidates
+/// in the same order.
+#[inline(always)]
+fn hit_at_scale(v: f32, widened: f64, scale: f64) -> Option<f64> {
+    let scaled = widened * scale;
+    let nearest = scaled.round();
+    let candidate = nearest / scale;
+    #[allow(clippy::cast_possible_truncation)]
+    // APPROVED: narrowing is the round-trip test itself
+    if candidate as f32 == v {
+        return Some(candidate);
+    }
+    let other = if scaled > nearest {
+        nearest + 1.0
+    } else {
+        nearest - 1.0
+    };
+    let candidate = other / scale;
+    #[allow(clippy::cast_possible_truncation)]
+    // APPROVED: narrowing is the round-trip test itself
+    if candidate as f32 == v {
+        return Some(candidate);
+    }
+    None
+}
+
 /// Converts `f32` → `f64` without IEEE-754 widening artifacts.
 ///
 /// The result is the `f64` nearest to the shortest decimal that
@@ -71,10 +117,47 @@ const ARITHMETIC_PATH_MAX_MAGNITUDE: f32 = 16_777_216.0;
 ///
 /// # Performance
 ///
-/// O(1): at most 10 scales × 2 candidates, then the text path. Measured
-/// 2026-10-09 (release, x86 dev container, 1,000 price-like inputs):
-/// about 17 ns per call against 129 ns for format-and-parse. Used per
-/// tick in `tick_persistence::append_tick` and the candle fold.
+/// O(1): at most 1 + 10 scales × 2 candidates, then the text path.
+/// Measured 2026-10-09 (release, x86 dev container, 1,000 price-like
+/// inputs): about 17 ns per call against 129 ns for format-and-parse.
+/// Used per tick in `tick_persistence::append_tick`, the depth rows and
+/// the candle fold. For the two-decimal fast path's figures see below.
+///
+/// # Two-decimal fast path (2026-11-17, plan ITEM DT)
+///
+/// For `0 < |v| < 2^17` the scale `10^2` is tried first, before the
+/// search. A hit returns at once; a miss runs the unchanged search from
+/// scale 1. Most prices have two decimals or fewer, so they now cost one
+/// scale step instead of up to three. Measured 2026-11-17 (release,
+/// x86 dev container, `test_f32_to_f64_clean_fast_path_timing`: 4,096
+/// inputs, 70% two-decimal prices 0.05 to 1,00,000, 15% one-decimal, 10%
+/// integers, 5% four-decimal; best of 5 per sample, 8 samples each):
+/// fast path 6.0 to 6.5 ns per call in 6 samples (the other two 10.3
+/// and 11.3 ns), frozen search 13.6 to 14.1 ns in 5 (the others 17.3,
+/// 17.4 and 19.4 ns). Not measured on the production host.
+///
+/// Why a hit is exactly what the search returns:
+///
+/// 1. Let `S` be the set of `f64` values `fl(M / 100)`, for integers
+///    `M`, that narrow to `v`. `fl` (IEEE division) and the narrowing
+///    are both monotone, so the reals `r` with `(fl(r) as f32) == v`
+///    form one interval, at most one `f32` spacing plus one `f64`
+///    spacing wide: below 2^17 that is under 2^-7 + 2^-36 < 0.01. So at
+///    most one `M / 100` lies in it, and `S` has at most one element.
+/// 2. A search hit at scale 1 or 10 is `fl(m / s)` with `s` dividing
+///    100, the correctly rounded value of the rational `m / s` =
+///    `(m · 100 / s) / 100`. So it equals `fl(M / 100)` with
+///    `M = m · 100 / s`, it narrows to `v`, and it is in `S`. The fast
+///    path's hit is in `S` too, so the two are the same `f64`.
+/// 3. If the search reaches scale 100 instead, its step there is the
+///    same `hit_at_scale` call with the same arguments: same candidates,
+///    nearest first, then the other neighbour, same result.
+///
+/// Negative values are the mirror image (`round` is symmetric, the
+/// interval argument does not use the sign). Zero, non-finite values and
+/// `|v| >= 2^17` never take the fast path. Checked for all 2^32 inputs
+/// against the search as it was before (frozen in the tests) by
+/// `test_f32_to_f64_clean_matches_frozen_search_for_every_f32`.
 #[inline]
 #[must_use]
 pub fn f32_to_f64_clean(v: f32) -> f64 {
@@ -83,24 +166,13 @@ pub fn f32_to_f64_clean(v: f32) -> f64 {
         // APPROVED: f64::from(f32) is exact; only the scaled candidates
         // below are returned, never this widened value.
         let widened = f64::from(v);
+        if magnitude < TWO_DECIMAL_FAST_PATH_MAX_MAGNITUDE
+            && let Some(candidate) = hit_at_scale(v, widened, TWO_DECIMAL_SCALE)
+        {
+            return candidate;
+        }
         for scale in DECIMAL_SCALES {
-            let scaled = widened * scale;
-            let nearest = scaled.round();
-            let candidate = nearest / scale;
-            #[allow(clippy::cast_possible_truncation)]
-            // APPROVED: narrowing is the round-trip test itself
-            if candidate as f32 == v {
-                return candidate;
-            }
-            let other = if scaled > nearest {
-                nearest + 1.0
-            } else {
-                nearest - 1.0
-            };
-            let candidate = other / scale;
-            #[allow(clippy::cast_possible_truncation)]
-            // APPROVED: narrowing is the round-trip test itself
-            if candidate as f32 == v {
+            if let Some(candidate) = hit_at_scale(v, widened, scale) {
                 return candidate;
             }
         }
@@ -367,6 +439,241 @@ mod tests {
             first = first.or(example);
         }
         assert_eq!(differences, 0, "first difference: {first:?}");
+    }
+
+    /// `f32_to_f64_clean` exactly as it was before the two-decimal fast
+    /// path (2026-11-17): the oracle the fast path must match bit for
+    /// bit. Frozen; never edit it to make a test pass.
+    fn f32_to_f64_clean_frozen_before_fast_path(v: f32) -> f64 {
+        let magnitude = v.abs();
+        if magnitude > 0.0 && magnitude < ARITHMETIC_PATH_MAX_MAGNITUDE {
+            let widened = f64::from(v);
+            for scale in DECIMAL_SCALES {
+                let scaled = widened * scale;
+                let nearest = scaled.round();
+                let candidate = nearest / scale;
+                #[allow(clippy::cast_possible_truncation)]
+                // APPROVED: narrowing is the round-trip test itself
+                if candidate as f32 == v {
+                    return candidate;
+                }
+                let other = if scaled > nearest {
+                    nearest + 1.0
+                } else {
+                    nearest - 1.0
+                };
+                let candidate = other / scale;
+                #[allow(clippy::cast_possible_truncation)]
+                // APPROVED: narrowing is the round-trip test itself
+                if candidate as f32 == v {
+                    return candidate;
+                }
+            }
+        }
+        f32_to_f64_clean_via_text(v)
+    }
+
+    #[test]
+    fn test_two_decimal_fast_path_constants_are_the_proven_values() {
+        // The proof needs the bound at 2^17 (f32 spacing below it is
+        // 2^-7 < 0.01) and the scale at the third DECIMAL_SCALES entry.
+        assert_eq!(TWO_DECIMAL_FAST_PATH_MAX_MAGNITUDE, 2_f32.powi(17));
+        let below = f32::from_bits(TWO_DECIMAL_FAST_PATH_MAX_MAGNITUDE.to_bits() - 1);
+        assert!(f64::from(TWO_DECIMAL_FAST_PATH_MAX_MAGNITUDE - below) < 0.01);
+        assert_eq!(TWO_DECIMAL_SCALE.to_bits(), DECIMAL_SCALES[2].to_bits());
+    }
+
+    #[test]
+    fn test_f32_to_f64_clean_matches_frozen_search_near_the_fast_path_bound() {
+        // Every f32 within 100,000 steps either side of 2^17 (where the
+        // spacing doubles and the fast path stops), both signs, plus a
+        // run of tiny values and every paise price up to 1,40,000.
+        let bound = TWO_DECIMAL_FAST_PATH_MAX_MAGNITUDE.to_bits();
+        for bits in (bound - 100_000)..=(bound + 100_000) {
+            let v = f32::from_bits(bits);
+            for v in [v, -v] {
+                let (new, old) = (
+                    f32_to_f64_clean(v),
+                    f32_to_f64_clean_frozen_before_fast_path(v),
+                );
+                assert!(same_bits(new, old), "{v:e}: {new} != {old}");
+            }
+        }
+        for bits in 1_u32..200_000 {
+            let v = f32::from_bits(bits);
+            let (new, old) = (
+                f32_to_f64_clean(v),
+                f32_to_f64_clean_frozen_before_fast_path(v),
+            );
+            assert!(same_bits(new, old), "{v:e}: {new} != {old}");
+        }
+        for paise in 0_u32..=14_000_000 {
+            #[allow(clippy::cast_precision_loss)]
+            // APPROVED: test input generation, paise < 2^24
+            let price = paise as f32 / 100.0;
+            for v in [price, -price] {
+                let (new, old) = (
+                    f32_to_f64_clean(v),
+                    f32_to_f64_clean_frozen_before_fast_path(v),
+                );
+                assert!(same_bits(new, old), "{v}: {new} != {old}");
+            }
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(4_096))]
+
+        #[test]
+        fn proptest_f32_to_f64_clean_equals_frozen_search_any_bits(bits in proptest::prelude::any::<u32>()) {
+            let v = f32::from_bits(bits);
+            let (new, old) = (f32_to_f64_clean(v), f32_to_f64_clean_frozen_before_fast_path(v));
+            proptest::prop_assert!(same_bits(new, old), "{:e}: {} != {}", v, new, old);
+        }
+
+        #[test]
+        fn proptest_f32_to_f64_clean_equals_frozen_search_on_prices(
+            units in 0_u32..30_000_000,
+            places in 0_u32..5,
+            negative in proptest::prelude::any::<bool>(),
+        ) {
+            // Decimal prices with 0..=4 places, up to 3,00,000 rupees:
+            // crosses the 2^17 fast-path bound.
+            #[allow(clippy::cast_precision_loss)]
+            // APPROVED: test input generation
+            let v = (units as f32) / 10_f32.powi(places as i32);
+            let v = if negative { -v } else { v };
+            let (new, old) = (f32_to_f64_clean(v), f32_to_f64_clean_frozen_before_fast_path(v));
+            proptest::prop_assert!(same_bits(new, old), "{}: {} != {}", v, new, old);
+        }
+    }
+
+    /// The full proof of the fast path: all 2^32 inputs, new against the
+    /// frozen search. Measured 2026-11-17: 0 differences, 417 s on 4 cores
+    /// (release; the frozen side pays the text path for every value the
+    /// search misses). Split across the machine's threads. Run with
+    /// `cargo test -p tickvault-common --release --lib -- --ignored frozen_search_for_every_f32`.
+    #[test]
+    #[ignore = "exhaustive: about 7 minutes in release, far longer in debug"]
+    fn test_f32_to_f64_clean_matches_frozen_search_for_every_f32() {
+        let threads = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
+        let threads = u64::try_from(threads).unwrap_or(4);
+        let span = 1_u64 << 32;
+        let handles: Vec<_> = (0..threads)
+            .map(|t| {
+                std::thread::spawn(move || {
+                    let (low, high) = (span * t / threads, span * (t + 1) / threads);
+                    let mut first_difference = None;
+                    let mut differences = 0_u64;
+                    let mut fast_path_inputs = 0_u64;
+                    for bits in low..high {
+                        #[allow(clippy::cast_possible_truncation)]
+                        // APPROVED: bits < 2^32
+                        let v = f32::from_bits(bits as u32);
+                        let magnitude = v.abs();
+                        if magnitude > 0.0 && magnitude < TWO_DECIMAL_FAST_PATH_MAX_MAGNITUDE {
+                            fast_path_inputs += 1;
+                        }
+                        let (new, old) = (
+                            f32_to_f64_clean(v),
+                            f32_to_f64_clean_frozen_before_fast_path(v),
+                        );
+                        if !same_bits(new, old) {
+                            differences += 1;
+                            first_difference.get_or_insert((v, new, old));
+                        }
+                    }
+                    (differences, first_difference, fast_path_inputs)
+                })
+            })
+            .collect();
+        let (mut differences, mut first, mut fast_path_inputs) = (0, None, 0);
+        for handle in handles {
+            let (count, example, fast) = handle.join().expect("worker thread panicked");
+            differences += count;
+            first = first.or(example);
+            fast_path_inputs += fast;
+        }
+        // Non-vacuity: the fast-path region is most of the f32 space.
+        assert!(fast_path_inputs > 2_000_000_000, "{fast_path_inputs}");
+        assert_eq!(differences, 0, "first difference: {first:?}");
+    }
+
+    /// Release timing of the new conversion against the frozen search on
+    /// a price-like mix. Prints; asserts nothing about speed. Run with
+    /// `cargo test -p tickvault-common --release --lib -- --ignored --nocapture fast_path_timing`.
+    #[test]
+    #[ignore = "wall-clock timing harness, release only"]
+    fn test_f32_to_f64_clean_fast_path_timing() {
+        // 4,096 inputs: 70% two-decimal prices 0.05..1,00,000 on a
+        // 0.05 tick, 15% one-decimal, 10% integers, 5% odd values.
+        let mut inputs = Vec::with_capacity(4_096);
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for i in 0..4_096_u32 {
+            let r = next();
+            #[allow(clippy::cast_precision_loss)]
+            // APPROVED: test input generation
+            let v = match i % 20 {
+                0..=13 => ((r % 2_000_000) + 1) as f32 * 5.0 / 100.0,
+                14..=16 => ((r % 1_000_000) + 1) as f32 / 10.0,
+                17 | 18 => ((r % 100_000) + 1) as f32,
+                _ => ((r % 10_000_000) + 1) as f32 / 1_000.0 + 0.000_7,
+            };
+            inputs.push(v);
+        }
+        // The mix must give identical output under both functions, and
+        // most of it must be the fast path's two-decimal shape.
+        for &v in &inputs {
+            let (new, old) = (
+                f32_to_f64_clean(v),
+                f32_to_f64_clean_frozen_before_fast_path(v),
+            );
+            assert!(same_bits(new, old), "{v}: {new} != {old}");
+        }
+        let fast_hits = inputs
+            .iter()
+            .filter(|&&v| hit_at_scale(v, f64::from(v), TWO_DECIMAL_SCALE).is_some())
+            .count();
+        assert!(
+            fast_hits * 10 >= inputs.len() * 9,
+            "fast-path hits {fast_hits}"
+        );
+        let rounds = 2_000;
+        let time = |f: fn(f32) -> f64| {
+            let mut best = f64::MAX;
+            for _ in 0..5 {
+                let start = std::time::Instant::now();
+                let mut sum = 0.0_f64;
+                for _ in 0..rounds {
+                    for &v in &inputs {
+                        sum += f(std::hint::black_box(v));
+                    }
+                }
+                std::hint::black_box(sum);
+                #[allow(clippy::cast_precision_loss)]
+                // APPROVED: timing arithmetic
+                let per_call = start.elapsed().as_nanos() as f64 / (rounds * inputs.len()) as f64;
+                best = best.min(per_call);
+            }
+            best
+        };
+        let old = time(f32_to_f64_clean_frozen_before_fast_path);
+        let new = time(f32_to_f64_clean);
+        let old_again = time(f32_to_f64_clean_frozen_before_fast_path);
+        let new_again = time(f32_to_f64_clean);
+        assert!(old > 0.0 && new > 0.0 && old_again > 0.0 && new_again > 0.0);
+        #[allow(clippy::print_stderr)]
+        {
+            eprintln!(
+                "f32_to_f64_clean per call (best of 5, ns): frozen search {old:.2} / {old_again:.2}, fast path {new:.2} / {new_again:.2}"
+            );
+        }
     }
 
     #[test]

@@ -204,6 +204,28 @@ const ALLOWED_IGNORED: &[(&str, &str)] = &[
         "crates/common/src/price_precision.rs",
         "test_f32_to_f64_clean_matches_text_path_for_every_f32",
     ),
+    // Added 2026-11-17 with the two-decimal fast path (plan ITEM DT): the
+    // same shape as the entry above, new `f32_to_f64_clean` against the
+    // frozen pre-fast-path search for all 2^32 inputs. Measured: 0
+    // differences, 417 s on 4 cores in release; a debug
+    // CI build would take far too long. It is not the gate: the bound-band
+    // test (100,000 f32 steps either side of 2^17, tiny values, every paise
+    // price to 1,40,000 rupees) and two proptests beside it run in every
+    // suite. Re-run it whenever the fast path changes:
+    //
+    //   cargo test -p tickvault-common --release --lib -- --ignored frozen_search_for_every_f32
+    (
+        "crates/common/src/price_precision.rs",
+        "test_f32_to_f64_clean_matches_frozen_search_for_every_f32",
+    ),
+    // Added 2026-11-17 (plan ITEM DT): a wall-clock harness that times the
+    // fast path against the frozen search and prints both; on a shared CI
+    // runner it would flake. It gates nothing; output equality on its own
+    // input mix is asserted inside it and by the tests above.
+    (
+        "crates/common/src/price_precision.rs",
+        "test_f32_to_f64_clean_fast_path_timing",
+    ),
     // Added 2026-10-30 with the tick row fast price path (plan ITEM DT): the
     // same shape as the entry above. It checks `tick_price_f64` against
     // `round_to_2dp(f32_to_f64_clean(v))` for every f32 below 2^17, both
