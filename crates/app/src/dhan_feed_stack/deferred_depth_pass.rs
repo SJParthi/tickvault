@@ -685,6 +685,9 @@ pub(crate) fn pass_counters() -> &'static DrainCounters {
             unknown_skipped: noop(),
             frames_wal_unbacked: noop(),
             depth_unbacked_not_shed: noop(),
+            lag_excluded_ltt_not_advanced: noop(),
+            lag_excluded_not_new_trade: noop(),
+            lag_excluded_not_a_trade: noop(),
         }
     })
 }
