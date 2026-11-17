@@ -660,8 +660,14 @@ impl AppliedSnapshot {
             // could not store (its slot held a different id, or a range too
             // wide to mark) set the overflow flag, checked above. Overflow is
             // cleared only into a bounded range (the boot fold, the in-session
-            // bound) or after a drain proved past its height, both checked
-            // above too. So a mark inside `[first, last]` is either in a slot
+            // bound), after a drain proved past its height, or at load when a
+            // trusted sidecar names the file's generation (`to_bytes` writes
+            // that generation only when the RAM table was NOT overflowed, so
+            // the loaded bit then means "ranges that did not fit the v1
+            // table", which the sidecar holds exactly), all checked above too
+            // (the ranges). `AppliedWatermark::snapshot` reads the flag and the
+            // ranges under one lock, so a bound racing it cannot drop both.
+            // So a mark inside `[first, last]` is either in a slot
             // or caught by an earlier check, and one pass over the slots
             // answers exactly: the same as the per-id loop below would over
             // the whole range (each id sits at `slot_of(id)`), never `false`
@@ -2984,8 +2990,18 @@ impl AppliedWatermark {
     /// Current RAM state.
     #[must_use]
     pub fn snapshot(&self) -> AppliedSnapshot {
-        let state = *self.lock_ranges();
-        self.snapshot_with(&state)
+        // ⚠ CHANGED 2026-11-17 (review): the ranges lock is held while the
+        // flag, the height and the slots are read. `bound_known_overflow_locked`
+        // adds the overflow's range and clears the flag under this lock, so a
+        // snapshot that copied the ranges, let go, and then read the flag could
+        // hold neither the range nor the flag: a range over the lost marks
+        // (the wide-range slot scan included) read applied. Reading 2 × 128
+        // atomics under it costs a few microseconds, cold.
+        let guard = self.lock_ranges();
+        let state = *guard;
+        let snap = self.snapshot_with(&state);
+        drop(guard);
+        snap
     }
 
     /// [`Self::snapshot`] with the ranges the caller already holds.
@@ -6333,6 +6349,164 @@ mod wide_range_tests {
             } else {
                 proptest::prop_assert!(old_unapplied_in(&snap, lo, hi));
             }
+        }
+    }
+
+    /// 2026-11-17 review: `to_bytes` names a sidecar generation only when the
+    /// RAM table is NOT overflowed. The trusted-sidecar load clears a loaded
+    /// overflow bit on the strength of that generation, so a pad written
+    /// while overflowed would clear a real overflow and every wide range
+    /// over it would read applied.
+    #[test]
+    fn test_to_bytes_names_no_sidecar_while_overflowed() {
+        let mut snap = AppliedSnapshot {
+            overflowed: true,
+            overflow_high_seq: W1_HI,
+            ranges_gen: 7,
+            ..AppliedSnapshot::default()
+        };
+        snap.ranges.add_range(W1_LO, W1_LO + 1_000);
+        assert_eq!(&snap.to_bytes()[6..8], &[0, 0]);
+        snap.overflowed = false;
+        assert_eq!(&snap.to_bytes()[6..8], &7_u16.to_le_bytes());
+    }
+
+    /// 2026-11-17 review: a snapshot taken while the in-session bound turns
+    /// an overflow into a range holds one of the two. The persist that bounds
+    /// it runs under the ranges lock; while a reader holds that lock (as
+    /// `snapshot` now does through all its reads) the bound cannot run.
+    #[test]
+    fn test_snapshot_holds_the_ranges_lock_while_it_reads_the_flag() {
+        let src = include_str!("wal_applied_watermark.rs");
+        let at = src
+            .find("    pub fn snapshot(&self) -> AppliedSnapshot {")
+            .expect("snapshot");
+        let body = &src[at..at + src[at..].find("\n    }\n").expect("end")];
+        let lock = body.find("let guard = self.lock_ranges();").expect("lock");
+        let read = body.find("self.snapshot_with(&state)").expect("read");
+        let release = body.find("drop(guard);").expect("release");
+        assert!(lock < read && read < release, "{body}");
+    }
+
+    #[derive(Debug, Clone)]
+    enum Op {
+        /// A frame shed at bucket offset, intra-bucket offset.
+        Note(u64, u64),
+        /// A rescue batch over `width` buckets from a bucket offset.
+        NoteRange(u64, u64),
+        /// A confirmed drain below the bucket offset (and intra offset).
+        Reset(u64, u64),
+        /// The once-a-second persist (bounds a known overflow into a range).
+        Persist,
+        /// Persist, then a new process binds the same folder (loads the file
+        /// and the sidecar).
+        Reload,
+        /// The boot fold, with `own_floor` above every mark so far; later
+        /// marks are minted above it, as the ratchet guarantees.
+        Fold,
+    }
+
+    fn op() -> impl proptest::strategy::Strategy<Value = Op> {
+        use proptest::prelude::*;
+        prop_oneof![
+            6 => (0_u64..700, 0_u64..(1_u64 << UNAPPLIED_BUCKET_SHIFT)).prop_map(|(b, o)| Op::Note(b, o)),
+            3 => (0_u64..700, 0_u64..300).prop_map(|(b, w)| Op::NoteRange(b, w)),
+            2 => (0_u64..1_100, 0_u64..(1_u64 << UNAPPLIED_BUCKET_SHIFT)).prop_map(|(b, o)| Op::Reset(b, o)),
+            2 => Just(Op::Persist),
+            2 => Just(Op::Reload),
+            1 => Just(Op::Fold),
+        ]
+    }
+
+    fn scratch_dir() -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "tv-applied-wide-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        drop(std::fs::remove_dir_all(&dir));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(64))]
+
+        /// 2026-11-17 review: the wide-range scan relies on every mark the
+        /// slots lose being caught by the overflow flag or a range. Collisions,
+        /// wide rescue ranges, drains, the in-session bound (persist), a
+        /// reload of the file and sidecar, and the boot fold are interleaved;
+        /// after every step each recorded frame no confirmed drain has passed
+        /// still reads unapplied, alone and inside wide ranges (128 buckets
+        /// and more, the slot-scan path).
+        #[test]
+        fn proptest_wide_ranges_hold_every_undrained_mark_across_overflow_drain_fold_and_reload(
+            ops in proptest::collection::vec(op(), 1..28),
+        ) {
+            let dir = scratch_dir();
+            let base = W1_LO >> UNAPPLIED_BUCKET_SHIFT;
+            let seq_at = |bucket: u64, off: u64| (bucket << UNAPPLIED_BUCKET_SHIFT) + off;
+            let mut wm = AppliedWatermark::new_for_tests();
+            wm.bind(&dir);
+            let mut shift = 0_u64;
+            let mut own_floor: Option<u64> = None;
+            let mut model: Vec<u64> = Vec::new();
+            let mut now = 1_u64;
+            for op in ops {
+                match op {
+                    Op::Note(b, o) => {
+                        let s = seq_at(base + shift + b, o);
+                        wm.note_unapplied(s);
+                        model.push(s);
+                    }
+                    Op::NoteRange(b, w) => {
+                        let lo = seq_at(base + shift + b, 7);
+                        let hi = seq_at(base + shift + b + w, 11);
+                        wm.note_unapplied_range(lo, hi);
+                        model.extend([lo, (lo / 2) + (hi / 2), hi]);
+                    }
+                    Op::Reset(b, o) => {
+                        let ceiling = seq_at(base + shift + b, o);
+                        wm.reset_unapplied_below(ceiling);
+                        let effective = own_floor.map_or(ceiling, |f| ceiling.max(f + 1));
+                        model.retain(|&s| s >= effective);
+                    }
+                    Op::Persist => {
+                        now += 10 * WATERMARK_DURABILITY_LAG_NANOS;
+                        wm.persist_at(now);
+                    }
+                    Op::Reload => {
+                        now += 10 * WATERMARK_DURABILITY_LAG_NANOS;
+                        wm.persist_at(now);
+                        wm = AppliedWatermark::new_for_tests();
+                        wm.bind(&dir);
+                        own_floor = None;
+                    }
+                    Op::Fold => {
+                        if own_floor.is_none() {
+                            let floor = (base + shift + 1_000) << UNAPPLIED_BUCKET_SHIFT;
+                            wm.fold_at_boot_with_spans(None, floor, floor, &[]);
+                            own_floor = Some(floor);
+                            shift += 1_001;
+                        }
+                    }
+                }
+                let snap = wm.snapshot();
+                for &s in &model {
+                    let wide = 300_u64 << UNAPPLIED_BUCKET_SHIFT;
+                    proptest::prop_assert!(snap.range_has_unapplied(s, s), "{s} alone");
+                    proptest::prop_assert!(
+                        snap.range_has_unapplied(s - wide, s + (50 << UNAPPLIED_BUCKET_SHIFT)),
+                        "{s} at the top of a wide range"
+                    );
+                    proptest::prop_assert!(
+                        snap.range_has_unapplied(s, s + wide),
+                        "{s} at the bottom of a wide range"
+                    );
+                }
+            }
+            drop(std::fs::remove_dir_all(&dir));
         }
     }
 }

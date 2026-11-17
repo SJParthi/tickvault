@@ -3216,14 +3216,18 @@ pub const RECEIPT_ANCHOR_REFRESH_COUNTER: &str = "tv_wal_receipt_anchor_refresh_
 
 #[inline]
 fn anchor_cell() -> &'static AnchorCell {
-    RECEIPT_ANCHOR.get_or_init(|| AnchorCell::new(take_anchor()))
+    RECEIPT_ANCHOR.get_or_init(|| {
+        let (first, read_gap) = receipt_anchor::take_anchor_from(read_anchor_clocks);
+        AnchorCell::with_read_gap(first, read_gap)
+    })
 }
 
-/// Counter (2026-11-17): a receipt-anchor refresh whose two clock reads could
-/// not be taken close together in any of its tries (the thread was
-/// descheduled between them), so the previous anchor was kept and no clock
-/// step was judged from it. Local `/metrics` only, registered at 0 when the
-/// WAL writer starts; no page, alarm, filter or EMF name.
+/// Counter (2026-11-17): a receipt-anchor reading (the first anchor or a
+/// refresh) whose two clock reads could not be taken close together in any of
+/// its tries (the thread was descheduled between them). A refresh then keeps
+/// the previous anchor (`outcome = "kept_noisy"` on the refresh counter) for
+/// at most 4 in a row. Local `/metrics` only, registered at 0 when the WAL
+/// writer starts; no page, alarm, filter or EMF name.
 pub const RECEIPT_ANCHOR_NOISY_READ_COUNTER: &str = "tv_wal_receipt_anchor_noisy_read_total";
 
 /// One paired reading of the clocks: monotonic, wall, monotonic. The wall
@@ -3242,18 +3246,6 @@ fn read_anchor_clocks() -> receipt_anchor::AnchorReading {
         nanos,
         after: Instant::now(),
     }
-}
-
-/// The first anchor: the tightest of at most three readings (there is no
-/// previous anchor to keep). O(3).
-fn take_anchor() -> ReceiptAnchor {
-    receipt_anchor::best_anchor_reading(read_anchor_clocks).0
-}
-
-/// A refresh anchor, or `None` when no reading was tight. O(3).
-fn take_tight_anchor() -> Option<ReceiptAnchor> {
-    let (anchor, tight) = receipt_anchor::best_anchor_reading(read_anchor_clocks);
-    tight.then_some(anchor)
 }
 
 /// Re-takes the receipt anchor from the wall clock.
@@ -3309,11 +3301,16 @@ pub fn refresh_receipt_anchor() {
     // rewind (slew) is still refused, and repeated refusals now end too: once
     // the accumulated slew passes the threshold it is adopted as a step.
     // ⚠ CHANGED 2026-11-17: a refresh whose clock reads a deschedule pulled
-    // apart keeps the previous anchor and judges no step from it (live: six
-    // false 1.0 to 1.1 s "steps"); the next refresh, 30 s later, reads again.
-    match cell.refresh_noting_step(take_tight_anchor, crate::wal_clock_step::note_clock_step) {
+    // apart keeps the previous anchor (at most 4 in a row) and judges no step
+    // the read gaps can explain (`receipt_anchor::refresh_cell`).
+    match receipt_anchor::refresh_cell(
+        cell,
+        read_anchor_clocks,
+        crate::wal_clock_step::note_clock_step,
+    ) {
         None => {
-            metrics::counter!(RECEIPT_ANCHOR_NOISY_READ_COUNTER).increment(1);
+            metrics::counter!(RECEIPT_ANCHOR_REFRESH_COUNTER, "outcome" => "kept_noisy")
+                .increment(1);
         }
         Some(AnchorRefresh::Adopt) => {
             metrics::counter!(RECEIPT_ANCHOR_REFRESH_COUNTER, "outcome" => "adopted").increment(1);

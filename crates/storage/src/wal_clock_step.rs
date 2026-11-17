@@ -520,7 +520,7 @@ pub(crate) struct ClockStepLog {
     /// writer reads the clock and the frame counter only while one exists.
     active: AtomicBool,
     /// The frame counter's lead over the wall began at a step recorded here
-    /// ([`Self::note`]), so [`Self::follow_counter_lead`] may raise that
+    /// ([`Self::note_from`]), so [`Self::follow_counter_lead`] may raise that
     /// step's window. Never set by [`Self::bind`]; cleared once the counter
     /// meets the wall or the followed window retires.
     following: AtomicBool,
@@ -583,7 +583,7 @@ impl ClockStepLog {
     /// (2026-11-15 audit, live-3). A lead with no step behind it (a window
     /// carried over from the last process, or a lead that started after the
     /// counter had met the wall: a burst above about 7,600 frames a second)
-    /// is recorded as a NEW step through [`Self::note`], so it is logged
+    /// is recorded as a NEW step through [`Self::note_from`], so it is logged
     /// ("wall clock step recorded"). ⚠ CHANGED 2026-11-16: that new step is
     /// now its own window unless it lies within one margin of an old one, so
     /// the hours between an old step and a new lead are no longer held for
@@ -603,7 +603,7 @@ impl ClockStepLog {
             return;
         }
         if !self.following.load(Ordering::Acquire) {
-            self.note(now_nanos, now_nanos, lead);
+            self.note_from("counter_lead", now_nanos, now_nanos, lead);
             return;
         }
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -622,9 +622,30 @@ impl ClockStepLog {
         self.dirty.store(true, Ordering::Release);
     }
 
+    /// [`Self::note_from`] for a test (`source = "test"`).
+    #[cfg(test)]
+    pub(crate) fn note(&self, start_nanos: u64, at_wall_nanos: u64, magnitude_nanos: u64) {
+        self.note_from("test", start_nanos, at_wall_nanos, magnitude_nanos);
+    }
+
     /// Records a step (see [`step_window`]); a move of 1 s or less is
     /// ignored. O(windows).
-    pub(crate) fn note(&self, start_nanos: u64, at_wall_nanos: u64, magnitude_nanos: u64) {
+    ///
+    /// ⚠ CHANGED 2026-11-17 (review): `source` names which check saw it, in
+    /// the log line: `receipt_anchor` (an anchor refresh moved the projected
+    /// wall time), `segment_rotation` (at a WAL rotation the frame counter or
+    /// the segment name was ahead of the wall) or `counter_lead` (the frame
+    /// counter ran ahead of the wall with no step behind it, e.g. a burst
+    /// above about 7,600 frames a second). The three wrote the same line
+    /// before, so the live 1.0 to 1.1 s steps of 17 Nov could not be told
+    /// apart.
+    pub(crate) fn note_from(
+        &self,
+        source: &'static str,
+        start_nanos: u64,
+        at_wall_nanos: u64,
+        magnitude_nanos: u64,
+    ) {
         let Some((lo, hi)) = step_window(start_nanos, at_wall_nanos, magnitude_nanos) else {
             return;
         };
@@ -640,6 +661,7 @@ impl ClockStepLog {
             (state.windows, holding)
         };
         info!(
+            source,
             step_ms = magnitude_nanos / 1_000_000,
             window_lo_nanos = lo,
             window_hi_nanos = hi,
@@ -770,9 +792,14 @@ impl ClockStepLog {
 /// The process log.
 static LOG: ClockStepLog = ClockStepLog::new();
 
-/// Records a clock step on the process log. See [`ClockStepLog::note`].
+/// Records a clock step on the process log. See [`ClockStepLog::note_from`].
 pub(crate) fn note_clock_step(start_nanos: u64, at_wall_nanos: u64, magnitude_nanos: u64) {
-    LOG.note(start_nanos, at_wall_nanos, magnitude_nanos);
+    LOG.note_from(
+        "receipt_anchor",
+        start_nanos,
+        at_wall_nanos,
+        magnitude_nanos,
+    );
 }
 
 /// The process's step windows (empty when no step is recorded or every
@@ -823,7 +850,7 @@ pub(crate) fn note_segment_rotation(now_nanos: u128, named_nanos: u128) {
 fn note_rotation_on(log: &ClockStepLog, now_nanos: u128, named_nanos: u128, frame_seq: u64) {
     let lead = rotation_lead_nanos(now_nanos, named_nanos, frame_seq);
     let now = u64::try_from(now_nanos).unwrap_or(u64::MAX);
-    log.note(now, now, lead);
+    log.note_from("segment_rotation", now, now, lead);
 }
 
 #[cfg(test)]
@@ -831,6 +858,28 @@ mod tests {
     use super::*;
 
     const SEC: u64 = 1_000_000_000;
+
+    /// 2026-11-17 review: the three production checks that record a step
+    /// each name themselves in the log line, so a live step can be traced to
+    /// the anchor refresh, a segment rotation or a counter lead. Production
+    /// never calls the test-only `note` wrapper.
+    #[test]
+    fn test_each_production_step_caller_names_its_source() {
+        let src = include_str!("wal_clock_step.rs");
+        let prod = &src[..src.find("#[cfg(test)]\nmod tests").expect("tests module")];
+        let squeezed: String = prod.split_whitespace().collect();
+        for source in ["receipt_anchor", "segment_rotation", "counter_lead"] {
+            let call = format!("note_from(\"{source}\",");
+            assert_eq!(squeezed.matches(call.as_str()).count(), 1, "{call}");
+        }
+        assert_eq!(squeezed.matches("note_from(\"test\",").count(), 1);
+        assert_eq!(
+            prod.matches(".note(").count(),
+            0,
+            "production records through note_from only"
+        );
+        assert!(prod.contains("            source,\n            step_ms"));
+    }
 
     /// The log's only window (`None` when it holds none); fails when it
     /// holds more than one.
