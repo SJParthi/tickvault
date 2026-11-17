@@ -21,12 +21,26 @@
 //! Every refusal and counter the drain applied before: the id-width and LTP
 //! refusals (`checked_tick_identity`, shared with [`TickRow::from_parsed_tick`]),
 //! the non-finite optional price count (`note_non_finite_optional_price`, in
-//! the same field order), the non-finite column tripwire (judged on the
-//! `f32`: a finite `f32` always converts to a finite `f64`, since
-//! `|f32::MAX| × 100` fits an `f64`), the band and window gates, the ledger
-//! and the placement. A non-finite optional price is counted on the drain and
-//! stored as `0.0`, which [`RawTick::to_row`] writes as NULL, exactly as the
-//! old row's `None`. [`RawTick::to_row`] cannot fail and counts nothing.
+//! the same field order), the band and window gates, the ledger and the
+//! placement. A non-finite optional price is counted on the drain and stored
+//! as `0.0`, which [`RawTick::to_row`] writes as NULL, exactly as the old
+//! row's `None`. [`RawTick::to_row`] cannot fail and counts nothing.
+//!
+//! # Dropped from the drain (review, 2026-11-17)
+//!
+//! * The non-finite column tripwire (`tv_tick_nonfinite_columns_total`). On a
+//!   drain tick it can never move: a non-finite LTP is refused by
+//!   `checked_tick_identity` before a [`RawTick`] exists, and every
+//!   non-finite optional price is stored as `0.0` (NULL). The old drain paid
+//!   six compares per tick to add 0; the staging now keeps only a
+//!   `debug_assert!` ([`RawTick::nonfinite_floats`]), and the proptest
+//!   `tick_stage_raw_tests` proves it is 0 for every drain tick. The counter
+//!   still counts the prepared rows the test-only `append_row` stages.
+//! * The volume saturation counter. `ParsedTick::volume` is `u32`, so
+//!   [`RawTick::to_row`] widens it with `i64::from` (lossless, the value the
+//!   old `saturate_volume_to_i64` returned for every `u32`). A future change
+//!   that widens the raw volume to `u64` fails to compile there instead of
+//!   moving a counter late, on the encoding thread, and once per encode.
 //!
 //! # Complexity
 //!
@@ -39,7 +53,7 @@ use tickvault_common::tick_types::ParsedTick;
 
 use super::{
     TickRow, TickRowError, checked_tick_identity, note_non_finite_optional_price,
-    row_timestamp_ist_nanos, saturate_volume_to_i64, tick_price_f64,
+    row_timestamp_ist_nanos, tick_price_f64,
 };
 
 /// Index of each price in [`RawTick::prices`].
@@ -163,8 +177,10 @@ impl RawTick {
 
     /// The non-finite float columns the converted row would hold: the
     /// tripwire `count_nonfinite_tick_floats` gives on [`Self::to_row`],
-    /// judged on the `f32` (a finite `f32` converts to a finite `f64`). Six
-    /// compares, O(1).
+    /// judged on the `f32` (a finite `f32` converts to a finite `f64`). Always
+    /// 0 for a tick built by [`Self::from_parsed_tick`]; the staging checks it
+    /// with a `debug_assert!` only (not on the release drain). Six compares,
+    /// O(1).
     #[must_use]
     pub(crate) fn nonfinite_floats(&self) -> u64 {
         self.prices.iter().filter(|v| !v.is_finite()).count() as u64
@@ -189,7 +205,9 @@ impl RawTick {
             security_id: self.security_id,
             segment: segment_code_to_str(self.segment_code),
             ltp: tick_price_f64(price(LTP)),
-            volume: saturate_volume_to_i64(u64::from(qty(0)), self.security_id),
+            // `u32` → `i64` is lossless: no saturation, no counter (see the
+            // module docs). Widening the raw volume breaks this line.
+            volume: i64::from(qty(0)),
             ts_ist_nanos: self.ts_ist_nanos,
             capture_seq: self.capture_seq,
             open: opt_price(OPEN),

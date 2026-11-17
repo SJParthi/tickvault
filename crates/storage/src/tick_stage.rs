@@ -46,7 +46,15 @@
 //! O(row bytes) per row, on the thread that encodes. Pre-touching a batch:
 //! O(capacity / rows per page) stores, at the split and when a fresh batch is
 //! reserved on the flush arm. SPACE: [`TICK_STAGED_ROWS_PRESIZE`] ×
-//! [`STAGED_ROW_BYTES`] per batch.
+//! [`STAGED_SLOT_BYTES`] per batch (speed fix 6: rows plus as many side
+//! rows, about 6 MiB; it was × 288 bytes, 4.5 MiB, before).
+//!
+//! An aux row that follows a tick row starts a new run (speed fix 6): it
+//! writes a 96-byte run row plus its 280-byte side row and a few compares,
+//! where it wrote one 288-byte row; inside a run it writes only the side
+//! row. Assumed a few ns more per INTERLEAVED aux row, not measured (no bench
+//! reaches an interleaved tick/aux frame); production subscribes Full, so
+//! open interest arrives inline and such rows are rare.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
@@ -193,9 +201,13 @@ pub const STAGED_ROW_BYTES: usize = std::mem::size_of::<StagedRow>();
 pub const STAGED_EXTRA_ROW_BYTES: usize = std::mem::size_of::<ExtraRow>();
 
 /// Address space one row SLOT of a batch reserves: its staged row plus a side
-/// row (a batch reserves as many side rows as rows, so an all-aux batch, the
-/// shape after 15:40, never grows). The park and its gauge count this
-/// (speed fix 6). Both are pre-touched, so this is also committed RAM.
+/// row (a batch reserves as many side rows as rows). The park and its gauge
+/// count [`StagedBatch::capacity`] slots of this (speed fix 6), so a batch
+/// whose side rows grew past its rows (an all-aux batch, the shape after
+/// 15:40, held past the pre-size across a full queue) is counted at the
+/// larger size, never under. A side row is touched at construction, or on
+/// first use for a batch reserved on the drain, so this is an upper bound on
+/// committed RAM.
 pub const STAGED_SLOT_BYTES: usize = STAGED_ROW_BYTES + STAGED_EXTRA_ROW_BYTES;
 
 const _: () = assert!(
@@ -205,8 +217,9 @@ const _: () = assert!(
 
 /// Rows every staged batch is reserved (and pre-touched) for. The old 2 MiB
 /// text buffer held about 15,000 rows at the measured ~133 bytes a row; this
-/// keeps at least that many. SPACE: 16,384 × [`STAGED_ROW_BYTES`] (4.5 MiB)
-/// per batch. ⚠ CORRECTED 2026-11-06 (review round 1): "at most nine
+/// keeps at least that many. SPACE: 16,384 × [`STAGED_SLOT_BYTES`] (about
+/// 6 MiB since speed fix 6; 16,384 × 288 B = 4.5 MiB before) per batch.
+/// ⚠ CORRECTED 2026-11-06 (review round 1): "at most nine
 /// batches" counted only the steady state (producer, four spares, four
 /// queued). The real worst case, during a QuestDB stall, is the producer,
 /// four queued and one in flight on the writer thread, four spares, two
@@ -225,6 +238,17 @@ const _: () = assert!(
 /// was tried and measured slower: a fresh batch's aux burst then took a page
 /// fault every 14 rows on the drain (`feed_drain` wrong-day written,
 /// +41%).
+/// ⚠ CHANGED 2026-11-17 (speed fix 6 review): that full touch now happens
+/// only where it is free, at construction ([`StagedBatch::presized`], off
+/// the frames). The spare-less hand-off on the drain
+/// ([`StagedBatch::reserve_presize`]) touches the rows (1.5 MiB, 384 pages)
+/// and only RESERVES the side rows, so it touches a third of what it
+/// touched before fix 6 (4.5 MiB, 1,152 pages); a side row on such a batch
+/// takes its page on first use (one fault per 14 aux rows, only the pages
+/// used). The `+41%` above was measured on a bench whose untimed fill had
+/// already grown the side rows past the pre-size, and that bench never
+/// reaches this hand-off. Committed RAM: a drain-reserved batch commits
+/// only the side rows it uses.
 pub const TICK_STAGED_ROWS_PRESIZE: usize = 16_384;
 
 /// The longest ILP line one staged row can encode to, in either encoder:
@@ -300,16 +324,25 @@ impl StagedBatch {
     #[must_use]
     pub(crate) fn presized() -> Self {
         let mut batch = Self::new();
-        let _fresh = batch.reserve_presize();
+        let _fresh = batch.reserve(true);
         batch
     }
 
-    /// Reserves the rows and the side rows to the pre-size, when smaller, and
-    /// touches every new page of both. At most two allocations; a
+    /// Reserves the rows and the side rows to the pre-size, when smaller;
+    /// touches every new page of the rows and leaves the side rows untouched
+    /// (speed fix 6 review: this runs on the drain's spare-less hand-off, so
+    /// it touches no more than the rows the next batch is sure to fill; a
+    /// side row takes its page on first use). At most two allocations; a
     /// batch already that big costs two compares. Returns `true` when it
     /// reserved (2026-11-16: the writer counts a fresh reserve on the drain's
     /// hand-off, `tv_tick_stage_presize_fresh_total`).
     pub(crate) fn reserve_presize(&mut self) -> bool {
+        self.reserve(false)
+    }
+
+    /// The reserve behind [`Self::presized`] (`touch_extras`: every page of
+    /// both) and [`Self::reserve_presize`] (the rows' pages only).
+    fn reserve(&mut self, touch_extras: bool) -> bool {
         let mut reserved = false;
         if self.rows.capacity() < TICK_STAGED_ROWS_PRESIZE {
             let have = self.rows.len();
@@ -322,7 +355,9 @@ impl StagedBatch {
             let have = self.extras.len();
             self.extras
                 .reserve_exact(TICK_STAGED_ROWS_PRESIZE.saturating_sub(have));
-            prefault(&mut self.extras, EXTRA_FILLER);
+            if touch_extras {
+                prefault(&mut self.extras, EXTRA_FILLER);
+            }
             reserved = true;
         }
         reserved
@@ -340,10 +375,15 @@ impl StagedBatch {
         self.count == 0
     }
 
-    /// Rows the batch holds before it must grow.
+    /// Row slots the batch holds: the larger of its rows' and its side
+    /// rows' capacity (speed fix 6 review). A run of aux rows is ONE staged
+    /// row, so an all-aux batch grows only its side rows; counting the rows
+    /// alone let the park, its gauge and the spare lane's size cap miss that
+    /// growth. Times [`STAGED_SLOT_BYTES`] this is an upper bound on the
+    /// batch's RAM (it counts the smaller store at the larger's size). O(1).
     #[must_use]
     pub fn capacity(&self) -> usize {
-        self.rows.capacity()
+        self.rows.capacity().max(self.extras.capacity())
     }
 
     /// The pin index for the table `labels` (a fresh table load), or the
@@ -537,12 +577,26 @@ impl StagedBatch {
         self.encode_matching(feed, out, |table| table.is_some_and(&keep))
     }
 
-    /// Whether the batch holds a row for `table`. O(rows); called only while
+    /// Whether the batch holds a row for `table`. O(rows + side rows); called only while
     /// that table is not keyed (B1 review 2), never per row.
     #[must_use]
     pub(crate) fn has_rows_for(&self, table: GatedTable) -> bool {
-        // O(1) EXEMPT: cold, only while that table is not keyed.
-        self.rows.iter().any(|r| r.table() == Some(table))
+        // O(1) EXEMPT: cold, only while that table is not keyed. A run counts
+        // only while one of its side rows is unrefused (speed fix 6 review: a
+        // refused side row is marked in place, its run keeps the table).
+        self.rows.iter().any(|r| match *r {
+            StagedRow::Extra {
+                first,
+                len,
+                table: run_table,
+                ..
+            } => {
+                run_table == table
+                    && run_indices(first, len)
+                        .any(|j| self.extras.get(j).is_some_and(|e| e.table() == Some(table)))
+            }
+            _ => r.table() == Some(table),
+        })
     }
 
     /// The encode that marks: a row (or side row) its encoder refuses is

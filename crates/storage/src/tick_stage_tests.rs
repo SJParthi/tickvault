@@ -317,6 +317,10 @@ fn test_len_is_empty_and_capacity_track_the_rows_and_reserve_presize_only_grows(
     assert_eq!(b.len(), 0);
     assert!(b.reserve_presize(), "an empty batch reserves");
     assert!(b.capacity() >= TICK_STAGED_ROWS_PRESIZE);
+    assert!(
+        b.extras.capacity() >= TICK_STAGED_ROWS_PRESIZE && b.extras.is_empty(),
+        "the drain's reserve reserves the side rows too (untouched, never filled)"
+    );
     let cap = b.capacity();
     b.push(StagedRow::Refused { capture_seq: 1 });
     assert_eq!(b.len(), 1);
@@ -734,4 +738,57 @@ fn test_push_extra_runs_side_rows_and_extra_row_table_and_capture_seq() {
     assert!(b.extras.capacity() >= TICK_STAGED_ROWS_PRESIZE);
     assert!(STAGED_ROW_BYTES <= 112, "{STAGED_ROW_BYTES}");
     assert_eq!(STAGED_SLOT_BYTES, STAGED_ROW_BYTES + STAGED_EXTRA_ROW_BYTES);
+}
+
+/// Fix 6 review: a run of aux rows is ONE staged row, so an all-aux batch
+/// grows only its side rows. `capacity` must report that growth, or the
+/// park, its gauge and the spare lane's size cap (all read `capacity`)
+/// under-count the batch.
+#[test]
+fn test_capacity_counts_the_side_rows_of_an_all_aux_batch() {
+    let aux = AuxPacketRow::from_header(AuxPacketKind::MarketStatus, 13, 0, 1, 42).expect("aux");
+    let mut b = StagedBatch::presized();
+    let rows_cap = b.rows.capacity();
+    for _ in 0..=MAX_PRODUCER_ROWS {
+        let _grew = b.push_extra(ExtraRow::Aux(aux), 0);
+    }
+    assert_eq!(b.rows.len(), 1, "one run");
+    assert_eq!(b.rows.capacity(), rows_cap, "the rows never grew");
+    assert!(b.extras.capacity() > MAX_PRODUCER_ROWS, "the side rows did");
+    assert_eq!(
+        b.capacity(),
+        b.extras.capacity(),
+        "capacity reads the larger"
+    );
+    assert!(
+        b.capacity() > MAX_PRODUCER_ROWS,
+        "so the spare lane's size cap drops this batch"
+    );
+    assert_eq!(b.len(), MAX_PRODUCER_ROWS + 1);
+}
+
+/// Fix 6 review: a side row an encode refuses is marked in place and its
+/// run keeps the table, so `has_rows_for` must look inside the run.
+#[test]
+fn test_has_rows_for_ignores_a_run_whose_side_rows_are_all_refused() {
+    let aux = AuxPacketRow::from_header(AuxPacketKind::MarketStatus, 13, 0, 1, 42).expect("aux");
+    let mut b = StagedBatch::presized();
+    let _grew = b.push_extra(ExtraRow::Aux(aux), 0);
+    let _grew = b.push_extra(ExtraRow::Aux(aux), 0);
+    assert!(b.has_rows_for(GatedTable::FeedAuxPackets));
+    if let Some(first) = b.extras.get_mut(0) {
+        *first = ExtraRow::Refused { capture_seq: 42 };
+    }
+    assert!(
+        b.has_rows_for(GatedTable::FeedAuxPackets),
+        "one unrefused side row left"
+    );
+    if let Some(second) = b.extras.get_mut(1) {
+        *second = ExtraRow::Refused { capture_seq: 42 };
+    }
+    assert!(
+        !b.has_rows_for(GatedTable::FeedAuxPackets),
+        "every side row refused: the run holds nothing for the table"
+    );
+    assert!(!b.has_rows_for(GatedTable::Ticks));
 }

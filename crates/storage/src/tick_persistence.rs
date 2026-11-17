@@ -714,22 +714,16 @@ impl TickRow {
 /// [`TickRow::from_parsed_tick`] and the drain's raw staging (speed fix 6,
 /// 2026-11-17), so both count exactly the same refusals: the id must fit the
 /// `LONG` column and the LTP must be finite. Returns the narrowed id. O(1).
+///
+/// `#[inline]` with the two refusal bodies in `#[cold]` helpers (review,
+/// 2026-11-17): the happy path is one `try_from` and one `is_finite` in the
+/// caller, as it was inside the old `from_parsed_tick`, with no call and no
+/// `Result` returned through memory.
+#[inline]
 fn checked_tick_identity(tick: &ParsedTick) -> Result<i64, TickRowError> {
-    let security_id = i64::try_from(tick.security_id).map_err(|_| {
-        metrics::counter!("tv_tick_rows_refused_total", "reason" => "security_id_width")
-            .increment(1);
-        error!(
-            code = ErrorCode::StorageGapTickDedupSegment.code_str(),
-            raw_security_id = tick.security_id,
-            segment = segment_code_to_str(tick.exchange_segment_code),
-            "tick row refused — security_id does not fit the LONG column; \
-             narrowing it would alias two instruments onto one DEDUP key \
-             (silent cross-instrument corruption). Row NOT written."
-        );
-        TickRowError::SecurityIdNotRepresentable {
-            raw: tick.security_id,
-        }
-    })?;
+    let Ok(security_id) = i64::try_from(tick.security_id) else {
+        return Err(refuse_security_id_width(tick));
+    };
 
     // Fail-closed on a non-finite LTP BEFORE it can reach an ILP line.
     // NaN compares unequal to everything, so a `!= 0.0` gate does NOT
@@ -738,7 +732,7 @@ fn checked_tick_identity(tick: &ParsedTick) -> Result<i64, TickRowError> {
     // this closes (rejected batch -> spilled buffer -> permanently-wedged
     // replay round).
     //
-    // ONLY the LTP is mandatory (2026-10-01 reality check). This loop
+    // ONLY the LTP is mandatory (2026-10-01 reality check). This check
     // used to refuse the whole row for a non-finite day open, high, low
     // or close as well, so one bad day-OHLC field threw away a tick whose
     // LTP was good: the row was missing from `ticks`, an `error!` fired
@@ -752,25 +746,49 @@ fn checked_tick_identity(tick: &ParsedTick) -> Result<i64, TickRowError> {
     // `0.0` stays legal everywhere: it is the documented "not carried"
     // sentinel for a Ticker (16-byte) packet and becomes NULL below.
     // Zero-alloc: one register compare on the happy path.
-    for (field, value) in [("ltp", tick.last_traded_price)] {
-        if !value.is_finite() {
-            metrics::counter!("tv_tick_rows_refused_total", "reason" => "price_not_finite")
-                .increment(1);
-            error!(
-                code = ErrorCode::StorageGapTickDedupSegment.code_str(),
-                security_id = tick.security_id,
-                segment = segment_code_to_str(tick.exchange_segment_code),
-                field,
-                value = %value,
-                "tick row refused — price field is non-finite (NaN/Inf); \
-                 emitting it would make QuestDB reject the whole batch, \
-                 spill the rescued buffer, and wedge the replay tier \
-                 behind a file it can never accept. Row NOT written."
-            );
-            return Err(TickRowError::PriceNotFinite { field });
-        }
+    if !tick.last_traded_price.is_finite() {
+        return Err(refuse_price_not_finite(tick, "ltp", tick.last_traded_price));
     }
     Ok(security_id)
+}
+
+/// The id-width refusal of [`checked_tick_identity`]: counted and logged.
+/// Cold. O(1).
+#[cold]
+#[inline(never)]
+fn refuse_security_id_width(tick: &ParsedTick) -> TickRowError {
+    metrics::counter!("tv_tick_rows_refused_total", "reason" => "security_id_width").increment(1);
+    error!(
+        code = ErrorCode::StorageGapTickDedupSegment.code_str(),
+        raw_security_id = tick.security_id,
+        segment = segment_code_to_str(tick.exchange_segment_code),
+        "tick row refused — security_id does not fit the LONG column; \
+         narrowing it would alias two instruments onto one DEDUP key \
+         (silent cross-instrument corruption). Row NOT written."
+    );
+    TickRowError::SecurityIdNotRepresentable {
+        raw: tick.security_id,
+    }
+}
+
+/// The non-finite price refusal of [`checked_tick_identity`]: counted and
+/// logged. Cold. O(1).
+#[cold]
+#[inline(never)]
+fn refuse_price_not_finite(tick: &ParsedTick, field: &'static str, value: f32) -> TickRowError {
+    metrics::counter!("tv_tick_rows_refused_total", "reason" => "price_not_finite").increment(1);
+    error!(
+        code = ErrorCode::StorageGapTickDedupSegment.code_str(),
+        security_id = tick.security_id,
+        segment = segment_code_to_str(tick.exchange_segment_code),
+        field,
+        value = %value,
+        "tick row refused — price field is non-finite (NaN/Inf); \
+         emitting it would make QuestDB reject the whole batch, \
+         spill the rescued buffer, and wedge the replay tier \
+         behind a file it can never accept. Row NOT written."
+    );
+    TickRowError::PriceNotFinite { field }
 }
 
 // ---------------------------------------------------------------------------
@@ -3336,17 +3354,15 @@ impl TickWriter {
     }
 
     /// Stages one drain-accepted `ticks` row RAW (speed fix 6, 2026-11-17):
-    /// the tripwire on the `f32` prices (the count `count_nonfinite_tick_floats`
-    /// gives on the converted row), then the 88-byte raw tick; the prices are
-    /// converted on the thread that writes the text. O(1), no allocation.
+    /// the 88-byte raw tick; the prices are converted on the thread that
+    /// writes the text. The non-finite tripwire is a `debug_assert!` only:
+    /// it cannot move on a drain tick (see `tick_stage_raw`'s module docs).
+    /// O(1), no allocation.
     ///
     /// # Errors
     /// None: staging cannot fail (see [`Self::append_row`]).
     fn append_raw_row(&mut self, row: &raw::RawTick) -> Result<()> {
-        let nonfinite = row.nonfinite_floats();
-        if nonfinite > 0 {
-            metrics::counter!(TICK_NONFINITE_COLUMNS_COUNTER).increment(nonfinite);
-        }
+        debug_assert_eq!(row.nonfinite_floats(), 0, "a drain tick is finite");
         let raw = *row;
         self.stage_row(|pin| StagedRow::Tick { raw, pin });
         self.note_tick_row_staged(row.capture_seq());
@@ -3362,10 +3378,7 @@ impl TickWriter {
     /// # Errors
     /// None: staging cannot fail.
     fn append_raw_quote_row(&mut self, row: &raw::RawTick) -> Result<()> {
-        let nonfinite = row.nonfinite_floats();
-        if nonfinite > 0 {
-            metrics::counter!(TICK_NONFINITE_COLUMNS_COUNTER).increment(nonfinite);
-        }
+        debug_assert_eq!(row.nonfinite_floats(), 0, "a drain tick is finite");
         let raw = *row;
         self.stage_row(|pin| StagedRow::Quote { raw, pin });
         self.note_tick_row_staged(row.capture_seq());
@@ -4515,7 +4528,12 @@ pub const PARKED_RESCUE_MAX_ROWS: usize = 4 * MAX_PRODUCER_ROWS;
 /// case since the park counts capacity (review round 1, 2026-11-06). ⚠ CHANGED
 /// 2026-11-17 (speed fix 6): a slot is a 96-byte staged row plus a 280-byte
 /// side row ([`STAGED_SLOT_BYTES`], both pre-touched), so the bound is
-/// 131,072 × 376 B = 47 MiB per sink, 11 MiB more than before.
+/// 131,072 × 376 B = 47 MiB per sink, 11 MiB more than before. ⚠ CORRECTED
+/// 2026-11-17 (fix 6 review): a run of aux rows is one staged row, so an
+/// all-aux batch grows only its side rows; [`StagedBatch::capacity`] now
+/// reports the larger of the two stores, so such a batch is counted at its
+/// side rows' size and 47 MiB stays an upper bound (before the correction
+/// it read the rows alone and could hold about 84 MiB under it).
 pub const PARKED_RESCUE_MAX_BYTES: usize = PARKED_RESCUE_MAX_ROWS * STAGED_SLOT_BYTES;
 
 const _: () = assert!(
