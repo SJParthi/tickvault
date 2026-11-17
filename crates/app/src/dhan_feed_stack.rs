@@ -343,13 +343,18 @@ static WS_LAG_MAX_MILLIS: std::sync::atomic::AtomicI64 = std::sync::atomic::Atom
 /// The same sample also goes into its segment class's maximum
 /// ([`ws_lag_class`], one compare and one relaxed `fetch_max`), published
 /// beside this one as `tv_dhan_ws_lag_max_ms_by_class`.
-fn record_ws_lag_max(segment_code: u8, exchange_timestamp: u32, received_at_nanos: i64) {
+///
+/// ⚠ CHANGED 2026-11-17 (speed fix 4): takes the whole-millisecond lag
+/// [`record_ws_lag`] already computed for the same tick (its return value)
+/// instead of working it out a second time from the stamp and the receipt.
+/// Same arithmetic, done once: `None` (an implausible stamp) and a
+/// non-positive lag still add nothing.
+fn record_ws_lag_max(segment_code: u8, lag_whole_ms: Option<i64>) {
     record_ws_lag_max_into(
         &WS_LAG_MAX_MILLIS,
         &ws_lag_class::WS_LAG_MAX_BY_CLASS,
         segment_code,
-        exchange_timestamp,
-        received_at_nanos,
+        lag_whole_ms,
     );
 }
 
@@ -361,10 +366,9 @@ fn record_ws_lag_max_into(
     max_millis: &std::sync::atomic::AtomicI64,
     by_class: &ws_lag_class::LagMaxByClass,
     segment_code: u8,
-    exchange_timestamp: u32,
-    received_at_nanos: i64,
+    lag_whole_ms: Option<i64>,
 ) {
-    if let Some(lag_ms) = ws_lag_whole_ms(exchange_timestamp, received_at_nanos)
+    if let Some(lag_ms) = lag_whole_ms
         && lag_ms > 0
     {
         fetch_max_if_above(max_millis, lag_ms);
@@ -2996,7 +3000,9 @@ impl LiveIngest {
         frame_seq: u64,
         recv_monotonic_millis: u64,
     ) -> IngestOutcome {
-        self.ingest_tick_at(tick, frame_seq, 0, recv_monotonic_millis)
+        let outcome = self.ingest_tick_at(tick, frame_seq, 0, recv_monotonic_millis);
+        count_row_ingested(&outcome);
+        outcome
     }
 
     /// Marks every pending row on this ingest's writers as lacking WAL backing
@@ -3061,6 +3067,14 @@ impl LiveIngest {
     /// old comment's fear — trading a visible duplicate for an invisible
     /// collision — does not apply to a scheme where collisions are impossible
     /// by construction rather than unlikely by argument.
+    ///
+    /// # Counting (⚠ CHANGED 2026-11-17, speed fix 4)
+    ///
+    /// This does NOT add to `tv_dhan_feed_ingest_ticks_total`. A caller counts
+    /// the row from the outcome: [`count_row_ingested`] once per call
+    /// ([`Self::ingest_tick`], the WAL refold), or the live drain once per
+    /// frame through `FrameTally`. Same total; one atomic per frame instead of
+    /// one per tick on the drain.
     pub fn ingest_tick_at(
         &mut self,
         tick: &ParsedTick,
@@ -3506,7 +3520,11 @@ impl LiveIngest {
         // is never reached, and rows accumulate in the ILP buffer forever
         // while every metric reports success.
         self.pending_rows = self.pending_rows.saturating_add(1);
-        counters().ingest_ticks.increment(1);
+        // `tv_dhan_feed_ingest_ticks_total` is NOT counted here since
+        // 2026-11-17 (speed fix 4): every return below this line is a written
+        // row (`WrittenOutOfSession` or `Folded`), so callers count it from
+        // the outcome (`count_row_ingested`); the live drain adds it once per
+        // frame through `FrameTally`.
         if verdict == fold_verdict::FoldVerdict::CandleOnly {
             // Counted under the SAME `out_of_session` reason as before, so the
             // existing 30s delta report and any dashboard built on it keep
@@ -4904,6 +4922,15 @@ pub struct DrainCounters {
     /// header they point at decoded cleanly (item 44b). Separate from
     /// `unparseable`/`abandoned_bytes` so a recovery is never read as a loss.
     unknown_skipped: metrics::Counter,
+    /// `tv_dhan_ws_lag_excluded_total{reason="ltt_not_advanced"}`: repeated
+    /// quotes kept out of the lag histogram. Same key `WsLagHandles` held until
+    /// 2026-11-17 (speed fix 4), so the series is unchanged; it moved here so
+    /// the drain adds it once per frame through `FrameTally`.
+    lag_excluded_ltt_not_advanced: metrics::Counter,
+    /// `tv_dhan_ws_lag_excluded_total{reason="not_new_trade"}` (same move).
+    lag_excluded_not_new_trade: metrics::Counter,
+    /// `tv_dhan_ws_lag_excluded_total{reason="not_a_trade"}` (same move).
+    lag_excluded_not_a_trade: metrics::Counter,
 }
 
 impl DrainCounters {
@@ -4994,6 +5021,18 @@ pub fn counters() -> &'static DrainCounters {
         main_feed_length_mismatch: metrics::counter!(DRAIN_FRAMES_COUNTER, "outcome" => "length_mismatch"),
         abandoned_bytes: metrics::counter!(DRAIN_ABANDONED_BYTES_COUNTER),
         unknown_skipped: metrics::counter!(DRAIN_UNKNOWN_PACKET_SKIPPED_COUNTER),
+        lag_excluded_ltt_not_advanced: metrics::counter!(
+            WS_LAG_EXCLUDED_COUNTER,
+            "reason" => "ltt_not_advanced"
+        ),
+        lag_excluded_not_new_trade: metrics::counter!(
+            WS_LAG_EXCLUDED_COUNTER,
+            "reason" => "not_new_trade"
+        ),
+        lag_excluded_not_a_trade: metrics::counter!(
+            WS_LAG_EXCLUDED_COUNTER,
+            "reason" => "not_a_trade"
+        ),
     })
 }
 
@@ -8678,10 +8717,37 @@ fn drain_may_shed_depth(frame: &CapturedFrame) -> bool {
 /// one frame.
 ///
 /// O(1) per packet: one compare and one add. No allocation.
+///
+/// ⚠ CHANGED 2026-11-17 (speed fix 4): four more per-tick increments moved
+/// here, each a success or exclusion count, never a refusal or loss count:
+/// `tv_dhan_feed_ingest_ticks_total` (one per row written, which is exactly
+/// one per `folded`: [`LiveIngest::ingest_tick_at`] returns `Folded` or
+/// `WrittenOutOfSession` only after the row is appended, and those are the
+/// only two arms that add to `folded`), and the three lag exclusions
+/// `ltt_not_advanced`, `not_new_trade` and `not_a_trade` of
+/// `tv_dhan_ws_lag_excluded_total`. The clamp and garbage-stamp exclusions
+/// stay per tick in `record_ws_lag`: they are the clock-fault signal.
+/// Totals equal the per-tick increments at the end of every frame, which is
+/// before any other drain arm (the 1,024-frame publish, the flush timer, the
+/// shutdown arm) runs.
 struct FrameTally<'c> {
     counters: &'c DrainCounters,
-    /// Packets folded or written this frame (the `folded` outcome).
+    /// Packets folded or written this frame (the `folded` outcome); also the
+    /// rows written, added to `ingest_ticks` at the end of the frame.
     folded: u64,
+    /// A REPEATED quote (same trade time, price and cumulative volume as the
+    /// previous packet). Its stamp is the time of an earlier trade, so its
+    /// "lag" is how long the instrument has been quiet, not transit time.
+    /// Counted under `ltt_not_advanced`, never recorded.
+    lag_repeat: u64,
+    /// A folded packet that carried no NEW trade (plan PR AL-1, 2026-11-06):
+    /// the first packet after a subscribe, a stale regression, a backup copy
+    /// accepted late. Counted under `not_new_trade`, never recorded.
+    lag_not_new_trade: u64,
+    /// A tick the fold did not accept as a trade (out of session, an earlier
+    /// trading day, a refused price or time, a failed write). Counted under
+    /// `not_a_trade`, never recorded (2026-10-05).
+    lag_not_a_trade: u64,
     /// The current run of one response code.
     run: CodeRun,
 }
@@ -8691,6 +8757,9 @@ impl<'c> FrameTally<'c> {
         Self {
             counters,
             folded: 0,
+            lag_repeat: 0,
+            lag_not_new_trade: 0,
+            lag_not_a_trade: 0,
             run: CodeRun::new(),
         }
     }
@@ -8702,6 +8771,26 @@ impl<'c> FrameTally<'c> {
             count_packets_by_response_code(done, packets);
         }
     }
+
+    /// A repeated quote, excluded from the lag measurement. One add.
+    #[inline]
+    fn exclude_repeat(&mut self) {
+        self.lag_repeat = self.lag_repeat.saturating_add(1);
+    }
+
+    /// A folded packet with no new trade, excluded from the lag measurement.
+    /// One add.
+    #[inline]
+    fn exclude_not_new_trade(&mut self) {
+        self.lag_not_new_trade = self.lag_not_new_trade.saturating_add(1);
+    }
+
+    /// A tick the fold did not accept as a trade, excluded from the lag
+    /// measurement. One add.
+    #[inline]
+    fn exclude_not_a_trade(&mut self) {
+        self.lag_not_a_trade = self.lag_not_a_trade.saturating_add(1);
+    }
 }
 
 impl Drop for FrameTally<'_> {
@@ -8711,6 +8800,22 @@ impl Drop for FrameTally<'_> {
         }
         if self.folded > 0 {
             self.counters.folded.increment(self.folded);
+            self.counters.ingest_ticks.increment(self.folded);
+        }
+        if self.lag_repeat > 0 {
+            self.counters
+                .lag_excluded_ltt_not_advanced
+                .increment(self.lag_repeat);
+        }
+        if self.lag_not_new_trade > 0 {
+            self.counters
+                .lag_excluded_not_new_trade
+                .increment(self.lag_not_new_trade);
+        }
+        if self.lag_not_a_trade > 0 {
+            self.counters
+                .lag_excluded_not_a_trade
+                .increment(self.lag_not_a_trade);
         }
     }
 }
@@ -9079,26 +9184,30 @@ pub fn drain_main_feed_frame(
                 // accepted late) is excluded too. Live that day the F&O worst
                 // delay read 4,038,655 ms while the index/spot class read
                 // 1,923 ms: an illiquid contract's old trade time is not lag.
+                //
+                // ⚠ CHANGED 2026-11-17 (speed fix 4): the three exclusion
+                // counts go into the frame's `tally` (one plain add each) and
+                // are added to their counters once, when the walk ends; the
+                // lag is worked out once and handed to the worst-delay
+                // recorder. The histogram, the day distribution, the maxima
+                // and the clamp and garbage counters stay per tick.
                 match outcome {
                     IngestOutcome::Folded {
                         repeat_quote: true, ..
-                    } => record_ws_lag_repeat_excluded(),
+                    } => tally.exclude_repeat(),
                     IngestOutcome::Folded {
                         advanced: false, ..
-                    } => record_ws_lag_not_new_trade_excluded(),
+                    } => tally.exclude_not_new_trade(),
                     IngestOutcome::Folded { .. } => {
-                        record_ws_lag(frame.connection_index, tick, received_at_nanos);
+                        let lag_whole_ms =
+                            record_ws_lag(frame.connection_index, tick, received_at_nanos);
                         // Worst delay on a LIVE socket only: a replayed WAL
                         // frame (`u8::MAX`) carries its replay time.
                         if frame.connection_index != u8::MAX {
-                            record_ws_lag_max(
-                                tick.exchange_segment_code,
-                                tick.exchange_timestamp,
-                                received_at_nanos,
-                            );
+                            record_ws_lag_max(tick.exchange_segment_code, lag_whole_ms);
                         }
                     }
-                    _ => record_ws_lag_not_a_trade_excluded(),
+                    _ => tally.exclude_not_a_trade(),
                 }
                 match outcome {
                     IngestOutcome::Folded { .. } => {
@@ -10994,7 +11103,16 @@ pub const WS_LAG_EXCLUDED_COUNTER: &str = "tv_dhan_ws_lag_excluded_total";
 /// can recover precision the vendor never transmitted.
 #[must_use]
 pub fn ws_lag_ms(exchange_timestamp: u32, received_at_nanos: i64) -> Option<WsLag> {
-    let lag_ms = ws_lag_whole_ms(exchange_timestamp, received_at_nanos)?;
+    ws_lag_from_whole_ms(ws_lag_whole_ms(exchange_timestamp, received_at_nanos))
+}
+
+/// The classification half of [`ws_lag_ms`], over a lag
+/// [`ws_lag_whole_ms`] already computed (speed fix 4, 2026-11-17): lets
+/// [`record_ws_lag`] classify the same number it returns to the worst-delay
+/// recorder, so the arithmetic runs once per tick. O(1), no allocation.
+#[inline]
+fn ws_lag_from_whole_ms(lag_whole_ms: Option<i64>) -> Option<WsLag> {
+    let lag_ms = lag_whole_ms?;
     if lag_ms < 0 {
         return Some(WsLag::ClampedNegative);
     }
@@ -11083,20 +11201,10 @@ struct WsLagHandles {
     unknown_slot: metrics::Counter,
     excluded_clamped_negative: metrics::Counter,
     excluded_implausible_ltt: metrics::Counter,
-    /// A REPEATED quote (same trade time, price and cumulative volume as the
-    /// previous packet). Its stamp is the time of an earlier trade, so its
-    /// "lag" is how long the instrument has been quiet. Counted, not recorded.
-    excluded_ltt_not_advanced: metrics::Counter,
-    /// A tick the fold did not accept as a trade, most often a contract that
-    /// has not traded today carrying an earlier day's trade time. Counted, not
-    /// recorded (2026-10-05).
-    excluded_not_a_trade: metrics::Counter,
-    /// A folded packet that carried no NEW trade (plan PR AL-1, 2026-11-06):
-    /// the first packet after a subscribe, a book or OI update with the same
-    /// cumulative, a stale regression, or the packet ending a replay gap. Its
-    /// trade time can be hours old. Counted under its own reason so the
-    /// 2026-10-05 `not_a_trade` series keeps its meaning.
-    excluded_not_new_trade: metrics::Counter,
+    // ⚠ CHANGED 2026-11-17 (speed fix 4): the `ltt_not_advanced`,
+    // `not_a_trade` and `not_new_trade` exclusion handles moved to
+    // `DrainCounters` (same keys), so the drain adds them once per frame
+    // through `FrameTally` instead of once per tick here.
 }
 
 impl WsLagHandles {
@@ -11117,18 +11225,6 @@ impl WsLagHandles {
             excluded_implausible_ltt: metrics::counter!(
                 WS_LAG_EXCLUDED_COUNTER,
                 "reason" => "implausible_ltt"
-            ),
-            excluded_ltt_not_advanced: metrics::counter!(
-                WS_LAG_EXCLUDED_COUNTER,
-                "reason" => "ltt_not_advanced"
-            ),
-            excluded_not_a_trade: metrics::counter!(
-                WS_LAG_EXCLUDED_COUNTER,
-                "reason" => "not_a_trade"
-            ),
-            excluded_not_new_trade: metrics::counter!(
-                WS_LAG_EXCLUDED_COUNTER,
-                "reason" => "not_new_trade"
             ),
         }
     }
@@ -11740,9 +11836,19 @@ pub fn escalate_refused_seal(seal: &tickvault_trading::candles::BufferedSeal) ->
 /// `pub` so `crates/app/tests/dhat_ws_lag.rs` can measure it from an
 /// integration test. The allocation this function must not do is invisible to
 /// a unit test; it needs a DHAT profiler, and that needs a test binary.
-pub fn record_ws_lag(connection_index: u8, tick: &ParsedTick, received_at_nanos: i64) {
+///
+/// Returns the signed whole-millisecond lag it classified (`None` for an
+/// implausible stamp), the input [`record_ws_lag_max`] takes, so the drain
+/// works the lag out once per tick (speed fix 4, 2026-11-17). Recording is
+/// unchanged.
+pub fn record_ws_lag(
+    connection_index: u8,
+    tick: &ParsedTick,
+    received_at_nanos: i64,
+) -> Option<i64> {
     let handles = ws_lag_handles();
-    match ws_lag_ms(tick.exchange_timestamp, received_at_nanos) {
+    let lag_whole_ms = ws_lag_whole_ms(tick.exchange_timestamp, received_at_nanos);
+    match ws_lag_from_whole_ms(lag_whole_ms) {
         Some(WsLag::Measured(ms)) => {
             // Also fold into the DAY distribution the 15:45 scoreboard
             // persists. Added 2026-09-05: the fold lost its last production
@@ -11782,36 +11888,18 @@ pub fn record_ws_lag(connection_index: u8, tick: &ParsedTick, received_at_nanos:
             handles.excluded_implausible_ltt.increment(1);
         }
     }
+    lag_whole_ms
 }
 
-/// Counts a REPEATED quote as excluded from the delivery-lag measurement.
-///
-/// A repeat carries the trade time, price and cumulative volume of the
-/// previous packet — Dhan re-sending a quote because the book or OI moved. Its
-/// "receipt − LTT" is the time since the instrument last TRADED, not the time
-/// the packet spent in transit, so recording it would report a quiet market as
-/// a slow feed. Live on 2026-09-23 that was the difference between a ~1 s
-/// median and a ~10 s p90. One relaxed atomic add; no allocation. It feeds
-/// neither the histogram nor the 15:45 day distribution.
-pub fn record_ws_lag_repeat_excluded() {
-    ws_lag_handles().excluded_ltt_not_advanced.increment(1);
-}
-
-/// Counts a tick the fold did not accept as a trade (out of session, an
-/// earlier trading day, a refused price or time, a failed write) as excluded
-/// from the delivery-lag measurement. Its stamp is not the time of a trade
-/// that just happened, so its "receipt − LTT" is not transit time. One
-/// relaxed atomic add; no allocation (2026-10-05).
-pub fn record_ws_lag_not_a_trade_excluded() {
-    ws_lag_handles().excluded_not_a_trade.increment(1);
-}
-
-/// Counts a folded packet that carried no NEW trade (plan PR AL-1,
-/// 2026-11-06) as excluded from the delivery-lag measurement, under reason
-/// `not_new_trade`. One relaxed atomic add; no allocation.
-fn record_ws_lag_not_new_trade_excluded() {
-    ws_lag_handles().excluded_not_new_trade.increment(1);
-}
+// ⚠ REMOVED 2026-11-17 (speed fix 4): `record_ws_lag_repeat_excluded`,
+// `record_ws_lag_not_a_trade_excluded` and `record_ws_lag_not_new_trade_excluded`.
+// Each made one atomic add per excluded tick; the drain now counts those
+// three reasons in its `FrameTally` and adds each once per frame (same
+// series, same totals at the end of every frame). Why each reason is kept out
+// of the lag histogram is on the `FrameTally` fields. A repeat carries the
+// trade time of an earlier trade, so its "receipt − LTT" is the time since the
+// instrument last traded, not transit time: live on 2026-09-23 that was the
+// difference between a ~1 s median and a ~10 s p90.
 
 /// Outcome of [`ws_lag_ms`] for a tick that DOES carry a usable timestamp.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -16430,6 +16518,19 @@ fn close_lane_before_dial(
     );
 }
 
+/// Adds one to `tv_dhan_feed_ingest_ticks_total` when `outcome` is a written
+/// row (`Folded` or `WrittenOutOfSession`): the count
+/// [`LiveIngest::ingest_tick_at`] made itself until speed fix 4
+/// (2026-11-17). For a caller with no frame tally. O(1), no allocation.
+fn count_row_ingested(outcome: &IngestOutcome) {
+    if matches!(
+        outcome,
+        IngestOutcome::Folded { .. } | IngestOutcome::WrittenOutOfSession
+    ) {
+        counters().ingest_ticks.increment(1);
+    }
+}
+
 /// Fold ONE replayed tick and classify the outcome.
 ///
 /// Extracted 2026-08-28 when the caller's `if let Ok(..)` became an exhaustive
@@ -16494,6 +16595,10 @@ fn refold_one_tick(
         // was produced. It is a row, so it belongs on the row side.
         IngestOutcome::Folded { .. } | IngestOutcome::WrittenOutOfSession => {
             out.refolded = out.refolded.saturating_add(1);
+            // Per call, as before speed fix 4 (2026-11-17): the replay has no
+            // frame tally, and a count held for later could be lost if the
+            // lane never starts.
+            counters().ingest_ticks.increment(1);
         }
         // Refused by the day rule, on the same receipt clock the live feed
         // used — not loss, and not recovered either. Its own bucket, so the
@@ -20323,7 +20428,7 @@ mod tests {
         let idx = ExchangeSegment::IdxI.binary_code();
         let fno = ExchangeSegment::NseFno.binary_code();
         let rec = |code: u8, ts: u32, recv: i64| {
-            record_ws_lag_max_into(&max, &by_class, code, ts, recv);
+            record_ws_lag_max_into(&max, &by_class, code, ws_lag_whole_ms(ts, recv));
         };
         // The class split (LH-05) leaves this gauge unchanged: it still takes
         // the maximum across every segment. The INDEX tick carries the largest
@@ -20700,18 +20805,38 @@ mod tests {
     #[test]
     fn test_record_ws_lag_repeat_excluded_counts_a_repeated_quote_and_skips_the_lag_histogram() {
         // A repeat must land on the `ltt_not_advanced` exclusion counter, never
-        // on the clamp or garbage counters. Checked against the helper's body,
-        // because a counter handle cannot be read back in-process.
-        record_ws_lag_repeat_excluded();
+        // on the clamp or garbage counters. Since speed fix 4 (2026-11-17)
+        // the drain counts it in `FrameTally` and adds it once per frame, so
+        // this pins the tally's method, the frame-end flush into the
+        // `ltt_not_advanced` handle, and that handle's key. The totals
+        // themselves are checked against the old per-tick code by
+        // `frame_tally_tests::test_fix4_counts_equal_the_per_tick_oracle_on_every_class`.
         let helper_src = include_str!("dhan_feed_stack.rs");
         let helper = helper_src
-            .find("pub fn record_ws_lag_repeat_excluded() {")
+            .find("fn exclude_repeat(&mut self) {")
             .map(|at| &helper_src[at..])
             .and_then(|tail| tail.find('}').map(|end| &tail[..end]))
-            .expect("the repeat-exclusion helper must exist");
+            .expect("the repeat-exclusion tally method must exist");
         assert!(
-            helper.contains(".excluded_ltt_not_advanced.increment(1)"),
-            "a repeat must increment the ltt_not_advanced exclusion counter, got: {helper}"
+            helper.contains("self.lag_repeat = self.lag_repeat.saturating_add(1);"),
+            "a repeat must add one to the frame's repeat tally, got: {helper}"
+        );
+        let flush = helper_src
+            .find("impl Drop for FrameTally<'_> {")
+            .map(|at| &helper_src[at..])
+            .and_then(|tail| tail.find("\n}\n").map(|end| &tail[..end]))
+            .expect("FrameTally must flush on drop");
+        assert!(
+            flush.contains(
+                ".lag_excluded_ltt_not_advanced\n                .increment(self.lag_repeat);"
+            ),
+            "the frame-end flush must add the repeat tally to `ltt_not_advanced`, got: {flush}"
+        );
+        assert!(
+            helper_src.contains(
+                "lag_excluded_ltt_not_advanced: metrics::counter!(\n            WS_LAG_EXCLUDED_COUNTER,\n            \"reason\" => \"ltt_not_advanced\""
+            ),
+            "the repeat handle must be the `ltt_not_advanced` series"
         );
 
         // Source-scan the drain: the lag is recorded AFTER the fold, and only
@@ -20723,7 +20848,7 @@ mod tests {
             .find("let outcome = ingest.ingest_tick_at(tick, frame.seq, packets, recv_millis);")
             .expect("the drain's fold call must exist");
         let excluded = prod
-            .find("=> record_ws_lag_repeat_excluded(),")
+            .find("=> tally.exclude_repeat(),")
             .expect("the drain must count repeats as excluded");
         let measured = prod
             .find("record_ws_lag(frame.connection_index, tick, received_at_nanos);")
@@ -20745,17 +20870,30 @@ mod tests {
         // carrying an earlier day's trade time) went into the lag histogram
         // and read as option sockets delivering most packets over 60 s. The
         // drain must record lag on the accepted-trade arm only and count
-        // every other outcome on its own exclusion reason.
-        record_ws_lag_not_a_trade_excluded();
+        // every other outcome on its own exclusion reason. Since speed fix 4
+        // (2026-11-17) the count goes through the frame's `FrameTally`.
         let src = include_str!("dhan_feed_stack.rs");
         let helper = src
-            .find("pub fn record_ws_lag_not_a_trade_excluded() {")
+            .find("fn exclude_not_a_trade(&mut self) {")
             .map(|at| &src[at..])
             .and_then(|tail| tail.find('}').map(|end| &tail[..end]))
-            .expect("the not-a-trade exclusion helper must exist");
+            .expect("the not-a-trade exclusion tally method must exist");
         assert!(
-            helper.contains(".excluded_not_a_trade.increment(1)"),
-            "a refused or out-of-session tick must increment the not_a_trade counter, got: {helper}"
+            helper.contains("self.lag_not_a_trade = self.lag_not_a_trade.saturating_add(1);"),
+            "a refused or out-of-session tick must add one to the not_a_trade tally, got: {helper}"
+        );
+        let flush = src
+            .find("impl Drop for FrameTally<'_> {")
+            .map(|at| &src[at..])
+            .and_then(|tail| tail.find("\n}\n").map(|end| &tail[..end]))
+            .expect("FrameTally must flush on drop");
+        assert!(
+            flush.contains(
+                ".lag_excluded_not_a_trade\n                .increment(self.lag_not_a_trade);"
+            ) && flush.contains(
+                ".lag_excluded_not_new_trade\n                .increment(self.lag_not_new_trade);"
+            ),
+            "the frame-end flush must add both tallies to their own series, got: {flush}"
         );
 
         let prod = &src[..src.find("#[cfg(test)]").unwrap_or(src.len())];
@@ -20770,7 +20908,7 @@ mod tests {
             .find("record_ws_lag(frame.connection_index, tick, received_at_nanos);")
             .expect("the drain must still record real lag");
         let other = arm
-            .find("_ => record_ws_lag_not_a_trade_excluded(),")
+            .find("_ => tally.exclude_not_a_trade(),")
             .expect("every other outcome must be counted as not a trade");
         assert!(
             folded_arm < measured && measured < other,
@@ -20793,7 +20931,7 @@ mod tests {
         // reason, so the 2026-10-05 `not_a_trade` series keeps its meaning.
         let after: String = arm[not_advanced..].chars().take(120).collect();
         assert!(
-            after.contains("record_ws_lag_not_new_trade_excluded()"),
+            after.contains("tally.exclude_not_new_trade()"),
             "the not-advanced arm must count `not_new_trade`"
         );
         assert!(src.contains("\"reason\" => \"not_new_trade\""));
