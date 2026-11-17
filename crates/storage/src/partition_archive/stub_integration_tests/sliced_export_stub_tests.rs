@@ -4,7 +4,7 @@
 //! ordered query's for the same rows.
 
 use super::*;
-use crate::partition_archive::sliced_export::ordered_export_slices;
+use crate::partition_archive::sliced_export::{ExportBusyBackoff, ordered_export_slices};
 
 /// The hour every test exports.
 const HOUR: &str = "2026-04-01T09";
@@ -141,4 +141,239 @@ async fn test_sliced_export_refuses_a_slice_with_another_header() {
         .expect_err("a header mismatch must fail the export");
     assert!(format!("{err:#}").contains("header differs"), "{err:#}");
     assert!(!path.exists(), "the temp file is removed");
+}
+
+// ---------------------------------------------------------------------------
+// 2026-11-17: a `/exp` refused with 429 (QuestDB's export connection limit)
+// is waited out and sent again, bounded; any other status fails as before.
+// ---------------------------------------------------------------------------
+
+/// The live 429 body of 2026-11-17 17:36 IST.
+const QDB_BUSY_BODY: &[u8] = b"exceeded connection limit [name=http_export_connections, \
+numOfConnections=3, connectionLimit=2]";
+
+/// A short schedule so a test does not wait the production 120 s.
+fn fast_backoff(first_ms: u64, cap_ms: u64, total_ms: u64) -> ExportBusyBackoff {
+    ExportBusyBackoff {
+        first: Duration::from_millis(first_ms),
+        step_cap: Duration::from_millis(cap_ms),
+        total: Duration::from_millis(total_ms),
+        hold_after_give_up: Duration::from_secs(60),
+    }
+}
+
+/// Wraps `inner`: the `/exp` requests whose 0-based number is in `busy`
+/// (or every one, with `forever`) get a 429; the rest go to `inner`.
+fn busy_on(busy: &'static [u64], forever: bool, inner: Responder) -> Responder {
+    let seen = Arc::new(AtomicU64::new(0));
+    Arc::new(move |req: &SeenRequest| {
+        if req.target.starts_with("/exp") {
+            let n = seen.fetch_add(1, Ordering::SeqCst);
+            if forever || busy.contains(&n) {
+                return (429, Vec::new(), QDB_BUSY_BODY.to_vec());
+            }
+        }
+        inner(req)
+    })
+}
+
+fn exp_requests(qlog: &Arc<Mutex<Vec<SeenRequest>>>) -> usize {
+    qlog.lock()
+        .expect("q")
+        .iter()
+        .filter(|r| r.target.starts_with("/exp"))
+        .count()
+}
+
+/// 429s on the first slice (twice) and on a middle slice: the export waits,
+/// sends each refused request again, and gives byte for byte what a run
+/// with no 429 gives. The slices before a refused one are kept, not resent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_export_429_then_200_gives_identical_bytes() {
+    let key = crate::tick_persistence::DEDUP_KEY_TICKS;
+    let (clean, _) = archiver_for(per_slice_qdb("\n", true)).await;
+    let clean_path = clean.temp_dir.join("clean.csv.gz");
+    let want = clean
+        .export_ordered_csv("ticks", HOUR, key, clean_path.clone())
+        .await
+        .expect("clean export");
+
+    // Requests 0 and 1 are slice 0's first two tries; request 4 is slice 2's
+    // first try (slice 0 succeeds on request 2, slice 1 on request 3).
+    let (busy, qlog) = archiver_for(busy_on(&[0, 1, 4], false, per_slice_qdb("\n", true))).await;
+    let busy = busy.with_export_busy_backoff(fast_backoff(10, 40, 2_000));
+    let busy_path = busy.temp_dir.join("busy.csv.gz");
+    let got = busy
+        .export_ordered_csv("ticks", HOUR, key, busy_path.clone())
+        .await
+        .expect("the 429s are waited out");
+    assert_eq!(got.rows, want.rows);
+    assert_eq!(got.csv_bytes, want.csv_bytes);
+    assert_eq!(got.gzip_bytes, want.gzip_bytes);
+    assert_eq!(got.gzip_sha256_hex, want.gzip_sha256_hex);
+    assert_eq!(
+        std::fs::read(&busy_path).expect("busy file"),
+        std::fs::read(&clean_path).expect("clean file")
+    );
+    let slices = ordered_export_slices(HOUR).expect("slices").len();
+    assert_eq!(
+        exp_requests(&qlog),
+        slices + 3,
+        "one resend per 429, no more"
+    );
+}
+
+/// QuestDB stays full: the export gives up once the wait budget is spent,
+/// with the same error a 429 always gave (plus the retry count), inside a
+/// bounded time, sending a bounded number of requests, and leaves no file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_export_429_forever_gives_up_at_the_bound() {
+    let (archiver, qlog) = archiver_for(busy_on(&[], true, per_slice_qdb("\n", true))).await;
+    // Waits 20, 40, 50, 50, then 40 (cut to the 200 ms budget): 5 retries.
+    let archiver = archiver.with_export_busy_backoff(fast_backoff(20, 50, 200));
+    let (start, end) = partition_range_bounds(HOUR).expect("bounds");
+    let path = archiver.temp_dir.join("busy-forever.csv.gz");
+    let began = std::time::Instant::now();
+    let err = archiver
+        .export_query_csv(
+            &build_export_sql_ordered("ticks", &start, &end, None),
+            path.clone(),
+        )
+        .await
+        .expect_err("a QuestDB that stays full must fail the export");
+    let took = began.elapsed();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("/exp export returned 429"), "{msg}");
+    assert!(msg.contains("exceeded connection limit"), "{msg}");
+    assert!(msg.contains("after 5 busy retries"), "{msg}");
+    assert_eq!(exp_requests(&qlog), 6, "the first try plus 5 retries");
+    assert!(
+        took >= Duration::from_millis(200),
+        "waited the budget: {took:?}"
+    );
+    assert!(took < Duration::from_secs(5), "bounded: {took:?}");
+    assert!(!path.exists(), "the temp file is removed");
+}
+
+/// A 429 while a deadline is near: the export never waits into it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_export_429_never_waits_past_the_export_deadline() {
+    let (archiver, qlog) = archiver_for(busy_on(&[], true, per_slice_qdb("\n", true))).await;
+    // A 10 s budget, but the deadline is 150 ms away.
+    let archiver = archiver.with_export_busy_backoff(fast_backoff(50, 50, 10_000));
+    let (start, end) = partition_range_bounds(HOUR).expect("bounds");
+    let path = archiver.temp_dir.join("busy-deadline.csv.gz");
+    let began = std::time::Instant::now();
+    let err = archiver
+        .export_requests_csv(
+            &[build_export_sql_ordered("ticks", &start, &end, None)],
+            Some(began + Duration::from_millis(150)),
+            path.clone(),
+        )
+        .await
+        .expect_err("the deadline ends the waiting");
+    let took = began.elapsed();
+    assert!(
+        format!("{err:#}").contains("/exp export returned 429"),
+        "{err:#}"
+    );
+    assert!(
+        took < Duration::from_secs(2),
+        "bounded by the deadline: {took:?}"
+    );
+    assert!(
+        exp_requests(&qlog) <= 4,
+        "at most 3 waits of 50 ms fit in 150 ms"
+    );
+    assert!(!path.exists(), "the temp file is removed");
+}
+
+/// Any status other than 429 is not retried: one request, today's error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_export_non_429_error_is_not_retried() {
+    for status in [400u16, 500, 503] {
+        let responder: Responder = Arc::new(move |req: &SeenRequest| {
+            if req.target.starts_with("/exp") {
+                return (status, Vec::new(), b"boom".to_vec());
+            }
+            (200, Vec::new(), b"{\"ddl\":\"OK\"}".to_vec())
+        });
+        let (archiver, qlog) = archiver_for(responder).await;
+        let archiver = archiver.with_export_busy_backoff(fast_backoff(10, 10, 1_000));
+        let (start, end) = partition_range_bounds(HOUR).expect("bounds");
+        let path = archiver.temp_dir.join("refused.csv.gz");
+        let err = archiver
+            .export_query_csv(
+                &build_export_sql_ordered("ticks", &start, &end, None),
+                path.clone(),
+            )
+            .await
+            .expect_err("a non-429 error fails the export");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(&format!("/exp export returned {status}")),
+            "{msg}"
+        );
+        assert!(!msg.contains("busy retries"), "{msg}");
+        assert_eq!(exp_requests(&qlog), 1, "status {status} is not retried");
+        assert!(!path.exists());
+    }
+}
+
+/// After one export spent its whole wait budget, the same archiver's next
+/// 429 fails at once (no second budget), so a pass over many refused
+/// partitions is not slowed by one budget each; an answered request lifts
+/// the hold.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_export_429_after_a_spent_budget_fails_at_once_until_an_answer() {
+    let refusing = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let flag = Arc::clone(&refusing);
+    let inner = per_slice_qdb("\n", true);
+    let responder: Responder = Arc::new(move |req: &SeenRequest| {
+        if req.target.starts_with("/exp") && flag.load(Ordering::SeqCst) {
+            return (429, Vec::new(), QDB_BUSY_BODY.to_vec());
+        }
+        inner(req)
+    });
+    let (archiver, qlog) = archiver_for(responder).await;
+    let archiver = archiver.with_export_busy_backoff(fast_backoff(20, 50, 200));
+    let (start, end) = partition_range_bounds(HOUR).expect("bounds");
+    let sql = build_export_sql_ordered("ticks", &start, &end, None);
+    let path = archiver.temp_dir.join("held.csv.gz");
+
+    archiver
+        .export_query_csv(&sql, path.clone())
+        .await
+        .expect_err("first export spends its budget");
+    assert_eq!(exp_requests(&qlog), 6);
+
+    let began = std::time::Instant::now();
+    let err = archiver
+        .export_query_csv(&sql, path.clone())
+        .await
+        .expect_err("second export fails at once");
+    assert!(
+        format!("{err:#}").contains("/exp export returned 429"),
+        "{err:#}"
+    );
+    assert_eq!(exp_requests(&qlog), 7, "one request, no second budget");
+    assert!(began.elapsed() < Duration::from_millis(150), "no wait");
+
+    // QuestDB answers again: the export succeeds and the hold is lifted.
+    refusing.store(false, Ordering::SeqCst);
+    archiver
+        .export_query_csv(&sql, path.clone())
+        .await
+        .expect("an answered request succeeds");
+    assert_eq!(exp_requests(&qlog), 8);
+    refusing.store(true, Ordering::SeqCst);
+    archiver
+        .export_query_csv(&sql, path.clone())
+        .await
+        .expect_err("refused again");
+    assert_eq!(
+        exp_requests(&qlog),
+        14,
+        "after an answer, a full budget again"
+    );
 }

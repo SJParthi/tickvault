@@ -227,6 +227,7 @@ pub fn register_brutex_export_metrics() {
     metrics::counter!("tv_partition_archive_export_unordered_fallback_total").increment(0);
     metrics::counter!("tv_partition_archive_export_unordered_in_session_total").increment(0);
     metrics::counter!("tv_partition_archive_amend_records_total").increment(0);
+    metrics::counter!(super::sliced_export::EXPORT_BUSY_RETRIES_COUNTER).increment(0);
     metrics::gauge!("tv_brutex_export_duration_secs").set(0.0);
     metrics::gauge!("tv_brutex_export_last_done_day").set(0.0);
 }
@@ -2699,6 +2700,7 @@ mod tests {
             "tv_partition_archive_export_unordered_fallback_total{}",
             "tv_partition_archive_export_unordered_in_session_total{}",
             "tv_partition_archive_amend_records_total{}",
+            "tv_partition_archive_export_busy_retries_total{}",
             "tv_brutex_export_duration_secs",
             "tv_brutex_export_last_done_day",
         ] {

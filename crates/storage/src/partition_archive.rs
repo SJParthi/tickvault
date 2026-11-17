@@ -1567,6 +1567,8 @@ pub const WAL_SNAPSHOT_WAIT_GAUGE: &str = "tv_partition_archive_wal_snapshot_wai
 /// the first wait. O(1).
 pub fn register_archive_snapshot_wait_gauge() {
     metrics::gauge!(WAL_SNAPSHOT_WAIT_GAUGE).set(0.0);
+    // 2026-11-17: the archiver's `/exp` busy retries, local only.
+    metrics::counter!(sliced_export::EXPORT_BUSY_RETRIES_COUNTER).increment(0);
 }
 
 /// The bytes of `worklist` partitions listed in `rows` (one table's
@@ -1828,6 +1830,12 @@ pub struct PartitionArchiver {
     exp_url: String,
     ddl_client: Client,
     export_client: Client,
+    /// How long a `/exp` request refused with 429 (QuestDB's export
+    /// connection limit) waits and retries (2026-11-17). Production:
+    /// [`sliced_export::ExportBusyBackoff::PRODUCTION`]; tests shrink it.
+    export_busy_backoff: sliced_export::ExportBusyBackoff,
+    /// A recent spent busy budget of this archiver (2026-11-17).
+    busy_hold: sliced_export::ExportBusyHold,
     cold: S3Cold,
     temp_dir: PathBuf,
     cfg: PartitionRetentionConfig,
@@ -2110,6 +2118,8 @@ impl PartitionArchiver {
             exp_url: format!("http://{}:{}/exp", questdb.host, questdb.http_port),
             ddl_client,
             export_client,
+            export_busy_backoff: sliced_export::ExportBusyBackoff::PRODUCTION,
+            busy_hold: sliced_export::ExportBusyHold::default(),
             cold,
             temp_dir: PathBuf::from(ARCHIVE_TEMP_DIR),
             cfg: cfg.clone(),
@@ -2163,6 +2173,8 @@ impl PartitionArchiver {
                 .no_proxy()
                 .build()
                 .context("test export client")?,
+            export_busy_backoff: sliced_export::ExportBusyBackoff::PRODUCTION,
+            busy_hold: sliced_export::ExportBusyHold::default(),
             cold: S3Cold::from_client(s3, bucket),
             temp_dir,
             cfg,
