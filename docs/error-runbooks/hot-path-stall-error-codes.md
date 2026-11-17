@@ -73,6 +73,19 @@ where a hand-off had no spare batch and reserved a fresh one on the drain:
 `tv_tick_stage_presize_fresh_total` and `tv_depth_stage_presize_fresh_total`
 (local `/metrics` only).
 
+**⚠ CHANGED 2026-11-17 (plan ITEM DT, measure first).** One more stage,
+measurement only and never paged, 1 ms budget (over-budget count and p99
+warn only): `drain_inline_depth`, the inline depth append (five bid and
+five ask levels staged) of ONE Full main-feed packet, timed for a sample of
+about 1 in 64 Full packets that reach that call, refused ones included, at
+jittered gaps (a packet whose depth is shed is not counted). A sample can
+hold a rare writer hand-off or rescue (the ninth contract-name table in one
+batch), so an over-budget sample is not necessarily slow staging. Its time
+is already inside that frame's `drain_main_frame`, `drain_main_tick` and
+`receipt_to_fold`, so do not add it to them. It splits
+the depth share out of `drain_main_tick`; it is not a stall signal and
+changes no speed.
+
 **Log-only line, same code.** When a stage's p99 over the last second passes
 its budget, the first second of that episode writes one `warn!` with
 `code = HOT-PATH-STALL-01`, `source = "stage_p99_over_budget"` and fields
