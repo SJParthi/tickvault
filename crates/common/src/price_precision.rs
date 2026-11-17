@@ -62,10 +62,14 @@ const TWO_DECIMAL_FAST_PATH_MAX_MAGNITUDE: f32 = 131_072.0;
 // The fast path sits inside the arithmetic path's range.
 const _: () = assert!(TWO_DECIMAL_FAST_PATH_MAX_MAGNITUDE < ARITHMETIC_PATH_MAX_MAGNITUDE);
 
+/// Index of `10^2` in [`DECIMAL_SCALES`]: the step the fast path has
+/// already tried, which the search skips after a fast-path miss.
+const TWO_DECIMAL_SCALE_INDEX: usize = 2;
+
 /// The scale the fast path tries first: `10^2`, two decimal places, the
-/// precision of exchange prices. Exact in `f64`, and the third entry of
-/// [`DECIMAL_SCALES`].
-const TWO_DECIMAL_SCALE: f64 = 1e2;
+/// precision of exchange prices. Exact in `f64`, and the entry of
+/// [`DECIMAL_SCALES`] at [`TWO_DECIMAL_SCALE_INDEX`].
+const TWO_DECIMAL_SCALE: f64 = DECIMAL_SCALES[TWO_DECIMAL_SCALE_INDEX];
 
 /// One step of [`f32_to_f64_clean`]'s search at `scale`: take the
 /// nearest integer `m` to `widened · scale`, then its other neighbour,
@@ -126,15 +130,21 @@ fn hit_at_scale(v: f32, widened: f64, scale: f64) -> Option<f64> {
 /// # Two-decimal fast path (2026-11-17, plan ITEM DT)
 ///
 /// For `0 < |v| < 2^17` the scale `10^2` is tried first, before the
-/// search. A hit returns at once; a miss runs the unchanged search from
-/// scale 1. Most prices have two decimals or fewer, so they now cost one
+/// search. A hit returns at once; a miss runs the search from scale 1,
+/// skipping the scale-100 step it has just made (the same call, so it
+/// would miss again). Most prices have two decimals or fewer, so they now cost one
 /// scale step instead of up to three. Measured 2026-11-17 (release,
 /// x86 dev container, `test_f32_to_f64_clean_fast_path_timing`: 4,096
 /// inputs, 70% two-decimal prices 0.05 to 1,00,000, 15% one-decimal, 10%
 /// integers, 5% four-decimal; best of 5 per sample, 8 samples each):
 /// fast path 6.0 to 6.5 ns per call in 6 samples (the other two 10.3
 /// and 11.3 ns), frozen search 13.6 to 14.1 ns in 5 (the others 17.3,
-/// 17.4 and 19.4 ns). Not measured on the production host.
+/// 17.4 and 19.4 ns). Re-run after the miss path stopped repeating the
+/// scale-100 step (same harness, 3 runs): price mix 5.7 to 5.9 ns
+/// against 12.6 to 17.0 ns; a miss-heavy mix (4,096 three- and
+/// four-decimal values below 2^17, 3,867 of them fast-path misses)
+/// 21.0 to 21.6 ns against 22.0 to 23.3 ns, so a miss costs no more
+/// than before. Not measured on the production host.
 ///
 /// Why a hit is exactly what the search returns:
 ///
@@ -149,9 +159,12 @@ fn hit_at_scale(v: f32, widened: f64, scale: f64) -> Option<f64> {
 ///    `(m · 100 / s) / 100`. So it equals `fl(M / 100)` with
 ///    `M = m · 100 / s`, it narrows to `v`, and it is in `S`. The fast
 ///    path's hit is in `S` too, so the two are the same `f64`.
-/// 3. If the search reaches scale 100 instead, its step there is the
-///    same `hit_at_scale` call with the same arguments: same candidates,
-///    nearest first, then the other neighbour, same result.
+/// 3. If the search would reach scale 100 instead, its step there is the
+///    same `hit_at_scale` call with the same arguments as the fast
+///    path's: same candidates, nearest first, then the other neighbour,
+///    same result. After a fast-path miss that result is `None`, so
+///    skipping the step leaves the output unchanged; a fast-path hit
+///    returns that same value.
 ///
 /// Negative values are the mirror image (`round` is symmetric, the
 /// interval argument does not use the sign). Zero, non-finite values and
@@ -166,12 +179,16 @@ pub fn f32_to_f64_clean(v: f32) -> f64 {
         // APPROVED: f64::from(f32) is exact; only the scaled candidates
         // below are returned, never this widened value.
         let widened = f64::from(v);
-        if magnitude < TWO_DECIMAL_FAST_PATH_MAX_MAGNITUDE
-            && let Some(candidate) = hit_at_scale(v, widened, TWO_DECIMAL_SCALE)
-        {
+        let fast_path_tried = magnitude < TWO_DECIMAL_FAST_PATH_MAX_MAGNITUDE;
+        if fast_path_tried && let Some(candidate) = hit_at_scale(v, widened, TWO_DECIMAL_SCALE) {
             return candidate;
         }
-        for scale in DECIMAL_SCALES {
+        for (index, scale) in DECIMAL_SCALES.into_iter().enumerate() {
+            // The fast path made this exact call and it missed; the call
+            // is deterministic, so running it again cannot hit.
+            if fast_path_tried && index == TWO_DECIMAL_SCALE_INDEX {
+                continue;
+            }
             if let Some(candidate) = hit_at_scale(v, widened, scale) {
                 return candidate;
             }
@@ -672,6 +689,67 @@ mod tests {
         {
             eprintln!(
                 "f32_to_f64_clean per call (best of 5, ns): frozen search {old:.2} / {old_again:.2}, fast path {new:.2} / {new_again:.2}"
+            );
+        }
+        // Miss-heavy mix: 3-decimal values up to 10,000 and 4-decimal
+        // values up to 1,000 (all below 2^17), where the
+        // fast path misses and the search runs. Measures the cost of a
+        // miss, which the price mix above barely reaches.
+        let mut misses = Vec::with_capacity(4_096);
+        for i in 0..4_096_u32 {
+            let r = next();
+            #[allow(clippy::cast_precision_loss)]
+            // APPROVED: test input generation
+            let v = if i % 2 == 0 {
+                ((r % 10_000_000) + 1) as f32 / 1_000.0
+            } else {
+                ((r % 10_000_000) + 1) as f32 / 10_000.0
+            };
+            misses.push(v);
+        }
+        for &v in &misses {
+            let (new, old) = (
+                f32_to_f64_clean(v),
+                f32_to_f64_clean_frozen_before_fast_path(v),
+            );
+            assert!(same_bits(new, old), "{v}: {new} != {old}");
+        }
+        let miss_count = misses
+            .iter()
+            .filter(|&&v| hit_at_scale(v, f64::from(v), TWO_DECIMAL_SCALE).is_none())
+            .count();
+        assert!(
+            miss_count * 10 >= misses.len() * 8,
+            "fast-path misses {miss_count}"
+        );
+        let time_misses = |f: fn(f32) -> f64| {
+            let mut best = f64::MAX;
+            for _ in 0..5 {
+                let start = std::time::Instant::now();
+                let mut sum = 0.0_f64;
+                for _ in 0..rounds {
+                    for &v in &misses {
+                        sum += f(std::hint::black_box(v));
+                    }
+                }
+                std::hint::black_box(sum);
+                #[allow(clippy::cast_precision_loss)]
+                // APPROVED: timing arithmetic
+                let per_call = start.elapsed().as_nanos() as f64 / (rounds * misses.len()) as f64;
+                best = best.min(per_call);
+            }
+            best
+        };
+        let miss_old = time_misses(f32_to_f64_clean_frozen_before_fast_path);
+        let miss_new = time_misses(f32_to_f64_clean);
+        let miss_old_again = time_misses(f32_to_f64_clean_frozen_before_fast_path);
+        let miss_new_again = time_misses(f32_to_f64_clean);
+        assert!(miss_old > 0.0 && miss_new > 0.0 && miss_old_again > 0.0 && miss_new_again > 0.0);
+        #[allow(clippy::print_stderr)]
+        {
+            eprintln!(
+                "f32_to_f64_clean miss-heavy mix ({miss_count} of {} miss the fast path), per call (best of 5, ns): frozen search {miss_old:.2} / {miss_old_again:.2}, fast path {miss_new:.2} / {miss_new_again:.2}",
+                misses.len()
             );
         }
     }
