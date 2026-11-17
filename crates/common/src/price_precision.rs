@@ -418,45 +418,8 @@ mod tests {
         }
     }
 
-    /// The full proof: all 2^32 inputs, split across the machine's
-    /// threads. Measured 2026-10-09: 0 differences, 382 s on 4
-    /// cores (release). Run with
-    /// `cargo test -p tickvault-common --release --lib -- --ignored every_f32`.
-    #[test]
-    #[ignore = "exhaustive: minutes in release, far longer in debug"]
-    fn test_f32_to_f64_clean_matches_text_path_for_every_f32() {
-        let threads = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
-        let threads = u64::try_from(threads).unwrap_or(4);
-        let span = 1_u64 << 32;
-        let handles: Vec<_> = (0..threads)
-            .map(|t| {
-                std::thread::spawn(move || {
-                    let (low, high) = (span * t / threads, span * (t + 1) / threads);
-                    let mut first_difference = None;
-                    let mut differences = 0_u64;
-                    for bits in low..high {
-                        #[allow(clippy::cast_possible_truncation)]
-                        // APPROVED: bits < 2^32
-                        let v = f32::from_bits(bits as u32);
-                        let (fast, text) = (f32_to_f64_clean(v), f32_to_f64_clean_via_text(v));
-                        if !same_bits(fast, text) {
-                            differences += 1;
-                            first_difference.get_or_insert((v, fast, text));
-                        }
-                    }
-                    (differences, first_difference)
-                })
-            })
-            .collect();
-        let mut differences = 0;
-        let mut first = None;
-        for handle in handles {
-            let (count, example) = handle.join().expect("worker thread panicked");
-            differences += count;
-            first = first.or(example);
-        }
-        assert_eq!(differences, 0, "first difference: {first:?}");
-    }
+    // The all-2^32 proof against the text path lives in
+    // `crates/common/tests/price_fast_path_harness.rs` (`#[ignore]`d).
 
     /// `f32_to_f64_clean` exactly as it was before the two-decimal fast
     /// path (2026-11-17): the oracle the fast path must match bit for

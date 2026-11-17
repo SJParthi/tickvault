@@ -216,9 +216,9 @@ const ALLOWED_IGNORED: &[(&str, &str)] = &[
     // boundary values) run in every suite. Re-run it whenever the arithmetic
     // path changes:
     //
-    //   cargo test -p tickvault-common --release --lib -- --ignored every_f32
+    //   cargo test -p tickvault-common --release --test price_fast_path_harness -- --ignored text_path_for_every_f32
     (
-        "crates/common/src/price_precision.rs",
+        "crates/common/tests/price_fast_path_harness.rs",
         "test_f32_to_f64_clean_matches_text_path_for_every_f32",
     ),
     // Added 2026-11-17 with the two-decimal fast path (plan ITEM DT): the
