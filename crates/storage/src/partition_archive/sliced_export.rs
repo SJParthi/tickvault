@@ -163,7 +163,7 @@ impl ExportBusyBackoff {
     /// deadline (a request sent at, or just before, the deadline cannot run,
     /// and its failure would hide the 429). Pure, O(1).
     #[must_use]
-    // TEST-EXEMPT: covered by test_export_busy_backoff_never_waits_into_the_deadline
+    // TEST-EXEMPT: covered by test_export_busy_backoff_next_wait_never_waits_into_the_deadline
     pub(crate) fn next_wait(
         &self,
         n: u32,
@@ -195,7 +195,7 @@ pub(crate) struct ExportBusyHold(std::sync::Mutex<Option<Instant>>);
 
 impl ExportBusyHold {
     /// Whether a give-up younger than `hold` is on record. O(1).
-    // TEST-EXEMPT: covered by test_export_busy_hold_records_and_forgets_a_give_up
+    // TEST-EXEMPT: covered by test_export_busy_hold_note_give_up_holds_and_clear_lifts
     pub(crate) fn active(&self, hold: Duration) -> bool {
         self.0
             .lock()
@@ -204,7 +204,7 @@ impl ExportBusyHold {
     }
 
     /// Records a spent budget now. O(1).
-    // TEST-EXEMPT: covered by test_export_busy_hold_records_and_forgets_a_give_up
+    // TEST-EXEMPT: covered by test_export_busy_hold_note_give_up_holds_and_clear_lifts
     pub(crate) fn note_give_up(&self) {
         if let Ok(mut g) = self.0.lock() {
             *g = Some(Instant::now());
@@ -212,7 +212,7 @@ impl ExportBusyHold {
     }
 
     /// Forgets the give-up (a `/exp` request was answered with a 2xx). O(1).
-    // TEST-EXEMPT: covered by test_export_busy_hold_records_and_forgets_a_give_up
+    // TEST-EXEMPT: covered by test_export_busy_hold_note_give_up_holds_and_clear_lifts
     pub(crate) fn clear(&self) {
         if let Ok(mut g) = self.0.lock() {
             *g = None;
@@ -750,7 +750,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_export_busy_hold_records_and_forgets_a_give_up() {
+    fn test_export_busy_hold_note_give_up_holds_and_clear_lifts() {
         let hold = ExportBusyHold::default();
         let long = Duration::from_secs(600);
         assert!(!hold.active(long), "nothing on record");
@@ -787,7 +787,7 @@ mod tests {
     }
 
     #[test]
-    fn test_export_busy_backoff_never_waits_into_the_deadline() {
+    fn test_export_busy_backoff_next_wait_never_waits_into_the_deadline() {
         let b = ExportBusyBackoff::PRODUCTION;
         // 2 s left and a 4 s wait due: give up now.
         assert_eq!(

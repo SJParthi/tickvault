@@ -402,3 +402,69 @@ async fn test_export_429_after_a_spent_budget_fails_at_once_until_an_answer() {
         .expect_err("refused again");
     assert_eq!(exp_requests(&qlog), 16, "after a 2xx, a full budget again");
 }
+
+/// 2026-11-17: the export client keeps no idle connection, so QuestDB's
+/// export slot is released the moment an export ends. A keep-alive server
+/// that counts accepted connections must see one connection per `/exp`
+/// request; with reqwest's default pool the second request would reuse the
+/// first connection (one accept), and that idle connection would hold one of
+/// QuestDB's two export slots for 90 s.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_export_client_keeps_no_idle_connection_between_exports() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let accepts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = Arc::clone(&accepts);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::spawn(async move {
+                let mut buf = vec![0_u8; 8192];
+                let mut seen = Vec::new();
+                loop {
+                    let Ok(n) = sock.read(&mut buf).await else {
+                        return;
+                    };
+                    if n == 0 {
+                        return;
+                    }
+                    seen.extend_from_slice(&buf[..n]);
+                    while let Some(end) = seen.windows(4).position(|w| w == b"\r\n\r\n") {
+                        seen.drain(..end + 4);
+                        let body = format!("{HEADER}\r\n{}\r\n", ROWS[0]);
+                        let reply = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/csv\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{body}",
+                            body.len()
+                        );
+                        if sock.write_all(reply.as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+    });
+    let qdb_url = format!("http://{addr}");
+    let (ilp_url, _) = spawn_stub(ilp_responder(204)).await;
+    let (s3_url, _) = spawn_stub(s3_responder(Arc::new(Mutex::new(HashMap::new())))).await;
+    let archiver = build_archiver(&qdb_url, &ilp_url, &s3_url, test_retention_cfg(200)).await;
+    let (start, end) = partition_range_bounds(HOUR).expect("bounds");
+    let sql = build_export_sql_ordered("ticks", &start, &end, None);
+    for round in 0..2 {
+        let path = archiver.temp_dir.join(format!("idle-{round}.csv.gz"));
+        let exported = archiver.export_query_csv(&sql, path).await.expect("export");
+        assert_eq!(exported.rows, 1, "round {round}");
+    }
+    assert_eq!(EXPORT_CLIENT_MAX_IDLE_PER_HOST, 0);
+    assert_eq!(
+        accepts.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "each /exp request must use its own connection (no idle keep-alive)"
+    );
+}

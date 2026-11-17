@@ -395,6 +395,13 @@ impl std::error::Error for SessionBytesError {}
 /// consumed incrementally so memory stays bounded either way.
 const ARCHIVE_EXPORT_TIMEOUT_SECS: u64 = 600;
 
+/// Idle `/exp` connections the archiver's export client keeps open: none.
+/// QuestDB counts an idle keep-alive connection against its export limit
+/// (`http_export_connections`, 2) until it closes, so a kept one blocked the
+/// next export (17 Nov 2026: three Brutex attempts refused with
+/// `numOfConnections=3`). Each request opens and closes its own connection.
+pub(crate) const EXPORT_CLIENT_MAX_IDLE_PER_HOST: usize = 0;
+
 /// Cap on any `/exec` response body read into memory (SEC-LOW2, review
 /// round 1). The largest legitimate body is a `table_partitions()` listing
 /// (a few hundred KB on the first catch-up sweep); 4 MiB bounds a hostile /
@@ -2108,8 +2115,16 @@ impl PartitionArchiver {
             .timeout(Duration::from_secs(ARCHIVE_DDL_TIMEOUT_SECS))
             .build()
             .context("failed to create DDL HTTP client for partition archiver")?;
+        // No idle keep-alive (2026-11-17): QuestDB counts an open /exp
+        // connection against `http_export_connections` (limit 2) until it
+        // closes. reqwest keeps an idle connection 90 s by default, so a
+        // finished export of one archiver (and the daily exporter's, kept
+        // across its attempts) still held a slot; every 17 Nov Brutex attempt
+        // was refused with numOfConnections=3. One fresh local TCP connect
+        // per /exp request costs microseconds.
         let export_client = Client::builder()
             .timeout(Duration::from_secs(ARCHIVE_EXPORT_TIMEOUT_SECS))
+            .pool_max_idle_per_host(EXPORT_CLIENT_MAX_IDLE_PER_HOST)
             .build()
             .context("failed to create export HTTP client for partition archiver")?;
         let cold = S3Cold::connect(bucket).await;
@@ -2170,6 +2185,7 @@ impl PartitionArchiver {
                 .context("test DDL client")?,
             export_client: Client::builder()
                 .timeout(Duration::from_secs(ARCHIVE_EXPORT_TIMEOUT_SECS))
+                .pool_max_idle_per_host(EXPORT_CLIENT_MAX_IDLE_PER_HOST)
                 .no_proxy()
                 .build()
                 .context("test export client")?,

@@ -864,7 +864,7 @@ mod tests {
     /// the anchor refresh, a segment rotation or a counter lead. Production
     /// never calls the test-only `note` wrapper.
     #[test]
-    fn test_each_production_step_caller_names_its_source() {
+    fn test_each_production_note_from_caller_names_its_source() {
         let src = include_str!("wal_clock_step.rs");
         let prod = &src[..src.find("#[cfg(test)]\nmod tests").expect("tests module")];
         let squeezed: String = prod.split_whitespace().collect();
