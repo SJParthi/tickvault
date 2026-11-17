@@ -652,7 +652,30 @@ impl AppliedSnapshot {
         };
         let last = bucket_hi >> UNAPPLIED_BUCKET_SHIFT;
         if last.saturating_sub(first) >= UNAPPLIED_BUCKETS as u64 {
-            return true;
+            // ⚠ CHANGED 2026-11-17: this returned `true` for every range of
+            // 128 buckets (about 9.8 hours) or wider, so a recorded clock-step
+            // window of four days (12 to 16 Nov, live) read unapplied forever,
+            // never retired, and held every hour inside it. The answer is now
+            // exact: each slot stores its FULL bucket id, and a mark the table
+            // could not store (its slot held a different id, or a range too
+            // wide to mark) set the overflow flag, checked above. Overflow is
+            // cleared only into a bounded range (the boot fold, the in-session
+            // bound) or after a drain proved past its height, both checked
+            // above too. So a mark inside `[first, last]` is either in a slot
+            // or caught by an earlier check, and one pass over the slots
+            // answers exactly: the same as the per-id loop below would over
+            // the whole range (each id sits at `slot_of(id)`), never `false`
+            // where a mark is recorded. A range reaching bucket 0 (no
+            // sequence) still reads unapplied, as before. O(`UNAPPLIED_BUCKETS`)
+            // = 128 compares, cold (replay, prune, archive gate).
+            if first == 0 {
+                return true;
+            }
+            // O(1) EXEMPT: fixed UNAPPLIED_BUCKETS iterations, cold decision
+            return self
+                .buckets
+                .iter()
+                .any(|&(id, _)| id != 0 && first <= id && id <= last);
         }
         // O(1) EXEMPT: bounded by UNAPPLIED_BUCKETS, boot-time replay decision
         let mut id = first;
@@ -6140,6 +6163,175 @@ mod w4_parked_confirm_tests {
                         "a foreign mark at {f} was trimmed"
                     );
                 }
+            }
+        }
+    }
+}
+
+/// 2026-11-17: `unapplied_in` answers a range of 128 buckets or wider
+/// exactly (one pass over the slots) instead of reading it unapplied. Live,
+/// a clock-step window of four days (12 to 16 Nov, 1,257 buckets) over a
+/// clean watermark read unapplied forever and held 51 partitions.
+#[cfg(test)]
+mod wide_range_tests {
+    use super::*;
+
+    /// W1 as recorded on the box (`clock_step.tvcs`, 17 Nov 2026).
+    const W1_LO: u64 = 1_794_480_050_881_500_204;
+    const W1_HI: u64 = 1_794_825_737_596_131_328;
+
+    /// The function as it was before 2026-11-17, frozen for the comparison.
+    fn old_unapplied_in(snap: &AppliedSnapshot, lo: u64, hi: u64) -> bool {
+        if lo > hi {
+            return true;
+        }
+        if snap.overflowed {
+            let height = if snap.overflow_high_seq == 0 {
+                u64::MAX
+            } else {
+                snap.overflow_high_seq
+            };
+            if lo <= height {
+                return true;
+            }
+        }
+        if snap.ranges.intersects(lo, hi) {
+            return true;
+        }
+        let first = lo >> UNAPPLIED_BUCKET_SHIFT;
+        let last = hi >> UNAPPLIED_BUCKET_SHIFT;
+        if last.saturating_sub(first) >= UNAPPLIED_BUCKETS as u64 {
+            return true;
+        }
+        (first..=last).any(|id| snap.buckets[slot_of(id)].0 == id)
+    }
+
+    /// The exact meaning: some id in the range's buckets is recorded at its
+    /// own slot. Unbounded loop, test only.
+    fn exact(snap: &AppliedSnapshot, lo: u64, hi: u64) -> bool {
+        let first = lo >> UNAPPLIED_BUCKET_SHIFT;
+        let last = hi >> UNAPPLIED_BUCKET_SHIFT;
+        (first..=last).any(|id| snap.buckets[slot_of(id)].0 == id)
+    }
+
+    fn table_with(ids: &[u64]) -> AppliedSnapshot {
+        let wm = AppliedWatermark::new_for_tests();
+        for &id in ids {
+            wm.note_unapplied(id << UNAPPLIED_BUCKET_SHIFT);
+        }
+        wm.snapshot()
+    }
+
+    #[test]
+    fn test_regression_a_four_day_range_over_an_empty_table_reads_applied() {
+        let first = W1_LO >> UNAPPLIED_BUCKET_SHIFT;
+        let last = W1_HI >> UNAPPLIED_BUCKET_SHIFT;
+        assert!(
+            last - first >= 1_250,
+            "the live window spans {} buckets",
+            last - first + 1
+        );
+        let clean = AppliedSnapshot::default();
+        assert!(!clean.range_has_unapplied(W1_LO, W1_HI));
+        assert!(
+            old_unapplied_in(&clean, W1_LO, W1_HI),
+            "the old rule held it"
+        );
+    }
+
+    #[test]
+    fn test_a_mark_inside_a_wide_range_holds_it() {
+        let inside = (W1_LO >> UNAPPLIED_BUCKET_SHIFT) + 700;
+        let snap = table_with(&[inside]);
+        assert!(snap.range_has_unapplied(W1_LO, W1_HI));
+        // Its first and last buckets count too.
+        for edge in [
+            W1_LO >> UNAPPLIED_BUCKET_SHIFT,
+            W1_HI >> UNAPPLIED_BUCKET_SHIFT,
+        ] {
+            assert!(table_with(&[edge]).range_has_unapplied(W1_LO, W1_HI));
+        }
+    }
+
+    #[test]
+    fn test_a_same_slot_id_outside_a_wide_range_does_not_hold_it() {
+        let last = W1_HI >> UNAPPLIED_BUCKET_SHIFT;
+        let first = W1_LO >> UNAPPLIED_BUCKET_SHIFT;
+        // Same slot as `last` and as `first`, one table length outside.
+        let snap = table_with(&[
+            last + UNAPPLIED_BUCKETS as u64,
+            first - UNAPPLIED_BUCKETS as u64,
+        ]);
+        assert_eq!(slot_of(last + UNAPPLIED_BUCKETS as u64), slot_of(last));
+        assert!(!snap.range_has_unapplied(W1_LO, W1_HI));
+    }
+
+    #[test]
+    fn test_an_overflow_or_a_range_still_holds_a_wide_range() {
+        let wm = AppliedWatermark::new_for_tests();
+        let inside = (W1_LO >> UNAPPLIED_BUCKET_SHIFT) + 3;
+        wm.note_unapplied(inside << UNAPPLIED_BUCKET_SHIFT);
+        // A different id on the same slot overflows the table.
+        wm.note_unapplied((inside + UNAPPLIED_BUCKETS as u64) << UNAPPLIED_BUCKET_SHIFT);
+        let snap = wm.snapshot();
+        assert!(snap.overflowed);
+        let mut only_overflow = snap.clone();
+        only_overflow.buckets = [(0, 0); UNAPPLIED_BUCKETS];
+        assert!(only_overflow.range_has_unapplied(W1_LO, W1_HI));
+        // An unknown height (a flag loaded from disk) holds everything.
+        let unknown = AppliedSnapshot {
+            overflowed: true,
+            overflow_high_seq: u64::MAX,
+            ..AppliedSnapshot::default()
+        };
+        assert!(unknown.range_has_unapplied(W1_LO, W1_HI));
+        // A bounded range inside the window holds it.
+        let mut ranged = AppliedSnapshot::default();
+        ranged.ranges.add_range(W1_LO + 1_000, W1_LO + 2_000);
+        assert!(ranged.range_has_unapplied(W1_LO, W1_HI));
+    }
+
+    #[test]
+    fn test_a_wide_range_reaching_bucket_zero_still_reads_unapplied() {
+        let clean = AppliedSnapshot::default();
+        assert!(clean.range_has_unapplied(0, W1_HI));
+        assert!(clean.range_has_unapplied(1, 200 << UNAPPLIED_BUCKET_SHIFT));
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(512))]
+
+        /// Narrow ranges (under 128 buckets) answer exactly as before; every
+        /// range answers exactly as the per-id loop over its whole span.
+        #[test]
+        fn proptest_wide_range_scan_matches_the_exact_per_id_loop(
+            marks in proptest::collection::vec(0_u64..800, 0..40),
+            start in 0_u64..800,
+            width in 0_u64..700,
+            lo_off in 0_u64..(1_u64 << UNAPPLIED_BUCKET_SHIFT),
+            hi_off in 0_u64..(1_u64 << UNAPPLIED_BUCKET_SHIFT),
+        ) {
+            let base = W1_LO >> UNAPPLIED_BUCKET_SHIFT;
+            let ids: Vec<u64> = marks.iter().map(|m| base + m).collect();
+            let wm = AppliedWatermark::new_for_tests();
+            for &id in &ids {
+                // Collisions overflow the table; a clean table is the case
+                // under test, so place only ids whose slot is free.
+                let snap = wm.snapshot();
+                if snap.buckets[slot_of(id)].0 == 0 {
+                    wm.note_unapplied(id << UNAPPLIED_BUCKET_SHIFT);
+                }
+            }
+            let snap = wm.snapshot();
+            proptest::prop_assert!(!snap.overflowed);
+            let lo = ((base + start) << UNAPPLIED_BUCKET_SHIFT) + lo_off;
+            let hi = ((base + start + width) << UNAPPLIED_BUCKET_SHIFT) + hi_off;
+            let new = snap.range_has_unapplied(lo, hi);
+            proptest::prop_assert_eq!(new, exact(&snap, lo, hi));
+            if width < UNAPPLIED_BUCKETS as u64 {
+                proptest::prop_assert_eq!(new, old_unapplied_in(&snap, lo, hi));
+            } else {
+                proptest::prop_assert!(old_unapplied_in(&snap, lo, hi));
             }
         }
     }
