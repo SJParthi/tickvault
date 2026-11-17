@@ -644,7 +644,7 @@ mod tests {
     /// it still is. Bites: the same first anchor with no recorded gap notes
     /// the false step.
     #[test]
-    fn test_regression_a_noisy_first_anchor_records_no_step_at_the_first_refresh() {
+    fn test_regression_take_anchor_from_with_read_gap_noisy_first_anchor_records_no_step() {
         let t0 = Instant::now();
         let wall0 = 1_794_911_430_000_000_000_i64;
         let noisy_first = [(0, 0, 1_050_000_000)];
@@ -685,7 +685,7 @@ mod tests {
     /// rewind its gap explains is refused like slew (receipts never moved
     /// back for noise).
     #[test]
-    fn test_a_noisy_streak_ends_after_the_kept_refreshes() {
+    fn test_refresh_cell_noisy_streak_ends_after_the_kept_refreshes() {
         let t0 = Instant::now();
         let wall0 = 1_794_911_430_000_000_000_i64;
         let desched = 1_050_000_000;
@@ -838,7 +838,7 @@ mod tests {
     /// process log. Reordering the reads, or bypassing the tight-read path,
     /// fails here.
     #[test]
-    fn test_production_anchor_wiring_reads_mono_wall_mono_through_the_tight_path() {
+    fn test_production_refresh_receipt_anchor_wiring_reads_mono_wall_mono_through_the_tight_path() {
         let src = include_str!("../ws_frame_spill.rs");
         let squeeze = |s: &str| s.split_whitespace().collect::<String>();
         let read = fn_body(src, "fn read_anchor_clocks()");
