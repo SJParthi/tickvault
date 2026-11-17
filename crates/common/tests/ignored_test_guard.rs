@@ -49,6 +49,23 @@ fn repo_root() -> PathBuf {
 /// This list may SHRINK freely. Growing it is a deliberate edit, in the same
 /// change, with the reason visible to a reviewer.
 const ALLOWED_IGNORED: &[(&str, &str)] = &[
+    // Added 2026-11-17 with the silence arm slot cells: two wall-clock
+    // measurement harnesses. One times the 30 s silence arm at 20,000
+    // instruments with the probe and with the slot cells; the other compares
+    // one std (SipHash), ahash and dense-array probe. Both print timings and
+    // gate nothing (a wall-clock number would flake on a shared runner); the
+    // arm's gates are the DHAT gate `dhat_silence_scan`, the frozen-oracle
+    // proptest and `silence_arm_slot_guard`. Run them with:
+    //
+    //   cargo test --release -p tickvault-app --lib silence_arm_cost -- --ignored --nocapture
+    (
+        "crates/app/src/dhan_feed_stack/silence_arm_cost.rs",
+        "silence_arm_cost_at_the_authorized_ceiling",
+    ),
+    (
+        "crates/app/src/dhan_feed_stack/silence_arm_cost.rs",
+        "probe_cost_std_vs_ahash_vs_dense",
+    ),
     // Added 2026-11-07 with plan item PR AA step 3 (owner Quote 51): a probe
     // of whether QuestDB re-creates a dropped WAL hour partition when a late
     // row for that hour is inserted. It needs a scratch QuestDB, so it cannot
