@@ -109,9 +109,8 @@ pub mod mid_session_exit;
 // 2026-11-15 audit (live-5): the WAL replay is paced on a non-trading day.
 mod replay_pace;
 // 2026-11-17: the 30 s silence arm's per-report tally.
-mod silence_tally;
-// 2026-11-17 (plan ITEM DT): the sampled `drain_inline_depth` stage.
 mod inline_depth_sample;
+mod silence_tally;
 use std::time::Instant;
 
 use secrecy::ExposeSecret;
@@ -1543,7 +1542,6 @@ pub struct LiveIngest {
     /// that part was always true, and it is what keeps every test and every
     /// other caller unaffected.
     inline_depth: Option<DepthIngest>,
-    /// Times 1 in 64 inline depth appends (`drain_inline_depth`, 2026-11-17).
     inline_depth_sample: inline_depth_sample::InlineDepthSampler,
     /// The live paper fill chain's tap (plan item LF-6b). `None` unless
     /// `[live_fill] enabled` AND an approved strategy engine exists, which is
@@ -8956,7 +8954,6 @@ pub fn drain_main_feed_frame(
                         // the `capture_seq` derivation inside. The frame stamp
                         // alone repeats across every packet in the frame, and
                         // the level ordinal alone repeats across every frame.
-                        // 2026-11-17: 1 in 64 timed (`drain_inline_depth`).
                         let rows = ingest.inline_depth_sample.time(|| {
                             append_inline_depth(
                                 sink,

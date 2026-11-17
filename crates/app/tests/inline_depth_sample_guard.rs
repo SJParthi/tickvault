@@ -10,7 +10,7 @@
 //! The behaviour half is
 //! `dhan_feed_stack::inline_depth_sample::tests::test_drain_samples_one_in_64_full_packets_with_inline_depth`
 //! (the live drain counts every append and the stage gains its samples) and
-//! the two Full gates in `dhat_live_ingest_seam.rs` (exactly 156 sampled
+//! the two Full gates in `dhat_live_ingest_seam.rs` (exactly 149 sampled
 //! packets inside each zero-allocation window).
 //!
 //! HONEST LIMIT: a text scan of one function. It proves the shape of the

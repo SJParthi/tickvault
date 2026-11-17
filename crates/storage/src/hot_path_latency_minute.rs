@@ -103,7 +103,7 @@
 //! hours. ⚠ CHANGED 2026-11-16: 14 rows a minute (the five `drain_arm_*`
 //! stages, one per non-frame arm of the frame drain), ~6,700 rows a day.
 //! ⚠ CHANGED 2026-11-17: 15 rows a minute (`drain_inline_depth`, the inline
-//! depth of a sample of 1 in 64 Full packets; its `samples` column counts
+//! depth of a sample of about 1 in 64 Full packets; its `samples` column counts
 //! the sampled packets only), ~7,200 rows a day.
 //! QuestDB only;
 //! nothing goes to `/metrics` except one drop counter.

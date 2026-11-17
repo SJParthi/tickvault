@@ -418,7 +418,9 @@ pub(crate) const fn stage_label(stage: Stage) -> &'static str {
         Stage::DrainArmSilence => "Feed processor: 30 s silent-contract check (diagnostic)",
         Stage::DrainArmIdle => "Feed processor: one idle-time step (diagnostic)",
         // 2026-11-17: a sampled part of the frame stage, never added to it.
-        Stage::DrainInlineDepth => "Order-book part of one Full tick, 1 in 64 sampled (diagnostic)",
+        Stage::DrainInlineDepth => {
+            "Order-book part of one Full tick, about 1 in 64 sampled (diagnostic)"
+        }
     }
 }
 

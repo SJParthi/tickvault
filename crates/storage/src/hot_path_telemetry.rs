@@ -115,7 +115,7 @@
 //!
 //! # Inline depth, sampled (2026-11-17, plan ITEM DT "PR 0, measure first")
 //!
-//! `drain_inline_depth` times the inline depth append of 1 in 64 Full
+//! `drain_inline_depth` times the inline depth append of about 1 in 64 Full
 //! packets (see [`Stage::DrainInlineDepth`]). It splits the depth share out
 //! of `drain_main_tick` (2,104 ns mean live) for measurement only; it speeds
 //! nothing up. Never paged; about 35 more `/metrics` series reach the
@@ -263,13 +263,24 @@ pub enum Stage {
     /// The inline depth append for ONE Full main-feed packet (2026-11-17,
     /// plan ITEM DT "PR 0, measure first"): the time inside
     /// `append_inline_depth` (five bid and five ask levels staged as level or
-    /// book rows), recorded for a SAMPLE of 1 in 64 Full packets that reach
-    /// that call (`INLINE_DEPTH_SAMPLE_EVERY` in the drain's
-    /// `inline_depth_sample` module). A packet whose depth is shed never
-    /// reaches the call and is not counted. The clock is read only on a
-    /// sampled packet; every other packet pays one counter add and one
-    /// branch. So `samples` in the minute table is about 1/64 of the Full
-    /// packets that wrote depth, not every packet. The time is already
+    /// book rows), recorded for a SAMPLE of about 1 in 64 calls (jittered
+    /// gaps of 32..=95 from a fixed sequence, so not phase-locked to the
+    /// frame shape; `INLINE_DEPTH_SAMPLE_EVERY` in the drain's
+    /// `inline_depth_sample` module). The calls are the Full packets that
+    /// reach that call, refused ones included (an unmappable segment, an id
+    /// overflow, a `capture_seq` refusal or rows outside the depth arrival
+    /// window return 0 rows in a few nanoseconds); a packet whose depth is
+    /// shed never reaches the call and is not counted. The clock is read only
+    /// on a sampled call; every other call pays one counter add, one compare
+    /// and one branch. So `samples` in the minute table is about 1/64 of the
+    /// Full packets that reach the inline depth call, not every packet. A
+    /// sample can also hold a rare hand-off or rescue: the ninth
+    /// contract-name table in one batch makes the append hand the batch off
+    /// (`DepthWriter::stage_pin_after_cut`: a fresh batch reserve and page
+    /// touch when no spare waits, or an inline rescue spill when the queue is
+    /// full), and the unsplit synchronous writer flushes over HTTP. Read the
+    /// median as the staging cost; the max, p99.9 and over-budget count can
+    /// hold one of those. The time is already
     /// inside the same frame's `drain_main_frame` and `drain_main_tick`
     /// (and `receipt_to_fold`), so do not add it to them; it is the depth
     /// share of that work, a measurement only, never a speed-up. Never
