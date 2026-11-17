@@ -130,6 +130,15 @@ WHERE ts IN today() AND stage = 'drain_frame_post'
 ORDER BY ts;
 ```
 
+- **The depth share of a Full tick: the `drain_inline_depth` stage (from 2026-11-17, plan ITEM DT "PR 0, measure first").** `drain_main_tick` (2,104 ns mean live on 17 Nov) holds the whole decode, fold, depth and row staging of a tick. This stage times only the inline depth append (five bid and five ask levels staged as rows) of ONE Full packet, for a sample of about 1 in 64 Full packets that reach that call, refused ones included (a packet refused there, for example outside the depth arrival window, returns in a few nanoseconds and can be sampled); a packet whose depth is shed is not counted. So `samples` is about 1/64 of the Full packets that reach the inline depth call, not every packet, and `mean_ns` is the mean of the sampled packets. The gap between samples is 32 to 95 calls from a fixed sequence, not random: it is jittered so the sample is not locked to one position in a frame (an every-64th sample always took the last packet of a 4-packet frame), Assumed representative. A sample can also hold a rare writer hand-off or rescue (the ninth contract-name table in one batch), so read `p50_ns` as the staging cost; `max_ns` and `p999_ns` can hold one of those. Its time is already inside the same frame's `drain_main_frame`, `drain_main_tick` and `receipt_to_fold`; do not add it to them. The depth share of the average tick is NOT the plain ratio of the two means: `drain_main_tick` divides each frame's whole time (non-tick packets included) by its tick packets, and this stage is a mean per Full packet that reached the depth call (shed and non-Full packets excluded). Estimate it as `drain_inline_depth.mean_ns` × (Full packets that reached the call ÷ tick packets), with the first count about `drain_inline_depth.samples` × 64 and the second the `drain_main_tick` `samples` over the same minutes; the ratio of the means alone overstates the share on a day with non-Full tick packets or shed depth. It is a measurement only; it makes nothing faster. A sampled packet also pays two clock reads (Assumed about 20 to 40 ns), which land in its frame's stages.
+
+```sql
+SELECT ts, samples AS sampled_packets, p50_ns, p99_ns, max_ns, mean_ns, samples_over_1024ns
+FROM hot_path_latency_minute
+WHERE ts IN today() AND stage IN ('drain_inline_depth', 'drain_main_tick')
+ORDER BY ts, stage;
+```
+
 ## 3. Host evidence per minute (CPU wait, CPU, disk, QuestDB, ticks)
 
 ```sql

@@ -145,6 +145,25 @@ const SESSION_EPOCH_SECS: u32 = 1_786_800_000;
 /// `SESSION_EPOCH_SECS` minus 5h30m, landing on 13:20:00 IST.
 const SESSION_RECEIPT_NANOS: i64 = (SESSION_EPOCH_SECS as i64 - 19_800) * 1_000_000_000;
 
+/// 2026-11-17 (plan ITEM DT "PR 0, measure first"): the Full gates time the
+/// inline depth of about 1 in 64 packets (`drain_inline_depth`, jittered gaps
+/// of 32..=95 calls from a fixed seed). Each gate warms up with 16 packets on
+/// a fresh `LiveIngest` (calls 1..=16, none sampled), then measures 10,000
+/// (calls 17..=10,016), so exactly 149 sampled packets fall inside the DHAT
+/// window; the count is pinned by the sampler's own unit test
+/// `test_dhat_window_holds_149_samples`. Both gates hold `DHAT_LOCK` and no
+/// other test here writes inline depth, so the process-wide stage delta is
+/// exact.
+const SAMPLED_FULL_PACKETS: u64 = 149;
+
+/// Samples recorded so far on the `drain_inline_depth` stage.
+fn inline_depth_stage_count() -> u64 {
+    tickvault_storage::hot_path_telemetry::stage_snapshot(
+        tickvault_storage::hot_path_telemetry::Stage::DrainInlineDepth,
+    )
+    .count
+}
+
 /// A tick shaped like a real Quote packet for one of the index instruments.
 fn tick(security_id: u64, price: f32, exchange_ts: u32) -> ParsedTick {
     ParsedTick {
@@ -711,6 +730,9 @@ fn full_mode_frame_with_inline_depth_does_not_allocate_per_tick() {
     // the drain and not of the test's own Vec growth.
     let frames: Vec<CapturedFrame> = (0..FRAMES).map(|n| frame(1_000 + n, n)).collect();
 
+    // 2026-11-17 (plan ITEM DT): read outside the window, so a SAMPLED
+    // packet (`drain_inline_depth`, about 1 in 64) is proven inside it.
+    let depth_samples_before = inline_depth_stage_count();
     let profiler = dhat::Profiler::builder().testing().build();
     let mut folded = 0u64;
     let mut depth_rows = 0u64;
@@ -721,6 +743,11 @@ fn full_mode_frame_with_inline_depth_does_not_allocate_per_tick() {
     }
     let stats = dhat::HeapStats::get();
     drop(profiler);
+    assert_eq!(
+        inline_depth_stage_count() - depth_samples_before,
+        SAMPLED_FULL_PACKETS,
+        "the window must time the inline depth of its 149 sampled Full packets"
+    );
 
     // NON-VACUITY FIRST. A Full packet that parses but is refused would make
     // every allocation number below meaningless while looking like a pass —
@@ -837,6 +864,7 @@ fn full_mode_frame_with_inline_depth_book_rows_does_not_allocate_per_tick() {
     const FRAMES: u64 = 2_500; // x4 packets = 10,000 ticks, 20,000 book rows
     let frames: Vec<CapturedFrame> = (0..FRAMES).map(|n| frame(1_000 + n, n)).collect();
 
+    let depth_samples_before = inline_depth_stage_count();
     let profiler = dhat::Profiler::builder().testing().build();
     let mut folded = 0u64;
     let mut depth_levels = 0u64;
@@ -847,6 +875,11 @@ fn full_mode_frame_with_inline_depth_book_rows_does_not_allocate_per_tick() {
     }
     let stats = dhat::HeapStats::get();
     drop(profiler);
+    assert_eq!(
+        inline_depth_stage_count() - depth_samples_before,
+        SAMPLED_FULL_PACKETS,
+        "the window must time the inline depth of its 149 sampled Full packets"
+    );
 
     assert_eq!(folded, FRAMES * 4, "every packet must fold");
     // The book path counts LEVELS stored, the same unit as the level path, so
