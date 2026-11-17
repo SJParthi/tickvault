@@ -7464,6 +7464,10 @@ Each step behind a config switch defaulting to today's behaviour until its live 
 ### Observability (Item DT)
 New stage `receipt_to_fold` in `tv_hot_path_stage_*` (local `/metrics`; any CloudWatch page needs its own dated noise-lock row first), boot log of the core layout and RT priority result, dashboard panels beside ring_dwell and runtime lag.
 
+- [x] DT-FIX4. Speed fix 4 of 8 (2026-11-17, plan ITEM DT, owner-approved speed work; removes work only). The drain computes the WebSocket lag once per new trade (`record_ws_lag` returns the whole-ms lag, `record_ws_lag_max(segment_code, lag)` reuses it; both still gated as before: max only on a live socket and a lag above 0), and four success counters (`tv_dhan_feed_ingest_ticks_total` and the `ltt_not_advanced`, `not_new_trade`, `not_a_trade` lag exclusions) are counted once per frame through `FrameTally`, flushed in its Drop on every return path, before any other drain arm can publish. Every loss, refusal and fault counter, the lag histogram, the day lag distribution and both maxima stay per tick. Measured (feed_drain, 3 alternating rounds, no metrics recorder): quotes -6%, others within +/-3% both ways, so no regression; the counter saving exists only under the production recorder and is not measured here.
+  - Files: crates/app/src/dhan_feed_stack.rs, crates/app/src/dhan_feed_stack/frame_tally_tests.rs, crates/app/tests/drain_loss_series_seeding_guard.rs, crates/app/tests/ws_lag_clock_guard.rs, CLAUDE.md
+  - Tests: frame_tally_tests (fixed every-class case + 96-case proptest against a per-tick twin), the lag-once old-vs-new edge test, dhat_ws_lag, dhat_ws_lag_recorder, dhat_live_ingest_seam, drain_loss_series_seeding_guard, ws_lag_clock_guard
+
 ## DT-PROOF integration — recoverable writes and honest daily evidence (2026-10-31)
 
 **Status:** IN_PROGRESS
