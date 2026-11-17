@@ -225,6 +225,7 @@ mod tests {
                     IN_SESSION_1000_IST_MILLIS,
                     &mut worst,
                     Instant::now() + std::time::Duration::from_secs(RECONCILE_DELTA_SECS + 1),
+                    None,
                 ),
                 (0, 0, 0),
                 "sparse instruments are excluded from the existing alarm"
