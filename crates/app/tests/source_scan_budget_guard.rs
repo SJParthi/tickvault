@@ -96,7 +96,9 @@ const BUDGET: &[(&str, usize)] = &[
     // `test_regression_a_flush_that_hands_nothing_off_does_not_busy_spin`), and
     // the lag class split is reached from the drain and the publish (paired
     // behaviour test: `test_ws_lag_max_takes_the_largest_and_resets`).
-    ("dhan_feed_stack.rs", 84),
+    // 2026-11-17 (speed fix 4 CI): lowered 84 -> 81; the tally's three scans
+    // moved with `FrameTally` to `frame_tally_tests.rs` (2 there, one fewer).
+    ("dhan_feed_stack.rs", 81),
     // 2026-11-07 (PR AA step 1, owner Quote 51): 1 wiring scan of the lane,
     // read by two tests: each catch-up chunk takes the archive quiesce lock
     // before its refold, and the boot refold takes it and lets go before the
@@ -138,6 +140,11 @@ const BUDGET: &[(&str, usize)] = &[
     // `test_hold_archive_quiesce_on_pin_cut_holds_the_in_append_commit`.
     ("dhan_feed_stack/deferred_depth_pass.rs", 4),
     ("dhan_feed_stack/feed_aux_tests.rs", 1),
+    // 2026-11-17 (speed fix 4 CI): 2 scans (the tally and the drain), moved
+    // from `dhan_feed_stack.rs` with `FrameTally`; paired behaviour tests:
+    // `test_fix4_counts_equal_the_per_tick_oracle_on_every_class` and
+    // `proptest_fix4_counts_equal_the_per_tick_oracle`.
+    ("dhan_feed_stack/frame_tally_tests.rs", 2),
     // 2026-10-26 (audit PR M / M4): 1 wiring scan, every dial batch republishes
     // the reserved-connections gauge (the widen dials long after bring-up and
     // cannot be staged in a unit test). Paired behaviour test:

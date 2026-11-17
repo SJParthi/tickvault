@@ -71,8 +71,11 @@ fn stack_src() -> String {
 fn ws_lag_is_measured_against_the_raw_exchange_stamp() {
     let src = stack_src();
 
+    // Speed fix 4 (2026-11-17): `record_ws_lag` works the lag out once with
+    // `ws_lag_whole_ms` (and returns it for the worst-delay gauge) instead of
+    // calling `ws_lag_ms`; the input that must be the raw stamp is the same.
     assert!(
-        src.contains("ws_lag_ms(tick.exchange_timestamp, received_at_nanos)"),
+        src.contains("ws_lag_whole_ms(tick.exchange_timestamp, received_at_nanos)"),
         "`record_ws_lag` must pass the RAW exchange stamp. Passing a fold-clock \
          value makes the subtraction `received - received`, so every lag reads \
          ~0 and the deaf-socket alarm can never fire again."
