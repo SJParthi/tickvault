@@ -4148,7 +4148,7 @@ mod slot_cell_tests {
     /// steady run takes the fast path, so the equality is not only ever
     /// checked on the probe. Deterministic so it cannot be lucky.
     #[test]
-    fn test_note_at_slot_fast_path_is_taken_and_agrees_with_note() {
+    fn test_fast_path_hits_count_each_fast_path_report_and_note_agrees() {
         let (a, _ra) = SubscribeReconcile::new(false);
         let (b, _rb) = SubscribeReconcile::new(false);
         let (tx, _rx) = socket();
