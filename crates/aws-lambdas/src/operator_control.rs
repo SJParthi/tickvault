@@ -1733,10 +1733,20 @@ pub async fn route<S: OpsShell>(event: &Value, shell: &S) -> Value {
 
     let headers = event.get("headers").cloned().unwrap_or(Value::Null);
     let secret = shell.control_secret().await;
+    // 2026-11-17 (owner card "Remember 30 days"): the page now remembers the
+    // key in the browser and forgets it on a 401. An unreadable secret is our
+    // failure, not a wrong key, so it answers 503: a 401 here would make the
+    // browser forget a correct key.
+    if secret.is_empty() {
+        return resp(
+            503,
+            &json!({"error": "control secret unreadable on the server — try again shortly"}),
+        );
+    }
     if !authorized(&headers, &secret) {
-        // An unreadable secret (empty) is our failure, not the caller's:
-        // it is refused as before but not counted against the source.
-        if !secret.is_empty() {
+        // An unreadable secret was answered 503 above, so every refusal here
+        // is a wrong key and counts against the source.
+        {
             match guard.record_failure(&source, shell.now_epoch()) {
                 AuthFailureRecord::LockedOut => {
                     tracing::error!(
@@ -3958,13 +3968,18 @@ mod tests {
         // generation it answered, and a snapshot from an older generation is
         // reloaded instead of rendered, so an older filter's rows never show
         // under newer controls (tab hidden mid-load was the path).
+        // RE-BLESSED 2026-11-17 (owner card "Remember 30 days", rust-only lock
+        // §0.20) — 85,542 -> 86,069 bytes: the key is remembered in this browser
+        // for 30 days (`tv_key` with an expiry) instead of per tab; Lock and a
+        // 401 forget it; the lock screen text says so. Pinned separately by
+        // `console_remembers_the_key_for_thirty_days_only`.
         let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, CONSOLE_HTML.as_bytes());
         let hex: String = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(
             hex,
-            "801ba17e37712bf3930d06274f9b45a7ee1217c0c536200ede769675f23bfc1a"
+            "96119d480539e50a633fb22de3b19842a1cf0c3885481a10e029fa596a97c160"
         );
-        assert_eq!(CONSOLE_HTML.len(), 85_542);
+        assert_eq!(CONSOLE_HTML.len(), 86_069);
     }
 
     // ------------------------------------------------ audit L4 source scans
@@ -4001,13 +4016,29 @@ mod tests {
     }
 
     #[test]
-    fn console_never_writes_the_key_to_local_storage() {
-        // Allowed: one removeItem that clears a key an older build left.
-        assert!(!CONSOLE_HTML.contains("localStorage.setItem"));
-        assert!(!CONSOLE_HTML.contains("localStorage.getItem"));
-        assert_eq!(CONSOLE_HTML.matches("localStorage").count(), 1);
-        assert!(CONSOLE_HTML.contains("localStorage.removeItem('tv_token')"));
-        assert!(CONSOLE_HTML.contains("sessionStorage.getItem('tv_token')"));
+    fn console_remembers_the_key_for_thirty_days_only() {
+        // Owner card 2026-11-17 "Remember 30 days (Recommended)": the key is
+        // remembered in THIS browser under `tv_key` with an expiry 30 days
+        // (2,592,000,000 ms) after it was pasted; an expired or unreadable
+        // record is removed and the lock screen shows. Lock removes it, and a
+        // 401 (wrong or rotated key) locks. Keys older builds left under
+        // `tv_token` (local or per-tab) are removed on load and never read.
+        assert_eq!(30_u64 * 24 * 3_600 * 1_000, 2_592_000_000);
+        assert!(CONSOLE_HTML.contains("e:Date.now()+2592e6"));
+        assert!(CONSOLE_HTML.contains("if(o.e>Date.now()&&typeof o.k==='string') return o.k; localStorage.removeItem('tv_key');"));
+        assert!(CONSOLE_HTML.contains("let TOKEN=keyLoad();"));
+        assert!(!CONSOLE_HTML.contains("getItem('tv_token')"));
+        assert!(!CONSOLE_HTML.contains("setItem('tv_token'"));
+        assert!(CONSOLE_HTML.contains(
+            "localStorage.removeItem('tv_token'); sessionStorage.removeItem('tv_token');"
+        ));
+        let lock_fn = CONSOLE_HTML
+            .lines()
+            .find(|l| l.starts_with("function lock()"))
+            .expect("lock() present");
+        assert!(lock_fn.contains("localStorage.removeItem('tv_key')"));
+        assert!(CONSOLE_HTML.contains("if(r.status===401){ lock();"));
+        assert_eq!(CONSOLE_HTML.matches("localStorage.setItem").count(), 1);
         // A key arriving in the address is stripped from it after reading.
         let reader = CONSOLE_HTML
             .lines()
@@ -4139,7 +4170,9 @@ mod tests {
         };
         for _ in 0..(AUTH_FAILURE_LIMIT * 2) {
             let r = route(&post_from("198.51.100.9", "anything"), &shell).await;
-            assert_eq!(status_of(&r), 401);
+            // 503, never 401: the page forgets a remembered key on a 401, so
+            // our own read failure must not look like a wrong key.
+            assert_eq!(status_of(&r), 503);
         }
         assert_eq!(shell.auth_failures.tracked_sources(), 0);
     }
@@ -4291,8 +4324,9 @@ mod tests {
     fn test_html_contains_no_secret() {
         // The page is a static shell — it must NOT embed any token/secret.
         assert!(!CONSOLE_HTML.contains("Bearer s3cret"));
-        // token kept client-side only, per tab (audit L4: sessionStorage)
-        assert!(CONSOLE_HTML.contains("sessionStorage.setItem('tv_token'"));
+        // The key is kept client-side only: remembered in this browser for 30
+        // days (owner 2026-11-17), never in a link or in the page.
+        assert!(CONSOLE_HTML.contains("localStorage.setItem('tv_key'"));
     }
 
     #[test]
@@ -4312,7 +4346,7 @@ mod tests {
         // A #key=... link must auto-unlock + strip the fragment from the URL.
         assert!(CONSOLE_HTML.contains("location.hash"));
         assert!(CONSOLE_HTML.contains("replaceState"));
-        assert!(CONSOLE_HTML.contains("tv_token"));
+        assert!(CONSOLE_HTML.contains("TOKEN=k; keySave(TOKEN);"));
     }
 
     #[test]
