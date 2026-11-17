@@ -63,6 +63,169 @@ pub(crate) const ORDERED_EXPORT_DAY_SLICE_SECS: i64 = 3_600;
 /// (`daily_export::EXPORT_PARTITION_WORST_SECS`).
 pub(crate) const ORDERED_EXPORT_TOTAL_TIMEOUT_SECS: u64 = 1_800;
 
+/// Counter: `/exp` requests QuestDB refused with 429 (its export connection
+/// limit) that were waited out and sent again (2026-11-17). Local `/metrics`
+/// only, registered at 0 by the archiver and the daily export; no page,
+/// alarm, metric filter or EMF name (noise lock).
+pub const EXPORT_BUSY_RETRIES_COUNTER: &str = "tv_partition_archive_export_busy_retries_total";
+
+/// First wait after a `/exp` 429, seconds ([`ExportBusyBackoff::PRODUCTION`]).
+const EXPORT_BUSY_FIRST_WAIT_SECS: u64 = 1;
+/// Longest single wait after a `/exp` 429, seconds.
+const EXPORT_BUSY_STEP_CAP_SECS: u64 = 15;
+/// Most one export call waits for a free `/exp` slot, seconds.
+const EXPORT_BUSY_TOTAL_WAIT_SECS: u64 = 120;
+/// How long a spent budget makes this archiver's later 429s fail at once
+/// (at most: the hold lives only as long as the archiver, see
+/// [`ExportBusyHold`]).
+const EXPORT_BUSY_HOLD_SECS: u64 = 600;
+/// Time a resent request must still have before the export's deadline, or
+/// the 429 is the final answer, seconds. A wait that would leave less gives
+/// up at once, so a near-deadline export fails on the 429 (its real cause),
+/// never on a sleep overshoot into the deadline or a near-zero request
+/// timeout.
+const EXPORT_BUSY_RESEND_MARGIN_SECS: u64 = 5;
+
+/// How a `/exp` request that QuestDB refused with 429 waits and tries again
+/// (2026-11-17).
+///
+/// Measured live 2026-11-17 17:36 IST: the daily Brutex export's `/exp` for
+/// `candles_10m` got `429 Too Many Requests: exceeded connection limit
+/// [name=http_export_connections, numOfConnections=3, connectionLimit=2]`
+/// while the archiver's export was running, and the whole day attempt failed
+/// (attempt 1 of 3, retried 900 s later). The limit is 2 on purpose
+/// (`deploy/docker/docker-compose.yml`): the HTTP pool is that limit plus one,
+/// so an export can never take the worker `/write` and `/exec` need. So a
+/// third `/exp` is refused, not queued, and the answer is to wait for a slot.
+///
+/// Honest limit: the wait is bounded at 120 s per export call. A competing
+/// `/exp` that holds its slot longer (an unordered archiver export can run
+/// 600 s) still fails the attempt as before; only a short overlap is waited
+/// out. Which third connection made `numOfConnections=3` is Unknown (Assumed
+/// candidates, not measured: a portal read, or an idle keep-alive of another
+/// archiver's export client, which uses reqwest's default connection pool).
+///
+/// The wait before retry `n` (0-based) is `first × 2^n`, capped at
+/// `step_cap`, and the waits of one export call (every slice of it) add up to
+/// at most `total`; never past the export's own deadline. A 429 carries no
+/// CSV, so the request is simply sent again; the slices before it are kept.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ExportBusyBackoff {
+    /// The first wait.
+    pub(crate) first: Duration,
+    /// The longest single wait.
+    pub(crate) step_cap: Duration,
+    /// The most one export call waits in total for a free slot.
+    pub(crate) total: Duration,
+    /// After an export spent `total`, how long this archiver's later 429s
+    /// fail at once instead of waiting (see [`ExportBusyHold`]).
+    pub(crate) hold_after_give_up: Duration,
+    /// Time a resent request must still have before the deadline; a wait
+    /// that would leave less gives up instead.
+    pub(crate) resend_margin: Duration,
+}
+
+impl ExportBusyBackoff {
+    /// 1 s, 2 s, 4 s, 8 s, then 15 s steps, at most 120 s in all: a fifth of
+    /// one request's own 600 s timeout (`ARCHIVE_EXPORT_TIMEOUT_SECS`) and a
+    /// fifteenth of a sliced export's 1,800 s
+    /// (`ORDERED_EXPORT_TOTAL_TIMEOUT_SECS`), which bounds the ordered
+    /// export's waits anyway. After a spent budget the same archiver fails
+    /// 429s at once for up to 10 minutes, then waits again. The hold lives
+    /// only as long as the archiver: each daily-archive and disk-pressure
+    /// pass builds a new one, so there it lasts for the rest of that pass;
+    /// only the daily exporter keeps its archiver across attempts (and its
+    /// 15-minute failure backoff outlasts the hold anyway). A wait never
+    /// leaves the resent request less than 5 s before the deadline.
+    pub(crate) const PRODUCTION: Self = Self {
+        first: Duration::from_secs(EXPORT_BUSY_FIRST_WAIT_SECS),
+        step_cap: Duration::from_secs(EXPORT_BUSY_STEP_CAP_SECS),
+        total: Duration::from_secs(EXPORT_BUSY_TOTAL_WAIT_SECS),
+        hold_after_give_up: Duration::from_secs(EXPORT_BUSY_HOLD_SECS),
+        resend_margin: Duration::from_secs(EXPORT_BUSY_RESEND_MARGIN_SECS),
+    };
+
+    /// The wait before retry `n` (0-based): `first × 2^n`, capped at
+    /// `step_cap`. Pure, O(1).
+    #[must_use]
+    // TEST-EXEMPT: covered by test_export_busy_backoff_production_schedule_doubles_then_caps
+    pub(crate) fn step(&self, n: u32) -> Duration {
+        let factor = 1u32.checked_shl(n.min(31)).unwrap_or(u32::MAX);
+        self.first
+            .checked_mul(factor)
+            .map_or(self.step_cap, |d| d.min(self.step_cap))
+    }
+
+    /// The wait before retry `n` when `waited` has gone already and
+    /// `deadline_left` is what the export has left (`None`: no deadline), or
+    /// `None` when the export must give up: the total is spent, or the wait
+    /// would leave the resent request `resend_margin` or less before the
+    /// deadline (a request sent at, or just before, the deadline cannot run,
+    /// and its failure would hide the 429). Pure, O(1).
+    #[must_use]
+    // TEST-EXEMPT: covered by test_export_busy_backoff_next_wait_never_waits_into_the_deadline
+    pub(crate) fn next_wait(
+        &self,
+        n: u32,
+        waited: Duration,
+        deadline_left: Option<Duration>,
+    ) -> Option<Duration> {
+        let wait = self.step(n).min(self.total.saturating_sub(waited));
+        if wait.is_zero()
+            || deadline_left.is_some_and(|left| left <= wait.saturating_add(self.resend_margin))
+        {
+            return None;
+        }
+        Some(wait)
+    }
+}
+
+/// When an export of one archiver last waited its whole busy budget out
+/// (`None`: never, or a `/exp` request was answered with a 2xx since; a
+/// non-429 error answer such as 400, 500 or 503 does not lift it). While a
+/// give-up is younger than [`ExportBusyBackoff::hold_after_give_up`], a 429
+/// fails at once, so a pass over many partitions against a QuestDB that keeps
+/// refusing costs one budget, not one per partition. The hold lives in the
+/// archiver, so it lasts at most that archiver's life: one daily-archive or
+/// disk-pressure pass (each builds a new archiver), or the daily exporter's
+/// whole run. One uncontended lock per `/exp` answer, never held across an
+/// await. Cold.
+#[derive(Debug, Default)]
+pub(crate) struct ExportBusyHold(std::sync::Mutex<Option<Instant>>);
+
+impl ExportBusyHold {
+    /// Whether a give-up younger than `hold` is on record. O(1).
+    // TEST-EXEMPT: covered by test_export_busy_hold_note_give_up_holds_and_clear_lifts
+    pub(crate) fn active(&self, hold: Duration) -> bool {
+        self.0
+            .lock()
+            .map(|g| g.is_some_and(|at| at.elapsed() < hold))
+            .unwrap_or(false)
+    }
+
+    /// Records a spent budget now. O(1).
+    // TEST-EXEMPT: covered by test_export_busy_hold_note_give_up_holds_and_clear_lifts
+    pub(crate) fn note_give_up(&self) {
+        if let Ok(mut g) = self.0.lock() {
+            *g = Some(Instant::now());
+        }
+    }
+
+    /// Forgets the give-up (a `/exp` request was answered with a 2xx). O(1).
+    // TEST-EXEMPT: covered by test_export_busy_hold_note_give_up_holds_and_clear_lifts
+    pub(crate) fn clear(&self) {
+        if let Ok(mut g) = self.0.lock() {
+            *g = None;
+        }
+    }
+}
+
+// Production waits stay well inside the timeouts they sit under.
+const _: () = assert!(
+    ExportBusyBackoff::PRODUCTION.total.as_secs() * 4 <= ARCHIVE_EXPORT_TIMEOUT_SECS
+        && ExportBusyBackoff::PRODUCTION.total.as_secs() * 4 <= ORDERED_EXPORT_TOTAL_TIMEOUT_SECS
+);
+
 /// Longest header record the joiner buffers while it looks for the header's
 /// line end (a real header is a few hundred bytes).
 const MAX_HEADER_BYTES: usize = 1024 * 1024;
@@ -317,6 +480,16 @@ impl SliceJoiner {
 }
 
 impl PartitionArchiver {
+    /// Puts a shorter busy-retry schedule on this archiver (tests only, so a
+    /// stub-server test does not wait the production 120 s).
+    #[cfg(test)]
+    #[must_use]
+    // TEST-EXEMPT: covered by test_export_429_forever_gives_up_at_the_bound
+    pub(crate) fn with_export_busy_backoff(mut self, backoff: ExportBusyBackoff) -> Self {
+        self.export_busy_backoff = backoff;
+        self
+    }
+
     /// Exports `partition` of `table` ordered by `order_by` as consecutive
     /// `ts` slices joined into one CSV (see the module docs), through gzip
     /// into `path`. A key that does not lead with `ts`, or a malformed
@@ -438,39 +611,102 @@ impl PartitionArchiver {
         let mut csv_bytes: u64 = 0;
         let mut out: Vec<u8> = Vec::new();
         let client_limit = Duration::from_secs(ARCHIVE_EXPORT_TIMEOUT_SECS);
+        // 2026-11-17: QuestDB's export connection limit answers 429 when
+        // its slots are taken (the archiver and the daily export can each
+        // hold one); wait and send the same request again, bounded.
+        let backoff = self.export_busy_backoff;
+        let mut busy_retries: u32 = 0;
+        let mut busy_waited = Duration::ZERO;
         for (index, sql) in sqls.iter().enumerate() {
-            let mut request = self
-                .export_client
-                .get(&self.exp_url)
-                .query(&[("query", sql)]);
-            if let Some(deadline) = deadline {
-                let left = deadline.saturating_duration_since(Instant::now());
-                anyhow::ensure!(
-                    !left.is_zero(),
-                    "/exp ordered export ran out of its {ORDERED_EXPORT_TOTAL_TIMEOUT_SECS} s \
-                     total before slice {index} of {}",
-                    sqls.len()
-                );
-                // The client's own timeout bounds each slice; only a deadline
-                // nearer than that cuts the request.
-                if left < client_limit {
-                    request = request.timeout(left);
-                }
-            }
-            let mut response = request.send().await.with_context(|| {
-                if sqls.len() == 1 {
-                    "/exp export request failed".to_string()
-                } else {
-                    format!(
-                        "/exp export request failed (slice {index} of {})",
+            let mut response = loop {
+                let mut request = self
+                    .export_client
+                    .get(&self.exp_url)
+                    .query(&[("query", sql)]);
+                if let Some(deadline) = deadline {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    anyhow::ensure!(
+                        !left.is_zero(),
+                        "/exp ordered export ran out of its {ORDERED_EXPORT_TOTAL_TIMEOUT_SECS} s \
+                         total before slice {index} of {}",
                         sqls.len()
-                    )
+                    );
+                    // The client's own timeout bounds each slice; only a
+                    // deadline nearer than that cuts the request.
+                    if left < client_limit {
+                        request = request.timeout(left);
+                    }
                 }
-            })?;
+                let response = request.send().await.with_context(|| {
+                    if sqls.len() == 1 {
+                        "/exp export request failed".to_string()
+                    } else {
+                        format!(
+                            "/exp export request failed (slice {index} of {})",
+                            sqls.len()
+                        )
+                    }
+                })?;
+                if response.status() != reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    // Only a 2xx lifts the hold: a 400, 500 or 503 says
+                    // nothing about whether an export slot is free.
+                    if response.status().is_success() {
+                        self.busy_hold.clear();
+                    }
+                    break response;
+                }
+                // A 429 is QuestDB refusing the connection before it runs the
+                // query: its body is the short refusal text, never CSV, and
+                // nothing of this slice has reached the joiner yet, so the
+                // request is sent again from scratch.
+                if self.busy_hold.active(backoff.hold_after_give_up) {
+                    // An earlier export of this archiver waited its whole
+                    // budget out moments ago: fail at once, as a 429 always
+                    // did, so a pass over many partitions is not slowed by a
+                    // QuestDB that keeps refusing.
+                    break response;
+                }
+                let deadline_left = deadline.map(|d| d.saturating_duration_since(Instant::now()));
+                let Some(wait) = backoff.next_wait(busy_retries, busy_waited, deadline_left) else {
+                    // Out of waiting: fail exactly as a 429 always did. A
+                    // spent budget (not a near deadline) holds later exports
+                    // of this archiver off waiting for a while.
+                    if busy_waited >= backoff.total {
+                        self.busy_hold.note_give_up();
+                    }
+                    break response;
+                };
+                let body =
+                    capture_rest_error_body(&read_body_capped(response).await.unwrap_or_default());
+                if busy_retries == 0 {
+                    tracing::warn!(
+                        code = tickvault_common::error_code::ErrorCode::StorageGap04S3ArchiveFailed
+                            .code_str(),
+                        slice = index,
+                        slices = sqls.len(),
+                        wait_budget_secs = backoff.total.as_secs(),
+                        body = %body,
+                        "/exp refused with 429 (QuestDB export connection limit); waiting \
+                         for a free slot and sending the same request again (logged once \
+                         per export)"
+                    );
+                }
+                metrics::counter!(EXPORT_BUSY_RETRIES_COUNTER).increment(1);
+                tokio::time::sleep(wait).await;
+                busy_retries = busy_retries.saturating_add(1);
+                busy_waited = busy_waited.saturating_add(wait);
+            };
             if !response.status().is_success() {
                 let status = response.status();
                 let body =
                     capture_rest_error_body(&read_body_capped(response).await.unwrap_or_default());
+                if busy_retries > 0 {
+                    anyhow::bail!(
+                        "/exp export returned {status}: {body} (after {busy_retries} busy \
+                         retries, {} s waited)",
+                        busy_waited.as_secs()
+                    );
+                }
                 anyhow::bail!("/exp export returned {status}: {body}");
             }
             joiner.begin_slice(index);
@@ -482,6 +718,13 @@ impl PartitionArchiver {
             out.clear();
             joiner.end_slice(&mut out)?;
             Self::pass_on(&out, &mut counter, &mut csv_bytes, encoder)?;
+        }
+        if busy_retries > 0 {
+            tracing::info!(
+                busy_retries,
+                waited_ms = u64::try_from(busy_waited.as_millis()).unwrap_or(u64::MAX),
+                "/exp export completed after waiting for a free QuestDB export slot"
+            );
         }
         Ok((counter, csv_bytes))
     }
@@ -505,6 +748,91 @@ impl PartitionArchiver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_export_busy_hold_note_give_up_holds_and_clear_lifts() {
+        let hold = ExportBusyHold::default();
+        let long = Duration::from_secs(600);
+        assert!(!hold.active(long), "nothing on record");
+        hold.note_give_up();
+        assert!(hold.active(long), "a fresh give-up holds");
+        assert!(!hold.active(Duration::ZERO), "a zero hold never holds");
+        hold.clear();
+        assert!(!hold.active(long), "an answered request lifts it");
+    }
+
+    #[test]
+    fn test_export_busy_backoff_production_schedule_doubles_then_caps() {
+        let b = ExportBusyBackoff::PRODUCTION;
+        let steps: Vec<u64> = (0..7).map(|n| b.step(n).as_secs()).collect();
+        assert_eq!(steps, vec![1, 2, 4, 8, 15, 15, 15]);
+        // A huge retry number never overflows; it stays at the cap.
+        assert_eq!(b.step(u32::MAX), b.step_cap);
+    }
+
+    #[test]
+    fn test_export_busy_backoff_total_wait_is_bounded() {
+        let b = ExportBusyBackoff::PRODUCTION;
+        let mut waited = Duration::ZERO;
+        let mut n = 0u32;
+        while let Some(w) = b.next_wait(n, waited, None) {
+            waited += w;
+            n += 1;
+            assert!(n < 1_000, "the schedule must end");
+        }
+        assert_eq!(waited, b.total, "the waits use the whole budget, no more");
+        assert!(waited.as_secs() * 4 <= ARCHIVE_EXPORT_TIMEOUT_SECS);
+        // 1+2+4+8 = 15, then 15 s steps up to 120: 4 + 7 = 11 retries.
+        assert_eq!(n, 11);
+    }
+
+    #[test]
+    fn test_export_busy_backoff_next_wait_never_waits_into_the_deadline() {
+        let b = ExportBusyBackoff::PRODUCTION;
+        // 2 s left and a 4 s wait due: give up now.
+        assert_eq!(
+            b.next_wait(2, Duration::ZERO, Some(Duration::from_secs(2))),
+            None
+        );
+        // Exactly the wait left: give up (a request sent at the deadline is refused).
+        assert_eq!(
+            b.next_wait(0, Duration::ZERO, Some(Duration::from_secs(1))),
+            None
+        );
+        // The wait fits but leaves the resent request almost nothing: give up
+        // on the 429 now, so a sleep overshoot never turns the final error
+        // into "ran out of its total" or a near-zero request timeout.
+        let wait = b.step(3);
+        assert_eq!(
+            b.next_wait(3, Duration::ZERO, Some(wait + Duration::from_millis(1))),
+            None
+        );
+        // Exactly the margin left after the wait: still give up.
+        assert_eq!(
+            b.next_wait(3, Duration::ZERO, Some(wait + b.resend_margin)),
+            None
+        );
+        // Just past the margin: wait.
+        assert_eq!(
+            b.next_wait(
+                3,
+                Duration::ZERO,
+                Some(wait + b.resend_margin + Duration::from_millis(1))
+            ),
+            Some(wait)
+        );
+        assert_eq!(b.resend_margin, Duration::from_secs(5));
+        assert_eq!(
+            b.next_wait(0, Duration::ZERO, Some(Duration::from_secs(7))),
+            Some(Duration::from_secs(1))
+        );
+        // The last wait is cut to the budget left.
+        assert_eq!(
+            b.next_wait(9, Duration::from_secs(110), None),
+            Some(Duration::from_secs(10))
+        );
+        assert_eq!(b.next_wait(10, b.total, None), None);
+    }
 
     /// Joins `slices` (each split into chunks of `chunk`) with the joiner.
     fn join(slices: &[&[u8]], chunk: usize) -> Result<Vec<u8>> {

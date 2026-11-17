@@ -55,19 +55,41 @@ pub(super) struct AnchorCell {
     base: Instant,
     active: AtomicUsize,
     slots: [AnchorSlot; 2],
-    /// Serialises refreshes (cold, one every 30 s). Never taken by a reader.
-    writer: std::sync::Mutex<()>,
+    /// Serialises refreshes (cold, one every 30 s) and holds their state.
+    /// Never taken by a reader.
+    writer: std::sync::Mutex<WriterState>,
 }
 
-/// How far `new` moves the time `old` projects for `new.instant`, either way,
-/// in nanos (saturating). Pure, O(1).
-fn anchor_jump_nanos(old: ReceiptAnchor, new: ReceiptAnchor) -> u64 {
+/// What the refresh keeps between calls (2026-11-17 review). Under
+/// `AnchorCell::writer`.
+#[derive(Debug, Default)]
+struct WriterState {
+    /// Refreshes in a row that kept the previous anchor on a noisy reading.
+    noisy_streak: u32,
+    /// How far apart the two monotonic reads of the PUBLISHED anchor were
+    /// (`0` for a synthetic anchor). Its wall time can be early by up to this
+    /// much, so a later forward jump of up to this much is that error, not a
+    /// step.
+    read_gap_nanos: u64,
+}
+
+/// How far `new` moves the time `old` projects for `new.instant`, in nanos
+/// (saturating), and whether it moves it forward. Pure, O(1).
+fn anchor_jump(old: ReceiptAnchor, new: ReceiptAnchor) -> (u64, bool) {
     let elapsed = new.instant.saturating_duration_since(old.instant);
     let projected = old
         .nanos
         .saturating_add(i64::try_from(elapsed.as_nanos()).unwrap_or(i64::MAX));
-    new.nanos.abs_diff(projected)
+    (new.nanos.abs_diff(projected), new.nanos >= projected)
 }
+
+/// How many refreshes in a row may keep the previous anchor because no
+/// reading was tight (2026-11-17 review). The next one adopts its tightest
+/// reading anyway, judging a step only past what the two readings' gaps can
+/// explain, so a real step under sustained starvation is recorded at most
+/// `ANCHOR_NOISY_REFRESHES_KEPT + 1` refreshes (2.5 minutes at 30 s) late
+/// instead of never, and a slew correction is not held off for longer.
+pub(super) const ANCHOR_NOISY_REFRESHES_KEPT: u32 = 4;
 
 /// `Duration` to `u64` nanos, saturating (584 years).
 #[inline]
@@ -76,7 +98,16 @@ fn duration_nanos_u64(duration: Duration) -> u64 {
 }
 
 impl AnchorCell {
+    /// A cell from a synthetic anchor (no read gap). Tests only.
+    #[cfg(test)]
     pub(super) fn new(first: ReceiptAnchor) -> Self {
+        Self::with_read_gap(first, 0)
+    }
+
+    /// A cell from the first reading and how far apart its two monotonic
+    /// reads were (2026-11-17 review: a noisy first anchor is remembered, so
+    /// the first refresh does not read its error as a clock step).
+    pub(super) fn with_read_gap(first: ReceiptAnchor, read_gap_nanos: u64) -> Self {
         Self {
             base: first.instant,
             active: AtomicUsize::new(0),
@@ -84,7 +115,10 @@ impl AnchorCell {
                 AnchorSlot::new(0, first.nanos),
                 AnchorSlot::new(0, first.nanos),
             ],
-            writer: std::sync::Mutex::new(()),
+            writer: std::sync::Mutex::new(WriterState {
+                noisy_streak: 0,
+                read_gap_nanos,
+            }),
         }
     }
 
@@ -150,7 +184,8 @@ impl AnchorCell {
     /// halves are stored.
     #[cfg(test)]
     pub(super) fn refresh_with(&self, new_anchor: impl FnOnce() -> ReceiptAnchor) -> AnchorRefresh {
-        self.refresh_noting_step(new_anchor, |_, _, _| {})
+        self.refresh_noting_step(|| (new_anchor(), 0), |_, _, _| {})
+            .unwrap_or(AnchorRefresh::RefuseBackward)
     }
 
     /// [`Self::refresh_with`], and when the adopted anchor moves the projected
@@ -161,22 +196,55 @@ impl AnchorCell {
     /// The production refresh passes `wal_clock_step::note_clock_step`; the
     /// cell tests pass nothing, so synthetic anchors never reach the process
     /// window. O(1).
+    ///
+    /// 2026-11-17: `new_anchor` returns a reading and how far apart its two
+    /// monotonic reads were ([`best_anchor_reading`]). A reading wider than
+    /// [`ANCHOR_READ_TIGHT_NANOS`] leaves the cell as it is, notes nothing
+    /// and returns `None`, for at most [`ANCHOR_NOISY_REFRESHES_KEPT`]
+    /// refreshes in a row; the next is adopted as any other.
+    ///
+    /// ⚠ CHANGED 2026-11-17 (review): a step is judged only past what the
+    /// read gaps can explain. An anchor's wall time can be early by up to its
+    /// gap, so a FORWARD jump is excused by the old anchor's gap (a noisy
+    /// first anchor, or one adopted after the streak) and a BACKWARD jump by
+    /// the new one's. The full jump is what is noted. Honest limit: a real
+    /// step no larger than that gap, met on such a refresh, is not recorded;
+    /// receipts still follow the adopted anchor.
     pub(super) fn refresh_noting_step(
         &self,
-        new_anchor: impl FnOnce() -> ReceiptAnchor,
+        new_anchor: impl FnOnce() -> (ReceiptAnchor, u64),
         note_step: impl FnOnce(u64, u64, u64),
-    ) -> AnchorRefresh {
-        let _writer = self
+    ) -> Option<AnchorRefresh> {
+        let mut writer = self
             .writer
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let new = new_anchor();
+        let (new, gap) = new_anchor();
+        if gap > ANCHOR_READ_TIGHT_NANOS && writer.noisy_streak < ANCHOR_NOISY_REFRESHES_KEPT {
+            writer.noisy_streak += 1;
+            return None;
+        }
+        writer.noisy_streak = 0;
         let old = self.current();
-        let decision = anchor_refresh_decision(old, new);
+        // A rewind the new reading's own gap can explain is not taken as a
+        // backward step (it would move receipts back for nothing); it is
+        // refused like slew. Matters only for a reading adopted after the
+        // noisy streak: a tight gap is at most 1 ms.
+        let decision = match anchor_refresh_decision(old, new) {
+            AnchorRefresh::AdoptBackwardStep { rewind_nanos }
+                if u64::try_from(rewind_nanos).unwrap_or(0).saturating_sub(gap)
+                    <= super::RECEIPT_ANCHOR_BACKWARD_STEP_NANOS.unsigned_abs() =>
+            {
+                AnchorRefresh::RefuseBackward
+            }
+            decision => decision,
+        };
         if decision != AnchorRefresh::RefuseBackward {
             self.publish(new);
-            let jump = anchor_jump_nanos(old, new);
-            if jump > crate::wal_clock_step::CLOCK_STEP_MIN_NANOS {
+            let (jump, forward) = anchor_jump(old, new);
+            let explained = if forward { writer.read_gap_nanos } else { gap };
+            writer.read_gap_nanos = gap;
+            if jump.saturating_sub(explained) > crate::wal_clock_step::CLOCK_STEP_MIN_NANOS {
                 note_step(
                     u64::try_from(old.nanos).unwrap_or(0),
                     u64::try_from(new.nanos).unwrap_or(0),
@@ -184,7 +252,7 @@ impl AnchorCell {
                 );
             }
         }
-        decision
+        Some(decision)
     }
 
     /// The receipt for `captured_at` against this cell: the anchor's nanos
@@ -198,6 +266,94 @@ impl AnchorCell {
             .saturating_sub(offset);
         nanos.saturating_add(i64::try_from(delta).unwrap_or(i64::MAX))
     }
+}
+
+/// How far apart the two monotonic reads around the wall-clock read may be
+/// for the reading to anchor receipts (2026-11-17). Live, the box recorded
+/// six "clock steps" of 1.0 to 1.1 s at restarts and load bursts while
+/// chrony's offset was 0.35 µs and it never stepped: the thread was
+/// descheduled for about a second between its wall-clock and monotonic
+/// reads, so the anchor paired a wall time with an instant a second later
+/// and the next refresh read the difference as a step. 1 ms is far above
+/// the two reads' own cost (well under a microsecond, Assumed) and far
+/// below the 1 s step threshold.
+pub(super) const ANCHOR_READ_TIGHT_NANOS: u64 = 1_000_000;
+
+/// How many readings [`best_anchor_reading`] takes at most.
+pub(super) const ANCHOR_READ_ATTEMPTS: u32 = 3;
+
+/// One paired reading of the two clocks (2026-11-17): the monotonic clock,
+/// then the wall clock, then the monotonic clock again.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct AnchorReading {
+    pub(super) before: Instant,
+    pub(super) nanos: i64,
+    pub(super) after: Instant,
+}
+
+impl AnchorReading {
+    /// How far apart the two monotonic reads are. O(1).
+    fn gap_nanos(self) -> u64 {
+        duration_nanos_u64(self.after.saturating_duration_since(self.before))
+    }
+
+    /// The wall nanos paired with the SECOND monotonic read: any delay
+    /// between the two makes a derived receipt slightly early, never late
+    /// (an early receipt files a frame in the bucket it arrived in), the
+    /// bias the single wall-then-monotonic read always had.
+    fn anchor(self) -> ReceiptAnchor {
+        ReceiptAnchor {
+            instant: self.after,
+            nanos: self.nanos,
+        }
+    }
+}
+
+/// Takes readings until one has its two monotonic reads within
+/// [`ANCHOR_READ_TIGHT_NANOS`], at most [`ANCHOR_READ_ATTEMPTS`]. Returns the
+/// tightest reading's anchor and its gap (tight when the gap is at most
+/// [`ANCHOR_READ_TIGHT_NANOS`]). A real wall-clock step shows on a tight
+/// reading exactly as on any other, so this never hides a step; it only
+/// refuses a pair of reads a deschedule pulled apart.
+/// O(attempts) = O(3), no allocation, no lock.
+pub(super) fn best_anchor_reading(mut read: impl FnMut() -> AnchorReading) -> (ReceiptAnchor, u64) {
+    let mut best = read();
+    let mut taken = 1;
+    // O(1) EXEMPT: bounded by ANCHOR_READ_ATTEMPTS (3)
+    loop {
+        if best.gap_nanos() <= ANCHOR_READ_TIGHT_NANOS || taken >= ANCHOR_READ_ATTEMPTS {
+            return (best.anchor(), best.gap_nanos());
+        }
+        let next = read();
+        taken += 1;
+        if next.gap_nanos() < best.gap_nanos() {
+            best = next;
+        }
+    }
+}
+
+/// The best of up to three readings from `read`, counting one that is not
+/// tight on `RECEIPT_ANCHOR_NOISY_READ_COUNTER` (2026-11-17 review: the first
+/// anchor and every refresh go through here, so a noisy first anchor is
+/// visible too). Production passes `read_anchor_clocks`. O(3).
+pub(super) fn take_anchor_from(read: impl FnMut() -> AnchorReading) -> (ReceiptAnchor, u64) {
+    let (anchor, gap) = best_anchor_reading(read);
+    if gap > ANCHOR_READ_TIGHT_NANOS {
+        metrics::counter!(super::RECEIPT_ANCHOR_NOISY_READ_COUNTER).increment(1);
+    }
+    (anchor, gap)
+}
+
+/// One refresh of `cell` from `read` (2026-11-17 review: the production
+/// refresh is this call on the process cell with `read_anchor_clocks` and
+/// `note_clock_step`, so the tests drive the same path with a scripted
+/// clock). O(3) clock reads plus [`AnchorCell::refresh_noting_step`].
+pub(super) fn refresh_cell(
+    cell: &AnchorCell,
+    read: impl FnMut() -> AnchorReading,
+    note_step: impl FnOnce(u64, u64, u64),
+) -> Option<AnchorRefresh> {
+    cell.refresh_noting_step(|| take_anchor_from(read), note_step)
 }
 
 /// ITEM DT (2026-10-30): the receipt anchor moved from an `ArcSwap` to a
@@ -372,21 +528,21 @@ mod tests {
         let mut seen: Vec<(u64, u64, u64)> = Vec::new();
         // Normal refresh, 5 ms of forward slew: adopted, no step.
         let normal = at(30, base_nanos + secs(30) + 5_000_000);
-        cell.refresh_noting_step(|| normal, |o, w, m| seen.push((o, w, m)));
+        cell.refresh_noting_step(|| (normal, 0), |o, w, m| seen.push((o, w, m)));
         // Slew-sized rewind: refused, no step.
         let slew = at(60, base_nanos + secs(60) - 10_000_000);
-        cell.refresh_noting_step(|| slew, |o, w, m| seen.push((o, w, m)));
+        cell.refresh_noting_step(|| (slew, 0), |o, w, m| seen.push((o, w, m)));
         assert!(seen.is_empty(), "no step expected, got {seen:?}");
         // A 600 s step back.
         let back = at(90, base_nanos + secs(90) + 5_000_000 - secs(600));
-        cell.refresh_noting_step(|| back, |o, w, m| seen.push((o, w, m)));
+        cell.refresh_noting_step(|| (back, 0), |o, w, m| seen.push((o, w, m)));
         assert_eq!(
             seen,
             vec![(normal.nanos as u64, back.nanos as u64, secs(600) as u64)]
         );
         // A 600 s step forward.
         let fwd = at(120, back.nanos + secs(30) + secs(600));
-        cell.refresh_noting_step(|| fwd, |o, w, m| seen.push((o, w, m)));
+        cell.refresh_noting_step(|| (fwd, 0), |o, w, m| seen.push((o, w, m)));
         assert_eq!(
             seen[1],
             (back.nanos as u64, fwd.nanos as u64, secs(600) as u64)
@@ -410,5 +566,303 @@ mod tests {
         });
         assert_eq!(cell.slots[1].version.load(Ordering::Relaxed) & 1, 0);
         assert_eq!(cell.load(), (1_000_000_000, 9));
+    }
+
+    /// A scripted clock: each reading is `(monotonic before, wall, monotonic
+    /// after)` as offsets in nanos from `t0` / `wall0`.
+    fn scripted(
+        t0: Instant,
+        wall0: i64,
+        script: &[(u64, i64, u64)],
+    ) -> impl FnMut() -> AnchorReading + '_ {
+        let mut next = 0;
+        move || {
+            let (before, wall, after) = script[next.min(script.len() - 1)];
+            next += 1;
+            AnchorReading {
+                before: t0 + Duration::from_nanos(before),
+                nanos: wall0 + wall,
+                after: t0 + Duration::from_nanos(after),
+            }
+        }
+    }
+
+    const SEC: u64 = 1_000_000_000;
+
+    /// 17 Nov 2026 live: the thread descheduled for 1.05 s between the
+    /// wall-clock read and the monotonic read made the anchor pair a wall
+    /// time with an instant 1.05 s later, and the refresh noted a 1.05 s
+    /// "clock step" although the clock never stepped. A reading whose two
+    /// monotonic reads are that far apart is retried, and when every retry
+    /// is as noisy, the refresh keeps the previous anchor and notes nothing.
+    /// Drives `refresh_cell`, the production refresh path, with a scripted
+    /// clock. Bites: the old single wall-then-monotonic read notes the step.
+    #[test]
+    fn test_regression_a_descheduled_read_records_no_clock_step() {
+        let t0 = Instant::now();
+        let wall0 = 1_794_911_430_000_000_000_i64;
+        let cell = AnchorCell::new(ReceiptAnchor {
+            instant: t0,
+            nanos: wall0,
+        });
+        // 30 s later, the clock has not stepped: wall = monotonic. Each try
+        // is descheduled 1.05 s after the wall read.
+        let at = 30 * SEC;
+        let late = at + 1_050_000_000;
+        let noisy = [(at, at as i64, late); 3];
+        let mut steps = Vec::new();
+        let mut reads = 0;
+        let mut clock = scripted(t0, wall0, &noisy);
+        let outcome = refresh_cell(
+            &cell,
+            || {
+                reads += 1;
+                clock()
+            },
+            |o, w, m| steps.push((o, w, m)),
+        );
+        assert_eq!(outcome, None, "the noisy reading is not adopted");
+        assert_eq!(reads, ANCHOR_READ_ATTEMPTS, "bounded retries");
+        assert!(steps.is_empty(), "no step noted: {steps:?}");
+        assert_eq!(cell.current().instant, t0, "the previous anchor stays");
+        // The old read (wall first, the instant after the deschedule) notes
+        // a 1.05 s step.
+        let old_read = ReceiptAnchor {
+            instant: t0 + Duration::from_nanos(late),
+            nanos: wall0 + at as i64,
+        };
+        let mut old_steps = Vec::new();
+        cell.refresh_noting_step(|| (old_read, 0), |o, w, m| old_steps.push((o, w, m)));
+        assert_eq!(old_steps.len(), 1);
+        assert_eq!(old_steps[0].2, 1_050_000_000);
+    }
+
+    /// 2026-11-17 review: the FIRST anchor was taken from a noisy reading
+    /// (descheduled 1.05 s after the wall read, the restart case). The first
+    /// tight refresh sees a 1.05 s forward jump, which the first reading's
+    /// gap explains, so no step is noted; a real 2 s forward step on top of
+    /// it still is. Bites: the same first anchor with no recorded gap notes
+    /// the false step.
+    #[test]
+    fn test_regression_take_anchor_from_with_read_gap_noisy_first_anchor_records_no_step() {
+        let t0 = Instant::now();
+        let wall0 = 1_794_911_430_000_000_000_i64;
+        let noisy_first = [(0, 0, 1_050_000_000)];
+        let first_cell = || {
+            let (first, gap) = take_anchor_from(scripted(t0, wall0, &noisy_first));
+            assert_eq!(gap, 1_050_000_000);
+            AnchorCell::with_read_gap(first, gap)
+        };
+        let tight = [(30 * SEC, (30 * SEC) as i64, 30 * SEC + 300)];
+        let cell = first_cell();
+        let mut steps = Vec::new();
+        let outcome = refresh_cell(&cell, scripted(t0, wall0, &tight), |o, w, m| {
+            steps.push((o, w, m));
+        });
+        assert_eq!(outcome, Some(AnchorRefresh::Adopt));
+        assert!(steps.is_empty(), "no false step: {steps:?}");
+        assert_eq!(cell.current().nanos, wall0 + (30 * SEC) as i64);
+        // A real 2 s forward step at the same refresh is still noted.
+        let stepped = [(30 * SEC, (32 * SEC) as i64, 30 * SEC + 300)];
+        let cell = first_cell();
+        refresh_cell(&cell, scripted(t0, wall0, &stepped), |o, w, m| {
+            steps.push((o, w, m));
+        });
+        assert_eq!(steps.len(), 1, "{steps:?}");
+        // Bite: without the remembered gap the same refresh notes 1.05 s.
+        let (first, _) = take_anchor_from(scripted(t0, wall0, &noisy_first));
+        let unaware = AnchorCell::new(first);
+        let mut bite = Vec::new();
+        refresh_cell(&unaware, scripted(t0, wall0, &tight), |o, w, m| {
+            bite.push((o, w, m));
+        });
+        assert_eq!(bite.len(), 1);
+    }
+
+    /// 2026-11-17 review: under sustained starvation a refresh cannot keep
+    /// the old anchor for ever. Four noisy refreshes in a row are kept; the
+    /// fifth is adopted, a real step it shows past its gap is noted, and a
+    /// rewind its gap explains is refused like slew (receipts never moved
+    /// back for noise).
+    #[test]
+    fn test_refresh_cell_noisy_streak_ends_after_the_kept_refreshes() {
+        let t0 = Instant::now();
+        let wall0 = 1_794_911_430_000_000_000_i64;
+        let desched = 1_050_000_000;
+        let noisy_at = |k: u64, step: u64| {
+            [(
+                k * 30 * SEC,
+                (k * 30 * SEC + step) as i64,
+                k * 30 * SEC + desched,
+            ); 3]
+        };
+        // A real 3 s forward step at the fifth refresh.
+        let cell = AnchorCell::new(ReceiptAnchor {
+            instant: t0,
+            nanos: wall0,
+        });
+        let mut steps = Vec::new();
+        for k in 1..=u64::from(ANCHOR_NOISY_REFRESHES_KEPT) {
+            let script = noisy_at(k, 0);
+            let outcome = refresh_cell(&cell, scripted(t0, wall0, &script), |o, w, m| {
+                steps.push((o, w, m));
+            });
+            assert_eq!(outcome, None, "refresh {k} kept");
+        }
+        assert_eq!(cell.current().instant, t0);
+        let k = u64::from(ANCHOR_NOISY_REFRESHES_KEPT) + 1;
+        let script = noisy_at(k, 3 * SEC);
+        let outcome = refresh_cell(&cell, scripted(t0, wall0, &script), |o, w, m| {
+            steps.push((o, w, m));
+        });
+        assert_eq!(outcome, Some(AnchorRefresh::Adopt));
+        assert_eq!(steps.len(), 1, "the real step is noted: {steps:?}");
+        // No step at the fifth: the apparent 1.05 s rewind is the gap.
+        let cell = AnchorCell::new(ReceiptAnchor {
+            instant: t0,
+            nanos: wall0,
+        });
+        let mut quiet = Vec::new();
+        for k in 1..=u64::from(ANCHOR_NOISY_REFRESHES_KEPT) {
+            let script = noisy_at(k, 0);
+            refresh_cell(&cell, scripted(t0, wall0, &script), |o, w, m| {
+                quiet.push((o, w, m));
+            });
+        }
+        let script = noisy_at(k, 0);
+        let outcome = refresh_cell(&cell, scripted(t0, wall0, &script), |o, w, m| {
+            quiet.push((o, w, m));
+        });
+        assert_eq!(outcome, Some(AnchorRefresh::RefuseBackward));
+        assert!(quiet.is_empty(), "{quiet:?}");
+        assert_eq!(cell.current().instant, t0, "receipts not moved back");
+        // The streak started over: the next noisy refresh is kept again.
+        let script = noisy_at(k + 1, 0);
+        assert_eq!(
+            refresh_cell(&cell, scripted(t0, wall0, &script), |_, _, _| {}),
+            None
+        );
+    }
+
+    /// One noisy reading then a tight one: the tight one is adopted after
+    /// two reads, and its instant is the second monotonic read.
+    #[test]
+    fn test_best_anchor_reading_retries_until_tight_and_pairs_the_second_read() {
+        let t0 = Instant::now();
+        let wall0 = 1_794_911_430_000_000_000_i64;
+        let script = [
+            (30 * SEC, (30 * SEC) as i64, 31 * SEC),
+            (32 * SEC, (32 * SEC) as i64, 32 * SEC + 500),
+        ];
+        let mut reads = 0;
+        let mut clock = scripted(t0, wall0, &script);
+        let (anchor, gap) = best_anchor_reading(|| {
+            reads += 1;
+            clock()
+        });
+        assert_eq!(gap, 500);
+        assert_eq!(reads, 2);
+        assert_eq!(anchor.instant, t0 + Duration::from_nanos(32 * SEC + 500));
+        assert_eq!(anchor.nanos, wall0 + (32 * SEC) as i64);
+        // A tight first reading takes one read.
+        let mut one = 0;
+        let mut clock = scripted(t0, wall0, &script[1..]);
+        let (_, gap) = best_anchor_reading(|| {
+            one += 1;
+            clock()
+        });
+        assert!(gap <= ANCHOR_READ_TIGHT_NANOS);
+        assert_eq!(one, 1);
+        // Every reading noisy: the tightest is returned with its gap.
+        let noisy = [
+            (0, 0, 3 * SEC),
+            (10 * SEC, (10 * SEC) as i64, 10 * SEC + 2_000_000),
+            (20 * SEC, (20 * SEC) as i64, 25 * SEC),
+        ];
+        let mut clock = scripted(t0, wall0, &noisy);
+        let (anchor, gap) = best_anchor_reading(&mut clock);
+        assert_eq!(gap, 2_000_000);
+        assert_eq!(anchor.nanos, wall0 + (10 * SEC) as i64);
+        // A gap of exactly the bound is tight.
+        let edge = [(0, 0, ANCHOR_READ_TIGHT_NANOS)];
+        assert!(best_anchor_reading(scripted(t0, wall0, &edge)).1 <= ANCHOR_READ_TIGHT_NANOS);
+    }
+
+    /// A real 2 s wall-clock step shows on a tight reading and is noted,
+    /// both ways.
+    #[test]
+    fn test_a_real_step_on_tight_reads_is_still_recorded() {
+        let t0 = Instant::now();
+        let wall0 = 1_794_911_430_000_000_000_i64;
+        let cell = AnchorCell::new(ReceiptAnchor {
+            instant: t0,
+            nanos: wall0,
+        });
+        let mut steps = Vec::new();
+        // Forward 2 s at 30 s, read tight (300 ns apart).
+        let fwd = [(30 * SEC, (32 * SEC) as i64, 30 * SEC + 300)];
+        let outcome = refresh_cell(&cell, scripted(t0, wall0, &fwd), |o, w, m| {
+            steps.push((o, w, m));
+        });
+        assert_eq!(outcome, Some(AnchorRefresh::Adopt));
+        assert_eq!(steps.len(), 1);
+        assert!(steps[0].2.abs_diff(2 * SEC) < 1_000, "{steps:?}");
+        // Back 2 s at 60 s, read tight.
+        let back = [(60 * SEC, (60 * SEC) as i64, 60 * SEC + 300)];
+        let outcome = refresh_cell(&cell, scripted(t0, wall0, &back), |o, w, m| {
+            steps.push((o, w, m));
+        });
+        assert!(matches!(
+            outcome,
+            Some(AnchorRefresh::AdoptBackwardStep { .. })
+        ));
+        assert_eq!(steps.len(), 2);
+        assert!(steps[1].2.abs_diff(2 * SEC) < 1_000, "{steps:?}");
+    }
+
+    /// The body of `fn <name>` in `src`, up to the first line that is a
+    /// lone closing brace at column 0.
+    fn fn_body<'a>(src: &'a str, signature: &str) -> &'a str {
+        let at = src
+            .find(signature)
+            .unwrap_or_else(|| panic!("{signature} not found"));
+        let rest = &src[at..];
+        let end = rest.find("\n}\n").expect("function end");
+        &rest[..end]
+    }
+
+    /// 2026-11-17 review: the production wiring the scripted tests cannot
+    /// reach. The clocks are read monotonic, wall, monotonic; the first
+    /// anchor and every refresh go through `take_anchor_from` /
+    /// `refresh_cell` with that reader, and the refresh notes steps on the
+    /// process log. Reordering the reads, or bypassing the tight-read path,
+    /// fails here.
+    #[test]
+    fn test_production_refresh_receipt_anchor_wiring_reads_mono_wall_mono_through_the_tight_path() {
+        let src = include_str!("../ws_frame_spill.rs");
+        let squeeze = |s: &str| s.split_whitespace().collect::<String>();
+        let read = fn_body(src, "fn read_anchor_clocks()");
+        let first_mono = read.find("Instant::now()").expect("first monotonic read");
+        let wall = read.find("SystemTime::now()").expect("wall read");
+        let second_mono = read.rfind("Instant::now()").expect("second monotonic read");
+        assert!(
+            first_mono < wall && wall < second_mono,
+            "read_anchor_clocks must read monotonic, wall, monotonic"
+        );
+        assert_eq!(read.matches("Instant::now()").count(), 2);
+        let cell = squeeze(fn_body(src, "fn anchor_cell()"));
+        assert!(
+            cell.contains("receipt_anchor::take_anchor_from(read_anchor_clocks)")
+                && cell.contains("AnchorCell::with_read_gap(first,read_gap)"),
+            "the first anchor keeps its read gap: {cell}"
+        );
+        let refresh = squeeze(fn_body(src, "pub fn refresh_receipt_anchor()"));
+        assert!(
+            refresh.contains(
+                "receipt_anchor::refresh_cell(cell,read_anchor_clocks,crate::wal_clock_step::note_clock_step"
+            ),
+            "the refresh goes through refresh_cell with the real reader: {refresh}"
+        );
+        assert!(!refresh.contains("refresh_noting_step("));
     }
 }

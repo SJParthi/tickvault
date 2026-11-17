@@ -1191,6 +1191,8 @@ impl WsFrameSpill {
         // fires once, on the bad boot, which is precisely the shape the agent's
         // first-sample rule swallows.
         metrics::counter!(WAL_REPLAY_RESTORE_FAILED_COUNTER).increment(0);
+        // 2026-11-17: refreshes skipped on a noisy clock read (local only).
+        metrics::counter!(RECEIPT_ANCHOR_NOISY_READ_COUNTER).increment(0);
         // Audit M1: the shed-then-lost counters, resolved before any socket
         // dials so the reader's shed arm never allocates.
         crate::wal_frame_fate::pre_register();
@@ -3214,21 +3216,35 @@ pub const RECEIPT_ANCHOR_REFRESH_COUNTER: &str = "tv_wal_receipt_anchor_refresh_
 
 #[inline]
 fn anchor_cell() -> &'static AnchorCell {
-    RECEIPT_ANCHOR.get_or_init(|| AnchorCell::new(take_anchor()))
+    RECEIPT_ANCHOR.get_or_init(|| {
+        let (first, read_gap) = receipt_anchor::take_anchor_from(read_anchor_clocks);
+        AnchorCell::with_read_gap(first, read_gap)
+    })
 }
 
-fn take_anchor() -> ReceiptAnchor {
-    // Order matters and the cost of getting it wrong is a systematic bias:
-    // read the WALL clock first, then the monotonic one, so any scheduling
-    // delay between the two makes the derived receipt slightly EARLY rather
-    // than late. An early receipt files a frame in the bucket it arrived in;
-    // a late one can push it into the next.
+/// Counter (2026-11-17): a receipt-anchor reading (the first anchor or a
+/// refresh) whose two clock reads could not be taken close together in any of
+/// its tries (the thread was descheduled between them). A refresh then keeps
+/// the previous anchor (`outcome = "kept_noisy"` on the refresh counter) for
+/// at most 4 in a row. Local `/metrics` only, registered at 0 when the WAL
+/// writer starts; no page, alarm, filter or EMF name.
+pub const RECEIPT_ANCHOR_NOISY_READ_COUNTER: &str = "tv_wal_receipt_anchor_noisy_read_total";
+
+/// One paired reading of the clocks: monotonic, wall, monotonic. The wall
+/// read sits before the second monotonic read, so any scheduling delay makes
+/// the derived receipt slightly EARLY rather than late (an early receipt
+/// files a frame in the bucket it arrived in). ⚠ CHANGED 2026-11-17: the
+/// first monotonic read lets a deschedule between the two be seen
+/// (`receipt_anchor::best_anchor_reading`). Three clock reads, no allocation.
+fn read_anchor_clocks() -> receipt_anchor::AnchorReading {
+    let before = Instant::now();
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0i64, |d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX));
-    ReceiptAnchor {
-        instant: Instant::now(),
+    receipt_anchor::AnchorReading {
+        before,
         nanos,
+        after: Instant::now(),
     }
 }
 
@@ -3284,15 +3300,26 @@ pub fn refresh_receipt_anchor() {
     // It is counted (`outcome = "adopted_backward_step"`) and logged. A small
     // rewind (slew) is still refused, and repeated refusals now end too: once
     // the accumulated slew passes the threshold it is adopted as a step.
-    match cell.refresh_noting_step(take_anchor, crate::wal_clock_step::note_clock_step) {
-        AnchorRefresh::Adopt => {
+    // ⚠ CHANGED 2026-11-17: a refresh whose clock reads a deschedule pulled
+    // apart keeps the previous anchor (at most 4 in a row) and judges no step
+    // the read gaps can explain (`receipt_anchor::refresh_cell`).
+    match receipt_anchor::refresh_cell(
+        cell,
+        read_anchor_clocks,
+        crate::wal_clock_step::note_clock_step,
+    ) {
+        None => {
+            metrics::counter!(RECEIPT_ANCHOR_REFRESH_COUNTER, "outcome" => "kept_noisy")
+                .increment(1);
+        }
+        Some(AnchorRefresh::Adopt) => {
             metrics::counter!(RECEIPT_ANCHOR_REFRESH_COUNTER, "outcome" => "adopted").increment(1);
         }
-        AnchorRefresh::RefuseBackward => {
+        Some(AnchorRefresh::RefuseBackward) => {
             metrics::counter!(RECEIPT_ANCHOR_REFRESH_COUNTER, "outcome" => "refused_backward")
                 .increment(1);
         }
-        AnchorRefresh::AdoptBackwardStep { rewind_nanos } => {
+        Some(AnchorRefresh::AdoptBackwardStep { rewind_nanos }) => {
             metrics::counter!(
                 RECEIPT_ANCHOR_REFRESH_COUNTER,
                 "outcome" => "adopted_backward_step"

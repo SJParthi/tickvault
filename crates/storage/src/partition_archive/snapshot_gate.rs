@@ -1961,6 +1961,77 @@ mod tests {
         let _ = std::fs::remove_dir_all(&wm_dir);
     }
 
+    /// Regression: 17 Nov 2026 live. The old one-window union of 12 to 16
+    /// Nov (1,257 buckets) loaded as one window and never retired: the
+    /// applied watermark read every range of 128 buckets or wider as
+    /// unapplied, so the window never settled and every hour inside it read
+    /// `ClockStepped` (51 partitions held) over a clean state. Bites: with
+    /// the old wide-range rule the window is not settled and the hour reads
+    /// `ClockStepped`.
+    #[test]
+    fn test_regression_a_four_day_step_window_over_a_clean_state_settles_and_retires() {
+        use crate::wal_clock_step::StepWindows;
+        let window = (1_794_480_050_881_500_204_u64, 1_794_825_737_596_131_328_u64);
+        let wm = AppliedWatermark::new_for_tests();
+        let wm_dir = reader_test_dir("four-day-window");
+        wm.bind(&wm_dir);
+        let past = window.1 + REPLAY_REORDER_SLACK_SEQ + 1;
+        wm.note_ticks_acked(past);
+        wm.note_depth_acked(past);
+        let marks = DeferredDepth::new_for_tests();
+        let retired = std::cell::Cell::new(false);
+        let settled_seen = std::cell::Cell::new(None);
+        let windows = || {
+            if retired.get() {
+                StepWindows::EMPTY
+            } else {
+                StepWindows::from(Some(window))
+            }
+        };
+        let retire = |w: (u64, u64), settled: bool| {
+            assert_eq!(w, window);
+            settled_seen.set(Some(settled));
+            if settled {
+                retired.set(true);
+            }
+            settled
+        };
+        let at_wall = || past + 3_600 * SEC;
+        let no_lead = || 0;
+        let hour = hour_span_at(window.0 + 86_400 * SEC);
+        let state = ProcessInFlightState {
+            watermark: &wm,
+            deferred: &marks,
+            clock_window: &windows,
+            retire_clock_window: &retire,
+            last_frame_seq: &no_lead,
+            wall_nanos: &at_wall,
+        };
+        assert_eq!(
+            process_in_flight_verdict_on(&state, DEPTH, hour),
+            InFlightVerdict::Clear
+        );
+        assert_eq!(settled_seen.get(), Some(true), "the window read settled");
+        assert!(retired.get(), "and retired");
+
+        // Judged directly against the window (before it retired): clear.
+        let applied = wm.snapshot();
+        let inputs = ack_only_inputs(&applied, past, StepWindows::from(Some(window)));
+        assert_eq!(
+            hour_in_flight_verdict(hour, &inputs),
+            InFlightVerdict::Clear
+        );
+        // One unapplied mark anywhere inside the window still holds the hour.
+        wm.note_unapplied(window.0 + 3 * 86_400 * SEC);
+        let marked = wm.snapshot();
+        let inputs = ack_only_inputs(&marked, past, StepWindows::from(Some(window)));
+        assert_eq!(
+            hour_in_flight_verdict(hour, &inputs),
+            InFlightVerdict::ClockStepped
+        );
+        let _ = std::fs::remove_dir_all(&wm_dir);
+    }
+
     proptest::proptest! {
         #![proptest_config(proptest::prelude::ProptestConfig::with_cases(256))]
 
