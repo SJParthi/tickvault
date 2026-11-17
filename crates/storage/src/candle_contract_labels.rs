@@ -488,6 +488,18 @@ mod tests {
         m
     }
 
+    /// Speed fix 5: an even generation is settled, an odd one means a
+    /// publish is between its two bumps (its store may be in flight).
+    #[test]
+    fn test_generation_is_settled_only_for_even_values() {
+        for even in [0_u64, 2, 4, 1_000, u64::MAX - 1] {
+            assert!(generation_is_settled(even), "{even} is settled");
+        }
+        for odd in [1_u64, 3, 999, u64::MAX] {
+            assert!(!generation_is_settled(odd), "{odd} is in flight");
+        }
+    }
+
     /// The finding's scenario: a publisher stored the new table and is then
     /// descheduled before it finishes. The generation is odd for that whole
     /// gap, so neither writer's batch answers from its cached pin: the next
