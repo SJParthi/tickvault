@@ -6225,6 +6225,12 @@ mod wide_range_tests {
     /// The exact meaning: some id in the range's buckets is recorded at its
     /// own slot. Unbounded loop, test only.
     fn exact(snap: &AppliedSnapshot, lo: u64, hi: u64) -> bool {
+        // An inverted range reads unapplied (keep more), the rule
+        // `unapplied_in` has always had; the per-id loop below would
+        // otherwise answer `false` for it.
+        if lo > hi {
+            return true;
+        }
         let first = lo >> UNAPPLIED_BUCKET_SHIFT;
         let last = hi >> UNAPPLIED_BUCKET_SHIFT;
         (first..=last).any(|id| snap.buckets[slot_of(id)].0 == id)
@@ -6305,6 +6311,21 @@ mod wide_range_tests {
         let mut ranged = AppliedSnapshot::default();
         ranged.ranges.add_range(W1_LO + 1_000, W1_LO + 2_000);
         assert!(ranged.range_has_unapplied(W1_LO, W1_HI));
+    }
+
+    /// Regression (2026-11-17, CI on PR 2269): the proptest's minimal input
+    /// `width = 0, lo_off > hi_off` builds `lo > hi`. `unapplied_in` reads an
+    /// inverted range as unapplied (keep more); the reference loop must agree.
+    #[test]
+    fn test_regression_an_inverted_range_reads_unapplied_in_the_scan_and_the_reference() {
+        let clean = AppliedSnapshot::default();
+        let base = W1_LO >> UNAPPLIED_BUCKET_SHIFT;
+        let lo = (base << UNAPPLIED_BUCKET_SHIFT) + 176_493_399_556;
+        let hi = base << UNAPPLIED_BUCKET_SHIFT;
+        assert!(lo > hi);
+        assert!(clean.range_has_unapplied(lo, hi));
+        assert!(exact(&clean, lo, hi));
+        assert!(old_unapplied_in(&clean, lo, hi));
     }
 
     #[test]
