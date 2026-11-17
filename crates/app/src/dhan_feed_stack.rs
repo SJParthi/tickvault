@@ -110,6 +110,8 @@ pub mod mid_session_exit;
 mod replay_pace;
 // 2026-11-17: the 30 s silence arm's per-report tally.
 mod silence_tally;
+// 2026-11-17 (plan ITEM DT): the sampled `drain_inline_depth` stage.
+mod inline_depth_sample;
 use std::time::Instant;
 
 use secrecy::ExposeSecret;
@@ -1541,6 +1543,8 @@ pub struct LiveIngest {
     /// that part was always true, and it is what keeps every test and every
     /// other caller unaffected.
     inline_depth: Option<DepthIngest>,
+    /// Times 1 in 64 inline depth appends (`drain_inline_depth`, 2026-11-17).
+    inline_depth_sample: inline_depth_sample::InlineDepthSampler,
     /// The live paper fill chain's tap (plan item LF-6b). `None` unless
     /// `[live_fill] enabled` AND an approved strategy engine exists, which is
     /// never today; see `live_fill::select_engine`.
@@ -2118,6 +2122,7 @@ impl LiveIngest {
             replay_gate: tickvault_storage::ilp_table_gate::live_tables_writable,
             // OFF unless explicitly enabled — see `with_inline_depth`.
             inline_depth: None,
+            inline_depth_sample: Default::default(),
             live_fill_tap: None,
             // Plan PR AL-5 (2026-11-06): the live lane's detector gives each
             // seeded NSE_FNO contract a 10-minute warmup and floors its judged
@@ -8951,8 +8956,9 @@ pub fn drain_main_feed_frame(
                         // the `capture_seq` derivation inside. The frame stamp
                         // alone repeats across every packet in the frame, and
                         // the level ordinal alone repeats across every frame.
-                        out.inline_depth_rows =
-                            out.inline_depth_rows.saturating_add(append_inline_depth(
+                        // 2026-11-17: 1 in 64 timed (`drain_inline_depth`).
+                        let rows = ingest.inline_depth_sample.time(|| {
+                            append_inline_depth(
                                 sink,
                                 t,
                                 levels,
@@ -8961,7 +8967,9 @@ pub fn drain_main_feed_frame(
                                 packets,
                                 frame.connection_index != u8::MAX,
                                 c,
-                            ));
+                            )
+                        });
+                        out.inline_depth_rows = out.inline_depth_rows.saturating_add(rows);
                     } else {
                         c.shed_inline_depth.increment(1);
                         // Item 45a: keep this frame's segment until the

@@ -102,6 +102,9 @@
 //! `drain_frame_post` on 2026-11-13), ~4,300 rows a day at the box's ~8
 //! hours. ⚠ CHANGED 2026-11-16: 14 rows a minute (the five `drain_arm_*`
 //! stages, one per non-frame arm of the frame drain), ~6,700 rows a day.
+//! ⚠ CHANGED 2026-11-17: 15 rows a minute (`drain_inline_depth`, the inline
+//! depth of a sample of 1 in 64 Full packets; its `samples` column counts
+//! the sampled packets only), ~7,200 rows a day.
 //! QuestDB only;
 //! nothing goes to `/metrics` except one drop counter.
 
@@ -746,7 +749,8 @@ impl HotPathLatencyMinuteWriter {
 
     /// Appends one row. Cold path: one per stage a minute (`ALL_STAGES`, eight
     /// since PR DP-6, nine since B3 added `drain_frame_post`, 14 since the
-    /// `drain_arm_*` stages on 2026-11-16), on the writer thread.
+    /// `drain_arm_*` stages on 2026-11-16, 15 since `drain_inline_depth` on
+    /// 2026-11-17), on the writer thread.
     ///
     /// # Errors
     /// Propagates ILP buffer errors.
@@ -1399,6 +1403,28 @@ mod tests {
         assert_eq!(post.samples_over_1024ns, Some(10));
         assert_eq!(post.max_ns, 600_000);
         assert!(over_1024ns_is_meaningful(Stage::DrainFramePost));
+    }
+
+    // 2026-11-17 (plan ITEM DT "PR 0, measure first"): every minute has a
+    // `drain_inline_depth` row (the sampled inline depth of Full packets)
+    // whose over-1,024 ns count is kept: a packet's depth append is expected
+    // well under 1 µs, so the count separates the slow ones.
+    #[test]
+    fn test_every_minute_has_a_drain_inline_depth_row() {
+        let mut acc = MinuteAccumulator::new();
+        let mut w = window_with(Stage::DrainInlineDepth, 500, 150);
+        w.stage_buckets[Stage::DrainInlineDepth as usize][bucket_index(4_000)] += 6;
+        w.stage_max_nanos[Stage::DrainInlineDepth as usize] = 4_000;
+        let _ = acc.absorb(minute(0), &w);
+        let rows = acc.rows().expect("rows");
+        assert_eq!(rows.len(), ALL_STAGES.len());
+        assert_eq!(STAGES_PER_MINUTE, 15);
+        let depth = row_of(&rows, Stage::DrainInlineDepth);
+        assert_eq!(depth.stage.as_str(), "drain_inline_depth");
+        assert_eq!(depth.samples, 156);
+        assert_eq!(depth.samples_over_1024ns, Some(6));
+        assert_eq!(depth.max_ns, 4_000);
+        assert!(over_1024ns_is_meaningful(Stage::DrainInlineDepth));
     }
 
     /// The max is the largest per-second max, per stage.

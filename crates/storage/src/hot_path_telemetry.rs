@@ -112,6 +112,15 @@
 //! split bins back together. No metric name/label or stall budget changes.
 //! Nullable versioned minute-table counts describe that recorded population,
 //! not complete elapsed intervals, source freshness or uninstrumented steps.
+//!
+//! # Inline depth, sampled (2026-11-17, plan ITEM DT "PR 0, measure first")
+//!
+//! `drain_inline_depth` times the inline depth append of 1 in 64 Full
+//! packets (see [`Stage::DrainInlineDepth`]). It splits the depth share out
+//! of `drain_main_tick` (2,104 ns mean live) for measurement only; it speeds
+//! nothing up. Never paged; about 35 more `/metrics` series reach the
+//! CloudWatch agent's scrape (Assumed under $0.05 a month), no EMF name,
+//! filter or alarm; one more `hot_path_latency_minute` row a minute.
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -251,10 +260,25 @@ pub enum Stage {
     /// no frame is ready, so a frame waits for at most one step. Never
     /// paged.
     DrainArmIdle = 13,
+    /// The inline depth append for ONE Full main-feed packet (2026-11-17,
+    /// plan ITEM DT "PR 0, measure first"): the time inside
+    /// `append_inline_depth` (five bid and five ask levels staged as level or
+    /// book rows), recorded for a SAMPLE of 1 in 64 Full packets that reach
+    /// that call (`INLINE_DEPTH_SAMPLE_EVERY` in the drain's
+    /// `inline_depth_sample` module). A packet whose depth is shed never
+    /// reaches the call and is not counted. The clock is read only on a
+    /// sampled packet; every other packet pays one counter add and one
+    /// branch. So `samples` in the minute table is about 1/64 of the Full
+    /// packets that wrote depth, not every packet. The time is already
+    /// inside the same frame's `drain_main_frame` and `drain_main_tick`
+    /// (and `receipt_to_fold`), so do not add it to them; it is the depth
+    /// share of that work, a measurement only, never a speed-up. Never
+    /// paged.
+    DrainInlineDepth = 14,
 }
 
 /// Every stage, in index order.
-pub const ALL_STAGES: [Stage; 14] = [
+pub const ALL_STAGES: [Stage; 15] = [
     Stage::SocketToWal,
     Stage::RingDwell,
     Stage::MainRuntimeLag,
@@ -269,6 +293,7 @@ pub const ALL_STAGES: [Stage; 14] = [
     Stage::DrainArmSeed,
     Stage::DrainArmSilence,
     Stage::DrainArmIdle,
+    Stage::DrainInlineDepth,
 ];
 
 /// The stages that time one non-frame arm of the frame drain (2026-11-16),
@@ -300,6 +325,7 @@ const _: () = assert!(Stage::DrainArmCatchup as usize >= PAGED_STAGE_COUNT);
 const _: () = assert!(Stage::DrainArmSeed as usize >= PAGED_STAGE_COUNT);
 const _: () = assert!(Stage::DrainArmSilence as usize >= PAGED_STAGE_COUNT);
 const _: () = assert!(Stage::DrainArmIdle as usize >= PAGED_STAGE_COUNT);
+const _: () = assert!(Stage::DrainInlineDepth as usize >= PAGED_STAGE_COUNT);
 
 impl Stage {
     /// The `stage` label value.
@@ -320,6 +346,7 @@ impl Stage {
             Self::DrainArmSeed => "drain_arm_seed",
             Self::DrainArmSilence => "drain_arm_silence",
             Self::DrainArmIdle => "drain_arm_idle",
+            Self::DrainInlineDepth => "drain_inline_depth",
         }
     }
 
@@ -359,6 +386,9 @@ impl Stage {
             | Self::DrainArmSeed
             | Self::DrainArmSilence
             | Self::DrainArmIdle => 1_000_000,
+            // 2026-11-17: one packet's inline depth, a part of the frame
+            // stage; the same 1 ms as the frame stages; never paged.
+            Self::DrainInlineDepth => 1_000_000,
         }
     }
 
@@ -1836,7 +1866,8 @@ mod tests {
         assert_eq!(Stage::DrainFramePost.as_str(), "drain_frame_post");
         // 2026-11-16: no longer the last stage; the drain arm stages follow it.
         assert_eq!(ALL_STAGES[8], Stage::DrainFramePost);
-        assert_eq!(ALL_STAGES.len(), 14);
+        // 2026-11-17: 15 with `drain_inline_depth`.
+        assert_eq!(ALL_STAGES.len(), 15);
         assert!(
             Stage::DrainFramePost as usize >= PAGED_STAGE_COUNT,
             "never paged"
@@ -1885,6 +1916,37 @@ mod tests {
                 Stage::ReaderRuntimeLag,
                 Stage::DrainMainFrame,
             ]
+        );
+    }
+
+    // 2026-11-17 (plan ITEM DT "PR 0, measure first"): the sampled inline
+    // depth stage is named, last, never paged and never a stall signal, with
+    // the frame stages' 1 ms budget. Only this test records it in this binary.
+    #[test]
+    fn test_drain_inline_depth_is_a_recorded_never_paged_stage() {
+        assert_eq!(Stage::DrainInlineDepth.as_str(), "drain_inline_depth");
+        assert_eq!(ALL_STAGES[14], Stage::DrainInlineDepth);
+        assert_eq!(*ALL_STAGES.last().expect("stages"), Stage::DrainInlineDepth);
+        assert!(!Stage::DrainInlineDepth.is_paged());
+        assert!(Stage::DrainInlineDepth as usize >= PAGED_STAGE_COUNT);
+        assert_eq!(Stage::DrainInlineDepth.stall_budget_nanos(), 1_000_000);
+        assert!(!DRAIN_ARM_STAGES.contains(&Stage::DrainInlineDepth));
+        for i in 0..SIGNAL_COUNT {
+            assert_ne!(signal_label(i).0, "drain_inline_depth");
+        }
+        let before = stage_snapshot(Stage::DrainInlineDepth);
+        record_stage(Stage::DrainInlineDepth, Duration::from_nanos(450));
+        record_stage_nanos(Stage::DrainInlineDepth, 1_000_001);
+        let after = stage_snapshot(Stage::DrainInlineDepth);
+        assert_eq!(after.count - before.count, 2);
+        assert_eq!(after.over_budget - before.over_budget, 1);
+        assert_eq!(after.buckets[0] - before.buckets[0], 1);
+        // A 5 s sample never starts a stall page.
+        let mut readings = quiet();
+        readings.stage_max_nanos[Stage::DrainInlineDepth as usize] = 5_000_000_000;
+        assert_eq!(
+            StallAlarm::new().observe(Instant::now(), true, &readings),
+            None
         );
     }
 

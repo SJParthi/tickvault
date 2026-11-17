@@ -417,6 +417,8 @@ pub(crate) const fn stage_label(stage: Stage) -> &'static str {
         Stage::DrainArmSeed => "Feed processor: new-contract intake (diagnostic)",
         Stage::DrainArmSilence => "Feed processor: 30 s silent-contract check (diagnostic)",
         Stage::DrainArmIdle => "Feed processor: one idle-time step (diagnostic)",
+        // 2026-11-17: a sampled part of the frame stage, never added to it.
+        Stage::DrainInlineDepth => "Order-book part of one Full tick, 1 in 64 sampled (diagnostic)",
     }
 }
 
@@ -498,6 +500,8 @@ fn speed_section(
                Receipt-to-fold overlaps earlier frame stages, and later frames' ring dwell \
                and receipt-to-fold include the time an earlier frame spent in work after a \
                frame (drain_frame_post); durations must not be added. \
+               The sampled order-book part of a Full tick (drain_inline_depth) is \
+               already inside the frame and tick stages. \
                The published 75-second maximum has no publication timestamp here. \
                Neither window is a session verdict."
             .to_string(),
@@ -535,6 +539,9 @@ fn strict_target_section(stages: &[StageFigures; ALL_STAGES.len()]) -> Section {
             | Stage::DrainArmSeed
             | Stage::DrainArmSilence
             | Stage::DrainArmIdle => return None,
+            // 2026-11-17: a sampled sub-step already inside the frame stage;
+            // diagnostic only, never a strict verdict on its own.
+            Stage::DrainInlineDepth => return None,
         };
         let (bound, recorded_failure) = if stage_samples_valid(fig) {
             match stage_quantiles(&fig.buckets).map(|q| q.p99) {
@@ -2172,6 +2179,28 @@ mod tests {
         let operational = speed_section(&inputs.stages, None);
         assert!(operational.note.contains("ring dwell"));
         assert!(operational.note.contains("drain_frame_post"));
+    }
+
+    /// 2026-11-17 (plan ITEM DT "PR 0, measure first"): the sampled inline
+    /// depth stage gets an operational tile labelled as sampled and
+    /// diagnostic, no strict-target tile, and the note says it is already
+    /// inside the frame and tick stages.
+    #[test]
+    fn test_drain_inline_depth_is_a_sampled_diagnostic_tile_only() {
+        let inputs = all_down_inputs(false);
+        let label = stage_label(Stage::DrainInlineDepth);
+        assert!(label.contains("1 in 64 sampled"));
+        assert!(label.contains("(diagnostic)"));
+        let operational = speed_section(&inputs.stages, None);
+        assert!(operational.tiles.iter().any(|tile| tile.label == label));
+        assert!(operational.note.contains("drain_inline_depth"));
+        assert!(
+            operational
+                .note
+                .contains("already inside the frame and tick stages")
+        );
+        let strict = strict_target_section(&inputs.stages);
+        assert!(strict.tiles.iter().all(|tile| tile.label != label));
     }
 
     #[test]

@@ -130,6 +130,15 @@ WHERE ts IN today() AND stage = 'drain_frame_post'
 ORDER BY ts;
 ```
 
+- **The depth share of a Full tick: the `drain_inline_depth` stage (from 2026-11-17, plan ITEM DT "PR 0, measure first").** `drain_main_tick` (2,104 ns mean live on 17 Nov) holds the whole decode, fold, depth and row staging of a tick. This stage times only the inline depth append (five bid and five ask levels staged as rows) of ONE Full packet, for a sample of 1 in 64 Full packets that reach that call; a packet whose depth is shed is not counted. So `samples` is about 1/64 of the Full packets that wrote depth, not every packet, and `mean_ns` is the mean of the sampled packets (Assumed representative: the sample is every 64th call, not random). Its time is already inside the same frame's `drain_main_frame`, `drain_main_tick` and `receipt_to_fold`; do not add it to them. Compare `mean_ns` with `drain_main_tick`'s `mean_ns` to read the depth share. It is a measurement only; it makes nothing faster. A sampled packet also pays two clock reads (Assumed about 20 to 40 ns), which land in its frame's stages.
+
+```sql
+SELECT ts, samples AS sampled_packets, p50_ns, p99_ns, max_ns, mean_ns, samples_over_1024ns
+FROM hot_path_latency_minute
+WHERE ts IN today() AND stage IN ('drain_inline_depth', 'drain_main_tick')
+ORDER BY ts, stage;
+```
+
 ## 3. Host evidence per minute (CPU wait, CPU, disk, QuestDB, ticks)
 
 ```sql
