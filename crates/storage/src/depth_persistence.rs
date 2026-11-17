@@ -1262,6 +1262,70 @@ pub struct DepthBookRow<'a> {
     pub ts_nanos: i64,
 }
 
+/// Both sides of one packet's book, for [`DepthWriter::append_book_pair`]
+/// (speed fix 5, 2026-11-17): the identity columns once, then the bid and
+/// the ask slices. It stands for the two [`DepthBookRow`]s (bid first) that
+/// share every identity column.
+#[derive(Debug, Clone, Copy)]
+pub struct DepthBookPair<'a> {
+    /// Dhan SecurityId.
+    pub security_id: i64,
+    /// Exchange segment wire label.
+    pub segment: &'static str,
+    /// `d5`, `d20` or `d200`.
+    pub depth_kind: &'static str,
+    /// Bid level prices, best first.
+    pub bid_prices: &'a [f64],
+    /// Bid level quantities, same order.
+    pub bid_quantities: &'a [f64],
+    /// Orders resting at each bid level, same order.
+    pub bid_orders: &'a [f64],
+    /// Ask level prices, best first.
+    pub ask_prices: &'a [f64],
+    /// Ask level quantities, same order.
+    pub ask_quantities: &'a [f64],
+    /// Orders resting at each ask level, same order.
+    pub ask_orders: &'a [f64],
+    /// Intra-second tiebreaker; see the module docs.
+    pub capture_seq: i64,
+    /// Designated timestamp — arrival time in IST, as `market_depth`.
+    pub ts_nanos: i64,
+}
+
+impl<'a> DepthBookPair<'a> {
+    /// The single row of one side (`DEPTH_SIDE_BID` or anything else for
+    /// the ask). O(1), borrows only.
+    fn side(&self, side: &'static str) -> DepthBookRow<'a> {
+        let (prices, quantities, orders) = if side == DEPTH_SIDE_BID {
+            (self.bid_prices, self.bid_quantities, self.bid_orders)
+        } else {
+            (self.ask_prices, self.ask_quantities, self.ask_orders)
+        };
+        DepthBookRow {
+            security_id: self.security_id,
+            segment: self.segment,
+            depth_kind: self.depth_kind,
+            side,
+            prices,
+            quantities,
+            orders,
+            capture_seq: self.capture_seq,
+            ts_nanos: self.ts_nanos,
+        }
+    }
+}
+
+// `append_book_pair` reuses the bid line's length for an ask line with the
+// same level count: the side label is the only text that differs.
+const _: () = assert!(DEPTH_SIDE_BID.len() == DEPTH_SIDE_ASK.len());
+
+/// Whether a book row's three slices are equal in length and at most
+/// [`MAX_DEPTH_BOOK_LEVELS`]: the shape `append_book_row` accepts. O(1).
+fn book_row_shape_is_valid(row: &DepthBookRow<'_>) -> bool {
+    let levels = row.prices.len();
+    levels <= MAX_DEPTH_BOOK_LEVELS && row.quantities.len() == levels && row.orders.len() == levels
+}
+
 /// The framed-spill record version for a buffer's protocol.
 ///
 /// A v2 buffer is binary and holds `\n` bytes inside its doubles and arrays,
@@ -2794,26 +2858,67 @@ impl DepthWriter {
         // name is resolved once per instrument run exactly as before, but the
         // cache records the name TABLE (as a pin in the batch) instead of the
         // name, so the encoder later reads the same name the old line held.
-        let hit = matches!(
-            &self.book_label,
-            Some((id, seg, _, _)) if *id == row.security_id && *seg == row.segment
-        );
-        if !hit {
-            let labels = crate::candle_contract_labels::candle_contract_labels();
-            let name_len = labels
-                .get(&(row.security_id, row.segment))
-                .map(|n| crate::depth_stage::escaped_symbol_len(n));
-            let pin = match self.staged.try_pin(labels) {
-                Ok(pin) => pin,
-                Err(labels) => self.stage_pin_after_cut(labels),
-            };
-            self.book_label = Some((row.security_id, row.segment, pin, name_len));
-        }
-        let (pin, name_len) = match &self.book_label {
-            Some((_, _, pin, name_len)) => (*pin, *name_len),
-            None => (0, None),
-        };
+        let (pin, name_len) = self.resolve_book_label(row.security_id, row.segment);
         let text_len = crate::depth_stage::book_line_len(self.feed, row, levels, name_len);
+        self.stage_book_side(row, pin, text_len);
+        self.note_pending_seq(row.capture_seq);
+        Ok(())
+    }
+
+    /// The run's `(pin, name length)` for `(security_id, segment)`: the
+    /// cached run on a hit (two compares), else the name resolved once.
+    ///
+    /// Speed fix 5 (2026-11-17): on a miss the table load is skipped while
+    /// no name table was published since the batch's last pin was loaded
+    /// (one acquire load and one compare,
+    /// `DepthStagedBatch::current_pin_at_generation`): the name is read from
+    /// that pinned table, which is the table a fresh load would return, so
+    /// the pin, the name and every byte are unchanged. O(1) plus one hash
+    /// probe and one name scan on a miss.
+    #[inline]
+    fn resolve_book_label(
+        &mut self,
+        security_id: i64,
+        segment: &'static str,
+    ) -> (u8, Option<usize>) {
+        if let Some((id, seg, pin, name_len)) = &self.book_label
+            && *id == security_id
+            && *seg == segment
+        {
+            return (*pin, *name_len);
+        }
+        let generation = crate::candle_contract_labels::candle_contract_labels_generation();
+        let (pin, name_len) = match self.staged.current_pin_at_generation(generation) {
+            Some(pin) => {
+                let name_len = self
+                    .staged
+                    .labels(pin)
+                    .get(&(security_id, segment))
+                    .map(|n| crate::depth_stage::escaped_symbol_len(n));
+                (pin, name_len)
+            }
+            None => {
+                // Read the generation BEFORE the load: a publish bumps to odd,
+                // stores, then bumps to even, so the loaded table is at least
+                // that generation's, and an odd one is never kept (`try_pin_at_generation`).
+                let labels = crate::candle_contract_labels::candle_contract_labels();
+                let name_len = labels
+                    .get(&(security_id, segment))
+                    .map(|n| crate::depth_stage::escaped_symbol_len(n));
+                let pin = match self.staged.try_pin_at_generation(labels, generation) {
+                    Ok(pin) => pin,
+                    Err(labels) => self.stage_pin_after_cut(labels),
+                };
+                (pin, name_len)
+            }
+        };
+        self.book_label = Some((security_id, segment, pin, name_len));
+        (pin, name_len)
+    }
+
+    /// Stages one checked side and counts it in `pending`. O(levels).
+    #[inline]
+    fn stage_book_side(&mut self, row: &DepthBookRow<'_>, pin: u8, text_len: usize) {
         if self.staged.push(row, pin, text_len) {
             // Past the pre-size: one reallocation on the drain, counted.
             self.flush_counters.stage_grow.increment(1);
@@ -2822,9 +2927,55 @@ impl DepthWriter {
         // flush, rescue and loss counter reads the same whichever table is
         // written. A side with no levels still counts one, so a buffered row
         // is never invisible to `pending`.
-        self.pending = self.pending.saturating_add(levels.max(1));
-        self.note_pending_seq(row.capture_seq);
-        Ok(())
+        self.pending = self.pending.saturating_add(row.prices.len().max(1));
+    }
+
+    /// Appends BOTH sides of one packet's book (speed fix 5, 2026-11-17):
+    /// what [`Self::append_book_row`] does for the bid row and then for the
+    /// ask row, with the work the two rows share done once (the window gate,
+    /// the layout check, the run's name lookup, the line length when both
+    /// sides carry the same number of levels, the pending range).
+    ///
+    /// Same rows in the same order, same bytes, same refusals and counts as
+    /// the two single appends; a pair the shared path cannot take whole (a
+    /// level writer, a malformed side) goes through the two single appends.
+    /// Returns the bid result, then the ask result. O(levels), no
+    /// allocation.
+    pub fn append_book_pair(&mut self, pair: &DepthBookPair<'_>) -> (Result<()>, Result<()>) {
+        let bid = pair.side(DEPTH_SIDE_BID);
+        let ask = pair.side(DEPTH_SIDE_ASK);
+        let bid_levels = bid.prices.len();
+        let ask_levels = ask.prices.len();
+        if self.layout != DepthLayout::Book
+            || !book_row_shape_is_valid(&bid)
+            || !book_row_shape_is_valid(&ask)
+        {
+            // Cold: the single appends refuse, count and mark exactly as
+            // they always have.
+            return (self.append_book_row(&bid), self.append_book_row(&ask));
+        }
+        if let Some(reason) = depth_arrival_window_refusal(pair.ts_nanos) {
+            // Counted per LEVEL per side, as two single appends count.
+            for levels in [bid_levels, ask_levels] {
+                let levels = u64::try_from(levels).unwrap_or(u64::MAX);
+                self.out_of_window.note_n(reason, levels.max(1));
+            }
+            return (Ok(()), Ok(()));
+        }
+        let (pin, name_len) = self.resolve_book_label(pair.security_id, pair.segment);
+        let bid_len = crate::depth_stage::book_line_len(self.feed, &bid, bid_levels, name_len);
+        // The side label is the only per-side text and both labels have the
+        // same length (asserted at compile time), so equal level counts give
+        // equal line lengths.
+        let ask_len = if ask_levels == bid_levels {
+            bid_len
+        } else {
+            crate::depth_stage::book_line_len(self.feed, &ask, ask_levels, name_len)
+        };
+        self.stage_book_side(&bid, pin, bid_len);
+        self.stage_book_side(&ask, pin, ask_len);
+        self.note_pending_seq(pair.capture_seq);
+        (Ok(()), Ok(()))
     }
 
     /// A ninth contract-name table arrived inside one staged batch (PF-4b,

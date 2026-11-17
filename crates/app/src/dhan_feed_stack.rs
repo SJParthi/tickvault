@@ -154,8 +154,8 @@ use tickvault_core::websocket::pool_supervisor::{
     take_main_feed_reconnect_recovery_max_ms,
 };
 use tickvault_storage::depth_persistence::{
-    DEPTH_KIND_5, DEPTH_KIND_20, DEPTH_KIND_200, DEPTH_SIDE_ASK, DEPTH_SIDE_BID, DepthBookRow,
-    DepthRow, DepthWriter, MAX_DEPTH_BOOK_LEVELS, depth_segment_label,
+    DEPTH_KIND_5, DEPTH_KIND_20, DEPTH_KIND_200, DEPTH_SIDE_ASK, DEPTH_SIDE_BID, DepthBookPair,
+    DepthBookRow, DepthRow, DepthWriter, MAX_DEPTH_BOOK_LEVELS, depth_segment_label,
 };
 use tickvault_storage::feed_aux_persistence::{AuxPacketKind, AuxPacketRow, aux_price};
 use tickvault_storage::hot_path_telemetry::{Stage as HotPathStage, StageTimer};
@@ -10419,6 +10419,11 @@ fn append_inline_depth(
 /// exactly as the level path does; a refused level is NaN in its slot and
 /// counted refused. Returns the levels stored (the same unit the level path
 /// counts), at most ten.
+///
+/// Speed fix 5 (2026-11-17): both sides are filled on the stack and handed
+/// to the writer in ONE append (`DepthWriter::append_book_pair`), which does
+/// the work the two rows share once. Same rows, bytes and counter totals as
+/// two single appends.
 fn append_inline_depth_book(
     sink: &mut DepthIngest,
     levels: &[tickvault_common::tick_types::MarketDepthLevel; 5],
@@ -10428,17 +10433,20 @@ fn append_inline_depth_book(
     ts_nanos: i64,
     c: &DrainCounters,
 ) -> u64 {
-    let Some(b) = sink.book.as_deref_mut() else {
+    if sink.book.is_none() {
         // Unreachable: the caller checked `writes_book`. Counted all the same.
         c.depth_refused.increment(1);
         return 0;
-    };
+    }
     let plausible = |p: f32| depth_level_price_is_plausible(f64::from(p));
-    let mut rows = 0_u64;
-    for side in [DEPTH_SIDE_BID, DEPTH_SIDE_ASK] {
-        let mut stored = 0_u64;
+    // [side][slot], side 0 = bid, 1 = ask.
+    let mut price = [[0.0_f64; 5]; 2];
+    let mut quantity = [[0.0_f64; 5]; 2];
+    let mut orders_at = [[0.0_f64; 5]; 2];
+    let mut stored = [0_u64; 2];
+    for side in 0..2 {
         for (slot, level) in levels.iter().enumerate() {
-            let (price, quantity, orders) = if side == DEPTH_SIDE_BID {
+            let (p, q, o) = if side == 0 {
                 (level.bid_price, level.bid_quantity, level.bid_orders)
             } else {
                 (level.ask_price, level.ask_quantity, level.ask_orders)
@@ -10452,29 +10460,41 @@ fn append_inline_depth_book(
             // `implausible_kept`; only a non-finite price (NaN or infinity,
             // which QuestDB cannot hold as a value) is stored as NaN, with its
             // quantity and orders still kept, and counted `refused`.
-            b.quantity[slot] = f64::from(quantity);
-            b.orders[slot] = f64::from(orders);
-            if plausible(price) {
-                b.price[slot] = tickvault_common::price_precision::f32_to_f64_clean(price);
-                stored = stored.saturating_add(1);
-            } else if price.is_finite() {
-                b.price[slot] = tickvault_common::price_precision::f32_to_f64_clean(price);
-                stored = stored.saturating_add(1);
+            quantity[side][slot] = f64::from(q);
+            orders_at[side][slot] = f64::from(o);
+            if plausible(p) {
+                price[side][slot] = tickvault_common::price_precision::f32_to_f64_clean(p);
+                stored[side] = stored[side].saturating_add(1);
+            } else if p.is_finite() {
+                price[side][slot] = tickvault_common::price_precision::f32_to_f64_clean(p);
+                stored[side] = stored[side].saturating_add(1);
                 c.depth_implausible_kept.increment(1);
             } else {
-                b.price[slot] = f64::NAN;
+                price[side][slot] = f64::NAN;
                 c.depth_refused.increment(1);
             }
         }
-        let key = BookKey {
-            security_id,
-            segment,
-            depth_kind: DEPTH_KIND_5,
-            side,
-            capture_seq,
-            ts_nanos,
-        };
-        if append_book_slots(&mut sink.writer, b, levels.len(), &key) {
+    }
+    let [bid_prices, ask_prices] = &price;
+    let [bid_quantities, ask_quantities] = &quantity;
+    let [bid_orders, ask_orders] = &orders_at;
+    let pair = DepthBookPair {
+        security_id,
+        segment,
+        depth_kind: DEPTH_KIND_5,
+        bid_prices,
+        bid_quantities,
+        bid_orders,
+        ask_prices,
+        ask_quantities,
+        ask_orders,
+        capture_seq,
+        ts_nanos,
+    };
+    let (bid, ask) = sink.writer.append_book_pair(&pair);
+    let mut rows = 0_u64;
+    for (outcome, stored) in [(bid.is_ok(), stored[0]), (ask.is_ok(), stored[1])] {
+        if outcome {
             rows = rows.saturating_add(stored);
         } else {
             c.depth_refused.increment(stored);

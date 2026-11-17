@@ -792,12 +792,18 @@ fn full_mode_frame_with_inline_depth_does_not_allocate_per_tick() {
 /// Plan item 49e step 3: the same production Full-packet shape with
 /// `[depth_storage] array_rows` ON, so each packet's five-level book becomes
 /// two `market_depth_book` rows (one bid, one ask) built in the `BookMode`
-/// scratch arrays, which are allocated once when the sink is built.
+/// scratch arrays, which are allocated once when the sink is built (since
+/// speed fix 5, 2026-11-17: in stack arrays inside `append_inline_depth_book`).
 ///
-/// This covers `append_book_slots`, the append the depth-20 and depth-200
-/// socket drains share. Those drains have no DHAT gate of their own (they are
-/// private to the crate, as before this change); this gate is the measured
-/// half, and it is stated here rather than implied.
+/// ⚠ CORRECTED 2026-11-17 (speed fix 5 review): this said it "covers
+/// `append_book_slots`, the append the depth-20 and depth-200 socket drains
+/// share". Since speed fix 5 the inline book goes to the writer as one pair
+/// (`DepthWriter::append_book_pair`) and never reaches `append_book_slots`,
+/// so this gate measures the pair path (inside `drain_main_feed_frame`, no
+/// flush and no name republish in the window; the hand-off and the
+/// republish are measured by `crates/storage/tests/dhat_depth_book_hand_off.rs`).
+/// `append_book_slots` is measured by
+/// `dhat_depth_drain.rs::depth20_book_drain_does_not_allocate_per_packet`.
 #[test]
 fn full_mode_frame_with_inline_depth_book_rows_does_not_allocate_per_tick() {
     let _serial = DHAT_LOCK.lock().unwrap_or_else(|e| e.into_inner());

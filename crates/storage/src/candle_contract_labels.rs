@@ -73,12 +73,76 @@ static LABELS: LazyLock<ArcSwap<CandleContractLabels>> =
 /// stored a table). A reader that remembers rows judged against one table
 /// compares this number to learn that a name may have changed since (operator
 /// Quote 61: `feed_aux_repeat`). Only ever grows.
+///
+/// Speed fix 5 review (2026-11-17): a publish moves it TWICE, to an odd
+/// value before its store and to the next even value after it, and two
+/// publishes never overlap ([`PublishInFlight`]), so an ODD value means "a
+/// store may be in flight" and an EVEN value means none is. The tick and
+/// depth writers keep a pinned table only under an even generation
+/// ([`generation_is_settled`]): while a publish is in flight, however long
+/// its thread is descheduled between the store and the second bump, they
+/// load the table on every lookup exactly as before speed fix 5, so no row
+/// keeps the previous table once the new one is stored.
 static LABELS_GENERATION: AtomicU64 = AtomicU64::new(0);
 
-/// How many times the name table has been published in this process. Moves
-/// on every [`publish_candle_contract_labels`] and on every
-/// [`publish_candle_contract_labels_if_empty`] that stored its table. One
-/// acquire load, O(1); read per wrong-day packet by the aux repeat filter.
+/// `true` when no publish is in flight at `generation` (an even value; see
+/// [`LABELS_GENERATION`]): a table loaded after reading it is the table a
+/// fresh load returns until the generation moves. O(1).
+#[inline]
+#[must_use]
+pub fn generation_is_settled(generation: u64) -> bool {
+    generation & 1 == 0
+}
+
+/// One publish in flight: the generation is odd from [`Self::begin`] until
+/// this guard drops (even again, also on an unwind, so a panicking publish
+/// can never leave the writers loading forever or the next publish
+/// waiting). Cold: a few publishes a day.
+struct PublishInFlight;
+
+impl PublishInFlight {
+    /// Moves the generation from even to odd. A second publisher waits
+    /// (yielding) until the first has finished, so an odd value always
+    /// covers every store in flight. AcqRel: the store that follows cannot
+    /// move ahead of it.
+    fn begin() -> Self {
+        let mut current = LABELS_GENERATION.load(Ordering::Acquire);
+        // O(1) EXEMPT: begin — publish only (a few a day); waits out another publish
+        loop {
+            if !generation_is_settled(current) {
+                std::thread::yield_now();
+                current = LABELS_GENERATION.load(Ordering::Acquire);
+                continue;
+            }
+            match LABELS_GENERATION.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Self,
+                Err(seen) => current = seen,
+            }
+        }
+        // O(1) EXEMPT: end
+    }
+}
+
+impl Drop for PublishInFlight {
+    fn drop(&mut self) {
+        // Even after the store, Release: a reader that sees the new
+        // generation then loads the new table, never the old one under the
+        // new number.
+        LABELS_GENERATION.fetch_add(1, Ordering::Release);
+    }
+}
+
+/// How many times the name table has been published in this process, times
+/// two (each publish moves it twice; odd while one is in flight). Moves on
+/// every [`publish_candle_contract_labels`] and on every
+/// [`publish_candle_contract_labels_if_empty`] that found the table empty.
+/// One acquire load, O(1); read per wrong-day packet by the aux repeat
+/// filter and per row by the tick and depth writers.
 #[must_use]
 pub fn candle_contract_labels_generation() -> u64 {
     LABELS_GENERATION.load(Ordering::Acquire)
@@ -89,12 +153,12 @@ pub fn candle_contract_labels_generation() -> u64 {
 /// A replace, never a merge: yesterday's names for expired ids must not
 /// survive into today, and a merge would keep them forever.
 pub fn publish_candle_contract_labels(labels: CandleContractLabels) -> usize {
-    let labels = sanitize_labels(labels);
+    let labels = Arc::new(sanitize_labels(labels));
     let n = labels.len();
-    LABELS.store(Arc::new(labels));
-    // After the store, Release: a reader that sees the new generation then
-    // loads the new table, never the old one under the new number.
-    LABELS_GENERATION.fetch_add(1, Ordering::Release);
+    {
+        let _in_flight = PublishInFlight::begin();
+        LABELS.store(labels);
+    }
     metrics::gauge!("tv_candle_contract_labels_published").set(n as f64);
     n
 }
@@ -109,18 +173,26 @@ pub fn publish_candle_contract_labels(labels: CandleContractLabels) -> usize {
 /// of the session, so the boot publish is a compare-and-swap against empty.
 pub fn publish_candle_contract_labels_if_empty(labels: CandleContractLabels) -> bool {
     let incoming = Arc::new(sanitize_labels(labels));
+    // A table is already published: refused, the generation does not move.
+    if !LABELS.load().is_empty() {
+        return false;
+    }
     let mut stored = false;
-    LABELS.rcu(|current| {
-        if current.is_empty() {
-            stored = true;
-            Arc::clone(&incoming)
-        } else {
-            stored = false;
-            Arc::clone(current)
-        }
-    });
+    {
+        // Moves the generation even when a racing attach filled the table
+        // first (then a writer only loads the table once more).
+        let _in_flight = PublishInFlight::begin();
+        LABELS.rcu(|current| {
+            if current.is_empty() {
+                stored = true;
+                Arc::clone(&incoming)
+            } else {
+                stored = false;
+                Arc::clone(current)
+            }
+        });
+    }
     if stored {
-        LABELS_GENERATION.fetch_add(1, Ordering::Release);
         metrics::gauge!("tv_candle_contract_labels_published").set(incoming.len() as f64);
     }
     stored
@@ -229,6 +301,10 @@ mod tests {
         assert!(
             candle_contract_labels_generation() > after_boot,
             "a replace moves it, even with the same names"
+        );
+        assert!(
+            generation_is_settled(candle_contract_labels_generation()),
+            "no publish in flight once publish returns"
         );
     }
 
@@ -402,5 +478,167 @@ mod tests {
         let out = sanitize_labels(m);
         let kept = out.get(&(1, "NSE_FNO")).expect("present");
         assert!(Arc::ptr_eq(kept, &clean));
+    }
+
+    // ---- Speed fix 5 review (2026-11-17): the odd/even publish window ----
+
+    fn numbered(n: i64) -> CandleContractLabels {
+        let mut m = CandleContractLabels::default();
+        m.insert((1, "NSE_FNO"), Arc::<str>::from(format!("T{n}").as_str()));
+        m
+    }
+
+    /// Speed fix 5: an even generation is settled, an odd one means a
+    /// publish is between its two bumps (its store may be in flight).
+    #[test]
+    fn test_generation_is_settled_only_for_even_values() {
+        for even in [0_u64, 2, 4, 1_000, u64::MAX - 1] {
+            assert!(generation_is_settled(even), "{even} is settled");
+        }
+        for odd in [1_u64, 3, 999, u64::MAX] {
+            assert!(!generation_is_settled(odd), "{odd} is in flight");
+        }
+    }
+
+    /// The finding's scenario: a publisher stored the new table and is then
+    /// descheduled before it finishes. The generation is odd for that whole
+    /// gap, so neither writer's batch answers from its cached pin: the next
+    /// lookup loads and pins the NEW table (before the fix, the generation
+    /// moved only after the store, so the cached pin of the old table
+    /// answered for as long as the publisher was off the CPU).
+    #[test]
+    fn test_regression_a_stalled_publish_never_keeps_the_previous_table() {
+        let _g = lock();
+        publish_candle_contract_labels(numbered(0));
+        let g0 = candle_contract_labels_generation();
+        assert!(generation_is_settled(g0));
+        let mut depth = crate::depth_stage::DepthStagedBatch::new();
+        let mut tick = crate::tick_stage::StagedBatch::new();
+        assert!(
+            depth
+                .try_pin_at_generation(candle_contract_labels(), g0)
+                .is_ok()
+        );
+        assert!(
+            tick.try_pin_at_generation(candle_contract_labels(), g0)
+                .is_ok()
+        );
+        assert_eq!(depth.current_pin_at_generation(g0), Some(0));
+        assert_eq!(tick.current_pin_at_generation(g0), Some(0));
+
+        // Publisher: odd, stored, and stalled before its second bump.
+        let in_flight = PublishInFlight::begin();
+        LABELS.store(Arc::new(numbered(1)));
+        let g = candle_contract_labels_generation();
+        assert!(!generation_is_settled(g), "odd while in flight");
+        assert_eq!(depth.current_pin_at_generation(g), None, "depth loads");
+        assert_eq!(tick.current_pin_at_generation(g), None, "tick loads");
+        let pin = depth
+            .try_pin_at_generation(candle_contract_labels(), g)
+            .expect("pin");
+        assert_eq!(pin, 1, "the NEW table is pinned");
+        assert_eq!(
+            depth.labels(pin).get(&(1, "NSE_FNO")).map(|n| &**n),
+            Some("T1")
+        );
+        assert_eq!(
+            depth.current_pin_at_generation(g),
+            None,
+            "an odd generation is never kept, so every lookup loads again"
+        );
+        assert_eq!(
+            tick.try_pin_at_generation(candle_contract_labels(), g).ok(),
+            Some(1)
+        );
+        assert_eq!(tick.current_pin_at_generation(g), None);
+        drop(in_flight);
+
+        let settled = candle_contract_labels_generation();
+        assert_eq!(settled, g0 + 2, "one publish moves it by two");
+        assert!(generation_is_settled(settled));
+        assert_eq!(
+            depth
+                .try_pin_at_generation(candle_contract_labels(), settled)
+                .ok(),
+            Some(1)
+        );
+        assert_eq!(depth.current_pin_at_generation(settled), Some(1));
+        publish_candle_contract_labels(CandleContractLabels::default());
+    }
+
+    /// Two publishes never overlap: a second publish waits until the first
+    /// one's guard drops, so an even generation always means no store is in
+    /// flight (two interleaved single bumps could otherwise read even).
+    #[test]
+    fn test_a_second_publish_waits_for_the_first_to_finish() {
+        let _g = lock();
+        publish_candle_contract_labels(numbered(0));
+        let g0 = candle_contract_labels_generation();
+        let in_flight = PublishInFlight::begin();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let other = std::thread::spawn(move || {
+            started_tx.send(()).expect("send");
+            publish_candle_contract_labels(numbered(2));
+        });
+        started_rx.recv().expect("started");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(
+            candle_contract_labels_generation(),
+            g0 + 1,
+            "the second publish has not begun"
+        );
+        assert_eq!(
+            candle_contract_labels().get(&(1, "NSE_FNO")).map(|n| &**n),
+            Some("T0"),
+            "nor stored"
+        );
+        drop(in_flight);
+        other.join().expect("join");
+        assert_eq!(candle_contract_labels_generation(), g0 + 4);
+        assert_eq!(
+            candle_contract_labels().get(&(1, "NSE_FNO")).map(|n| &**n),
+            Some("T2")
+        );
+        publish_candle_contract_labels(CandleContractLabels::default());
+    }
+
+    /// Many publishers at once: every publish moves the generation by
+    /// exactly two and it ends even (no lost bump, no stuck odd value).
+    #[test]
+    fn test_concurrent_publishes_move_the_generation_by_two_each_and_end_settled() {
+        let _g = lock();
+        let g0 = candle_contract_labels_generation();
+        assert!(generation_is_settled(g0));
+        let threads: Vec<_> = (0..4)
+            .map(|t| {
+                std::thread::spawn(move || {
+                    for i in 0..50 {
+                        publish_candle_contract_labels(numbered(t * 100 + i));
+                    }
+                })
+            })
+            .collect();
+        for th in threads {
+            th.join().expect("join");
+        }
+        assert_eq!(candle_contract_labels_generation(), g0 + 2 * 200);
+        publish_candle_contract_labels(CandleContractLabels::default());
+    }
+
+    /// A publish that unwinds between its two bumps still leaves the
+    /// generation settled, so the next publish does not wait forever.
+    #[test]
+    fn test_a_panicking_publish_still_settles_the_generation() {
+        let _g = lock();
+        let g0 = candle_contract_labels_generation();
+        let unwound = std::panic::catch_unwind(|| {
+            let _in_flight = PublishInFlight::begin();
+            panic!("publish failed mid-flight");
+        });
+        assert!(unwound.is_err());
+        assert_eq!(candle_contract_labels_generation(), g0 + 2);
+        publish_candle_contract_labels(numbered(5));
+        assert_eq!(candle_contract_labels_generation(), g0 + 4);
+        publish_candle_contract_labels(CandleContractLabels::default());
     }
 }

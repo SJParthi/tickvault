@@ -177,6 +177,12 @@ pub struct StagedBatch {
     rows: Vec<StagedRow>,
     pins: [Option<Arc<CandleContractLabels>>; TICK_STAGE_LABEL_PINS],
     pin_count: u8,
+    /// Speed fix 5 (2026-11-17): the name-table publish generation read
+    /// just before the table at the LAST pin was loaded, when known. While
+    /// the generation has not moved, that table is the one a fresh load
+    /// would return, so staging a row can skip the load. `None` after a pin
+    /// of unknown generation and after [`Self::clear`].
+    last_pin_generation: Option<u64>,
     /// Rows an encode marked `Refused` (each already counted by the encoder).
     refused: usize,
 }
@@ -200,6 +206,7 @@ impl StagedBatch {
             rows: Vec::new(),
             pins: [const { None }; TICK_STAGE_LABEL_PINS],
             pin_count: 0,
+            last_pin_generation: None,
             refused: 0,
         }
     }
@@ -266,8 +273,42 @@ impl StagedBatch {
             return Err(labels);
         };
         *slot = Some(Guard::into_inner(labels));
+        // Pinned with no generation: the next row loads the table again.
+        self.last_pin_generation = None;
         self.pin_count += 1;
         Ok(self.pin_count - 1)
+    }
+
+    /// [`Self::try_pin`] for a table loaded right AFTER `generation` was
+    /// read (speed fix 5, 2026-11-17): on success under a settled (even)
+    /// generation, the generation is kept with the last pin, so [`Self::current_pin_at_generation`] can answer
+    /// the next row without a table load. O(1).
+    pub(crate) fn try_pin_at_generation(
+        &mut self,
+        labels: Guard<Arc<CandleContractLabels>>,
+        generation: u64,
+    ) -> std::result::Result<u8, Guard<Arc<CandleContractLabels>>> {
+        let pinned = self.try_pin(labels);
+        // Kept only under a settled (even) generation: an odd one means a
+        // publish may be storing right now, so the next lookup loads again.
+        if pinned.is_ok() && crate::candle_contract_labels::generation_is_settled(generation) {
+            self.last_pin_generation = Some(generation);
+        }
+        pinned
+    }
+
+    /// The last pin, when it was loaded under `generation` (speed fix 5):
+    /// no table was published since, so a fresh table load would return
+    /// the table already pinned there and [`Self::try_pin`] would answer
+    /// this same index. `None` sends the caller to the load. O(1), one
+    /// compare.
+    #[inline]
+    pub(crate) fn current_pin_at_generation(&self, generation: u64) -> Option<u8> {
+        if self.last_pin_generation == Some(generation) {
+            self.pin_count.checked_sub(1)
+        } else {
+            None
+        }
     }
 
     /// Pushes one row. Returns `true` when the batch had to grow (past its
@@ -283,6 +324,7 @@ impl StagedBatch {
         self.rows.clear();
         self.pins = [const { None }; TICK_STAGE_LABEL_PINS];
         self.pin_count = 0;
+        self.last_pin_generation = None;
         self.refused = 0;
     }
 

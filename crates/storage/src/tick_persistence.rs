@@ -3384,11 +3384,26 @@ impl TickWriter {
     /// into the pre-sized batch. O(1), no allocation inside the pre-size; a
     /// push past it grows the batch (cold, counted on
     /// `tv_tick_stage_grow_total`), never drops.
+    ///
+    /// Speed fix 5 (2026-11-17): the table load is skipped while no name
+    /// table was published since the batch's last pin was loaded (one
+    /// acquire load and one compare, see
+    /// `StagedBatch::current_pin_at_generation`); the pin is the index the
+    /// load would have produced, so every row and every byte is unchanged.
     fn stage_row(&mut self, make: impl FnOnce(u8) -> StagedRow) {
-        let labels = crate::candle_contract_labels::candle_contract_labels();
-        let pin = match self.staged.try_pin(labels) {
-            Ok(pin) => pin,
-            Err(labels) => self.pin_after_cut(labels),
+        let generation = crate::candle_contract_labels::candle_contract_labels_generation();
+        let pin = match self.staged.current_pin_at_generation(generation) {
+            Some(pin) => pin,
+            None => {
+                // Read the generation BEFORE the load: a publish bumps to odd,
+                // stores, then bumps to even, so the loaded table is at least
+                // that generation's, and an odd one is never kept (`try_pin_at_generation`).
+                let labels = crate::candle_contract_labels::candle_contract_labels();
+                match self.staged.try_pin_at_generation(labels, generation) {
+                    Ok(pin) => pin,
+                    Err(labels) => self.pin_after_cut(labels),
+                }
+            }
         };
         if self.staged.push(make(pin)) {
             self.flush_counters.stage_grow.increment(1);

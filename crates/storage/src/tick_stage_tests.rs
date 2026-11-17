@@ -487,3 +487,137 @@ fn test_encode_tables_into_and_has_rows_for_split_a_batch_by_table() {
     assert_eq!(b.encode_into(Feed::Dhan, &mut whole), parts);
     assert_eq!(whole.as_bytes().len(), bytes);
 }
+
+// ---- Speed fix 5 (2026-11-17): the generation-checked pin ----
+
+fn publish_numbered(n: u64) {
+    let mut labels = CandleContractLabels::default();
+    labels.insert((1, "NSE_FNO"), Arc::from(format!("T{n}").as_str()));
+    publish_candle_contract_labels(labels);
+}
+
+/// The pin `TickWriter::stage_row` takes: the generation check, else a load.
+fn generation_pin(batch: &mut StagedBatch) -> Option<u8> {
+    let g = crate::candle_contract_labels::candle_contract_labels_generation();
+    match batch.current_pin_at_generation(g) {
+        Some(pin) => Some(pin),
+        None => batch
+            .try_pin_at_generation(candle_contract_labels(), g)
+            .ok(),
+    }
+}
+
+#[test]
+fn test_tick_try_pin_at_generation_records_the_generation_only_on_success() {
+    let _g = lock();
+    let mut batch = StagedBatch::new();
+    for n in 0..TICK_STAGE_LABEL_PINS as u64 {
+        publish_numbered(n);
+        let g = crate::candle_contract_labels::candle_contract_labels_generation();
+        let pin = batch
+            .try_pin_at_generation(candle_contract_labels(), g)
+            .expect("free slot");
+        assert_eq!(usize::from(pin), n as usize);
+        assert_eq!(batch.current_pin_at_generation(g), Some(pin));
+    }
+    publish_numbered(99);
+    let g = crate::candle_contract_labels::candle_contract_labels_generation();
+    assert!(
+        batch
+            .try_pin_at_generation(candle_contract_labels(), g)
+            .is_err()
+    );
+    assert_eq!(batch.current_pin_at_generation(g), None, "nothing recorded");
+    publish_candle_contract_labels(CandleContractLabels::default());
+}
+
+#[test]
+fn test_tick_current_pin_at_generation_answers_only_the_last_pin_of_that_generation() {
+    let _g = lock();
+    publish_numbered(0);
+    let mut batch = StagedBatch::new();
+    let g = crate::candle_contract_labels::candle_contract_labels_generation();
+    assert_eq!(batch.current_pin_at_generation(g), None);
+    assert_eq!(generation_pin(&mut batch), Some(0));
+    assert_eq!(batch.current_pin_at_generation(g), Some(0));
+    assert_eq!(batch.current_pin_at_generation(g + 1), None);
+    batch.clear_rows();
+    assert_eq!(batch.current_pin_at_generation(g), Some(0), "pins kept");
+    publish_numbered(1);
+    batch.try_pin(candle_contract_labels()).expect("pin");
+    assert_eq!(
+        batch.current_pin_at_generation(g + 1),
+        None,
+        "try_pin never records"
+    );
+    batch.clear();
+    assert_eq!(batch.current_pin_at_generation(g), None, "clear forgets");
+    publish_candle_contract_labels(CandleContractLabels::default());
+}
+
+#[derive(Debug, Clone)]
+enum PinOp {
+    Publish,
+    Pin,
+    ClearRows,
+    Clear,
+}
+
+proptest::proptest! {
+    #![proptest_config(proptest::prelude::ProptestConfig { cases: 512, ..proptest::prelude::ProptestConfig::default() })]
+
+    /// Speed fix 5: across random publishes (a ninth distinct table
+    /// included) and clears, the generation-checked pin gives the SAME pin
+    /// index and the SAME table as a fresh load plus `try_pin` every time.
+    #[test]
+    fn proptest_fix5_tick_generation_pin_equals_a_fresh_load_across_publishes(
+        ops in proptest::collection::vec(
+            proptest::prop_oneof![
+                4 => proptest::strategy::Just(PinOp::Publish),
+                8 => proptest::strategy::Just(PinOp::Pin),
+                1 => proptest::strategy::Just(PinOp::ClearRows),
+                1 => proptest::strategy::Just(PinOp::Clear),
+            ],
+            1..120,
+        )
+    ) {
+        let _g = lock();
+        let mut published = 0_u64;
+        publish_numbered(published);
+        let mut fast = StagedBatch::new();
+        let mut reference = StagedBatch::new();
+        for op in &ops {
+            match op {
+                PinOp::Publish => {
+                    published += 1;
+                    publish_numbered(published);
+                }
+                PinOp::Pin => {
+                    let got = generation_pin(&mut fast);
+                    let want = reference.try_pin(candle_contract_labels()).ok();
+                    proptest::prop_assert_eq!(got, want);
+                    match want {
+                        Some(pin) => proptest::prop_assert!(std::ptr::eq(
+                            fast.labels(pin),
+                            reference.labels(pin)
+                        )),
+                        None => {
+                            fast.clear();
+                            reference.clear();
+                        }
+                    }
+                }
+                PinOp::ClearRows => {
+                    fast.clear_rows();
+                    reference.clear_rows();
+                }
+                PinOp::Clear => {
+                    fast.clear();
+                    reference.clear();
+                }
+            }
+            proptest::prop_assert_eq!(fast.pin_count(), reference.pin_count());
+        }
+        publish_candle_contract_labels(CandleContractLabels::default());
+    }
+}
