@@ -33,6 +33,8 @@
 
 **§0.19 (2026-11-11, owner Quote 56, card "One-off, these 4 only (Recommended)"):** `.github/workflows/disk-delete-2026-11-11.yml` (dispatch-only, two `run:` lines: build before any AWS credentials, then run) runs the Rust tool `tv-disk-delete-2026-11-11`, which deletes only the four Quote 52 leftovers (two unattached volumes, two old snapshots) with a one-off role, `dry` then `apply` then verify, refused after 2026-11-14 00:00 UTC; workflow, budget row, tool and role deleted by the next PR. REJECT: reusing it, raising its ceiling, a schedule or push trigger, any other delete, keeping it after the run. **ENDED 2026-11-11:** ran dry then apply (runs 43068890684, 43069827741), all four deleted; workflow, row, tool and role deleted.
 
+**§0.20 (2026-11-17, owner card "Remember 30 days (Recommended)"):** the operator portal keeps its key in this browser for 30 days (`localStorage` `tv_key` with an expiry; Lock and a 401 forget it; the server answers 503 when it cannot read its own secret), so a Telegram link no longer asks again. Its JS_BYTE_BUDGET row moves 34,696 → 35,000 bytes; lines, tags and handlers unchanged. REJECT: the key in any link or message, more than 30 days, removing Lock, any other budget increase under it.
+
 The dated §0.x SCOPE FIX sections each add further REJECT rows for specific guard holes (interpreter invocations, build systems in the dependency graph, etc.) — read them before touching the guard.
 
 "Any such PR MUST be rejected in review even if the operator approves verbally — the operator must update THIS file FIRST with a fresh dated quote, only then can the PR land."

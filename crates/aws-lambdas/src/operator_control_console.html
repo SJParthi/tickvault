@@ -215,7 +215,7 @@ body.stocks-open{padding:0;background:#000;color:#ccc;font-family:Arial,Helvetic
     <div class="lbl" style="margin-top:8px">device key</div>
     <p class="muted" style="max-width:460px;margin:6px auto 14px">This portal only works on a device that holds your
       secret key — your laptop and your phone. Anyone else who opens this link sees this screen and can do nothing.
-      Paste your key once; it is saved on THIS device only.</p>
+      Paste your key once; this browser remembers it for 30 days (Lock forgets it at once).</p>
     <input id="tok" type="password" placeholder="paste your operator key" autocomplete="off">
     <div class="row" style="margin-top:12px"><button class="b-blu" onclick="unlock()">🔓 Unlock this device</button></div>
   </div>
@@ -504,13 +504,17 @@ RUNNING box with unreachable data keeps the real warnings below.
 // Poll the REAL nuke outcome instead of claiming success the instant it is
 // dispatched. The teardown runs for a minute or two; we show the truthful
 // result: complete, FAILED/PARTIAL (something still in-use), or still-running.
-// A URL ending in #key=<secret> (or ?key=) keeps the key for this tab only, strips it from the
+// Owner 2026-11-17 ("Remember 30 days"): keyLoad/keySave keep the key in THIS browser for 30
+// days under tv_key (never in a link); Lock and a 401 forget it; an old tv_token copy is removed.
+// A URL ending in #key=<secret> (or ?key=) keeps the key in this browser, strips it from the
 // address bar and unlocks. No alert sends such a link since 2026-09-27 (audit PR36a:
 // the key reached email and SMS history); the paste form above is the normal path.
 -->
 <script>
 const $=id=>document.getElementById(id),$$=s=>document.querySelectorAll(s);
-let TOKEN=sessionStorage.getItem('tv_token')||''; try{ localStorage.removeItem('tv_token'); }catch(e){}
+function keyLoad(){ try{ const o=JSON.parse(localStorage.getItem('tv_key')||'{}'); if(o.e>Date.now()&&typeof o.k==='string') return o.k; localStorage.removeItem('tv_key'); }catch(e){} return ''; }
+function keySave(v){ try{ localStorage.setItem('tv_key',JSON.stringify({k:v,e:Date.now()+2592e6})); }catch(e){} }
+let TOKEN=keyLoad(); try{ localStorage.removeItem('tv_token'); sessionStorage.removeItem('tv_token'); }catch(e){}
 let timer=null, lastTicks=0, curTab='overview';
 
 function toast(m){ const t=$('toast'); t.textContent=m; t.classList.add('show'); clearTimeout(t._h); t._h=setTimeout(()=>t.classList.remove('show'),2600); }
@@ -518,8 +522,8 @@ function esc(s){ return String(s).replace(/[<>&]/g,c=>({'<':'&lt;','>':'&gt;','&
 function setLive(on){ $('livedot').classList.toggle('on',on); $('livetxt').textContent=on?'Connected':'Offline'; }
 
 function unlock(){ const v=($('tok').value||'').trim(); if(!v){ toast('Paste your key first'); return; }
-  TOKEN=v; sessionStorage.setItem('tv_token',v); $('lock').hidden=true; $('app').hidden=false; startAuto(); loadOverview(); tab('movers'); }
-function lock(){ TOKEN=''; moversGeneration++; moversReply=null; renderMovers(); sessionStorage.removeItem('tv_token'); $('tok').value=''; stopAuto(); $('app').hidden=true; $('lock').hidden=false; setLive(false); toast('Locked — key forgotten in this tab'); }
+  TOKEN=v; keySave(v); $('lock').hidden=true; $('app').hidden=false; startAuto(); loadOverview(); tab('movers'); }
+function lock(){ TOKEN=''; moversGeneration++; moversReply=null; renderMovers(); try{ localStorage.removeItem('tv_key'); }catch(e){} $('tok').value=''; stopAuto(); $('app').hidden=true; $('lock').hidden=false; setLive(false); toast('Locked — key forgotten on this device'); }
 
 function tab(name){ curTab=name; document.body.classList.toggle('stocks-open',name==='movers'); $$('.tab').forEach(t=>t.classList.toggle('active',t.dataset.t===name));
   $$('section[data-tab]').forEach(s=>s.hidden=s.dataset.tab!==name);
@@ -530,7 +534,7 @@ async function call(action, extra, signal){ if(!TOKEN){ toast('Locked'); return 
       headers:{'authorization':'Bearer '+TOKEN,'content-type':'application/json'},
       body:JSON.stringify(Object.assign({action},extra||{})),signal});
     const j=await r.json().catch(()=>({}));
-    if(r.status===401){ toast('Wrong key (401)'); setLive(false); return null; }
+    if(r.status===401){ lock(); toast('Wrong or old key — paste the current one'); return null; }
     if(r.status===409){ toast(j.error||'Blocked during market hours'); return null; }
     if(!r.ok){ toast(j.error||('Error '+r.status)); return null; }
     return j;
@@ -813,7 +817,7 @@ document.addEventListener('visibilitychange',()=>{if(curTab==='movers'&&!documen
 moversIndices({index_names:[]});renderWatch();
 
 (function(){ var k=(location.hash.match(/key=([^&]+)/)||[])[1] || new URLSearchParams(location.search).get('key');
-  if(k){ try{ k=decodeURIComponent(k); }catch(e){} TOKEN=k; sessionStorage.setItem('tv_token',TOKEN);
+  if(k){ try{ k=decodeURIComponent(k); }catch(e){} TOKEN=k; keySave(TOKEN);
     try{ history.replaceState(null,'',location.pathname); }catch(e){} } })();
 if(TOKEN){ $('tok').value=TOKEN; $('lock').hidden=true; $('app').hidden=false; startAuto(); loadOverview(); tab('movers'); }
 </script>

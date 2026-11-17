@@ -3246,3 +3246,9 @@ hand-over sealed them).
 | MEDIUM: this plan's ticked items named two tests that do not exist, and said 19:30 | Real. Names and Failure Modes corrected; this table added | `plan-verify.sh` |
 | MEDIUM: a TEST-EXEMPT cited a missing test | Real. It cites the real tests, and the scan now asserts both flags start false and that the pending flag is set only in the Run arm | `test_the_loop_marks_a_run_and_reads_every_gate` |
 | MEDIUM: the rule file said a day leaving the window is "logged once"; the owner has no notification channel | Real. "once per process" (about 7 to 28 lines), and the rule file, runbook and module doc now say that until a noise-lock row exists the owner learns of a missed export only from the app logs | docs |
+
+### 2026-11-17 — operator portal remembers its key for 30 days (owner card "Remember 30 days (Recommended)")
+
+- [x] The portal keeps the key in this browser for 30 days (`localStorage` `tv_key` with an expiry) instead of per tab, so a Telegram link no longer asks again; Lock and a 401 forget it; the server answers 503 when it cannot read its own secret, so a read failure never makes the browser forget a correct key; JS budget 34,696 → 35,000 (rust-only lock §0.20).
+  - Files: crates/aws-lambdas/src/operator_control_console.html, crates/aws-lambdas/src/operator_control.rs, crates/common/tests/browser_surface_and_toolchain_guard.rs, docs/claude-rules-full/project/rust-only-forever-lock-2026-07-19.md, .claude/rules/project/rust-only-forever-lock-2026-07-19.md
+  - Tests: console_remembers_the_key_for_thirty_days_only, route_does_not_count_wrong_keys_while_the_secret_is_unreadable, console_html_content_pin, javascript_bytes_inside_script_tags_stay_under_the_ceiling
