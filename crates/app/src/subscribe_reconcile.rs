@@ -315,6 +315,10 @@ struct Inner {
     /// reset. While it is clear every entry has `rounds == 0`, which is what
     /// lets the fast path skip `mark_recovered` and the exhausted branch.
     rounds_any: bool,
+    /// Reports judged on the fast path since the book was built, added at
+    /// each `finish_at` (2026-11-17 review: the proof the fast path runs,
+    /// read by the DHAT gate). Never reset.
+    fast_path_hits: u64,
     /// The first [`NAMED_IN_LOG`] instruments that used their last round in
     /// the current sweep, for the log line. Pre-sized once and cleared per
     /// sweep, so `note` never allocates; the full count is kept apart.
@@ -399,6 +403,7 @@ impl SubscribeReconcile {
                     RECONCILE_CELL_SLOTS
                 ],
                 rounds_any: false,
+                fast_path_hits: 0,
                 exhausted_named: Vec::with_capacity(NAMED_IN_LOG),
                 ist_day: ist_day_now(),
                 feed_silent_reported: false,
@@ -566,6 +571,14 @@ impl SubscribeReconcile {
             .count()
     }
 
+    /// Reports judged on [`ReconcileSweep::note_at_slot`]'s fast path (the
+    /// slot cell, no hash) since the book was built, counted at each
+    /// `finish_at`. Diagnostic: O(1) under the book's lock, never on the drain.
+    #[must_use]
+    pub fn fast_path_hits(&self) -> u64 {
+        self.lock().fast_path_hits
+    }
+
     /// Test-only: everything a sweep can change, as text, minus the slot
     /// cells and `view_slot` (a book judged only through `note` keeps none).
     /// Two books that saw the same records and reports print the same text.
@@ -617,10 +630,14 @@ impl SubscribeReconcile {
             if cell.socket == CELL_EMPTY {
                 continue;
             }
-            let entry = inner
-                .expected
-                .get(&(cell.security_id, cell.segment))
-                .unwrap_or_else(|| panic!("valid cell {slot} holds a key not expected"));
+            // An assert, not a panic macro: `production_panic_macro_guard` counts
+            // those above `mod tests`, and this `#[cfg(test)]` fn sits above it.
+            let entry = inner.expected.get(&(cell.security_id, cell.segment));
+            assert!(
+                entry.is_some(),
+                "valid cell {slot} holds a key not expected"
+            );
+            let Some(entry) = entry else { continue };
             assert_eq!(entry.view_slot as usize, slot, "cell {slot} view_slot");
             assert_eq!(entry.socket, cell.socket, "cell {slot} socket");
             assert_eq!(
@@ -659,6 +676,7 @@ impl SubscribeReconcile {
             now,
             missing: 0,
             exhausted: 0,
+            fast_hits: 0,
         }
     }
 
@@ -764,25 +782,29 @@ pub struct ReconcileSweep<'a> {
     /// Instruments that used their last round in this sweep (the first
     /// [`NAMED_IN_LOG`] are named in `Inner::exhausted_named`).
     exhausted: u32,
+    /// Reports this sweep judged on [`Self::note_at_slot`]'s fast path.
+    fast_hits: u32,
 }
 
 impl ReconcileSweep<'_> {
-    /// Judges one silence report: expected O(1), one hash probe.
-    pub fn note(&mut self, report: &SilenceReport) {
+    /// Judges one silence report: expected O(1), one hash probe. Returns
+    /// whether the book expects the report's key (`false` only on a miss), so
+    /// [`Self::note_at_slot`] skips its second probe for a key it never holds.
+    pub fn note(&mut self, report: &SilenceReport) -> bool {
         let now = self.now;
         let inner = &mut *self.inner;
         let Some(entry) = inner.expected.get_mut(&report.key) else {
-            return;
+            return false;
         };
         let Some(socket) = inner.sockets.get_mut(usize::from(entry.socket)) else {
-            return;
+            return true;
         };
         match report.verdict {
             SilenceVerdict::NeverTicked => {}
             SilenceVerdict::Live => {
                 socket.delivering = socket.delivering.saturating_add(1);
                 mark_recovered(entry);
-                return;
+                return true;
             }
             // Ticked, but too few gaps for a baseline. `Warming` never looks at
             // how long it has been quiet, so a thin contract that ticked at
@@ -793,18 +815,18 @@ impl ReconcileSweep<'_> {
                     socket.delivering = socket.delivering.saturating_add(1);
                 }
                 mark_recovered(entry);
-                return;
+                return true;
             }
             // Ticked earlier, quiet now: neither delivering nor missing.
             SilenceVerdict::Exceeded => {
                 mark_recovered(entry);
-                return;
+                return true;
             }
         }
         if now.saturating_duration_since(entry.recorded_at)
             < Duration::from_secs(RECONCILE_DELTA_SECS)
         {
-            return;
+            return true;
         }
         self.missing = self.missing.saturating_add(1);
         if entry.rounds >= RECONCILE_MAX_ROUNDS {
@@ -821,11 +843,12 @@ impl ReconcileSweep<'_> {
                     inner.exhausted_named.push(entry.instrument);
                 }
             }
-            return;
+            return true;
         }
         if socket.candidates.len() < RECONCILE_MAX_PER_SOCKET_PER_ROUND {
             socket.candidates.push(entry.instrument);
         }
+        true
     }
 
     /// [`Self::note`] for a report the silence detector handed out with its
@@ -847,7 +870,13 @@ impl ReconcileSweep<'_> {
     /// `note` unchanged, then, while no round is reserved, caches the entry in
     /// this slot's cell for the next sweep (one more probe, and one for a
     /// different key the cell held, rare). So the first sweep after a
-    /// subscribe pays the probe and every later one reads the dense cells.
+    /// subscribe pays the probe and every later one reads the dense cells. A
+    /// key the book does not expect (refused past the cap, or forgotten while
+    /// the detector still tracks it) gets no cell and costs its one probe on
+    /// every sweep, as before the cells.
+    ///
+    /// Each fast-path report is counted ([`SubscribeReconcile::fast_path_hits`])
+    /// so a test can prove the fast path ran, not only that the cells are valid.
     ///
     /// No allocation on either path (the candidate list is pre-sized).
     pub fn note_at_slot(&mut self, slot: u32, report: &SilenceReport) {
@@ -867,6 +896,7 @@ impl ReconcileSweep<'_> {
                 })
         };
         if let Some(cell) = cell {
+            self.fast_hits = self.fast_hits.saturating_add(1);
             let Some(socket) = inner.sockets.get_mut(usize::from(cell.socket)) else {
                 return;
             };
@@ -897,8 +927,10 @@ impl ReconcileSweep<'_> {
             }
             return;
         }
-        self.note(report);
-        self.cache_slot(slot, report.key);
+        // A key the book does not expect never gets a cell: one probe, not two.
+        if self.note(report) {
+            self.cache_slot(slot, report.key);
+        }
     }
 
     /// The slow path's second half: puts `key`'s entry in `slot`'s cell while
@@ -960,6 +992,10 @@ impl ReconcileSweep<'_> {
 
     /// Ends the pass at `secs_of_day_ist` on IST day `ist_day`.
     pub fn finish_at(mut self, secs_of_day_ist: u32, ist_day: i64) -> SweepSummary {
+        self.inner.fast_path_hits = self
+            .inner
+            .fast_path_hits
+            .saturating_add(u64::from(self.fast_hits));
         let mut summary = SweepSummary {
             missing: self.missing,
             newly_exhausted: self.exhausted,
@@ -4143,9 +4179,46 @@ mod slot_cell_tests {
                 sb.note_at_slot(slot, &r);
             }
             assert_eq!(hits, if sweep_n == 0 { 0 } else { 50 }, "sweep {sweep_n}");
+            // The count of fast-path decisions, not only valid cells: the slow
+            // path re-fills the same cells, so `hits` alone cannot tell them apart.
+            assert_eq!(
+                sb.fast_hits,
+                if sweep_n == 0 { 0 } else { 50 },
+                "fast-path decisions, sweep {sweep_n}"
+            );
             assert_eq!(sa.finish_at(IN_SESSION, DAY), sb.finish_at(IN_SESSION, DAY));
             assert_eq!(observe(&a), observe(&b));
             b.assert_cell_invariant();
         }
+        assert_eq!(
+            b.fast_path_hits(),
+            150,
+            "three steady sweeps of 50 on the fast path"
+        );
+        assert_eq!(a.fast_path_hits(), 0, "note never takes the fast path");
+    }
+
+    /// A key the book does not expect: `note` reports the miss, and
+    /// `note_at_slot` caches nothing and never counts a fast-path hit, so it
+    /// pays one probe per sweep, not two (2026-11-17 review).
+    #[test]
+    fn test_unexpected_key_is_probed_once_and_never_cached() {
+        let (book, _rounds) = SubscribeReconcile::new(false);
+        let (tx, _rx) = socket();
+        let t0 = Instant::now();
+        book.record_subscribed_at(&tx, &[si(1)], t0);
+        for sweep_n in 0..3u64 {
+            let mut sweep = book.sweep_at(t0 + Duration::from_secs(60 * sweep_n));
+            assert!(
+                !sweep.note(&report(7, SilenceVerdict::Live)),
+                "not expected"
+            );
+            assert!(sweep.note(&report(1, SilenceVerdict::Live)), "expected");
+            sweep.note_at_slot(7, &report(7, SilenceVerdict::Live));
+            assert_eq!(sweep.fast_hits, 0, "an unexpected key never hits a cell");
+            let _ = sweep.finish_at(IN_SESSION, DAY);
+            assert_eq!(book.cached_cells(), 0, "an unexpected key gets no cell");
+        }
+        assert_eq!(book.fast_path_hits(), 0);
     }
 }

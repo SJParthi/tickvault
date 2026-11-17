@@ -355,6 +355,13 @@ mod hash_probe {
             a_map.insert(*k, Fat([i as u64; 9]));
             dense.push(Fat([i as u64; 9]));
         }
+        // Non-vacuity: every timed loop below must visit all 20,000 entries.
+        assert_eq!(
+            (std_map.len(), a_map.len(), dense.len()),
+            (20_000, 20_000, 20_000)
+        );
+        // Sum of the stored indices 0..20,000, which each probe loop must reach.
+        let full: u64 = (0..20_000u64).sum();
         let mut flushbuf = vec![1u64; (768usize << 20) / 8];
         for cold in [false, true] {
             let (mut a, mut b, mut c, mut d) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
@@ -370,6 +377,7 @@ mod hash_probe {
                         s += e.0[0];
                     }
                 }
+                assert_eq!(s, full, "the SipHash loop found every key");
                 black_box(s);
                 a.push(t.elapsed());
 
@@ -384,6 +392,7 @@ mod hash_probe {
                         s += e.0[0];
                     }
                 }
+                assert_eq!(s, full, "the ahash loop found every key");
                 black_box(s);
                 b.push(t.elapsed());
 
@@ -396,6 +405,7 @@ mod hash_probe {
                     e.0[1] = e.0[1].wrapping_add(1);
                     s += e.0[0];
                 }
+                assert_eq!(s, full, "the dense loop visited every slot");
                 black_box(s);
                 c.push(t.elapsed());
 

@@ -47,6 +47,28 @@ fn arm_body(stack: &str) -> &str {
     &rest[..end]
 }
 
+/// Whether `src` calls `.note` followed by optional whitespace and `(`, under
+/// any argument spelling. `.note_at_slot(` does not match (an `_` follows).
+fn has_bare_note_call(src: &str) -> bool {
+    src.match_indices(".note")
+        .any(|(at, m)| src[at + m.len()..].trim_start().starts_with('('))
+}
+
+#[test]
+fn the_bare_note_scan_matches_every_spelling_and_not_note_at_slot() {
+    for bad in [
+        "sweep.note(&report);",
+        "sweep.note(&r);",
+        "s.note (&*report)",
+        "x.note(\n &report)",
+    ] {
+        assert!(has_bare_note_call(bad), "{bad}");
+    }
+    for good in ["sweep.note_at_slot(slot, &report);", "notes(", "note(x)"] {
+        assert!(!has_bare_note_call(good), "{good}");
+    }
+}
+
 #[test]
 fn the_silence_arm_judges_reconcile_by_slot_not_by_probe() {
     let stack = strip_line_comments(&read("src/dhan_feed_stack.rs"));
@@ -60,8 +82,8 @@ fn the_silence_arm_judges_reconcile_by_slot_not_by_probe() {
         "scan_silence_named_at must judge reconcile with note_at_slot (slot cells, no probe)"
     );
     assert!(
-        !body.contains(".note(&report)"),
-        "scan_silence_named_at went back to one reconcile hash probe per report"
+        !has_bare_note_call(body),
+        "scan_silence_named_at went back to one reconcile hash probe per report (a `.note(` call)"
     );
 }
 

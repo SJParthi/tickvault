@@ -10,9 +10,10 @@
 //! `scan_silence_named` calls. Budget: 0 blocks, 0 bytes.
 //!
 //! Non-vacuity: the detector tracks all 20,000, the book expects all 20,000,
-//! and all 20,000 cells are valid before and after the profiled scans, so
-//! every report took the fast path (a valid cell holding the report's key, and
-//! no round reserved in shadow mode, is exactly the fast-path condition).
+//! and the book's fast-path counter (`SubscribeReconcile::fast_path_hits`)
+//! rises by exactly 20,000 per profiled scan, so every report took the fast
+//! path. Valid cells alone would not prove it: the probe path re-fills the
+//! same cells and allocates nothing either (2026-11-17 review).
 //!
 //! One heap case per binary (DHAT's profiler is process-global).
 //! Run: `cargo test -p tickvault-app --test dhat_silence_scan`
@@ -89,6 +90,7 @@ fn silence_scan_with_reconcile_slot_cells_does_not_allocate() {
         "the warm-up scan must cache every instrument"
     );
 
+    let hits_before = book.fast_path_hits();
     let profiler = dhat::Profiler::builder().testing().build();
     let mut quiet = 0u64;
     for _ in 0..SCANS {
@@ -100,10 +102,11 @@ fn silence_scan_with_reconcile_slot_cells_does_not_allocate() {
 
     assert_eq!(quiet, 0, "every instrument is Live");
     assert_eq!(
-        book.cached_cells(),
-        INSTRUMENTS as usize,
+        book.fast_path_hits() - hits_before,
+        SCANS as u64 * INSTRUMENTS,
         "every profiled report took the fast path"
     );
+    assert_eq!(book.cached_cells(), INSTRUMENTS as usize);
     assert_eq!(
         (stats.total_blocks, stats.total_bytes),
         (0, 0),

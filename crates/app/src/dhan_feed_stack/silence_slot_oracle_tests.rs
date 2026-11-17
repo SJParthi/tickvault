@@ -7,12 +7,17 @@
 //! `scan_silence_named_at` (slot cells), its twin with the frozen copy below
 //! (`scan_silence` + `note`). Every return value, every named instrument,
 //! the dead-class latch, every reconcile book field and every round handed to
-//! the executor must agree.
+//! the executor must agree. Both lanes end each sweep at a GENERATED reconcile
+//! clock (IST second of day, mostly inside the 09:17-15:15 window, and IST day,
+//! moving both ways), never the wall clock, so rounds are reserved whatever
+//! time CI runs and the two lanes can never straddle a gate second (2026-11-17
+//! review). `test_frozen_oracle_and_slot_arm_agree_after_a_reserved_round` is
+//! the deterministic proof that a round is reached.
 
 #[cfg(test)]
 mod tests {
     use super::super::*;
-    use crate::subscribe_reconcile::SubscribeReconcile;
+    use crate::subscribe_reconcile::{RECONCILE_DELTA_SECS, SubscribeReconcile};
     use proptest::prelude::*;
     use std::time::Duration;
     use tickvault_core::pipeline::tick_gap_detector::TickObservation;
@@ -21,12 +26,15 @@ mod tests {
 
     /// The arm exactly as it stood on 2026-11-17 before the slot cells
     /// (`5e1bc0158`), comments trimmed. Frozen: do not edit to follow the
-    /// production function; it is the oracle.
+    /// production function; it is the oracle. The one edit: the reconcile
+    /// ends at the injected clock (`finish_at`) instead of `finish_now`, the
+    /// same seam the production arm takes in this test.
     fn scan_silence_named_frozen(
         lane: &LiveIngest,
         now_millis: u64,
         worst: &mut [SilentInstrument; WORST_SILENT_NAMED],
         reconcile_now: Instant,
+        reconcile_clock: (u32, i64),
     ) -> (u64, u64, usize) {
         let mut silent = 0u64;
         let mut never = 0u64;
@@ -69,7 +77,7 @@ mod tests {
             );
         });
         if let Some(sweep) = reconcile {
-            sweep.finish_now();
+            sweep.finish_at(reconcile_clock.0, reconcile_clock.1);
         }
         metrics::gauge!(INSTRUMENTS_SILENT_GAUGE).set(silent as f64);
         metrics::gauge!(INSTRUMENTS_NEVER_TICKED_GAUGE).set(never as f64);
@@ -121,6 +129,8 @@ mod tests {
         Sweep {
             now: u64,
             at_ms: u64,
+            secs: u32,
+            day: i64,
         },
     }
 
@@ -136,9 +146,25 @@ mod tests {
                 .prop_map(|(socket, keys, at_ms)| Op::Record { socket, keys, at_ms }),
             1 => (0usize..3).prop_map(|socket| Op::CloseSocket { socket }),
             1 => keys().prop_map(|keys| Op::Forget { keys }),
-            4 => (0u64..2_500_000, 0u64..900_000)
-                .prop_map(|(now, at_ms)| Op::Sweep { now, at_ms }),
+            4 => (0u64..2_500_000, 0u64..900_000, secs_strategy(), 0i64..3)
+                .prop_map(|(now, at_ms, secs, day)| Op::Sweep {
+                    now,
+                    at_ms,
+                    secs,
+                    day: DAY + day,
+                }),
         ]
+    }
+
+    /// An IST day for the generated reconcile clock.
+    const DAY: i64 = 20_000;
+    /// 10:00 IST, inside the reconcile window.
+    const IN_WINDOW: u32 = 10 * 3_600;
+
+    /// Mostly inside the reconcile window (09:17-15:15 IST), sometimes anywhere
+    /// in the day, so both the round and the early-return paths are drawn.
+    fn secs_strategy() -> impl Strategy<Value = u32> {
+        prop_oneof![3 => 33_420u32..54_900, 1 => 0u32..86_400]
     }
 
     fn list(keys: &[(u64, usize)]) -> Vec<SubscribeInstrument> {
@@ -179,6 +205,67 @@ mod tests {
         let mut worst = [SilentInstrument::EMPTY; WORST_SILENT_NAMED];
         let _ = ingest.scan_silence_named(2_000, &mut worst);
         assert_eq!(book.cached_cells(), 1, "the arm judged the attached book");
+    }
+
+    /// The deterministic proof that the oracle comparison reaches a reserved
+    /// round (2026-11-17 review): in auto mode an expected instrument that
+    /// never ticked, beside a live one on the same socket, is resent at an
+    /// in-window clock; both lanes hand over the same round, and the next
+    /// sweep (a round reserved, so the slot arm must take the probe) still
+    /// agrees and counts no fast-path hit.
+    #[test]
+    fn test_frozen_oracle_and_slot_arm_agree_after_a_reserved_round() {
+        let (book_new, mut rounds_new) = SubscribeReconcile::new(true);
+        let (book_old, mut rounds_old) = SubscribeReconcile::new(true);
+        let mut new = lane(&book_new);
+        let mut old = lane(&book_old);
+        let (tx, _rx) = mpsc::channel(4);
+        let base = Instant::now();
+        let both = list(&[(1, 2), (2, 2)]);
+        book_new.record_subscribed_at(&tx, &both, base);
+        book_old.record_subscribed_at(&tx, &both, base);
+        const SEED_MS: u64 = 1_000_000;
+        for ingest in [&mut new, &mut old] {
+            assert!(ingest.seed(1, ExchangeSegment::NseFno, SEED_MS));
+            assert!(ingest.seed(2, ExchangeSegment::NseFno, SEED_MS));
+            for k in 0..9u32 {
+                let _ = ingest.detector.observe(TickObservation {
+                    key: (1, ExchangeSegment::NseFno),
+                    ltt_epoch_secs: 1_786_800_000 + k,
+                    volume: 10 + k,
+                    open_interest: 0,
+                    recv_monotonic_millis: SEED_MS + u64::from(k) * 1_000,
+                });
+            }
+        }
+        let now = SEED_MS + 9_000;
+        let clock = (IN_WINDOW, DAY);
+        for (sweep_n, extra) in [(0u32, 1u64), (1, 2)] {
+            let at = base + Duration::from_secs(RECONCILE_DELTA_SECS + extra);
+            let mut worst_new = [SilentInstrument::EMPTY; WORST_SILENT_NAMED];
+            let mut worst_old = [SilentInstrument::EMPTY; WORST_SILENT_NAMED];
+            let got = new.scan_silence_named_at(now, &mut worst_new, at, Some(clock));
+            let want = scan_silence_named_frozen(&old, now, &mut worst_old, at, clock);
+            assert_eq!(got, want, "sweep {sweep_n}");
+            assert_eq!(worst_new, worst_old, "sweep {sweep_n}");
+            assert_eq!(book_new.test_fingerprint(), book_old.test_fingerprint());
+            book_new.assert_cell_invariant();
+            if sweep_n == 0 {
+                let a = rounds_new
+                    .try_recv()
+                    .expect("the slot arm reserved a round");
+                let b = rounds_old
+                    .try_recv()
+                    .expect("the frozen arm reserved a round");
+                assert_eq!(a.test_view(), b.test_view());
+            }
+            assert!(rounds_new.try_recv().is_err() && rounds_old.try_recv().is_err());
+        }
+        assert_eq!(
+            book_new.fast_path_hits(),
+            0,
+            "a reserved round sends every report down the probe"
+        );
     }
 
     proptest! {
@@ -241,12 +328,14 @@ mod tests {
                         book_new.forget(&l);
                         book_old.forget(&l);
                     }
-                    Op::Sweep { now, at_ms } => {
+                    Op::Sweep { now, at_ms, secs, day } => {
                         let mut worst_new = [SilentInstrument::EMPTY; WORST_SILENT_NAMED];
                         let mut worst_old = [SilentInstrument::EMPTY; WORST_SILENT_NAMED];
-                        let got = new.scan_silence_named_at(now, &mut worst_new, at(at_ms));
+                        let clock = (secs, day);
+                        let got =
+                            new.scan_silence_named_at(now, &mut worst_new, at(at_ms), Some(clock));
                         let want =
-                            scan_silence_named_frozen(&old, now, &mut worst_old, at(at_ms));
+                            scan_silence_named_frozen(&old, now, &mut worst_old, at(at_ms), clock);
                         prop_assert_eq!(got, want);
                         prop_assert_eq!(worst_new, worst_old);
                         prop_assert_eq!(

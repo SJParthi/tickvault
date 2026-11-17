@@ -108,6 +108,8 @@ mod aux_repeat;
 pub mod mid_session_exit;
 // 2026-11-15 audit (live-5): the WAL replay is paced on a non-trading day.
 mod replay_pace;
+// 2026-11-17: the 30 s silence arm's per-report tally.
+mod silence_tally;
 use std::time::Instant;
 
 use secrecy::ExposeSecret;
@@ -4064,21 +4066,21 @@ impl LiveIngest {
         now_millis: u64,
         worst: &mut [SilentInstrument; WORST_SILENT_NAMED],
     ) -> (u64, u64, usize) {
-        self.scan_silence_named_at(now_millis, worst, Instant::now())
+        self.scan_silence_named_at(now_millis, worst, Instant::now(), None)
     }
 
     /// Inject the same monotonic instant for the whole cold sweep. Keeping this
     /// seam private lets tests age queued subscriptions without wall-clock sleeps.
+    /// `reconcile_clock` is the reconcile's `(IST seconds of day, IST day)`;
+    /// `None` reads the wall clock (`finish_now`), as production does.
     fn scan_silence_named_at(
         &self,
         now_millis: u64,
         worst: &mut [SilentInstrument; WORST_SILENT_NAMED],
         reconcile_now: Instant,
+        reconcile_clock: Option<(u32, i64)>,
     ) -> (u64, u64, usize) {
-        let mut silent = 0u64;
-        let mut never = 0u64;
-        let mut named = 0usize;
-        let mut classes = ClassLiveness::default();
+        let mut tally = silence_tally::SilenceTally::default();
         let mut reconcile = self
             .subscribe_reconcile
             .as_ref()
@@ -4086,67 +4088,28 @@ impl LiveIngest {
         // 2026-11-17: the scan hands out each report's detector slot, so the
         // reconcile judges it from a dense per-slot cell instead of a hash
         // probe per report (`ReconcileSweep::note_at_slot`; it falls back to
-        // the probe whenever the cell cannot be trusted). The probe was ~85%
-        // of this arm's measured 2.3 ms at 20,000 instruments.
+        // the probe whenever the cell cannot be trusted). Live on 17 Nov the
+        // arm took about 2.9 ms per firing at 20,000 instruments, about 85% of
+        // it the probe (release harness cold median 3,171.8 µs before).
         self.detector
             .scan_silence_slots(now_millis, |slot, report| {
                 if let Some(sweep) = reconcile.as_mut() {
                     sweep.note_at_slot(slot, &report);
                 }
-                // CLASS ROLLUP — folded here, BEFORE the alarm filter below, and
-                // deliberately not behind `counts_toward_alarm()`.
-                //
-                // That filter is `!sparse && (Exceeded | NeverTicked)`, so it
-                // drops HEALTHY instruments. Reusing it as the class denominator
-                // would leave a denominator of "only the troubled ones", making
-                // `never == eligible` true the moment any instrument in a segment
-                // had never ticked — the detector would fire on a healthy lane
-                // every sweep. The rollup therefore does its own classification
-                // from the raw report, and rides this sweep rather than adding a
-                // second O(n) pass over the universe.
-                classes.observe(
-                    report.key.1,
-                    report.sparse,
-                    report.verdict == SilenceVerdict::NeverTicked,
-                    report.silent_millis > report.expected_millis,
-                );
-                if !report.counts_toward_alarm() {
-                    return;
-                }
-                // `NeverTicked` is returned by `classify_silence` the instant an
-                // instrument is seeded, with NO elapsed-time condition — it means
-                // "has never ticked", full stop. Counting it raw would report
-                // every instrument in the book as silent for the whole window
-                // between subscribing and the first tick, which is a false alarm
-                // on every single boot. `silent_millis` is time-since-seeding for
-                // this verdict, so requiring it to clear the same quiet ceiling
-                // the other verdicts are judged against gives the subscribe a
-                // fair chance to produce something first.
-                //
-                // Found by a test, not by review: the first version asserted a
-                // freshly-seeded instrument reports nothing and it reported (1,1).
-                if report.silent_millis <= report.expected_millis {
-                    return;
-                }
-                silent = silent.saturating_add(1);
-                if report.verdict == SilenceVerdict::NeverTicked {
-                    never = never.saturating_add(1);
-                }
-                named = rank_silent(
-                    worst,
-                    named,
-                    SilentInstrument {
-                        security_id: report.key.0,
-                        segment: report.key.1,
-                        silent_millis: report.silent_millis,
-                        expected_millis: report.expected_millis,
-                        never_ticked: report.verdict == SilenceVerdict::NeverTicked,
-                    },
-                );
+                tally.observe(worst, &report);
             });
         if let Some(sweep) = reconcile {
-            sweep.finish_now();
+            match reconcile_clock {
+                Some((secs, day)) => sweep.finish_at(secs, day),
+                None => sweep.finish_now(),
+            };
         }
+        let silence_tally::SilenceTally {
+            silent,
+            never,
+            named,
+            classes,
+        } = tally;
         metrics::gauge!(INSTRUMENTS_SILENT_GAUGE).set(silent as f64);
         metrics::gauge!(INSTRUMENTS_NEVER_TICKED_GAUGE).set(never as f64);
         // CORRECTED 2026-09-10: the class verdict is judged ONLY inside the
