@@ -127,7 +127,8 @@ fn a_refused_row_is_not_reported_as_a_loss() {
         .find("is_refusal()")
         .expect("gate missing -- covered by the test above");
     let arm = &body[refuse_at..];
-    let arm_end = arm.find("self.append_row(&row)").unwrap_or(arm.len());
+    // Speed fix 6 (2026-11-17): the drain stages the raw tick.
+    let arm_end = arm.find("self.append_raw_row(&row)").unwrap_or(arm.len());
     let refusal_arm = &arm[..arm_end];
 
     assert!(
@@ -156,13 +157,15 @@ fn the_gate_reads_the_built_row_not_the_raw_tick() {
     let src = tick_persistence_src();
     let body = append_fn_body(&src);
 
-    // Order matters: from_parsed_tick -> verdict -> append_row.
+    // Order matters: from_parsed_tick -> verdict -> append_raw_row. Since
+    // speed fix 6 (2026-11-17) the built row is the RAW tick: its `ts` and
+    // `received_at` are computed exactly as the converted row's were.
     let build = body
-        .find("TickRow::from_parsed_tick")
+        .find("RawTick::from_parsed_tick")
         .expect("build site gone");
     let gate = body.find("session_window::verdict(").expect("gate gone");
     let append = body
-        .find("self.append_row(&row)")
+        .find("self.append_raw_row(&row)")
         .expect("append site gone");
 
     assert!(

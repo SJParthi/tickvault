@@ -5,6 +5,7 @@ use crate::candle_contract_labels::{
     TEST_PUBLISH_LOCK, candle_contract_labels, publish_candle_contract_labels,
 };
 use crate::feed_aux_persistence::AuxPacketKind;
+use tickvault_common::tick_types::ParsedTick;
 
 fn lock() -> std::sync::MutexGuard<'static, ()> {
     TEST_PUBLISH_LOCK
@@ -38,7 +39,7 @@ fn row(seq: i64) -> TickRow {
 
 #[test]
 fn test_staged_row_is_small_and_a_presized_batch_holds_the_presize() {
-    assert!(STAGED_ROW_BYTES <= 320, "{STAGED_ROW_BYTES}");
+    assert!(STAGED_ROW_BYTES <= 112, "{STAGED_ROW_BYTES}");
     let b = StagedBatch::presized();
     assert!(b.capacity() >= TICK_STAGED_ROWS_PRESIZE);
     assert!(b.is_empty(), "pre-touching never changes the length");
@@ -121,20 +122,22 @@ fn test_encode_counts_a_refused_row_once_and_writes_the_rest() {
     let pin = b.try_pin(candle_contract_labels()).expect("pin");
     let mut bad = row(9);
     bad.ts_ist_nanos = -1; // ILP refuses a negative designated timestamp
-    b.push(StagedRow::Tick { row: row(8), pin });
-    b.push(StagedRow::Tick { row: bad, pin });
-    b.push(StagedRow::Quote {
-        row: row(10),
-        exchange_ts: Some(1_793_268_000_000_000_000),
+    b.push_extra(ExtraRow::Tick(row(8)), pin);
+    b.push_extra(ExtraRow::Tick(bad), pin);
+    b.push_extra(
+        ExtraRow::Quote {
+            row: row(10),
+            exchange_ts: Some(1_793_268_000_000_000_000),
+        },
         pin,
-    });
+    );
     let before = encode_failures_so_far();
     for encoder in [TickIlpEncoder::Library, TickIlpEncoder::Own] {
         let mut out = TickRowBuffer::new(encoder);
         let mut copy = StagedBatch::presized();
         let p = copy.try_pin(candle_contract_labels()).expect("pin");
         for r in [row(8), bad] {
-            copy.push(StagedRow::Tick { row: r, pin: p });
+            copy.push_extra(ExtraRow::Tick(r), p);
         }
         assert_eq!(copy.encode_into(Feed::Dhan, &mut out), 1, "{encoder:?}");
         let text = String::from_utf8(out.as_bytes().to_vec()).expect("utf8");
@@ -161,8 +164,8 @@ fn test_encode_counts_a_refused_row_once_and_writes_the_rest() {
         "each refused row was counted exactly once per batch"
     );
     assert!(matches!(
-        b.rows.get(1),
-        Some(StagedRow::Refused { capture_seq: 9 })
+        b.extras.get(1),
+        Some(ExtraRow::Refused { capture_seq: 9 })
     ));
 }
 
@@ -172,7 +175,7 @@ fn test_encode_readonly_matches_encode_into_and_leaves_the_batch() {
     publish_candle_contract_labels(CandleContractLabels::default());
     let mut b = StagedBatch::presized();
     let pin = b.try_pin(candle_contract_labels()).expect("pin");
-    b.push(StagedRow::Tick { row: row(1), pin });
+    b.push_extra(ExtraRow::Tick(row(1)), pin);
     let aux = AuxPacketRow::from_header(
         AuxPacketKind::MarketStatus,
         13,
@@ -181,7 +184,7 @@ fn test_encode_readonly_matches_encode_into_and_leaves_the_batch() {
         2,
     )
     .expect("aux");
-    b.push(StagedRow::Aux { row: aux, pin });
+    b.push_extra(ExtraRow::Aux(aux), pin);
     let readonly = b.encode_readonly(Feed::Dhan, TickIlpEncoder::Library);
     let mut out = TickRowBuffer::new(TickIlpEncoder::Library);
     assert_eq!(b.encode_into(Feed::Dhan, &mut out), 2);
@@ -242,19 +245,49 @@ fn test_max_ilp_line_bytes_covers_a_maximal_row() {
         aux.oi_day_low = Some(i64::MIN);
         aux.reason_code = Some(i64::MIN);
         for encoder in [TickIlpEncoder::Library, TickIlpEncoder::Own] {
+            // Speed fix 6: the raw shapes the drain stages, at their extremes.
+            let raw = crate::tick_persistence::raw::RawTick::from_parsed_tick(
+                &ParsedTick {
+                    security_id: i64::MAX as u64,
+                    exchange_segment_code: code,
+                    last_traded_price: f32::MIN,
+                    last_trade_quantity: u16::MAX,
+                    exchange_timestamp: u32::MAX,
+                    received_at_nanos: i64::MAX,
+                    average_traded_price: -f32::MIN_POSITIVE,
+                    volume: u32::MAX,
+                    total_sell_quantity: u32::MAX,
+                    total_buy_quantity: u32::MAX,
+                    day_open: f32::MIN,
+                    day_close: -f32::MIN_POSITIVE,
+                    day_high: f32::MIN,
+                    day_low: -f32::MIN_POSITIVE,
+                    open_interest: u32::MAX,
+                    oi_day_high: u32::MAX,
+                    oi_day_low: u32::MAX,
+                    ..ParsedTick::default()
+                },
+                i64::MIN,
+            )
+            .expect("raw");
+            labels.insert((i64::MAX, seg), Arc::from(name.as_str()));
             for staged in [
-                StagedRow::Tick { row: max, pin: 0 },
-                StagedRow::Quote {
+                Err(ExtraRow::Tick(max)),
+                Err(ExtraRow::Quote {
                     row: max,
                     exchange_ts: Some(i64::MAX),
-                    pin: 0,
-                },
-                StagedRow::Aux { row: aux, pin: 0 },
+                }),
+                Err(ExtraRow::Aux(aux)),
+                Ok(StagedRow::Tick { raw, pin: 0 }),
+                Ok(StagedRow::Quote { raw, pin: 0 }),
             ] {
                 let mut b = StagedBatch::new();
                 b.pins[0] = Some(Arc::new(labels.clone()));
                 b.pin_count = 1;
-                b.push(staged);
+                match staged {
+                    Ok(row) => b.push(row),
+                    Err(extra) => b.push_extra(extra, 0),
+                };
                 let mut out = TickRowBuffer::new(encoder);
                 assert_eq!(
                     b.encode_into(Feed::Truedata, &mut out),
@@ -312,14 +345,17 @@ fn test_encode_counted_counts_a_refused_row_without_marking_it() {
     let pin = b.try_pin(candle_contract_labels()).expect("pin");
     let mut bad = row(2);
     bad.ts_ist_nanos = -1;
-    b.push(StagedRow::Tick { row: row(1), pin });
-    b.push(StagedRow::Tick { row: bad, pin });
+    b.push_extra(ExtraRow::Tick(row(1)), pin);
+    b.push_extra(ExtraRow::Tick(bad), pin);
     let before = encode_failures_so_far();
     let mut out = TickRowBuffer::new(TickIlpEncoder::Own);
     assert_eq!(b.encode_counted(Feed::Dhan, &mut out), 1);
     assert!(encode_failures_so_far() > before);
     assert_eq!(b.refused(), 0, "not marked");
-    assert!(matches!(b.rows.get(1), Some(StagedRow::Tick { .. })));
+    assert!(
+        matches!(b.extras.get(1), Some(ExtraRow::Tick(_))),
+        "not marked"
+    );
 }
 
 /// The two pinned-table writers write the row through the marker and read
@@ -419,7 +455,7 @@ fn test_clear_rows_keeps_pins_and_capacity_and_pin_count_tracks_them() {
     publish_candle_contract_labels(CandleContractLabels::default());
     let mut b = StagedBatch::presized();
     let pin = b.try_pin(candle_contract_labels()).expect("pin");
-    b.push(StagedRow::Tick { row: row(1), pin });
+    b.push_extra(ExtraRow::Tick(row(1)), pin);
     let cap = b.capacity();
     b.clear_rows();
     assert!(b.is_empty());
@@ -442,7 +478,7 @@ fn test_encode_tables_into_and_has_rows_for_split_a_batch_by_table() {
     publish_candle_contract_labels(CandleContractLabels::default());
     let mut b = StagedBatch::presized();
     let pin = b.try_pin(candle_contract_labels()).expect("pin");
-    b.push(StagedRow::Tick { row: row(1), pin });
+    b.push_extra(ExtraRow::Tick(row(1)), pin);
     assert!(b.has_rows_for(GatedTable::Ticks));
     assert!(!b.has_rows_for(GatedTable::FeedAuxPackets), "ticks only");
     assert!(!b.has_rows_for(GatedTable::TickQuotes), "ticks only");
@@ -454,13 +490,15 @@ fn test_encode_tables_into_and_has_rows_for_split_a_batch_by_table() {
         2,
     )
     .expect("aux");
-    b.push(StagedRow::Aux { row: aux, pin });
-    b.push(StagedRow::Tick { row: row(3), pin });
-    b.push(StagedRow::Quote {
-        row: row(4),
-        exchange_ts: Some(1_793_268_000_000_000_000),
+    b.push_extra(ExtraRow::Aux(aux), pin);
+    b.push_extra(ExtraRow::Tick(row(3)), pin);
+    b.push_extra(
+        ExtraRow::Quote {
+            row: row(4),
+            exchange_ts: Some(1_793_268_000_000_000_000),
+        },
         pin,
-    });
+    );
     assert!(b.has_rows_for(GatedTable::FeedAuxPackets));
     assert!(b.has_rows_for(GatedTable::TickQuotes));
     let mut parts = 0;
@@ -620,4 +658,80 @@ proptest::proptest! {
         }
         publish_candle_contract_labels(CandleContractLabels::default());
     }
+}
+
+/// Speed fix 6: consecutive side rows of one table and pin are ONE staged
+/// run; a different table or pin starts a new run; `len` counts every row;
+/// `push_extra` reports growth like `push`; a clear empties the side rows.
+#[test]
+fn test_push_extra_runs_side_rows_and_extra_row_table_and_capture_seq() {
+    let aux = AuxPacketRow::from_header(AuxPacketKind::MarketStatus, 13, 0, 1, 42).expect("aux");
+    assert_eq!(ExtraRow::Aux(aux).table(), Some(GatedTable::FeedAuxPackets));
+    assert_eq!(ExtraRow::Aux(aux).capture_seq(), 42);
+    assert_eq!(ExtraRow::Tick(row(5)).table(), Some(GatedTable::Ticks));
+    let quote = ExtraRow::Quote {
+        row: row(6),
+        exchange_ts: None,
+    };
+    assert_eq!(quote.table(), Some(GatedTable::TickQuotes));
+    assert_eq!(quote.capture_seq(), 6);
+    let refused = ExtraRow::Refused { capture_seq: 7 };
+    assert_eq!(refused.table(), None);
+    assert_eq!(refused.capture_seq(), 7);
+
+    let mut b = StagedBatch::new();
+    assert!(b.push_extra(ExtraRow::Aux(aux), 0), "zero capacity grows");
+    let mut b = StagedBatch::presized();
+    assert!(
+        !b.push_extra(refused, 0),
+        "a refused side row is never staged"
+    );
+    assert!(b.is_empty());
+    for (extra, pin) in [
+        (ExtraRow::Aux(aux), 0),
+        (ExtraRow::Aux(aux), 0),
+        (quote, 0),
+        (ExtraRow::Aux(aux), 1),
+        (ExtraRow::Aux(aux), 1),
+    ] {
+        assert!(!b.push_extra(extra, pin), "a pre-sized batch takes it");
+    }
+    assert_eq!(b.len(), 5, "every side row counts as a staged row");
+    assert_eq!(b.extras.len(), 5);
+    assert_eq!(b.rows.len(), 3, "three runs: aux pin 0, quote, aux pin 1");
+    assert!(matches!(
+        b.rows.as_slice(),
+        [
+            StagedRow::Extra {
+                first: 0,
+                len: 2,
+                pin: 0,
+                table: GatedTable::FeedAuxPackets
+            },
+            StagedRow::Extra {
+                first: 2,
+                len: 1,
+                table: GatedTable::TickQuotes,
+                ..
+            },
+            StagedRow::Extra {
+                first: 3,
+                len: 2,
+                pin: 1,
+                ..
+            },
+        ]
+    ));
+    assert_eq!(
+        b.rows.get(1).and_then(StagedRow::table),
+        Some(GatedTable::TickQuotes)
+    );
+    b.clear_rows();
+    assert!(
+        b.extras.is_empty() && b.is_empty(),
+        "clear_rows empties both"
+    );
+    assert!(b.extras.capacity() >= TICK_STAGED_ROWS_PRESIZE);
+    assert!(STAGED_ROW_BYTES <= 112, "{STAGED_ROW_BYTES}");
+    assert_eq!(STAGED_SLOT_BYTES, STAGED_ROW_BYTES + STAGED_EXTRA_ROW_BYTES);
 }

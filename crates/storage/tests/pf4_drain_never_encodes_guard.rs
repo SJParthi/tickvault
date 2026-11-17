@@ -69,9 +69,13 @@ fn pf4_the_drain_append_path_writes_no_ilp_text() {
     for sig in [
         "fn append_tick_into(",
         "pub(crate) fn append_row(",
-        "fn append_quote_row(",
+        "fn append_raw_row(",
+        "fn append_raw_quote_row(",
         "pub fn append_aux(",
         "fn stage_row(",
+        "fn stage_extra(",
+        "fn stage_pin(",
+        "fn note_tick_row_staged(",
         "fn persist_refused_tick(",
         "fn note_pending_seq(",
     ] {
@@ -83,14 +87,38 @@ fn pf4_the_drain_append_path_writes_no_ilp_text() {
             );
         }
     }
-    for sig in [
-        "fn append_row(",
-        "fn append_quote_row(",
-        "pub fn append_aux(",
+    for (sig, stage) in [
+        ("fn append_row(", "self.stage_extra("),
+        ("fn append_raw_row(", "self.stage_row("),
+        ("fn append_raw_quote_row(", "self.stage_row("),
+        ("pub fn append_aux(", "self.stage_extra("),
     ] {
         assert!(
-            body_of(&src, sig).contains("self.stage_row("),
+            body_of(&src, sig).contains(stage),
             "`{sig}` must stage its row"
+        );
+    }
+    // Speed fix 6 (2026-11-17): the drain stages the RAW tick; its builder
+    // converts no price (the conversions run on the encoding thread, in
+    // `to_row`). A conversion back in it would undo the move.
+    let append = body_of(&src, "fn append_tick_into(");
+    assert!(
+        append.contains("raw::RawTick::from_parsed_tick(")
+            && !append.contains("TickRow::from_parsed_tick("),
+        "the drain builds the raw tick, not the converted row"
+    );
+    let raw = production("tick_stage_raw.rs");
+    let build = body_of(&raw, "fn from_parsed_tick(");
+    for conversion in [
+        "tick_price_f64",
+        "f32_to_f64_clean",
+        "round_to_2dp",
+        "to_row(",
+    ] {
+        assert!(
+            !build.contains(conversion),
+            "`RawTick::from_parsed_tick` names `{conversion}`: price conversions run on the \
+             encoding thread, never on the drain (speed fix 6)"
         );
     }
 }
