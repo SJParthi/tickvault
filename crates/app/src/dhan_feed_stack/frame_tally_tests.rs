@@ -1,13 +1,17 @@
+#![cfg(test)]
 //! Old-vs-new equality for the drain's per-tick savings (plan ITEM DT,
 //! sub-µs drain, 2026-10-30): the per-frame counter tally and the
 //! load-guarded `fetch_max`. Each test compares the new code
-//! against the exact code it replaced.
+//! against the exact code it replaced. Also the source scans that pin the
+//! tally's methods and its frame-end flush (moved here from the parent's
+//! `tests` module on 2026-11-17 with the tally itself).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 use proptest::prelude::*;
 
+use super::frame_tally::CodeRun;
 use super::*;
 use tickvault_common::feed::Feed;
 use tickvault_core::websocket::pool_budget::DhanEndpointType;
@@ -391,7 +395,19 @@ proptest! {
             1..40,
         )
     ) {
-        let _ = run_drain_against_oracle(&frames);
+        let totals = run_drain_against_oracle(&frames);
+        let packets: u64 = frames.iter().map(|f| f.len() as u64).sum();
+        // Every row written is one `folded` (the fix-4 claim behind adding
+        // `ingest_ticks` from the `folded` tally).
+        prop_assert_eq!(totals[0], totals[1]);
+        // Each packet is folded, written out of session (counted as folded
+        // AND not a trade), or refused (not a trade): together they cover
+        // every packet fed.
+        prop_assert!(totals[0] + totals[4] >= packets);
+        // A packet lands in at most one exclusion class, and the two folded
+        // exclusions are folded packets.
+        prop_assert!(totals[2] + totals[3] <= totals[0]);
+        prop_assert!(totals[2] + totals[3] + totals[4] <= packets);
     }
 }
 
@@ -451,4 +467,148 @@ fn test_fix4_lag_computed_once_matches_the_two_computation_path() {
             }
         }
     }
+}
+
+// ---- Source scans of the tally (moved from the parent's `tests` module,
+// 2026-11-17, with `FrameTally` itself; same assertions, new file paths) ----
+
+/// The tally's own source, for the scans of its methods and flush.
+const TALLY_SRC: &str = include_str!("frame_tally.rs");
+/// The drain's source, for the scans of the fold arm and the handle keys.
+const PARENT_SRC: &str = include_str!("../dhan_feed_stack.rs");
+
+#[test]
+fn test_record_ws_lag_repeat_excluded_counts_a_repeated_quote_and_skips_the_lag_histogram() {
+    // A repeat must land on the `ltt_not_advanced` exclusion counter, never
+    // on the clamp or garbage counters. Since speed fix 4 (2026-11-17)
+    // the drain counts it in `FrameTally` and adds it once per frame, so
+    // this pins the tally's method, the frame-end flush into the
+    // `ltt_not_advanced` handle, and that handle's key. The totals
+    // themselves are checked against the old per-tick code by
+    // `frame_tally_tests::test_fix4_counts_equal_the_per_tick_oracle_on_every_class`.
+    let helper_src = TALLY_SRC;
+    let helper = helper_src
+        .find("fn exclude_repeat(&mut self) {")
+        .map(|at| &helper_src[at..])
+        .and_then(|tail| tail.find('}').map(|end| &tail[..end]))
+        .expect("the repeat-exclusion tally method must exist");
+    assert!(
+        helper.contains("self.lag_repeat = self.lag_repeat.saturating_add(1);"),
+        "a repeat must add one to the frame's repeat tally, got: {helper}"
+    );
+    let flush = helper_src
+        .find("impl Drop for FrameTally<'_> {")
+        .map(|at| &helper_src[at..])
+        .and_then(|tail| tail.find("\n}\n").map(|end| &tail[..end]))
+        .expect("FrameTally must flush on drop");
+    assert!(
+        flush.contains(
+            ".lag_excluded_ltt_not_advanced\n                .increment(self.lag_repeat);"
+        ),
+        "the frame-end flush must add the repeat tally to `ltt_not_advanced`, got: {flush}"
+    );
+    assert!(
+        PARENT_SRC.contains(
+            "lag_excluded_ltt_not_advanced: metrics::counter!(\n            WS_LAG_EXCLUDED_COUNTER,\n            \"reason\" => \"ltt_not_advanced\""
+        ),
+        "the repeat handle must be the `ltt_not_advanced` series"
+    );
+
+    // Source-scan the drain: the lag is recorded AFTER the fold, and only
+    // on the non-repeat arm. Recording before the fold (the pre-2026-09-23
+    // shape) cannot know a packet is a repeat.
+    let src = PARENT_SRC;
+    let prod = &src[..src.find("#[cfg(test)]").unwrap_or(src.len())];
+    let fold = prod
+        .find("let outcome = ingest.ingest_tick_at(tick, frame.seq, packets, recv_millis);")
+        .expect("the drain's fold call must exist");
+    let excluded = prod
+        .find("=> tally.exclude_repeat(),")
+        .expect("the drain must count repeats as excluded");
+    let measured = prod
+        .find("record_ws_lag(frame.connection_index, tick, received_at_nanos);")
+        .expect("the drain must still record real lag");
+    assert!(
+        fold < excluded && fold < measured,
+        "lag must be recorded after the fold, which is the only place a repeat is known"
+    );
+    assert_eq!(
+        prod.matches("record_ws_lag(frame.connection_index").count(),
+        1,
+        "exactly one live lag-recording site"
+    );
+}
+
+#[test]
+fn test_record_ws_lag_not_a_trade_excluded_only_an_accepted_trade_is_a_lag_sample() {
+    // 2026-10-05: out-of-session ticks (a contract not traded today,
+    // carrying an earlier day's trade time) went into the lag histogram
+    // and read as option sockets delivering most packets over 60 s. The
+    // drain must record lag on the accepted-trade arm only and count
+    // every other outcome on its own exclusion reason. Since speed fix 4
+    // (2026-11-17) the count goes through the frame's `FrameTally`.
+    let src = PARENT_SRC;
+    let tally_src = TALLY_SRC;
+    let helper = tally_src
+        .find("fn exclude_not_a_trade(&mut self) {")
+        .map(|at| &tally_src[at..])
+        .and_then(|tail| tail.find('}').map(|end| &tail[..end]))
+        .expect("the not-a-trade exclusion tally method must exist");
+    assert!(
+        helper.contains("self.lag_not_a_trade = self.lag_not_a_trade.saturating_add(1);"),
+        "a refused or out-of-session tick must add one to the not_a_trade tally, got: {helper}"
+    );
+    let flush = tally_src
+        .find("impl Drop for FrameTally<'_> {")
+        .map(|at| &tally_src[at..])
+        .and_then(|tail| tail.find("\n}\n").map(|end| &tail[..end]))
+        .expect("FrameTally must flush on drop");
+    assert!(
+        flush.contains(
+            ".lag_excluded_not_a_trade\n                .increment(self.lag_not_a_trade);"
+        ) && flush.contains(
+            ".lag_excluded_not_new_trade\n                .increment(self.lag_not_new_trade);"
+        ),
+        "the frame-end flush must add both tallies to their own series, got: {flush}"
+    );
+
+    let prod = &src[..src.find("#[cfg(test)]").unwrap_or(src.len())];
+    let fold = prod
+        .find("let outcome = ingest.ingest_tick_at(tick, frame.seq, packets, recv_millis);")
+        .expect("the drain's fold call must exist");
+    let arm = &prod[fold..];
+    let folded_arm = arm
+        .find("IngestOutcome::Folded { .. } => {")
+        .expect("lag must be recorded inside the accepted-trade arm");
+    let measured = arm
+        .find("record_ws_lag(frame.connection_index, tick, received_at_nanos);")
+        .expect("the drain must still record real lag");
+    let other = arm
+        .find("_ => tally.exclude_not_a_trade(),")
+        .expect("every other outcome must be counted as not a trade");
+    assert!(
+        folded_arm < measured && measured < other,
+        "the lag sample must sit inside the Folded arm, before the catch-all"
+    );
+    // Plan PR AL-1 (2026-11-06): a folded packet that is not a new trade
+    // is excluded BEFORE the arm that records lag.
+    let not_advanced = arm
+        .find("advanced: false, ..")
+        .expect("a not-advanced fold must be excluded from the lag sample");
+    assert!(
+        not_advanced < folded_arm,
+        "the not-advanced exclusion must come before the recording arm"
+    );
+    assert!(
+        src.contains("\"reason\" => \"not_a_trade\""),
+        "the exclusion reason label must be registered"
+    );
+    // Review 2026-11-06: a not-NEW-trade packet is counted under its own
+    // reason, so the 2026-10-05 `not_a_trade` series keeps its meaning.
+    let after: String = arm[not_advanced..].chars().take(120).collect();
+    assert!(
+        after.contains("tally.exclude_not_new_trade()"),
+        "the not-advanced arm must count `not_new_trade`"
+    );
+    assert!(src.contains("\"reason\" => \"not_new_trade\""));
 }
