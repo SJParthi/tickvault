@@ -342,8 +342,8 @@ impl DepthStagedBatch {
     }
 
     /// [`Self::try_pin`] for a table loaded right AFTER `generation` was
-    /// read (speed fix 5, 2026-11-17): on success the generation is kept
-    /// with the last pin, so [`Self::current_pin_at_generation`] can answer
+    /// read (speed fix 5, 2026-11-17): on success under a settled (even)
+    /// generation, the generation is kept with the last pin, so [`Self::current_pin_at_generation`] can answer
     /// the next lookup without a table load. O(1).
     pub(crate) fn try_pin_at_generation(
         &mut self,
@@ -351,7 +351,9 @@ impl DepthStagedBatch {
         generation: u64,
     ) -> std::result::Result<u8, Guard<Arc<CandleContractLabels>>> {
         let pinned = self.try_pin(labels);
-        if pinned.is_ok() {
+        // Kept only under a settled (even) generation: an odd one means a
+        // publish may be storing right now, so the next lookup loads again.
+        if pinned.is_ok() && crate::candle_contract_labels::generation_is_settled(generation) {
             self.last_pin_generation = Some(generation);
         }
         pinned

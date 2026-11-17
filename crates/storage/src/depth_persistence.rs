@@ -2898,8 +2898,9 @@ impl DepthWriter {
                 (pin, name_len)
             }
             None => {
-                // Read the generation BEFORE the load: a publish stores, then
-                // bumps, so the loaded table is at least that generation's.
+                // Read the generation BEFORE the load: a publish bumps to odd,
+                // stores, then bumps to even, so the loaded table is at least
+                // that generation's, and an odd one is never kept (`try_pin_at_generation`).
                 let labels = crate::candle_contract_labels::candle_contract_labels();
                 let name_len = labels
                     .get(&(security_id, segment))
