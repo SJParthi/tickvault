@@ -22,9 +22,11 @@
 //! bounded (`sliced_export::ExportBusyBackoff`: at most 120 s per export
 //! call). Property 2 still holds in this form: the first refused partition
 //! of a pass waits one budget, and once a budget is spent every later 429 of
-//! that archiver fails at once for 10 minutes, so a pass over many refused
-//! partitions costs one budget, not one per partition. The tests below use a
-//! short schedule.
+//! that archiver fails at once for up to 10 minutes (for the rest of that
+//! pass: each daily-archive and disk-pressure pass builds a new archiver,
+//! so the hold never carries into the next pass), so a pass over many
+//! refused partitions costs one budget, not one per partition. The tests
+//! below use a short schedule.
 //!
 //! Reuses the parent module's stub harness (QuestDB `/exec`, ILP and S3 on
 //! 127.0.0.1). The export endpoint for the slow cases is a separate local
@@ -178,6 +180,7 @@ async fn test_regression_tg3_export_429_keeps_every_partition_and_uploads_nothin
             step_cap: Duration::from_millis(50),
             total: Duration::from_millis(200),
             hold_after_give_up: Duration::from_secs(60),
+            resend_margin: Duration::from_millis(5),
         });
     let summary = archiver.run_archive_pass().await;
 
@@ -221,6 +224,7 @@ async fn test_regression_tg3_a_partition_kept_by_429_is_archived_once_exp_answer
             step_cap: Duration::from_millis(20),
             total: Duration::from_millis(60),
             hold_after_give_up: Duration::from_secs(60),
+            resend_margin: Duration::from_millis(5),
         });
     let first = archiver.run_archive_pass().await;
     assert_eq!((first.failed, first.dropped), (1, 0));

@@ -159,6 +159,7 @@ fn fast_backoff(first_ms: u64, cap_ms: u64, total_ms: u64) -> ExportBusyBackoff 
         step_cap: Duration::from_millis(cap_ms),
         total: Duration::from_millis(total_ms),
         hold_after_give_up: Duration::from_secs(60),
+        resend_margin: Duration::from_millis(5),
     }
 }
 
@@ -322,16 +323,24 @@ async fn test_export_non_429_error_is_not_retried() {
 
 /// After one export spent its whole wait budget, the same archiver's next
 /// 429 fails at once (no second budget), so a pass over many refused
-/// partitions is not slowed by one budget each; an answered request lifts
-/// the hold.
+/// partitions is not slowed by one budget each. Only a 2xx answer lifts the
+/// hold: a 500 in between leaves it in place.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_export_429_after_a_spent_budget_fails_at_once_until_an_answer() {
-    let refusing = Arc::new(std::sync::atomic::AtomicBool::new(true));
-    let flag = Arc::clone(&refusing);
+    // 0: refuse with 429; 1: answer (CSV); 2: fail with 500.
+    const REFUSE: u8 = 0;
+    const ANSWER: u8 = 1;
+    const FAIL_500: u8 = 2;
+    let mode = Arc::new(std::sync::atomic::AtomicU8::new(REFUSE));
+    let flag = Arc::clone(&mode);
     let inner = per_slice_qdb("\n", true);
     let responder: Responder = Arc::new(move |req: &SeenRequest| {
-        if req.target.starts_with("/exp") && flag.load(Ordering::SeqCst) {
-            return (429, Vec::new(), QDB_BUSY_BODY.to_vec());
+        if req.target.starts_with("/exp") {
+            match flag.load(Ordering::SeqCst) {
+                REFUSE => return (429, Vec::new(), QDB_BUSY_BODY.to_vec()),
+                FAIL_500 => return (500, Vec::new(), b"boom".to_vec()),
+                _ => {}
+            }
         }
         inner(req)
     });
@@ -347,7 +356,9 @@ async fn test_export_429_after_a_spent_budget_fails_at_once_until_an_answer() {
         .expect_err("first export spends its budget");
     assert_eq!(exp_requests(&qlog), 6);
 
-    let began = std::time::Instant::now();
+    // The request count alone proves there was no wait: every wait is
+    // followed by a resend, so a waited 429 would add a request. (No
+    // wall-clock bound: it would flake on a loaded, instrumented runner.)
     let err = archiver
         .export_query_csv(&sql, path.clone())
         .await
@@ -356,24 +367,38 @@ async fn test_export_429_after_a_spent_budget_fails_at_once_until_an_answer() {
         format!("{err:#}").contains("/exp export returned 429"),
         "{err:#}"
     );
+    assert!(!format!("{err:#}").contains("busy retries"), "{err:#}");
     assert_eq!(exp_requests(&qlog), 7, "one request, no second budget");
-    assert!(began.elapsed() < Duration::from_millis(150), "no wait");
+
+    // A non-2xx answer (500) does not lift the hold.
+    mode.store(FAIL_500, Ordering::SeqCst);
+    let err = archiver
+        .export_query_csv(&sql, path.clone())
+        .await
+        .expect_err("a 500 fails the export");
+    assert!(
+        format!("{err:#}").contains("/exp export returned 500"),
+        "{err:#}"
+    );
+    assert_eq!(exp_requests(&qlog), 8);
+    mode.store(REFUSE, Ordering::SeqCst);
+    archiver
+        .export_query_csv(&sql, path.clone())
+        .await
+        .expect_err("still held after a 500");
+    assert_eq!(exp_requests(&qlog), 9, "the hold survived the 500: no wait");
 
     // QuestDB answers again: the export succeeds and the hold is lifted.
-    refusing.store(false, Ordering::SeqCst);
+    mode.store(ANSWER, Ordering::SeqCst);
     archiver
         .export_query_csv(&sql, path.clone())
         .await
         .expect("an answered request succeeds");
-    assert_eq!(exp_requests(&qlog), 8);
-    refusing.store(true, Ordering::SeqCst);
+    assert_eq!(exp_requests(&qlog), 10);
+    mode.store(REFUSE, Ordering::SeqCst);
     archiver
         .export_query_csv(&sql, path.clone())
         .await
         .expect_err("refused again");
-    assert_eq!(
-        exp_requests(&qlog),
-        14,
-        "after an answer, a full budget again"
-    );
+    assert_eq!(exp_requests(&qlog), 16, "after a 2xx, a full budget again");
 }
