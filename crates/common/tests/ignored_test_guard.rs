@@ -230,9 +230,9 @@ const ALLOWED_IGNORED: &[(&str, &str)] = &[
     // price to 1,40,000 rupees) and two proptests beside it run in every
     // suite. Re-run it whenever the fast path changes:
     //
-    //   cargo test -p tickvault-common --release --lib -- --ignored frozen_search_for_every_f32
+    //   cargo test -p tickvault-common --release --test price_fast_path_harness -- --ignored frozen_search_for_every_f32
     (
-        "crates/common/src/price_precision.rs",
+        "crates/common/tests/price_fast_path_harness.rs",
         "test_f32_to_f64_clean_matches_frozen_search_for_every_f32",
     ),
     // Added 2026-11-17 (plan ITEM DT): a wall-clock harness that times the
@@ -240,7 +240,7 @@ const ALLOWED_IGNORED: &[(&str, &str)] = &[
     // runner it would flake. It gates nothing; output equality on its own
     // input mix is asserted inside it and by the tests above.
     (
-        "crates/common/src/price_precision.rs",
+        "crates/common/tests/price_fast_path_harness.rs",
         "test_f32_to_f64_clean_fast_path_timing",
     ),
     // Added 2026-10-30 with the tick row fast price path (plan ITEM DT): the
