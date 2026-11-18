@@ -58,9 +58,10 @@ unsound = "all"
 # replace later (Recommended)": ignored here with this note; chrono-tz is to
 # be replaced next (IST is a fixed +05:30 offset), and the chrono migration
 # is its own project. Remove each entry in the PR that removes its crate.
+# 2026-11-18: chrono-tz removed (its one use, a test, now uses the fixed
+# +05:30 offset), so its RUSTSEC-2026-0555 entry is removed with it.
 ignore = [
     { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained, no fix exists; questdb-rs depends on it; owner card 2026-11-17 Allow now, replace later" },
-    { id = "RUSTSEC-2026-0555", reason = "chrono-tz unmaintained, no fix exists; to be replaced by a fixed IST offset; owner card 2026-11-17" },
 ]
 
 # --- Licenses: Block incompatible licenses ---

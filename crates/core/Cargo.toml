@@ -26,7 +26,6 @@ crossbeam-channel = { workspace = true }
 # workspace root Cargo.toml; only this unused core declaration is dropped.
 arrayvec = { workspace = true }
 chrono = { workspace = true }
-chrono-tz = { workspace = true }
 serde = { workspace = true }
 reqwest = { workspace = true }
 csv = { workspace = true }
@@ -121,4 +120,4 @@ harness = false
 # 2026-08-08: "papaya" dropped from this allowlist together with the unused
 # dependency itself — an entry here permanently hides a dep from cargo-machete,
 # so the allowlist must shrink whenever the underlying dep goes.
-ignored = ["ahash", "arrayvec", "bytes", "chrono-tz", "failsafe", "loom", "rtrb"]
+ignored = ["ahash", "arrayvec", "bytes", "failsafe", "loom", "rtrb"]

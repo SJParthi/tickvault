@@ -90,9 +90,11 @@ fn test_current_year_holidays_present_and_valid() {
     // The CURRENT year (IST — Asia/Kolkata drives the trading calendar) must
     // have a plausible NSE count. Every January this fails until the new
     // year's official calendar is added: the RED build is the reminder.
-    let current_year = chrono::Utc::now()
-        .with_timezone(&chrono_tz::Asia::Kolkata)
-        .year();
+    // IST is a fixed +05:30 with no daylight saving, so a fixed offset is
+    // exact (2026-11-17: the unmaintained chrono-tz crate is removed).
+    let ist = chrono::FixedOffset::east_opt(tickvault_common::constants::IST_UTC_OFFSET_SECONDS)
+        .expect("+05:30 is a valid offset");
+    let current_year = chrono::Utc::now().with_timezone(&ist).year();
     let current_year_prefix = format!("{current_year}-");
     let current_year_count = entries
         .iter()
