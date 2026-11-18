@@ -740,6 +740,13 @@ impl HotPathLatencyMinuteWriter {
         }
     }
 
+    /// Whether the boot ensure has confirmed every proof table keyed.
+    /// One Acquire load; writer thread only.
+    #[must_use]
+    pub fn is_keyed(&self) -> bool {
+        self.readiness.keyed.load(Ordering::Acquire)
+    }
+
     /// Rows appended but not yet flushed.
     #[must_use]
     // TEST-EXEMPT: accessor, exercised by the append tests below.
@@ -1026,11 +1033,36 @@ fn spawn_writer_into(
     Ok(thread)
 }
 
+/// How long after the writer starts a "tables not yet keyed" refusal stays
+/// quiet: the ensure task's own quiet window (`ENSURE_ATTEMPTS` tries,
+/// `retry_interval` apart). 2026-11-18: the first flush at the first minute
+/// change after every boot or deploy (08:31:00 IST, 8 times 14 to 18 Nov) was
+/// refused because QuestDB was still starting, and logged a STORAGE-GAP-03
+/// ERROR that recovered 30 s later. The rows are retained and the overflow
+/// policy runs exactly as before; only the log waits. A send failure, or tables
+/// still not keyed after the window, logs as before.
+fn boot_quiet_window(retry_interval: std::time::Duration) -> std::time::Duration {
+    retry_interval.saturating_mul(ENSURE_ATTEMPTS)
+}
+
+/// True when a failed flush is only the boot-time "not yet keyed" refusal
+/// inside the quiet window. Pure, so the rule is unit-tested.
+fn quiet_boot_refusal(
+    flush_failed: bool,
+    keyed: bool,
+    since_start: std::time::Duration,
+    quiet_window: std::time::Duration,
+) -> bool {
+    flush_failed && !keyed && since_start < quiet_window
+}
+
 fn run_writer(
     rx: crossbeam_channel::Receiver<ProofMessage>,
     mut writer: HotPathLatencyMinuteWriter,
     retry_interval: std::time::Duration,
 ) -> HotPathLatencyMinuteWriter {
+    let started = std::time::Instant::now();
+    let quiet_window = boot_quiet_window(retry_interval);
     let mut episode = FlushEpisode::default();
     let mut append_episode = FlushEpisode::default();
     loop {
@@ -1056,6 +1088,14 @@ fn run_writer(
         }
         // Also retries when readiness changes after the last producer item.
         let result = writer.flush();
+        if quiet_boot_refusal(
+            result.is_err(),
+            writer.is_keyed(),
+            started.elapsed(),
+            quiet_window,
+        ) {
+            continue;
+        }
         match (episode.step(result.is_ok()), &result) {
             (Some(true), Err(err)) => error!(
                 code = ErrorCode::StorageGap03AuditWriteFailed.code_str(),
@@ -1810,6 +1850,48 @@ mod tests {
         let ist = wall_ist_nanos_now();
         let diff = ist - utc - IST_UTC_OFFSET_NANOS;
         assert!(diff.abs() < 5_000_000_000, "within 5 s: {diff}");
+    }
+
+    /// 2026-11-18: the boot-time "not yet keyed" refusal is quiet only while
+    /// the tables are unkeyed AND inside the ensure task's own quiet window;
+    /// a keyed send failure, or a refusal past the window, still logs.
+    #[test]
+    fn test_quiet_boot_refusal_only_while_unkeyed_inside_the_window() {
+        use std::time::Duration;
+        let window = boot_quiet_window(ENSURE_RETRY_INTERVAL);
+        assert_eq!(window, Duration::from_secs(300), "10 tries x 30 s");
+        let early = Duration::from_secs(30);
+        let late = Duration::from_secs(301);
+        // Boot refusal inside the window: quiet.
+        assert!(quiet_boot_refusal(true, false, early, window));
+        // Same refusal past the window: logs.
+        assert!(!quiet_boot_refusal(true, false, late, window));
+        assert!(!quiet_boot_refusal(true, false, window, window));
+        // Keyed tables and a failed send: a real failure, logs at once.
+        assert!(!quiet_boot_refusal(true, true, early, window));
+        // A success is never "quiet": it must reach the recovery log.
+        assert!(!quiet_boot_refusal(false, false, early, window));
+        assert!(!quiet_boot_refusal(false, true, early, window));
+    }
+
+    #[test]
+    fn test_boot_quiet_window_saturates_and_scales_with_the_retry_interval() {
+        use std::time::Duration;
+        assert_eq!(
+            boot_quiet_window(Duration::from_millis(5)),
+            Duration::from_millis(50)
+        );
+        assert_eq!(boot_quiet_window(Duration::MAX), Duration::MAX);
+    }
+
+    #[test]
+    fn test_is_keyed_reads_the_readiness_gate() {
+        let w = HotPathLatencyMinuteWriter::for_test();
+        assert!(!w.is_keyed(), "a fresh writer starts closed");
+        w.readiness.keyed.store(true, Ordering::Release);
+        assert!(w.is_keyed());
+        w.readiness.keyed.store(false, Ordering::Release);
+        assert!(!w.is_keyed());
     }
 }
 
