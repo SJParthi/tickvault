@@ -17,7 +17,6 @@ sha2 = { workspace = true }
 toml = { workspace = true }
 notify = { workspace = true }
 chrono = { workspace = true }
-chrono-tz = { workspace = true }
 uuid = { workspace = true }
 governor = { workspace = true }
 reqwest = { workspace = true }
@@ -83,4 +82,4 @@ harness = false
 # key was removed from quality/benchmark-budgets.toml in the same PR.
 
 [package.metadata.cargo-machete]
-ignored = ["anyhow", "aws-lc-rs", "chrono", "chrono-tz", "tickvault-common", "governor", "jaeckel", "loom", "metrics", "secrecy", "serde", "thiserror", "tokio", "tokio-tungstenite", "tracing", "uuid"]
+ignored = ["anyhow", "aws-lc-rs", "chrono", "tickvault-common", "governor", "jaeckel", "loom", "metrics", "secrecy", "serde", "thiserror", "tokio", "tokio-tungstenite", "tracing", "uuid"]

@@ -134,7 +134,7 @@ name = "backup_dedup"
 harness = false
 
 [package.metadata.cargo-machete]
-ignored = ["chrono-tz", "clap", "signal-hook"]
+ignored = ["clap", "signal-hook"]
 
 # Explicit name so the documented invocation works. Cargo derives a bin name
 # from the FILE name, giving `tv_guarantees`, while this binary's own docs --

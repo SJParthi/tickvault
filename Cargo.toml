@@ -112,7 +112,6 @@ figment = { version = "=0.10.19", features = ["toml", "env"] }
 
 # ---- Section 10: Date & Time ----
 chrono = { version = "=0.4.45", features = ["serde"] }
-chrono-tz = "=0.10.4"
 
 # ---- Section 11: Serialization & Errors ----
 serde = { version = "=1.0.229", features = ["derive"] }

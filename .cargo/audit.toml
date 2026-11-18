@@ -42,7 +42,9 @@
 # 2026-11-17: RUSTSEC-2026-0543 (chrono) and RUSTSEC-2026-0555 (chrono-tz)
 # mark both UNMAINTAINED (no vulnerability, no fixed version). Owner card
 # 2026-11-17 "Allow now, replace later"; mirrored in deny.toml with reasons.
-ignore = ["RUSTSEC-2026-0543", "RUSTSEC-2026-0555"]
+# 2026-11-18: chrono-tz removed from the tree, so RUSTSEC-2026-0555 is no
+# longer ignored.
+ignore = ["RUSTSEC-2026-0543"]
 
 [output]
 quiet = false
