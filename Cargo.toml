@@ -87,7 +87,7 @@ tracing-appender = "=0.2.5"
 # jsonwebtoken removed 2026-06-10 (operator-approved dead-pin cleanup): zero
 # consumers anywhere in the repo — the Dhan JWT is handled as an opaque
 # Secret<String>, never decoded locally.
-arc-swap = "=1.9.4"
+arc-swap = "=1.9.5"
 totp-rs = { version = "=6.0.0", features = ["otpauth"] }
 
 # ---- Section 6: Trading Domain — OMS & Risk ----
@@ -107,7 +107,7 @@ tower = { version = "=0.5.3", features = ["full"] }
 tower-http = { version = "=0.7.1", features = ["cors", "trace", "compression-gzip", "fs"] }
 
 # ---- Section 9: Configuration ----
-toml = "=1.2.0"
+toml = "=1.2.1"
 figment = { version = "=0.10.19", features = ["toml", "env"] }
 
 # ---- Section 10: Date & Time ----
@@ -144,7 +144,7 @@ sha2 = "=0.11.1"
 # the spill/rescue free-space probe. Same version, no new package; the edge
 # from tickvault-storage is new and is flagged for the owner in that change.
 libc = "=0.2.191"
-notify = "=8.2.1"
+notify = "=8.2.2"
 # signal-hook-tokio removed in S11 — dead dep with zero references across
 # crates/ and fuzz/. signal-hook itself is kept because crates/app/Cargo.toml
 # declares it with { workspace = true } (via machete ignore list) for a
@@ -253,7 +253,7 @@ form_urlencoded = "=1.2.2"
 # ---- Section 16: CLI ----
 
 # ---- Section 17: Unique IDs ----
-uuid = { version = "=1.29.1", features = ["v4", "serde"] }
+uuid = { version = "=1.29.2", features = ["v4", "serde"] }
 
 # ---- Section 18: Telegram Alerts ----
 
