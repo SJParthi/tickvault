@@ -95,7 +95,7 @@ use anyhow::{Context, Result};
 use questdb::ingress::Sender;
 
 use crate::tick_ilp::{IlpLine, TickIlpEncoder, TickIlpError, TickIlpSender, TickRowBuffer};
-use crate::tick_stage::{MAX_PRODUCER_ROWS, STAGED_ROW_BYTES, StagedBatch, StagedRow};
+use crate::tick_stage::{ExtraRow, MAX_PRODUCER_ROWS, STAGED_SLOT_BYTES, StagedBatch, StagedRow};
 use tracing::{error, info, warn};
 
 use tickvault_common::config::QuestDbConfig;
@@ -109,6 +109,11 @@ use tickvault_common::tick_types::ParsedTick;
 
 use crate::feed_aux_persistence::{AuxPacketKind, AuxPacketRow, FEED_AUX_ROWS_COUNTER};
 use crate::ilp_table_gate::GatedTable;
+
+/// The raw tick the drain stages (speed fix 6, 2026-11-17); a child module so
+/// it shares this module's private refusal and conversion helpers.
+#[path = "tick_stage_raw.rs"]
+pub(crate) mod raw;
 
 // ---------------------------------------------------------------------------
 // Table + key contract
@@ -630,68 +635,14 @@ impl TickRow {
     /// # Errors
     /// [`TickRowError::SecurityIdNotRepresentable`] when the id has bit 63 set.
     pub fn from_parsed_tick(tick: &ParsedTick, capture_seq: i64) -> Result<Self, TickRowError> {
-        let security_id = i64::try_from(tick.security_id).map_err(|_| {
-            metrics::counter!("tv_tick_rows_refused_total", "reason" => "security_id_width")
-                .increment(1);
-            error!(
-                code = ErrorCode::StorageGapTickDedupSegment.code_str(),
-                raw_security_id = tick.security_id,
-                segment = segment_code_to_str(tick.exchange_segment_code),
-                "tick row refused — security_id does not fit the LONG column; \
-                 narrowing it would alias two instruments onto one DEDUP key \
-                 (silent cross-instrument corruption). Row NOT written."
-            );
-            TickRowError::SecurityIdNotRepresentable {
-                raw: tick.security_id,
-            }
-        })?;
-
-        // Fail-closed on a non-finite LTP BEFORE it can reach an ILP line.
-        // NaN compares unequal to everything, so a `!= 0.0` gate does NOT
-        // stop it, and `f32_to_f64_clean` passes non-finite through
-        // unchanged — see `TickRowError::PriceNotFinite` for the full chain
-        // this closes (rejected batch -> spilled buffer -> permanently-wedged
-        // replay round).
-        //
-        // ONLY the LTP is mandatory (2026-10-01 reality check). This loop
-        // used to refuse the whole row for a non-finite day open, high, low
-        // or close as well, so one bad day-OHLC field threw away a tick whose
-        // LTP was good: the row was missing from `ticks`, an `error!` fired
-        // for every such tick on the drain, every replay refused it again,
-        // and the candle fold (which reads the LTP) still counted it, so
-        // `ticks` and `candles_*` disagreed. The day OHLC are auxiliary
-        // columns exactly like the average price, so they now take the same
-        // path: a non-finite value becomes NULL and is counted on
-        // `tv_tick_optional_price_dropped_total` (`opt_price` below).
-        //
-        // `0.0` stays legal everywhere: it is the documented "not carried"
-        // sentinel for a Ticker (16-byte) packet and becomes NULL below.
-        // Zero-alloc: one register compare on the happy path.
-        for (field, value) in [("ltp", tick.last_traded_price)] {
-            if !value.is_finite() {
-                metrics::counter!("tv_tick_rows_refused_total", "reason" => "price_not_finite")
-                    .increment(1);
-                error!(
-                    code = ErrorCode::StorageGapTickDedupSegment.code_str(),
-                    security_id = tick.security_id,
-                    segment = segment_code_to_str(tick.exchange_segment_code),
-                    field,
-                    value = %value,
-                    "tick row refused — price field is non-finite (NaN/Inf); \
-                     emitting it would make QuestDB reject the whole batch, \
-                     spill the rescued buffer, and wedge the replay tier \
-                     behind a file it can never accept. Row NOT written."
-                );
-                return Err(TickRowError::PriceNotFinite { field });
-            }
-        }
+        let security_id = checked_tick_identity(tick)?;
 
         // A Ticker (16-byte) packet carries only LTP + LTT; Quote/Full add the
         // rest. Zero means "not carried" for those, so it becomes NULL. A
         // non-finite value is NULL too (the `is_finite` arm below), so the
         // `!= 0.0` gate means exactly what it reads as.
         // 2026-08-25 — `is_finite()` added, and it is NOT redundant with the
-        // loop above.
+        // LTP check (now in `checked_tick_identity`).
         //
         // That loop then covered five fields; `average_traded_price` was a
         // SIXTH caller of this closure and was never in it. Since 2026-10-01
@@ -757,6 +708,87 @@ impl TickRow {
             payload_hash: None,
         })
     }
+}
+
+/// The two refusals every tick row passes first, shared by
+/// [`TickRow::from_parsed_tick`] and the drain's raw staging (speed fix 6,
+/// 2026-11-17), so both count exactly the same refusals: the id must fit the
+/// `LONG` column and the LTP must be finite. Returns the narrowed id. O(1).
+///
+/// `#[inline]` with the two refusal bodies in `#[cold]` helpers (review,
+/// 2026-11-17): the happy path is one `try_from` and one `is_finite` in the
+/// caller, as it was inside the old `from_parsed_tick`, with no call and no
+/// `Result` returned through memory.
+#[inline]
+fn checked_tick_identity(tick: &ParsedTick) -> Result<i64, TickRowError> {
+    let Ok(security_id) = i64::try_from(tick.security_id) else {
+        return Err(refuse_security_id_width(tick));
+    };
+
+    // Fail-closed on a non-finite LTP BEFORE it can reach an ILP line.
+    // NaN compares unequal to everything, so a `!= 0.0` gate does NOT
+    // stop it, and `f32_to_f64_clean` passes non-finite through
+    // unchanged — see `TickRowError::PriceNotFinite` for the full chain
+    // this closes (rejected batch -> spilled buffer -> permanently-wedged
+    // replay round).
+    //
+    // ONLY the LTP is mandatory (2026-10-01 reality check). This check
+    // used to refuse the whole row for a non-finite day open, high, low
+    // or close as well, so one bad day-OHLC field threw away a tick whose
+    // LTP was good: the row was missing from `ticks`, an `error!` fired
+    // for every such tick on the drain, every replay refused it again,
+    // and the candle fold (which reads the LTP) still counted it, so
+    // `ticks` and `candles_*` disagreed. The day OHLC are auxiliary
+    // columns exactly like the average price, so they now take the same
+    // path: a non-finite value becomes NULL and is counted on
+    // `tv_tick_optional_price_dropped_total` (`opt_price` below).
+    //
+    // `0.0` stays legal everywhere: it is the documented "not carried"
+    // sentinel for a Ticker (16-byte) packet and becomes NULL below.
+    // Zero-alloc: one register compare on the happy path.
+    if !tick.last_traded_price.is_finite() {
+        return Err(refuse_price_not_finite(tick, "ltp", tick.last_traded_price));
+    }
+    Ok(security_id)
+}
+
+/// The id-width refusal of [`checked_tick_identity`]: counted and logged.
+/// Cold. O(1).
+#[cold]
+#[inline(never)]
+fn refuse_security_id_width(tick: &ParsedTick) -> TickRowError {
+    metrics::counter!("tv_tick_rows_refused_total", "reason" => "security_id_width").increment(1);
+    error!(
+        code = ErrorCode::StorageGapTickDedupSegment.code_str(),
+        raw_security_id = tick.security_id,
+        segment = segment_code_to_str(tick.exchange_segment_code),
+        "tick row refused — security_id does not fit the LONG column; \
+         narrowing it would alias two instruments onto one DEDUP key \
+         (silent cross-instrument corruption). Row NOT written."
+    );
+    TickRowError::SecurityIdNotRepresentable {
+        raw: tick.security_id,
+    }
+}
+
+/// The non-finite price refusal of [`checked_tick_identity`]: counted and
+/// logged. Cold. O(1).
+#[cold]
+#[inline(never)]
+fn refuse_price_not_finite(tick: &ParsedTick, field: &'static str, value: f32) -> TickRowError {
+    metrics::counter!("tv_tick_rows_refused_total", "reason" => "price_not_finite").increment(1);
+    error!(
+        code = ErrorCode::StorageGapTickDedupSegment.code_str(),
+        security_id = tick.security_id,
+        segment = segment_code_to_str(tick.exchange_segment_code),
+        field,
+        value = %value,
+        "tick row refused — price field is non-finite (NaN/Inf); \
+         emitting it would make QuestDB reject the whole batch, \
+         spill the rescued buffer, and wedge the replay tier \
+         behind a file it can never accept. Row NOT written."
+    );
+    TickRowError::PriceNotFinite { field }
 }
 
 // ---------------------------------------------------------------------------
@@ -3095,7 +3127,10 @@ impl TickWriter {
         capture_seq: i64,
         to_quotes: bool,
     ) -> Result<()> {
-        let outcome = match TickRow::from_parsed_tick(tick, capture_seq) {
+        // Speed fix 6 (2026-11-17): the drain stages the RAW tick; the six
+        // price conversions run on the thread that writes the text. Every
+        // refusal and counter below is the one the converted row had.
+        let outcome = match raw::RawTick::from_parsed_tick(tick, capture_seq) {
             Ok(row) => {
                 // THE SESSION-WINDOW GATE (operator requirement, 2026-09-05).
                 //
@@ -3148,7 +3183,7 @@ impl TickWriter {
                     use tickvault_trading::candles::multi_tf_aggregator::{
                         MAX_PLAUSIBLE_EXCHANGE_TS_SECS, MIN_PLAUSIBLE_EXCHANGE_TS_SECS,
                     };
-                    let secs = row.ts_ist_nanos.div_euclid(1_000_000_000);
+                    let secs = row.ts_ist_nanos().div_euclid(1_000_000_000);
                     let in_band = u32::try_from(secs).is_ok_and(|s| {
                         (MIN_PLAUSIBLE_EXCHANGE_TS_SECS..=MAX_PLAUSIBLE_EXCHANGE_TS_SECS)
                             // O(1) EXEMPT: RangeInclusive::contains on a const range is two integer compares, not a scan
@@ -3163,8 +3198,8 @@ impl TickWriter {
                     }
                 }
                 let verdict = tickvault_common::session_window::verdict(
-                    row.ts_ist_nanos,
-                    row.received_at_ist_nanos,
+                    row.ts_ist_nanos(),
+                    row.received_at_ist_nanos(),
                 );
                 // COUNT first, REFUSE second, and they are not the same set.
                 // A late RECEIPT is noteworthy but never a refusal -- see
@@ -3183,8 +3218,8 @@ impl TickWriter {
                 // M5 (2026-10-27): a packet routed to quotes with a receipt goes to
                 // `tick_quotes`, stamped at arrival (`received_at`, the same
                 // value as that column); every other row goes to `ticks`.
-                if let (true, Some(arrival)) = (to_quotes, row.received_at_ist_nanos) {
-                    let appended = self.append_quote_row(&row, arrival, tick.exchange_timestamp);
+                if let (true, Some(arrival)) = (to_quotes, row.received_at_ist_nanos()) {
+                    let appended = self.append_raw_quote_row(&row);
                     if appended.is_ok() {
                         self.quote_rows_appended = self.quote_rows_appended.saturating_add(1);
                         crate::tick_quotes_persistence::note_row();
@@ -3196,15 +3231,15 @@ impl TickWriter {
                     }
                     appended
                 } else {
-                    let appended = self.append_row(&row);
+                    let appended = self.append_raw_row(&row);
                     // K4 (2026-10-26): the daily conservation check's process
                     // side. One relaxed add per accepted Dhan row, O(1), no alloc.
                     if appended.is_ok() && self.feed == Feed::Dhan {
                         crate::tick_conservation_ledger::ledger()
-                            .note_row_appended(row.ts_ist_nanos);
+                            .note_row_appended(row.ts_ist_nanos());
                         // M1 (2026-10-26): append, late in its hour, or older
                         // partition. One `fetch_max`, one counter add, O(1).
-                        let _placement = crate::tick_ts_placement::note_row(row.ts_ist_nanos);
+                        let _placement = crate::tick_ts_placement::note_row(row.ts_ist_nanos());
                     }
                     appended
                 }
@@ -3264,6 +3299,10 @@ impl TickWriter {
 
     /// Appends one prepared [`TickRow`] to the ILP buffer (no flush).
     ///
+    /// ⚠ CHANGED 2026-11-17 (speed fix 6): test-only. The drain stages the
+    /// raw tick (`append_raw_row`), so nothing in production calls this; the
+    /// tests that drive hostile rows through the writer still do.
+    ///
     /// **`pub(crate)`, and that visibility is the point.** This is the raw
     /// append: it does NOT consult the session window. The gate lives one
     /// level up in [`TickWriter::append_tick_with_seq`], so a caller reaching
@@ -3294,6 +3333,7 @@ impl TickWriter {
     /// # Errors
     /// Propagates ILP buffer errors (table/column append failure). The buffer
     /// then holds exactly what it held before the call.
+    #[cfg(test)]
     pub(crate) fn append_row(&mut self, row: &TickRow) -> Result<()> {
         // Tripwire (2026-09-26 audit fix PR2), the tick twin of the candle
         // writer's. QuestDB stores a non-finite ILP float as NULL with no
@@ -3306,48 +3346,51 @@ impl TickWriter {
         // PF-4 (2026-11-06): staged, not written. The text is written by the
         // thread that sends or spills the batch, with the name table pinned
         // here. Staging cannot fail; a row the encoder later refuses is
-        // counted there (owner decision 2026-11-06).
-        self.stage_row(|pin| StagedRow::Tick { row: *row, pin });
-        self.pending = self.pending.saturating_add(1);
-        self.last_capture_seq = self.last_capture_seq.max(row.capture_seq);
-        self.note_pending_seq(row.capture_seq);
+        // counted there (owner decision 2026-11-06). Speed fix 6: a prepared
+        // row is a side row; drain ticks go through `append_raw_row`.
+        self.stage_extra(ExtraRow::Tick(*row));
+        self.note_tick_row_staged(row.capture_seq);
         Ok(())
     }
 
-    /// Appends one `tick_quotes` row (plan item M5): the `ticks` columns with
-    /// the designated `ts` replaced by `arrival_ist_nanos`, plus the vendor's
-    /// last trade time `ltt_ist_secs` (IST epoch seconds, written unchanged;
-    /// the never-traded `0` is omitted, so the cell is NULL). Same buffer,
-    /// same pending range as a `ticks` row. O(1), no allocation.
+    /// Stages one drain-accepted `ticks` row RAW (speed fix 6, 2026-11-17):
+    /// the 88-byte raw tick; the prices are converted on the thread that
+    /// writes the text. The non-finite tripwire is a `debug_assert!` only:
+    /// it cannot move on a drain tick (see `tick_stage_raw`'s module docs).
+    /// O(1), no allocation.
     ///
     /// # Errors
-    /// ILP buffer errors; the buffer is then exactly as before the call.
-    fn append_quote_row(
-        &mut self,
-        row: &TickRow,
-        arrival_ist_nanos: i64,
-        ltt_ist_secs: u32,
-    ) -> Result<()> {
-        let nonfinite = count_nonfinite_tick_floats(row);
-        if nonfinite > 0 {
-            metrics::counter!(TICK_NONFINITE_COLUMNS_COUNTER).increment(nonfinite);
-        }
-        let quote = TickRow {
-            ts_ist_nanos: arrival_ist_nanos,
-            ..*row
-        };
-        // Dhan's LTT is already IST epoch seconds: no offset is added.
-        let exchange_ts = (ltt_ist_secs != 0).then(|| i64::from(ltt_ist_secs) * 1_000_000_000);
-        // PF-4: staged for `tick_quotes`, written later (see `append_row`).
-        self.stage_row(|pin| StagedRow::Quote {
-            row: quote,
-            exchange_ts,
-            pin,
-        });
-        self.pending = self.pending.saturating_add(1);
-        self.last_capture_seq = self.last_capture_seq.max(row.capture_seq);
-        self.note_pending_seq(row.capture_seq);
+    /// None: staging cannot fail (see [`Self::append_row`]).
+    fn append_raw_row(&mut self, row: &raw::RawTick) -> Result<()> {
+        debug_assert_eq!(row.nonfinite_floats(), 0, "a drain tick is finite");
+        let raw = *row;
+        self.stage_row(|pin| StagedRow::Tick { raw, pin });
+        self.note_tick_row_staged(row.capture_seq());
         Ok(())
+    }
+
+    /// Stages one `tick_quotes` row RAW (plan item M5; raw since speed fix 6):
+    /// written with the arrival time as its designated `ts` and the vendor's
+    /// last trade time in `exchange_timestamp` ([`raw::RawTick::to_quote_row`]).
+    /// Called only for a tick with a receipt time. Same buffer, same pending
+    /// range as a `ticks` row. O(1), no allocation.
+    ///
+    /// # Errors
+    /// None: staging cannot fail.
+    fn append_raw_quote_row(&mut self, row: &raw::RawTick) -> Result<()> {
+        debug_assert_eq!(row.nonfinite_floats(), 0, "a drain tick is finite");
+        let raw = *row;
+        self.stage_row(|pin| StagedRow::Quote { raw, pin });
+        self.note_tick_row_staged(row.capture_seq());
+        Ok(())
+    }
+
+    /// The bookkeeping every staged `ticks` or `tick_quotes` row does: one
+    /// more pending row, and the capture sequence ranges. O(1).
+    fn note_tick_row_staged(&mut self, capture_seq: i64) {
+        self.pending = self.pending.saturating_add(1);
+        self.last_capture_seq = self.last_capture_seq.max(capture_seq);
+        self.note_pending_seq(capture_seq);
     }
 
     /// Appends one `feed_aux_packets` row to this writer's ILP buffer (plan
@@ -3369,7 +3412,7 @@ impl TickWriter {
     /// `Result` is kept so callers keep their handling.
     pub fn append_aux(&mut self, row: &AuxPacketRow) -> Result<()> {
         // PF-4: staged, written later (see `append_row`).
-        self.stage_row(|pin| StagedRow::Aux { row: *row, pin });
+        self.stage_extra(ExtraRow::Aux(*row));
         self.pending = self.pending.saturating_add(1);
         self.aux_rows_appended = self.aux_rows_appended.saturating_add(1);
         if let Some(c) = self.aux_counters.get(row.kind.index()) {
@@ -3391,8 +3434,28 @@ impl TickWriter {
     /// `StagedBatch::current_pin_at_generation`); the pin is the index the
     /// load would have produced, so every row and every byte is unchanged.
     fn stage_row(&mut self, make: impl FnOnce(u8) -> StagedRow) {
+        let pin = self.stage_pin();
+        if self.staged.push(make(pin)) {
+            self.flush_counters.stage_grow.increment(1);
+        }
+    }
+
+    /// [`Self::stage_row`] for a side row (speed fix 6: aux rows and prepared
+    /// rows, kept whole beside the 96-byte staged rows). Same pin, same grow
+    /// count. O(1), no allocation inside the pre-size.
+    fn stage_extra(&mut self, extra: ExtraRow) {
+        let pin = self.stage_pin();
+        if self.staged.push_extra(extra, pin) {
+            self.flush_counters.stage_grow.increment(1);
+        }
+    }
+
+    /// The pin index for the name table in force now (see [`Self::stage_row`]);
+    /// may hand the batch off first on a ninth table ([`Self::pin_after_cut`]).
+    #[inline]
+    fn stage_pin(&mut self) -> u8 {
         let generation = crate::candle_contract_labels::candle_contract_labels_generation();
-        let pin = match self.staged.current_pin_at_generation(generation) {
+        match self.staged.current_pin_at_generation(generation) {
             Some(pin) => pin,
             None => {
                 // Read the generation BEFORE the load: a publish bumps to odd,
@@ -3404,9 +3467,6 @@ impl TickWriter {
                     Err(labels) => self.pin_after_cut(labels),
                 }
             }
-        };
-        if self.staged.push(make(pin)) {
-            self.flush_counters.stage_grow.increment(1);
         }
     }
 
@@ -3835,7 +3895,7 @@ impl TickWriter {
     fn publish_parked_bytes(&self) {
         self.flush_counters
             .rescue_parked_bytes
-            .set(self.parked_rescue_slots.saturating_mul(STAGED_ROW_BYTES) as f64);
+            .set(self.parked_rescue_slots.saturating_mul(STAGED_SLOT_BYTES) as f64);
     }
 
     /// Parks one refused rescue batch in RAM (H4). O(1), no allocation (the
@@ -4465,8 +4525,16 @@ pub const PARKED_RESCUE_MAX_ROWS: usize = 4 * MAX_PRODUCER_ROWS;
 /// RAM the park may hold, in bytes: [`PARKED_RESCUE_MAX_ROWS`] staged row
 /// slots (PF-4: this was the 128 MiB of ILP text; the rows are now staged, so
 /// the bound is their RAM). 131,072 × 288 B = 36 MiB per sink, the real worst
-/// case since the park counts capacity (review round 1, 2026-11-06).
-pub const PARKED_RESCUE_MAX_BYTES: usize = PARKED_RESCUE_MAX_ROWS * STAGED_ROW_BYTES;
+/// case since the park counts capacity (review round 1, 2026-11-06). ⚠ CHANGED
+/// 2026-11-17 (speed fix 6): a slot is a 96-byte staged row plus a 280-byte
+/// side row ([`STAGED_SLOT_BYTES`], both pre-touched), so the bound is
+/// 131,072 × 376 B = 47 MiB per sink, 11 MiB more than before. ⚠ CORRECTED
+/// 2026-11-17 (fix 6 review): a run of aux rows is one staged row, so an
+/// all-aux batch grows only its side rows; [`StagedBatch::capacity`] now
+/// reports the larger of the two stores, so such a batch is counted at its
+/// side rows' size and 47 MiB stays an upper bound (before the correction
+/// it read the rows alone and could hold about 84 MiB under it).
+pub const PARKED_RESCUE_MAX_BYTES: usize = PARKED_RESCUE_MAX_ROWS * STAGED_SLOT_BYTES;
 
 const _: () = assert!(
     PARKED_RESCUE_MAX_ROWS * crate::tick_stage::MAX_ILP_LINE_BYTES <= 4 * MAX_PRODUCER_BUFFER_BYTES,
@@ -4479,8 +4547,9 @@ pub const TICK_RESCUE_PARKED_COUNTER: &str = "tv_tick_rescue_parked_total";
 
 /// RAM the parked rescue batches hold right now, in bytes (H4). ⚠ CHANGED
 /// 2026-11-06 (PF-4): the parked rows are staged, not text, so this is their
-/// RAM (row slots, i.e. each batch's capacity, × [`STAGED_ROW_BYTES`]; review
-/// round 1 corrected rows to capacity); before, it was their ILP text bytes.
+/// RAM (row slots, i.e. each batch's capacity, × [`STAGED_SLOT_BYTES`] since
+/// speed fix 6, 2026-11-17, was × the staged row size; review round 1
+/// corrected rows to capacity); before, it was their ILP text bytes.
 /// Same name; no alarm or filter reads it.
 pub const TICK_RESCUE_PARKED_BYTES_GAUGE: &str = "tv_tick_rescue_parked_bytes";
 
@@ -6445,7 +6514,7 @@ mod tests {
             .find("count_nonfinite_tick_floats(row)")
             .expect("append_row must count non-finite floats");
         let first_write = body
-            .find("self.stage_row(|pin| StagedRow::Tick")
+            .find("self.stage_extra(ExtraRow::Tick")
             .expect("append_row stages the row");
         assert!(
             tripwire < first_write,
@@ -8311,7 +8380,7 @@ mod tests {
         );
         assert_eq!(
             PARKED_RESCUE_MAX_BYTES,
-            PARKED_RESCUE_MAX_ROWS * STAGED_ROW_BYTES
+            PARKED_RESCUE_MAX_ROWS * crate::tick_stage::STAGED_SLOT_BYTES
         );
         assert!(PARKED_RESCUE_MAX_BYTES <= 128 * 1024 * 1024);
     }

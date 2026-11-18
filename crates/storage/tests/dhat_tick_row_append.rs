@@ -180,4 +180,49 @@ fn dhat_tick_row_append_is_zero_allocation() {
         );
         assert!(writer.pending() >= before + ROWS_PER_ATTEMPT);
     }
+
+    // Speed fix 6 (2026-11-17): an aux burst. Ticks stamped 16:30 IST are
+    // refused by the window and staged as `feed_aux_packets` SIDE rows (the
+    // whole post-close shape), which a pre-sized batch reserves too: no
+    // allocation either. Every attempt stages into a FRESH writer (swapped in
+    // outside the window), so a side row store that grows on first use
+    // allocates on every attempt and cannot hide behind the phantom retry.
+    let late: Vec<ParsedTick> = (0..ROWS_PER_ATTEMPT)
+        .map(|i| {
+            let mut t = tick(i);
+            t.exchange_timestamp += 23_400;
+            t.received_at_nanos += 23_400 * 1_000_000_000;
+            t
+        })
+        .collect();
+    for encoder in [TickIlpEncoder::Library, TickIlpEncoder::Own] {
+        let mut fresh: Vec<TickWriter> = (0..3).map(|_| warmed_writer(encoder, &ticks)).collect();
+        let writer = std::cell::RefCell::new(fresh.pop().expect("a fresh writer"));
+        let mut seq = 200_000_i64;
+        let (bytes, blocks) = dhat_support::measure_with_phantom_retry(
+            BUDGET_BYTES,
+            BUDGET_BLOCKS,
+            || {
+                if let Some(next) = fresh.pop() {
+                    drop(writer.replace(next));
+                }
+            },
+            || {
+                let mut w = writer.borrow_mut();
+                for t in &late {
+                    seq += 1;
+                    std::hint::black_box(w.append_tick_with_seq(t, seq).is_ok());
+                }
+            },
+        );
+        assert!(
+            bytes == BUDGET_BYTES && blocks == BUDGET_BLOCKS,
+            "{encoder:?}: staging {ROWS_PER_ATTEMPT} aux side rows allocated {bytes} bytes / \
+             {blocks} blocks; the side rows are reserved with the batch."
+        );
+        assert!(
+            writer.borrow().aux_rows_appended() >= ROWS_PER_ATTEMPT as u64,
+            "{encoder:?}: the late ticks were not staged as aux rows"
+        );
+    }
 }

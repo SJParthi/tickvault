@@ -9,8 +9,8 @@
 //! each spent batch back (`TickRescueSink::recycle`, cleared on that thread).
 //!
 //! Two measured cases, each over several hand-offs:
-//! - spare lane EMPTY: the hand-off allocates exactly one block (the fresh
-//!   batch's reserve), and that block is the pre-size. Bounded and visible,
+//! - spare lane EMPTY: the hand-off allocates exactly two blocks (the fresh
+//!   batch's rows and side rows, speed fix 6), together the pre-size. Bounded and visible,
 //!   never more; this is the cost the recycle removes.
 //! - spare lane holding a recycled batch: the hand-off allocates nothing.
 //!
@@ -24,7 +24,9 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
 use tickvault_common::feed::Feed;
 use tickvault_common::tick_types::ParsedTick;
 use tickvault_storage::tick_persistence::{RescueBatch, TickRescueSink, TickWriter};
-use tickvault_storage::tick_stage::{STAGED_ROW_BYTES, TICK_STAGED_ROWS_PRESIZE};
+use tickvault_storage::tick_stage::{
+    STAGED_EXTRA_ROW_BYTES, STAGED_ROW_BYTES, TICK_STAGED_ROWS_PRESIZE,
+};
 
 /// Hand-offs measured per case.
 const HAND_OFFS: usize = 5;
@@ -94,7 +96,10 @@ fn hand_off(
 #[test]
 fn dhat_rescue_hand_off_reuses_a_recycled_batch() {
     let _profiler = dhat::Profiler::builder().testing().build();
-    let presize_bytes = (TICK_STAGED_ROWS_PRESIZE * STAGED_ROW_BYTES) as u64;
+    // Speed fix 6 (2026-11-17): a pre-sized batch is two blocks, its staged
+    // rows and its side rows (aux and prepared rows), both reserved at once.
+    let presize_bytes =
+        (TICK_STAGED_ROWS_PRESIZE * (STAGED_ROW_BYTES + STAGED_EXTRA_ROW_BYTES)) as u64;
     let mut i = 0_usize;
 
     // Case 1: nothing comes back (the spent batch is dropped), so the lane
@@ -102,12 +107,12 @@ fn dhat_rescue_hand_off_reuses_a_recycled_batch() {
     let mut empty = TickWriter::for_test(Feed::Dhan);
     let (_sink, rx) = empty.split_rescue_offload();
     for _ in 0..HAND_OFFS {
-        let got = hand_off(&mut empty, &rx, None, &mut i, (presize_bytes, 1));
+        let got = hand_off(&mut empty, &rx, None, &mut i, (presize_bytes, 2));
         assert_eq!(
             got,
-            (presize_bytes, 1),
-            "a hand-off with an empty spare lane must reserve exactly one pre-sized batch \
-             (bytes, blocks)"
+            (presize_bytes, 2),
+            "a hand-off with an empty spare lane must reserve exactly one pre-sized batch, \
+             its rows and its side rows (bytes, blocks)"
         );
     }
 
