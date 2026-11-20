@@ -5581,3 +5581,19 @@ removed the 90%+ page PR DP review M1 added, not only the false one, so the
 **REJECT (§2.23):** counting a pass that freed a partition toward the stall
 below 90% used; not counting it at 90% or more; paging a stall below high water; removing the page for a pass that freed
 nothing; changing the page text under §2.23.
+
+### §2.24 — 2026-11-20: Dhan feed-time page (prices outside the session, or no candles for 10 minutes), and one notice a day when the time correction switches on
+
+Owner cards (2026-11-20), verbatim: **"Yes, page me (Recommended)"** — "One Telegram page per day per cause during 9:15 AM–3:30 PM. Today it would have fired at about 9:25 AM." **"After correction (Recommended)"** — "Pages only if prices are still wrong after our fix, i.e. a real problem remains. A corrected day does not page." **"Yes, one a day (Recommended)"** — "You know the same morning that Dhan changed format and that it was handled. At most one message a day."
+
+Why: on 20 Nov 2026 Dhan sent trade times as UTC (see `websocket-connection-scope-lock.md`, 2026-11-20). No candle was sealed from 08:32 to 14:52 and nothing paged until the 15:50 cross-check.
+
+| Cause | Fires when | At most |
+|---|---|---|
+| A: prices outside the session | During 09:15–15:30 IST (or the published Muhurat window), in two 30 s scans in a row, at least 20 live index ticks and at least half of them carry a trade time (after the correction) outside 09:00–15:40 or more than 5 minutes from receipt | once per IST day |
+| B: no candles | 20 scans in a row (10 minutes) in the same window with main-feed frames arriving in each and no candle sealed by the live drain (replay not counted) | once per IST day |
+| Notice | The time correction arms on a day ("Dhan sent trade times 5 h 30 min early; correcting from <time>, raw data kept") | once per IST day |
+
+Code `DHAN-FEED-TIME-01` for both page causes (one `error_code_alerts` entry, period 300 s, threshold 1, no `ok_actions`). The latch is per cause per IST day and is persisted off the drain. When a cause fires, that day is auto-held (daily-universe Quote 63).
+
+**REJECT (§2.24):** firing outside the session gate or from replay; judging cause A on Dhan's raw time; more than once per cause per IST day; `ok_actions` or a recovery page; fewer than 20 ticks or 2 scans for A, or under 10 minutes for B; a per-instrument or per-connection dimension; persisting the latch on the drain; more than one notice a day; paging the correction's own coded warnings.

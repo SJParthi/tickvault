@@ -1115,6 +1115,10 @@ pub enum StopReason {
     /// Less than the disk floor plus the next partition's size is free (or
     /// the volume could not be read). The caller waits before trying again.
     Disk,
+    /// The day is held (daily-universe Quote 63): nothing is exported until its
+    /// repair writes `.done`. Not an attempt; the scheduler skips a held day
+    /// before calling, so this answers only a hold written in between.
+    Held,
 }
 
 impl StopReason {
@@ -1124,6 +1128,7 @@ impl StopReason {
         match self {
             Self::Window => "window",
             Self::Disk => "disk",
+            Self::Held => "held_day",
         }
     }
 }
@@ -1175,6 +1180,17 @@ fn stopped(day: NaiveDate, at: &str, reason: StopReason) -> ExportOutcome {
         "brutex export: stopped (not sealed, not a failure)"
     );
     ExportOutcome::Stopped(reason)
+}
+
+/// Counts and logs an attempt stopped because the day is held (Quote 63):
+/// once, as `outcome="held_day"`, never also as `stopped`. O(1).
+fn held_stop(day: NaiveDate, at: &str) -> ExportOutcome {
+    metrics::counter!("tv_brutex_export_runs_total", "outcome" => "held_day").increment(1);
+    info!(
+        %day, at,
+        "brutex export: day HELD (Quote 63), not exported until its repair is verified"
+    );
+    ExportOutcome::Stopped(StopReason::Held)
 }
 
 /// Whether the volume can take the next partition: free bytes at or above
@@ -1492,6 +1508,12 @@ impl DailyExporter {
         let started = now_ist_text();
         let started_ist_nanos = super::now_ist_nanos();
         let clock = std::time::Instant::now();
+        // Quote 63: a held day writes no object, manifest or DONE, forced or
+        // not (`crate::held_days`). At most two small file reads. Counted once,
+        // as `held_day` (not also as `stopped`).
+        if crate::off_worker::off_worker(|| self.archiver.held_days.is_held(day)) {
+            return Ok(held_stop(day, "start"));
+        }
         if self.is_sealed(day).await? {
             metrics::counter!("tv_brutex_export_runs_total", "outcome" => "skipped_done")
                 .increment(1);
@@ -1518,6 +1540,12 @@ impl DailyExporter {
         for table in export_tables() {
             if !(opts.keep_going)() {
                 return Ok(stopped(day, table, StopReason::Window));
+            }
+            // Quote 63: a `.hold` written while this export runs (the
+            // feed-time page) stops it before the next table (one small file
+            // read per table; a table already placed stays placed).
+            if crate::off_worker::off_worker(|| self.archiver.held_days.is_held(day)) {
+                return Ok(held_stop(day, table));
             }
             match self.export_table(table, day, &mut reasons, opts).await {
                 Ok(TableStep::Done(t)) => results.push(*t),

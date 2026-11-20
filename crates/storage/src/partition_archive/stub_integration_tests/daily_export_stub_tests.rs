@@ -1372,3 +1372,101 @@ async fn test_regression_uncapped_pressure_pass_skips_exported_after_a_fresh_dro
     assert_eq!(dropped_partitions(&qlog), vec![PART_LATER.to_string()]);
     assert!(!has_sidecar(&objects), "no second copy: {:?}", objects);
 }
+
+/// Regression (daily-universe Quote 63, 2026-11-20): a held day's partition
+/// is neither copied nor dropped by the archive pass, and the export (even a
+/// last-chance run) writes no object, manifest or DONE, until a verified
+/// repair's `.done` releases it; then both run as usual.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_regression_held_day_archive_pass_and_export_day_write_nothing_until_done() {
+    let scratch = std::env::temp_dir().join(format!(
+        "tv-held-day-stub-{}-{}",
+        std::process::id(),
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+    ));
+    let held = crate::held_days::HeldDays::with_dirs(
+        vec![day()],
+        scratch.join("held-days"),
+        scratch.join("day-repair"),
+    )
+    // Today pinned after the `.done` below (a later `.done` releases nothing).
+    .with_today(day() + chrono::TimeDelta::days(30));
+    let objects: StubObjects = Arc::new(Mutex::new(HashMap::new()));
+    let (archiver, log) = setup(NO_AUDIT, three_rows(), Arc::clone(&objects), true).await;
+    let mut archiver = archiver.with_test_held_days(held.clone());
+    let summary = archiver.run_archive_pass().await;
+    assert!(summary.pass_ran, "{summary:?}");
+    assert_eq!(summary.held_day, 1, "{summary:?}");
+    assert_eq!(summary.verified, 0, "{summary:?}");
+    assert_eq!(summary.dropped, 0, "{summary:?}");
+    let mut ex = DailyExporter::from_archiver(archiver);
+    let out = run(&mut ex, vec![], true).await.expect("held export");
+    assert_eq!(out, ExportOutcome::Stopped(StopReason::Held));
+    assert!(puts(&log).is_empty(), "nothing written: {:?}", puts(&log));
+    assert!(objects.lock().expect("o").is_empty());
+
+    // The repair's verify passed: the hold releases on both paths.
+    crate::held_days::write_day_marker(
+        held.done_dir(),
+        crate::held_days::MarkerKind::Done,
+        day(),
+        day() + chrono::TimeDelta::days(4),
+        "verified",
+    )
+    .expect("done marker");
+    let report = seal(&mut ex, vec![]).await;
+    assert!(report.sealed_by_this_run && report.rows == 3, "{report:?}");
+    // Hostile review 2026-11-20: with the export on, the archiver waits for
+    // the export to seal the released day (`.exported`) before it copies.
+    let waiting = held
+        .clone()
+        .with_export_first(true)
+        .with_today(day() + chrono::TimeDelta::days(5));
+    let (archiver, _log) = setup(NO_AUDIT, three_rows(), Arc::clone(&objects), true).await;
+    let mut archiver = archiver.with_test_held_days(waiting.clone());
+    let summary = archiver.run_archive_pass().await;
+    assert_eq!(summary.held_day, 1, "{summary:?}");
+    assert_eq!(summary.verified, 0, "{summary:?}");
+    assert!(waiting.note_exported(day()).expect("exported marker"));
+    let (archiver, _log) = setup(NO_AUDIT, three_rows(), Arc::clone(&objects), true).await;
+    let mut archiver = archiver.with_test_held_days(waiting);
+    let summary = archiver.run_archive_pass().await;
+    assert_eq!(summary.held_day, 0, "{summary:?}");
+    assert_eq!(summary.verified, 1, "{summary:?}");
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+/// Hostile review 2026-11-20: a `.hold` written while a pass runs stops the
+/// copy at the next held-kind partition (`held_since_pass_start`), counted
+/// once on `held_day`; a table that is never held reads no file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_held_since_pass_start_counts_a_hold_written_mid_pass() {
+    let scratch = std::env::temp_dir().join(format!(
+        "tv-held-mid-pass-{}-{}",
+        std::process::id(),
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+    ));
+    let held = crate::held_days::HeldDays::with_dirs(
+        Vec::new(),
+        scratch.join("held-days"),
+        scratch.join("day-repair"),
+    );
+    let objects: StubObjects = Arc::new(Mutex::new(HashMap::new()));
+    let (archiver, _log) = setup(NO_AUDIT, three_rows(), objects, true).await;
+    let archiver = archiver.with_test_held_days(held.clone());
+    let mut summary = ArchiveRunSummary::default();
+    let partition = format!("{}T10", day().format("%Y-%m-%d"));
+    assert!(!archiver.held_since_pass_start("ticks", &partition, &mut summary));
+    crate::held_days::write_day_marker(
+        held.hold_dir(),
+        crate::held_days::MarkerKind::Hold,
+        day(),
+        day(),
+        "feed time page",
+    )
+    .expect("hold marker");
+    assert!(archiver.held_since_pass_start("ticks", &partition, &mut summary));
+    assert!(!archiver.held_since_pass_start("market_depth_book", &partition, &mut summary));
+    assert_eq!(summary.held_day, 1, "{summary:?}");
+    let _ = std::fs::remove_dir_all(&scratch);
+}

@@ -570,6 +570,40 @@ This plan converts hope into bounded, tested, alarmed guarantees. It does NOT pr
     `refund_ghost_resend_returns_one_place_and_saturates_at_zero`
   - Full design: ITEM RESUB addendum below
 
+- [x] ITEM UTC-HOLD — hold 2026-11-20 (and any auto-held day) out of the archiver, the Brutex export and the cross-check catch-up until a verified repair writes `.done` (daily-universe Quote 63, owner cards 2026-11-20)
+  - Files: crates/storage/src/held_days.rs (+ held_days_tests.rs; `HeldDays`, `.hold` / `.done` markers with CRC-32, `install_process_held_days`), crates/storage/src/partition_archive/held_day_filter.rs (`apply_held_days`, before the cross-verify hold, backlog and cap), crates/storage/src/partition_archive.rs (`run_archive_pass`, `worklist_sizes`, `ArchiveRunSummary::held_day`), crates/storage/src/partition_archive/daily_export.rs (`export_day` refuses, `StopReason::Held`), crates/app/src/brutex_export_boot.rs (skip before any attempt; `eligibility_day`, `visit_order_with_released`, `left_window_report_wanted`), crates/app/src/dhan_live_crossverify_boot.rs (`past_days_to_check` `is_held`), crates/app/src/daily_archive_boot.rs (install), crates/common/src/config.rs (`held_days` + validation), config/base.toml (`held_days = ["2026-11-20"]`)
+  - Tests: test_regression_held_day_skipped_by_all_three_paths (crates/app/tests/held_day_paths_guard.rs, with the source-scan guards), test_regression_held_day_export_eligibility_from_done (brutex_export_boot), test_regression_done_marker_releases_hold (held_days_tests), test_regression_held_day_archive_pass_and_export_day_write_nothing_until_done (stub pass + export), test_partition_retention_held_days_default_parse_and_validate
+  - Hostile review fixes (2026-11-20, one commit): the archiver waits for the export of a released day (`.exported`, `HeldDays::archive_verdict`, `note_exported`, at most 8 days, kept after the entry is removed); `.hold` re-read per partition (`PartitionArchiver::held_since_pass_start`) and per exported table (`held_stop`, counted once); folder failures told apart (`damaged_marker_cause`, `read_day_marker_checked`, coded STORAGE-GAP-04 once); a bad `held_days` entry holds every day instead of stopping the boot (`held_days_config_unreadable`); a future-dated `.done` releases nothing (`today_ist`); `released_days` caps only `.done` files; late-released days checked once for DONE (`days_leaving_window_with_released`). Tests: test_regression_archive_verdict_note_exported_with_export_first_wait_for_the_export, test_regression_archive_holds_a_repaired_day_after_its_entry_is_removed, test_regression_future_dated_done_releases_nothing_with_today_and_today_ist, test_damaged_marker_cause_and_read_day_marker_checked_tell_folder_from_file, test_regression_held_days_config_unreadable_holds_every_day (held_days_tests), test_days_leaving_window_with_released_reports_a_late_done_day (brutex_export_boot), held_day_paths_held_skip_detector_bites and the export-first rows of test_regression_held_day_skipped_by_all_three_paths (guard), the export-first pass in test_regression_held_day_archive_pass_and_export_day_write_nothing_until_done, test_held_since_pass_start_counts_a_hold_written_mid_pass (stub), test_held_since_pass_start_runs_before_every_copy_in_the_pass_loop (held_day_filter)
+- [ ] ITEM UTC-PAGE — DHAN-FEED-TIME-01 page (noise lock §2.24: prices outside the session after correction, or 10 minutes with no candle), one notice a day when the correction arms, auto-hold of a firing day
+  - Files: crates/app/src/dhan_feed_stack.rs (30 s arm), a new feed_time_episode module, crates/common/src/error_code.rs, deploy/aws/terraform/error-code-alarms.tf, docs/error-runbooks
+  - Tests: feed_time_episode property tests, a 20-Nov-shaped test paging at 09:16 and 09:25, DHAT 0 blocks, wiring and latch-off-drain guards
+- [ ] ITEM UTC-FIX — correct Dhan trade time by exactly +19,800 s from a persisted, armed per-IST-day record (scope lock 2026-11-20)
+  - Files: crates/core/src/parser/dispatcher.rs, crates/app/src/dhan_feed_stack.rs, a new ltt_correction module (table, detector, record thread), WAL replay callers
+  - Tests: correction property tests, live-vs-replay identity with crash injection, the named 2026-11-20 regressions, DHAT 0 blocks, dispatch_frame/ticker_ltt_armed bench
+  - Rules: scope lock 2026-11-20, daily-universe Quote 63, noise lock §2.24; design in the UTC addendum below
+
+---
+
+## ITEM UTC — DESIGN ADDENDUM (added 2026-11-20, owner cards "Auto-detect daily", "Copy, delete, rebuild", "Yes, page me", "After correction", "Yes, one a day", "Yes, hold that day", "Deploy 8:31 AM Monday")
+
+On 2026-11-20 Dhan sent every Last Trade Time as UTC epoch (19,800 s early under the documented IST rule). The design is a correction in the core dispatcher from an armed per-day record, a hold that keeps a wrong day out of the archive and the export, an early page, and a one-off repair of 20 Nov.
+
+## Edge Cases (Item UTC)
+- Pre-open and connect snapshots carrying the previous day's trade time; illiquid contracts whose last trade is about 5 h 30 m old; a mid-day flip either way; Muhurat sessions; a restart with an open entry; frames with no WAL receipt stamp; `0` and out-of-band trade times.
+
+## Failure Modes (Item UTC)
+- A crash between the record write and the arm: the entry is neither armed nor voided, so replay holds that day (coded error), never a silent mismatch.
+- A wrong arm on a good day: prevented by at least 99% agreement across several distinct instruments and the receipt + 5 s cap; the switch can be set to `shadow` or `off`.
+- A held day never repaired: it stays on the box and in raw S3 and is never exported.
+
+## Test Plan (Item UTC)
+- Property tests for the correction and the detector; live vs replay identity with crash injection; the named 20 Nov regressions; the held-day paths guard; DHAT and the dispatch bench.
+
+## Rollback (Item UTC)
+- `[dhan_feed] ltt_utc_autocorrect = "off"`; removing a date from `held_days`; the page is one alarm entry.
+
+## Observability (Item UTC)
+- `tv_dhan_ltt_*` counters and gauges (local), `tv_partition_archive_skipped_total{reason="held_day"}`, coded `DHAN-LTT-01`/`02` logs, the `DHAN-FEED-TIME-01` page and the once-a-day notice.
 
 ---
 

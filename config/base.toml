@@ -486,6 +486,16 @@ drain_hold_counts_archive = true
 # overwrites. false stops the export and its amend records; the archiver still
 # sorts only against an existing object and only outside 08:30-15:45 IST.
 brutex_export_enabled = true
+# Daily-universe Quote 63 (2026-11-20): Dhan sent trade times 5 h 30 min
+# early on 2026-11-20. A held day is kept out of the archiver (ticks,
+# tick_quotes, feed_aux_packets and candle tables; depth is not held), the
+# Brutex export and the cross-check catch-up until the repair writes
+# data/state/day-repair/<day>.done. After the .done the archiver still waits
+# for the export to seal the day (data/state/day-repair/<day>.exported, at most
+# 8 days), with or without this entry. A bad entry holds EVERY day (coded
+# error), it never stops the boot. Removing 2026-11-20 later (PR-6) also needs
+# crates/app/tests/held_day_paths_guard.rs changed, which pins this line.
+held_days = ["2026-11-20"]
 
 # [valkey] section DELETED in #O4 (2026-05-24). Valkey removed from
 # the runtime; the dual-instance lock moved to AWS SSM Parameter Store

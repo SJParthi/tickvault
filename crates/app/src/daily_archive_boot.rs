@@ -793,6 +793,11 @@ pub fn spawn_supervised_daily_archive_loop(
     market_close_time: String,
     verified_day_gate: Option<VerifiedDayGate>,
 ) -> Option<tokio::task::JoinHandle<()>> {
+    // Quote 63: the held days for paths with no config of their own (the
+    // cross-check catch-up). First, before any return, so it is installed
+    // whatever the archive switch says; `main` runs this before it spawns
+    // the cross-check (pinned by `held_day_paths_guard`).
+    tickvault_storage::held_days::install_process_held_days(&cfg);
     if !cfg.archive_enabled {
         info!("daily partition archive disabled by config — no sweep will be scheduled");
         return None;

@@ -84,6 +84,7 @@ Examples:
 | `2026-04-15-ticket-5519522-still-failing.md` | #5519522 | Initial escalation after both fixes applied |
 | `2026-04-15-reply-to-trishul.md` | #5519522 | Reply to Trishul with today's 4 precise ATM contracts |
 | `2026-11-13-feed-latency-and-zone.md` | Ready to send (filled 2026-11-18 with that morning's measurements, five sample packets and zone ID `aps1-az3`); not yet sent | Live Market Feed delivery delay, AWS region / zone of the feed and order servers, faster feed options |
+| `2026-11-20-ltt-sent-as-utc.md` | Ready to send (drafted 2026-11-20 with six sample packets from that day); not yet sent | Live Market Feed Last Trade Time arrived as UTC epoch (5 h 30 m early) on 2026-11-20 for every segment |
 
 (The rows above are not a complete list; `ls docs/dhan-support/` is.)
 
