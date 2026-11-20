@@ -3838,3 +3838,28 @@ Owner, 2026-11-16, after the Quote 60 card "One decision waiting for you: extra 
 - Sorting an export during 08:30 to the ingest end to avoid copies, or switching the export off, without a fresh dated quote.
 - Letting the month's copies pass 20 GB without asking the owner again, or dropping the weekly check.
 - A page, alarm, metric filter or EMF name for the copies under Quote 62.
+
+#### Quote 63 — 2026-11-20: hold, copy, delete and rebuild 20 Nov 2026 after Dhan sent UTC trade times; auto-hold a day the feed-time page fires
+
+**Owner cards (2026-11-20), verbatim:**
+- **"Stop app now (Recommended)"** — "Safely stops the app on the server (no data lost; raw data stays on disk and in S3). The export cannot publish wrong data. I then fix the time handling and rebuild 20 Nov from the raw data before Monday." (Done 16:26:34 IST; the 20 Nov Brutex export did not run.)
+- **"Copy, delete, rebuild (Recommended)"** — "Wrong rows are copied to S3 (kept forever), then deleted from the database only; 20 Nov is rebuilt from the raw data with corrected times."
+- **"Deploy 8:31 AM Monday (Recommended)"** — "The server starts at 8:30 AM as usual; I deploy the fixes at 8:31–8:44, before trading. The old program runs about 10 minutes, during which exports are blocked by its own rules."
+- **"Yes, hold that day (Recommended)"** — "A day with a known feed problem never reaches Brutex's permanent files until repaired. The data stays safe on the server and in raw S3."
+
+##### What Quote 63 allows
+| Step | Scope |
+|---|---|
+| Hold | 2026-11-20 is held: the archiver (day, hour and pressure paths) does not copy or drop its `ticks`, `tick_quotes`, `feed_aux_packets` or candle partitions, and the Brutex export (forced and last-chance runs included) and the cross-check past-day catch-up skip it, until a verified repair writes its `.done`. `market_depth*` and the cross-verify tables are not held. |
+| Auto-hold | A future session day on which the feed-time page (noise lock §2.24) fires is held the same way, automatically, until it is repaired under its own dated quote. |
+| Copy | Each wrong 20 Nov partition (`candles_{1s,1m,3m,5m,10m,15m,30m,60m}` day 2026-11-20; the 20 Nov hours of `tick_quotes`, `feed_aux_packets`, `ticks`) is exported and copied create-only to `s3://tv-prod-cold/quarantine/2026-11-20-ltt-utc-shift/`, size and SHA-256 checked and recounted, with a `day_repair_audit` row. This prefix is not Quote 60's export and never a canonical key, manifest, amend record or `partition_archive_audit` row. |
+| Delete | Only those partitions, only in QuestDB, only after their verified quarantine row. 20 Nov seal, spill and DLQ files are copied there too and then MOVED to `data/held/2026-11-20/` (never deleted). |
+| Rebuild | 20 Nov is refolded from its raw WAL frames (S3 `raw-frames/2026-11-20/`, every SHA sidecar checked) with the +19,800 s correction recorded for that day, then verified; only a passed verify writes `.done` and releases the hold. |
+
+##### What violates Quote 63 (REJECT)
+- Any S3 delete; any date other than 2026-11-20 (a later day needs its own quote; an auto-hold only holds).
+- A database drop without a verified quarantine copy; any drop of `market_depth*`, cross-verify, SEBI or audit rows.
+- Running the repair with the app up, or 08:00–16:30 IST on a trading day.
+- Writing canonical keys, manifests, amend records or `partition_archive_audit` rows from the repair.
+- A manual or SSM delete of market data (Quote 51 binds).
+- Reusing Quote 63 for another day or another delete.

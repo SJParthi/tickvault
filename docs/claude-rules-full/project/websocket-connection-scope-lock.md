@@ -9624,3 +9624,18 @@ Owner's tap, recorded with the card text in `daily-universe-scope-expansion-2026
 - Everything else in the section above stands (columns, DEDUP key, retention, S3 copy, readers).
 
 REJECT (adds to the section above): any per-contract, per-socket or order-dependent input to the routing decision; a threshold other than 2 s without a fresh dated quote.
+
+### 2026-11-20 — DHAN TRADE TIME SENT AS UTC: CORRECTED BY EXACTLY +19,800 s FROM A PERSISTED, ARMED PER-DAY RECORD
+
+**What happened (Verified on prod, 2026-11-20).** From the first packet at 08:31:22 IST, every main-feed Ticker, Quote and Full packet on every segment (`IDX_I`, `NSE_EQ`, `NSE_FNO`) carried a Last Trade Time that read 19,800 s (5 h 30 m) early under the documented IST-epoch rule (`docs/dhan-ref` live-market-feed Section 10 note 1): it matched plain UTC epoch seconds. Example: NIFTY 50 (`13`) received 11:00:00 IST, raw LTT `1795152600` (05:30:00 read as IST). 19 Nov was normal on the same binary. Effect: from 08:32 to 14:52 no candle was sealed (the ticks read as pre-market or another day), and after 14:30 the shifted times entered the window, so 14:45–16:18 trades were folded as 09:15–10:48 candles. Raw WAL frames were complete.
+
+**Owner decision (card, 2026-11-20): "Auto-detect daily (Recommended)"** — "Each day the program checks the index prices (which update every second) against our own clock. If Dhan's times are exactly 5½ hours early, it corrects every price that day. The choice is saved so a later rebuild gives the same result, and it is logged." Notice card: **"Yes, one a day (Recommended)"** — one Telegram message on a day the correction switches on (recorded in the noise lock §2.24).
+
+**The rule.**
+- The correction is applied in one place, the core dispatcher, on the Ticker, Quote and Full arms only, before any consumer reads the trade time, so the fold, routing, writer `ts`, session window, spot store, previous close, lag, `feed_aux_packets.exchange_ts` and the live-fill tap all see one value. Raw WAL and S3 bytes are never changed.
+- It is exactly +19,800 s, and only from a persisted per-IST-day record entry that the live drain armed (a two-step commit: the record line is fsynced first, an `armed` marker after the drain arms it). Replay and every rebuild apply only armed entries, by the frame's WAL receipt stamp, so live and replay produce identical rows. An entry neither armed nor voided holds that day's segments from replay (coded error, no silent mismatch).
+- A corrected time is never later than receipt + 5 s, never on another day than the receipt's (or inside the previous IST day's session), never applied to `0` or an out-of-band value, never applied to a frame without a WAL receipt stamp, and on a segment not yet confirmed it is applied only to fresh prints (within 120 s of receipt).
+- The detector votes only on live frames (never replay), from index ticks and new trades of F&O-underlying NSE_EQ spots; it needs several distinct instruments and at least 99% agreement, closes a segment only on at least 99% normal evidence (no timer veto), and freezes after 8 entries a day with a coded error.
+- A switch `[dhan_feed] ltt_utc_autocorrect = "act" | "shadow" | "off"`, default `act`.
+
+**REJECT:** any offset other than +19,800 s; correcting without an armed record, before an entry's `from`, or deciding in replay; a result after receipt + 5 s or outside the receipt's day or the previous day's session; correcting a stale print on an unconfirmed segment; shifting `0` or out-of-band values; an entry carried across IST midnight; a time-based segment veto; changing raw WAL or S3 bytes; removing the switch or the dispatcher threading guard.
