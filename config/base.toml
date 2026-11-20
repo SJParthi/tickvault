@@ -490,7 +490,11 @@ brutex_export_enabled = true
 # early on 2026-11-20. A held day is kept out of the archiver (ticks,
 # tick_quotes, feed_aux_packets and candle tables; depth is not held), the
 # Brutex export and the cross-check catch-up until the repair writes
-# data/state/day-repair/<day>.done. Remove an entry only after its export.
+# data/state/day-repair/<day>.done. After the .done the archiver still waits
+# for the export to seal the day (data/state/day-repair/<day>.exported, at most
+# 8 days), with or without this entry. A bad entry holds EVERY day (coded
+# error), it never stops the boot. Removing 2026-11-20 later (PR-6) also needs
+# crates/app/tests/held_day_paths_guard.rs changed, which pins this line.
 held_days = ["2026-11-20"]
 
 # [valkey] section DELETED in #O4 (2026-05-24). Valkey removed from

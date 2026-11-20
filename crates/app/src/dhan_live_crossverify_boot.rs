@@ -1692,8 +1692,10 @@ async fn run_past_days(
             if held {
                 info!(
                     day = %d,
-                    "Dhan 1-minute cross-verification: a HELD past day (Quote 63) is not \
-                     checked until its repair is verified"
+                    "Dhan 1-minute cross-verification: a HELD past day (Quote 63) is skipped. \
+                     The catch-up looks back only 3 days, so a day released later is never \
+                     checked; once that window passes the archive copies it without a check \
+                     (logged as STORAGE-GAP-04)"
                 );
             }
             held

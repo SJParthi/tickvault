@@ -9,9 +9,20 @@
 //! counted as copy work for the drain hold. Each removal adds one to
 //! `tv_partition_archive_skipped_total{reason="held_day"}`.
 //!
-//! Cost: one held-day verdict (at most two small file reads) per distinct
+//! A released day waits too while the Brutex export has not sealed it
+//! ([`crate::held_days::HeldDays::archive_holds`]), so its repaired hours are
+//! exported in DEDUP-key order before the archiver copies them (hostile
+//! review 2026-11-20).
+//!
+//! A `.hold` written while a pass runs (the feed-time page's auto-hold) is
+//! re-read just before each held-kind partition is copied
+//! ([`super::PartitionArchiver::held_since_pass_start`]), so the running
+//! pass stops at the next partition, not only the next pass.
+//!
+//! Cost: one archive verdict (at most three small file reads) per distinct
 //! (day) among held-kind partitions in the worklist, then O(worklist)
-//! compares, once per pass, off the runtime worker. Cold path.
+//! compares, once per pass; plus one verdict per held-kind partition just
+//! before its copy. All off the runtime worker. Cold path.
 
 use chrono::NaiveDate;
 use tracing::{info, warn};
@@ -30,19 +41,19 @@ pub(crate) fn count_held_day(n: u64) {
     .increment(n);
 }
 
+/// One distinct day's decision: its verdict, and whether the archiver keeps
+/// it back ([`HeldDays::archive_verdict`]).
+pub(crate) type DayDecision = (NaiveDate, HeldVerdict, bool);
+
 /// Splits `worklist` into the partitions kept and the number held, with the
-/// verdict of each distinct held-kind day read once through `verdict`.
-/// Pure apart from `verdict`, O(worklist × distinct days) with a handful of
-/// distinct days.
+/// archive decision of each distinct held-kind day read once through
+/// `decide`. Pure apart from `decide`, O(worklist × distinct days) with a
+/// handful of distinct days.
 pub(crate) fn split_held_partitions(
     worklist: Vec<(&'static str, String)>,
-    mut verdict: impl FnMut(NaiveDate) -> HeldVerdict,
-) -> (
-    Vec<(&'static str, String)>,
-    u32,
-    Vec<(NaiveDate, HeldVerdict)>,
-) {
-    let mut seen: Vec<(NaiveDate, HeldVerdict)> = Vec::new();
+    mut decide: impl FnMut(NaiveDate) -> (HeldVerdict, bool),
+) -> (Vec<(&'static str, String)>, u32, Vec<DayDecision>) {
+    let mut seen: Vec<DayDecision> = Vec::new();
     let mut kept = Vec::with_capacity(worklist.len());
     let mut held: u32 = 0;
     for (table, partition) in worklist {
@@ -53,12 +64,12 @@ pub(crate) fn split_held_partitions(
         };
         let is_held = day.is_some_and(|day| {
             // O(1) EXEMPT: a handful of distinct days per pass.
-            if let Some((_, v)) = seen.iter().find(|(d, _)| *d == day) {
-                v.is_held()
+            if let Some((_, _, keep)) = seen.iter().find(|(d, _, _)| *d == day) {
+                *keep
             } else {
-                let v = verdict(day);
-                seen.push((day, v));
-                v.is_held()
+                let (verdict, keep) = decide(day);
+                seen.push((day, verdict, keep));
+                keep
             }
         });
         if is_held {
@@ -80,14 +91,14 @@ impl PartitionArchiver {
         summary: &mut ArchiveRunSummary,
     ) -> Vec<(&'static str, String)> {
         let held_days: &HeldDays = &self.held_days;
-        let (kept, held, verdicts) = crate::off_worker::off_worker(|| {
-            split_held_partitions(worklist, |day| held_days.verdict(day))
+        let (kept, held, decisions) = crate::off_worker::off_worker(|| {
+            split_held_partitions(worklist, |day| held_days.archive_verdict(day))
         });
         summary.held_day = summary.held_day.saturating_add(held);
         if held > 0 {
             count_held_day(u64::from(held));
         }
-        for (day, verdict) in verdicts {
+        for (day, verdict, keep) in decisions {
             match verdict {
                 HeldVerdict::Held {
                     source,
@@ -97,8 +108,9 @@ impl PartitionArchiver {
                         warn!(
                             %day,
                             "partition archive: this held day has a repair `.done` file that \
-                             fails its check, so the day stays held (nothing copied or \
-                             dropped) until a valid one from the repair tool replaces it"
+                             fails its check or is dated after today, so the day stays held \
+                             (nothing copied or dropped) until a valid one from the repair \
+                             tool replaces it"
                         );
                     }
                     info!(
@@ -108,15 +120,52 @@ impl PartitionArchiver {
                          candle partitions are not copied or dropped until its repair is verified"
                     );
                 }
+                HeldVerdict::Released { .. } | HeldVerdict::NotHeld if keep => {
+                    info!(
+                        %day,
+                        "partition archive: repaired day waits for its Brutex export (Quote \
+                         63) — its tick, quote, aux and candle partitions are copied after the \
+                         export seals it, so they reach S3 in order"
+                    );
+                }
                 HeldVerdict::Released { .. } | HeldVerdict::NotHeld => {}
             }
         }
         kept
     }
 
+    /// Whether `partition` of `table` became held after this pass listed it
+    /// (a `.hold` written mid-pass): re-read just before its copy; when so,
+    /// counted in `summary.held_day` and on the `held_day` skip counter. A
+    /// table that is never held answers `false` with no file read.
+    // TEST-EXEMPT: one call of HeldDays::holds_partition plus the count; covered by test_regression_held_day_archive_pass_and_export_day_write_nothing_until_done and test_holds_partition_and_table_is_held_kind_and_partition_day
+    pub(crate) fn held_since_pass_start(
+        &self,
+        table: &str,
+        partition: &str,
+        summary: &mut ArchiveRunSummary,
+    ) -> bool {
+        if !table_is_held_kind(table) {
+            return false;
+        }
+        let held =
+            crate::off_worker::off_worker(|| self.held_days.holds_partition(table, partition));
+        if held {
+            summary.held_day = summary.held_day.saturating_add(1);
+            count_held_day(1);
+            info!(
+                table,
+                partition,
+                "partition archive: day became HELD during this pass (Quote 63); this \
+                 partition is not copied or dropped"
+            );
+        }
+        held
+    }
+
     /// Whether the drain-hold backlog counts `partition` of `table`: not when
-    /// its day is held (nothing tonight can copy it). At most two small file
-    /// reads, off the runtime worker.
+    /// the archiver keeps its day back (nothing tonight can copy it). At most
+    /// three small file reads, off the runtime worker.
     // TEST-EXEMPT: one call of HeldDays::holds_partition, covered by test_holds_partition_and_table_is_held_kind_and_partition_day
     pub(crate) fn backlog_counts_held(&self, table: &str, partition: &str) -> bool {
         !crate::off_worker::off_worker(|| self.held_days.holds_partition(table, partition))
@@ -153,20 +202,23 @@ mod tests {
             ("candles_1m", "2026-11-19".to_string()),
         ];
         let mut reads = 0;
-        let (kept, held, verdicts) = split_held_partitions(worklist, |day| {
+        let (kept, held, decisions) = split_held_partitions(worklist, |day| {
             reads += 1;
             if day == d("2026-11-20") {
-                HeldVerdict::Held {
-                    source: HeldSource::Config,
-                    done_damaged: false,
-                }
+                (
+                    HeldVerdict::Held {
+                        source: HeldSource::Config,
+                        done_damaged: false,
+                    },
+                    true,
+                )
             } else {
-                HeldVerdict::NotHeld
+                (HeldVerdict::NotHeld, false)
             }
         });
         assert_eq!(held, 4);
         assert_eq!(reads, 2, "each distinct day is read once");
-        assert_eq!(verdicts.len(), 2);
+        assert_eq!(decisions.len(), 2);
         assert_eq!(
             kept,
             vec![
@@ -181,11 +233,36 @@ mod tests {
     #[test]
     fn test_split_held_partitions_releases_after_done() {
         let worklist = vec![("tick_quotes", "2026-11-20T10".to_string())];
-        let (kept, held, _) = split_held_partitions(worklist.clone(), |_| HeldVerdict::Released {
+        let released = HeldVerdict::Released {
             done_on: d("2026-11-25"),
-        });
+        };
+        let (kept, held, _) = split_held_partitions(worklist.clone(), |_| (released, false));
         assert_eq!(held, 0);
         assert_eq!(kept, worklist);
+        // Released but waiting for its export: still kept back.
+        let (kept, held, _) = split_held_partitions(worklist, |_| (released, true));
+        assert_eq!(held, 1);
+        assert!(kept.is_empty());
+    }
+
+    /// The per-partition re-read sits in the pass loop before any copy
+    /// (behaviour: `test_held_since_pass_start_counts_a_hold_written_mid_pass`
+    /// in the stub tests).
+    #[test]
+    fn test_held_since_pass_start_runs_before_every_copy_in_the_pass_loop() {
+        let src = include_str!("../partition_archive.rs");
+        let call = src
+            .find("self.held_since_pass_start(table, &partition, &mut summary)")
+            .expect("the pass loop re-reads the hold");
+        for copy in [
+            "self.process_one(table, &partition, &mut summary)",
+            "archive_with_snapshot_gate(self, table, &partition, gate, &mut summary)",
+            "self.archive_one_quiesced(table, &partition, &mut summary)",
+        ] {
+            let at = src.find(copy).expect(copy);
+            assert!(call < at, "the hold re-read must come before `{copy}`");
+        }
+        assert!(!table_is_held_kind("market_depth_book"));
     }
 
     #[test]
@@ -194,7 +271,7 @@ mod tests {
         count_held_day(0);
         count_held_day(3);
         assert_eq!(
-            split_held_partitions(Vec::new(), |_| HeldVerdict::NotHeld).1,
+            split_held_partitions(Vec::new(), |_| (HeldVerdict::NotHeld, false)).1,
             0
         );
     }

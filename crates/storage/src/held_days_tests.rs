@@ -27,6 +27,8 @@ impl Scratch {
             self.0.join("held-days"),
             self.0.join("day-repair"),
         )
+        // Every `.done` these tests write is dated in the past of this day.
+        .with_today(d("2026-12-31"))
     }
 }
 
@@ -369,5 +371,199 @@ fn test_install_process_held_days_feeds_process_held_days() {
             PathBuf::from(HELD_DAYS_DIR),
             PathBuf::from(DAY_REPAIR_DIR)
         )
+    );
+}
+
+/// Hostile review 2026-11-20: a `.done` dated after today (a clock step, or
+/// a wrong date given to the tool) releases nothing until that day comes.
+#[test]
+fn test_regression_future_dated_done_releases_nothing_with_today_and_today_ist() {
+    let s = Scratch::new("future");
+    let day = d("2026-11-20");
+    let held = s.held(&["2026-11-20"]).with_today(d("2026-11-27"));
+    write_day_marker(
+        held.done_dir(),
+        MarkerKind::Done,
+        day,
+        d("2026-12-20"),
+        "wrong date",
+    )
+    .expect("done");
+    assert_eq!(
+        held.verdict(day),
+        HeldVerdict::Held {
+            source: HeldSource::Config,
+            done_damaged: true
+        }
+    );
+    assert!(held.released_days().is_empty());
+    let later = held.with_today(d("2026-12-20"));
+    assert_eq!(
+        later.verdict(day),
+        HeldVerdict::Released {
+            done_on: d("2026-12-20")
+        }
+    );
+    assert_eq!(later.released_days(), vec![(day, d("2026-12-20"))]);
+    assert!(today_ist() >= d("2026-11-20"));
+}
+
+/// Hostile review 2026-11-20: a released day's held-kind partitions stay out
+/// of the archiver until the export seals it (`.exported`), or
+/// `RELEASE_EXPORT_WAIT_DAYS` after the `.done`, or at once with the export
+/// off; the export itself is released at once.
+#[test]
+fn test_regression_archive_verdict_note_exported_with_export_first_wait_for_the_export() {
+    let s = Scratch::new("export-first");
+    let day = d("2026-11-20");
+    let done_on = d("2026-11-25");
+    let held = s
+        .held(&["2026-11-20"])
+        .with_export_first(true)
+        .with_today(done_on);
+    // Held: nothing written by note_exported.
+    assert!(!held.note_exported(day).expect("noop"));
+    write_day_marker(held.done_dir(), MarkerKind::Done, day, done_on, "verified").expect("done");
+    let (verdict, archive) = held.archive_verdict(day);
+    assert_eq!(verdict, HeldVerdict::Released { done_on });
+    assert!(archive, "the archiver waits for the export");
+    assert!(!held.is_held(day), "the export is released at once");
+    assert!(held.holds_partition("tick_quotes", "2026-11-20T10"));
+    assert!(!held.holds_partition("market_depth_book", "2026-11-20T10"));
+    // The export sealed: one marker, then nothing more.
+    assert!(held.note_exported(day).expect("exported"));
+    assert!(!held.note_exported(day).expect("again"));
+    assert!(!held.archive_verdict(day).1);
+    assert!(!held.holds_partition("tick_quotes", "2026-11-20T10"));
+    // No marker: the wait ends RELEASE_EXPORT_WAIT_DAYS after the `.done`.
+    std::fs::remove_file(day_marker_path(held.done_dir(), MarkerKind::Exported, day))
+        .expect("rm exported");
+    let last = done_on + chrono::TimeDelta::days(RELEASE_EXPORT_WAIT_DAYS);
+    assert!(held.clone().with_today(last).archive_verdict(day).1);
+    assert!(
+        !held
+            .clone()
+            .with_today(last + chrono::TimeDelta::days(1))
+            .archive_verdict(day)
+            .1
+    );
+    // Export off: no wait.
+    assert!(!held.clone().with_export_first(false).archive_verdict(day).1);
+    // A not-held day never waits.
+    assert!(!held.archive_holds(d("2026-11-19"), HeldVerdict::NotHeld));
+}
+
+/// Hostile review 2026-11-20: a folder failure is told apart from a damaged
+/// day file. A path that is not a folder (or under a file) holds nothing; a
+/// damaged file in a readable folder still holds.
+#[test]
+fn test_damaged_marker_cause_and_read_day_marker_checked_tell_folder_from_file() {
+    let s = Scratch::new("folder");
+    let day = d("2026-11-23");
+    // `held-days` is a regular file: no `.hold` can exist.
+    std::fs::write(s.0.join("held-days"), "not a folder").expect("file");
+    let held = s.held(&[]);
+    assert_eq!(
+        read_day_marker(held.hold_dir(), MarkerKind::Hold, day),
+        MarkerRead::Damaged
+    );
+    assert_eq!(
+        damaged_marker_cause(held.hold_dir()),
+        DamagedCause::FolderNotADirectory
+    );
+    assert_eq!(
+        read_day_marker_checked(held.hold_dir(), MarkerKind::Hold, day),
+        MarkerRead::Missing
+    );
+    assert_eq!(held.verdict(day), HeldVerdict::NotHeld);
+    // A folder under that file: not a folder either.
+    assert_eq!(
+        damaged_marker_cause(&held.hold_dir().join("sub")),
+        DamagedCause::FolderNotADirectory
+    );
+    // A torn file in a readable folder: still damaged, still held.
+    let ok = Scratch::new("folder-ok");
+    let held_ok = ok.held(&[]);
+    std::fs::create_dir_all(held_ok.hold_dir()).expect("dir");
+    std::fs::write(
+        day_marker_path(held_ok.hold_dir(), MarkerKind::Hold, day),
+        "torn",
+    )
+    .expect("torn");
+    assert_eq!(damaged_marker_cause(held_ok.hold_dir()), DamagedCause::File);
+    assert_eq!(
+        read_day_marker_checked(held_ok.hold_dir(), MarkerKind::Hold, day),
+        MarkerRead::Damaged
+    );
+    assert!(held_ok.is_held(day));
+    // Reported once per process per (kind, cause); a file cause never.
+    let _ = report_folder_failure(
+        held.hold_dir(),
+        MarkerKind::Exported,
+        DamagedCause::FolderUnreadable,
+    );
+    assert!(!report_folder_failure(
+        held.hold_dir(),
+        MarkerKind::Exported,
+        DamagedCause::FolderUnreadable
+    ));
+    assert!(!report_folder_failure(
+        held.hold_dir(),
+        MarkerKind::Hold,
+        DamagedCause::File
+    ));
+    assert_eq!(MarkerKind::Exported.as_str(), "exported");
+}
+
+/// Hostile review 2026-11-20: a `held_days` entry that is not a date no
+/// longer stops the app at boot; it holds EVERY day instead.
+#[test]
+fn test_regression_held_days_config_unreadable_holds_every_day() {
+    let entries = vec!["2026-11-2O".to_string()];
+    assert!(held_days_config_unreadable(&entries));
+    assert!(!held_days_config_unreadable(&["2026-11-20".to_string()]));
+    assert!(parse_held_days(&entries).is_empty());
+    let cfg = PartitionRetentionConfig {
+        held_days: entries.clone(),
+        brutex_export_enabled: true,
+        ..PartitionRetentionConfig::default()
+    };
+    let held = HeldDays::from_config(&cfg);
+    for day in [d("2026-11-20"), d("2026-11-23"), d("2030-01-02")] {
+        assert_eq!(
+            held.verdict(day),
+            HeldVerdict::Held {
+                source: HeldSource::ConfigUnreadable,
+                done_damaged: false
+            },
+            "{day}"
+        );
+        assert!(held.holds_partition("ticks", &format!("{}T10", day.format("%Y-%m-%d"))));
+    }
+    // Reported once per process.
+    let _ = report_config_unreadable(&entries);
+    assert!(!report_config_unreadable(&entries));
+}
+
+/// Hostile review 2026-11-20: removing the config entry (PR-6) before the
+/// export sealed the repaired day never lets the archiver go first: a valid
+/// `.done` keeps the export-first wait on its own.
+#[test]
+fn test_regression_archive_holds_a_repaired_day_after_its_entry_is_removed() {
+    let s = Scratch::new("entry-removed");
+    let day = d("2026-11-20");
+    let done_on = d("2026-11-25");
+    let unlisted = s.held(&[]).with_export_first(true).with_today(done_on);
+    assert_eq!(unlisted.archive_verdict(day), (HeldVerdict::NotHeld, false));
+    write_day_marker(unlisted.done_dir(), MarkerKind::Done, day, done_on, "ok").expect("done");
+    assert_eq!(unlisted.archive_verdict(day), (HeldVerdict::NotHeld, true));
+    assert!(unlisted.holds_partition("candles_1m", "2026-11-20"));
+    assert!(unlisted.note_exported(day).expect("exported"));
+    assert_eq!(unlisted.archive_verdict(day), (HeldVerdict::NotHeld, false));
+    // Export off: a removed entry is simply not held.
+    assert!(
+        !unlisted
+            .with_export_first(false)
+            .archive_holds(day, HeldVerdict::NotHeld)
     );
 }

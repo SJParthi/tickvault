@@ -463,6 +463,41 @@ pub fn days_leaving_window(session_day: NaiveDate) -> Vec<NaiveDate> {
         .collect()
 }
 
+/// [`days_leaving_window`] plus every day a repair released whose window,
+/// counted from its `.done` date ([`eligibility_day`]), has just left (or
+/// long left) the window of `session_day` (Quote 63, hostile review
+/// 2026-11-20): a `.done` written a week or more after its day would
+/// otherwise leave the window past the lookback and never be reported.
+/// Pure, O(days + released).
+#[must_use]
+pub fn days_leaving_window_with_released(
+    session_day: NaiveDate,
+    released: &[(NaiveDate, NaiveDate)],
+) -> Vec<NaiveDate> {
+    let mut days = days_leaving_window(session_day);
+    let newest = session_day.checked_sub_signed(chrono::TimeDelta::days(CATCH_UP_DAYS));
+    let oldest = session_day.checked_sub_signed(chrono::TimeDelta::days(
+        CATCH_UP_DAYS + LEFT_WINDOW_LOOKBACK_DAYS - 1,
+    ));
+    let (Some(newest), Some(oldest)) = (newest, oldest) else {
+        return days;
+    };
+    let first = first_export_day();
+    for (day, _) in released {
+        let eligible = eligibility_day(*day, released);
+        // O(1) EXEMPT: at most LEFT_WINDOW_LOOKBACK_DAYS + a handful released.
+        if eligible >= oldest
+            && eligible <= newest
+            && *day >= first
+            && !days.contains(day)
+            && export_open_secs(session_info(*day)).is_some()
+        {
+            days.push(*day);
+        }
+    }
+    days
+}
+
 /// How one run ended, for the per-day bookkeeping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunEnd {
@@ -856,19 +891,52 @@ async fn past_reasons(exporter: &DailyExporter, day: NaiveDate) -> Vec<String> {
     compose_reasons(exporter.pending_reasons().await, gates)
 }
 
+/// Quote 63 (hostile review 2026-11-20): when `day` is a day a repair
+/// released and the export has sealed it, writes its `.exported` marker so
+/// the archiver may copy its partitions (they wait for it, so they reach S3
+/// in DEDUP-key order). Not released: nothing. A failed write is logged and
+/// retried on the next poll (the archiver waits at most
+/// `RELEASE_EXPORT_WAIT_DAYS`). At most three small file reads and one write.
+fn note_released_day_exported(
+    held_days: &tickvault_storage::held_days::HeldDays,
+    released: &[(NaiveDate, NaiveDate)],
+    day: NaiveDate,
+) {
+    // O(1) EXEMPT: a handful of released days.
+    if !released.iter().any(|(d, _)| *d == day) {
+        return;
+    }
+    match tickvault_storage::off_worker::off_worker(|| held_days.note_exported(day)) {
+        Ok(true) => info!(
+            %day,
+            "brutex export: repaired day sealed; its partitions may now be archived"
+        ),
+        Ok(false) => {}
+        Err(err) => warn!(
+            %day,
+            error = %err,
+            "brutex export: the repaired day's exported marker was not written; the \
+             archiver keeps its partitions until it is (retried next poll)"
+        ),
+    }
+}
+
 /// Reports, once per process, every session day of the last
 /// [`LEFT_WINDOW_LOOKBACK_DAYS`] past the window that has no DONE. `true`
 /// when every day could be checked (a failed HEAD is retried next poll).
 /// A day `wanted` refuses ([`left_window_report_wanted`]: held, or released
 /// and still inside its window from its `.done`) is skipped, not reported.
+/// Released days whose window from the `.done` date has left are included
+/// ([`days_leaving_window_with_released`]).
 async fn report_days_left_window(
     ex: &DailyExporter,
     session_day: NaiveDate,
+    released: &[(NaiveDate, NaiveDate)],
     reported: &mut std::collections::HashSet<NaiveDate>,
     wanted: impl Fn(NaiveDate) -> bool,
 ) -> bool {
     let mut all_checked = true;
-    for day in days_leaving_window(session_day) {
+    for day in days_leaving_window_with_released(session_day, released) {
         if reported.contains(&day) {
             continue;
         }
@@ -959,7 +1027,8 @@ async fn run_export_loop(
             left_window_report_wanted(d, session_day, held, &released)
         };
         if left_checked != Some(session_day)
-            && report_days_left_window(ex, session_day, &mut left_reported, left_wanted).await
+            && report_days_left_window(ex, session_day, &released, &mut left_reported, left_wanted)
+                .await
         {
             left_checked = Some(session_day);
         }
@@ -996,16 +1065,24 @@ async fn run_export_loop(
             // Past the horizon the session day is a catch-up day (no hold).
             let is_session_day = is_today && within_session_horizon(ssecs, open);
             let state = days.entry(day).or_default();
-            if state.sealed || state.gave_up {
+            if state.sealed {
+                // Quote 63: a released day the export sealed lets the
+                // archiver copy it (retried each poll until written).
+                note_released_day_exported(&held_days, &released, day);
+                continue;
+            }
+            if state.gave_up {
                 continue;
             }
             if crate::daily_task_marker::daily_marker_exists(EXPORT_MARKER_TASK, day) {
                 state.sealed = true;
+                note_released_day_exported(&held_days, &released, day);
                 continue;
             }
             match ex.is_sealed(day).await {
                 Ok(true) => {
                     state.sealed = true;
+                    note_released_day_exported(&held_days, &released, day);
                     if let Err(err) =
                         crate::daily_task_marker::try_write_daily_marker(EXPORT_MARKER_TASK, day)
                     {
@@ -1093,6 +1170,7 @@ async fn run_export_loop(
                     match outcome {
                         Ok(ExportOutcome::Sealed(report)) => {
                             apply_run_end(state, RunEnd::Sealed, now_unix);
+                            note_released_day_exported(&held_days, &released, day);
                             if let Err(err) = crate::daily_task_marker::try_write_daily_marker(
                                 EXPORT_MARKER_TASK,
                                 day,
@@ -1511,6 +1589,45 @@ mod tests {
             false,
             &[]
         ));
+    }
+
+    /// Hostile review 2026-11-20: a day whose `.done` came a week or more
+    /// after it leaves its window (counted from the `.done`) past the plain
+    /// lookback, and is still checked for a DONE once.
+    #[test]
+    fn test_days_leaving_window_with_released_reports_a_late_done_day() {
+        let released = [(nd("2026-11-20"), nd("2026-11-30"))];
+        // 30 Nov left the window of 7 Dec; 20 Nov is past the plain lookback.
+        assert!(!days_leaving_window(nd("2026-12-07")).contains(&nd("2026-11-20")));
+        let days = days_leaving_window_with_released(nd("2026-12-07"), &released);
+        assert!(days.contains(&nd("2026-11-20")), "{days:?}");
+        assert!(left_window_report_wanted(
+            nd("2026-11-20"),
+            nd("2026-12-07"),
+            false,
+            &released
+        ));
+        // Still inside its window from the `.done` (3 Dec: oldest window day
+        // 27 Nov): not reported, though its own date is in the plain list.
+        assert!(
+            days_leaving_window_with_released(nd("2026-12-03"), &released)
+                .iter()
+                .filter(|d| **d == nd("2026-11-20"))
+                .count()
+                <= 1,
+            "listed at most once"
+        );
+        assert!(!left_window_report_wanted(
+            nd("2026-11-20"),
+            nd("2026-12-03"),
+            false,
+            &released
+        ));
+        // No released day: the plain list.
+        assert_eq!(
+            days_leaving_window_with_released(nd("2026-12-07"), &[]),
+            days_leaving_window(nd("2026-12-07"))
+        );
     }
 
     #[test]

@@ -3046,6 +3046,11 @@ impl PartitionArchiver {
                 );
                 break;
             }
+            // Quote 63: a `.hold` written while this pass runs stops the
+            // copy here, not only on the next pass (one small file read).
+            if self.held_since_pass_start(table, &partition, &mut summary) {
+                continue;
+            }
             // O(1) EXEMPT: begin — at most one entry per swept table, cold
             // once-per-run loop.
             if wal_blocked.contains(&table) {

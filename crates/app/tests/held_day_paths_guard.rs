@@ -13,9 +13,13 @@
 //! The source scans below fail the build when any of the three call sites
 //! stops consulting the hold, when the hold moves after the per-pass cap or
 //! the backlog measure, or when `main` could spawn the cross-check before the
-//! held days are installed. The behaviour test drives the public deciders of
-//! all three paths against real state files. Bite-proven: each scan has a
-//! negative fixture.
+//! held days are installed. The behaviour test drives, against real state
+//! files: `HeldDays::holds_partition` (the same `archive_verdict` the pass
+//! filter calls through `split_held_partitions`), `HeldDays::is_held` (the
+//! exact check the export loop and `export_day` make; the loop's `continue`
+//! is pinned by a scan, not run), and the cross-check's own
+//! `past_days_to_check`. Bite-proven: each order scan has a negative
+//! fixture.
 
 use std::path::{Path, PathBuf};
 
@@ -101,7 +105,29 @@ fn held_day_paths_archive_pass_filters_before_cap_and_backlog() {
         "PartitionArchiver::new and from_parts must both build the held days"
     );
     let filter = read("crates/storage/src/partition_archive/held_day_filter.rs");
-    assert!(filter.contains("held_days.verdict(day)"));
+    assert!(filter.contains("held_days.archive_verdict(day)"));
+    // A `.hold` written mid-pass stops the copy at the next partition.
+    let recheck = at(
+        pass,
+        "self.held_since_pass_start(table, &partition, &mut summary)",
+        "run_archive_pass",
+    );
+    assert!(
+        recheck
+            < at(
+                pass,
+                "self.process_one(table, &partition, &mut summary)",
+                "run_archive_pass"
+            )
+    );
+    assert!(
+        recheck
+            < at(
+                pass,
+                "archive_with_snapshot_gate(self, table",
+                "run_archive_pass"
+            )
+    );
     assert!(filter.contains("\"reason\" => \"held_day\""));
 }
 
@@ -118,6 +144,32 @@ fn held_day_paths_archive_order_detector_bites() {
     assert!(archive_pass_order(right).is_ok());
 }
 
+/// The export loop's held-day block ends in `continue` before the session
+/// day is classified (a skip that only logs would run the day). `Err`
+/// names the defect.
+fn held_skip_continues(lp: &str) -> Result<(), String> {
+    let start = lp
+        .find("held_days.is_held(day))")
+        .ok_or("the loop does not ask whether the day is held")?;
+    let end = lp[start..]
+        .find("let is_session_day")
+        .ok_or("`let is_session_day` missing after the held check")?;
+    if lp[start..start + end].contains("continue;") {
+        Ok(())
+    } else {
+        Err("the held-day block does not `continue`".to_string())
+    }
+}
+
+#[test]
+fn held_day_paths_held_skip_detector_bites() {
+    let wrong = "if held_days.is_held(day)) { info!(\"held\"); }\nlet is_session_day = 1;";
+    assert!(held_skip_continues(wrong).is_err());
+    assert!(held_skip_continues("let is_session_day").is_err());
+    let right = "if held_days.is_held(day)) { continue;\n }\nlet is_session_day = 1;";
+    assert!(held_skip_continues(right).is_ok());
+}
+
 #[test]
 fn held_day_paths_export_skips_before_any_attempt_or_object() {
     // The export itself refuses a held day before its DONE check and before
@@ -127,7 +179,17 @@ fn held_day_paths_export_skips_before_any_attempt_or_object() {
     let held = at(day_fn, "self.archiver.held_days.is_held(day)", "export_day");
     assert!(held < at(day_fn, "self.is_sealed(day)", "export_day"));
     assert!(held < at(day_fn, "for table in export_tables()", "export_day"));
-    assert!(day_fn.contains("StopReason::Held"));
+    assert!(day_fn.contains("return Ok(held_stop(day, \"start\"));"));
+    let stop_fn = body(&export, "fn held_stop(", "\n}\n");
+    assert!(stop_fn.contains("ExportOutcome::Stopped(StopReason::Held)"));
+    assert!(stop_fn.contains("\"outcome\" => \"held_day\""));
+    // A `.hold` written mid-export stops it before the next table.
+    let tables = at(day_fn, "for table in export_tables()", "export_day");
+    assert!(tables < at(day_fn, "return Ok(held_stop(day, table));", "export_day"));
+    assert!(
+        !day_fn.contains("stopped(day, \"held_day\""),
+        "a held stop is counted once, as held_day"
+    );
 
     // The scheduler skips a held day before it counts an attempt, checks a
     // DONE, or can mark the session day pending (the drain hold).
@@ -153,6 +215,16 @@ fn held_day_paths_export_skips_before_any_attempt_or_object() {
     assert!(
         lp.contains("Ok(ExportOutcome::Stopped(StopReason::Held))"),
         "a hold written mid-run must not count as an attempt"
+    );
+    held_skip_continues(lp).unwrap_or_else(|e| panic!("{e}"));
+    // Every way the loop learns a released day is sealed records it, so the
+    // archiver (which waits for that) copies the repaired day after the
+    // export placed it in order.
+    assert_eq!(
+        lp.matches("note_released_day_exported(&held_days, &released, day);")
+            .count(),
+        4,
+        "the in-process seal, the local done cache, the DONE check and the run"
     );
 }
 
@@ -191,6 +263,9 @@ fn held_day_paths_cross_check_catch_up_consults_the_hold() {
     );
 }
 
+// PR-6 (cleanup) removes 2026-11-20 from `held_days`: change this test in
+// the same PR (it pins the entry). The archiver still waits for the
+// day's export after the entry is gone (a valid `.done` keeps the wait).
 #[test]
 fn held_day_paths_config_holds_2026_11_20_without_disabling_the_archive() {
     let base = read("config/base.toml");
@@ -255,7 +330,11 @@ fn test_regression_held_day_skipped_by_all_three_paths() {
     let s = Scratch::new();
     let day = d("2026-11-20");
     let monday = d("2026-11-23");
-    let held = HeldDays::with_dirs(vec![day], s.path("held-days"), s.path("day-repair"));
+    // Today pinned after the `.done` written below (a later `.done` releases
+    // nothing).
+    let today = d("2026-11-30");
+    let held =
+        HeldDays::with_dirs(vec![day], s.path("held-days"), s.path("day-repair")).with_today(today);
     // Held by config: no path takes it; depth still archives.
     assert_eq!(paths_take(&held, day, monday), [false, false, false]);
     assert!(!held.holds_partition("market_depth_book", "2026-11-20T10"));
@@ -266,7 +345,8 @@ fn test_regression_held_day_skipped_by_all_three_paths() {
         [true, true, true]
     );
     // An auto-held day (a `.hold` file, no config entry) is held the same way.
-    let unlisted = HeldDays::with_dirs(Vec::new(), s.path("held-days"), s.path("day-repair"));
+    let unlisted = HeldDays::with_dirs(Vec::new(), s.path("held-days"), s.path("day-repair"))
+        .with_today(today);
     write_day_marker(
         &s.path("held-days"),
         MarkerKind::Hold,
@@ -296,5 +376,12 @@ fn test_regression_held_day_skipped_by_all_three_paths() {
         )
         .contains(&day)
     );
+    // With the export on (production), the ARCHIVER waits for the export to
+    // seal the released day (`.exported`), so the repaired hours reach S3 in
+    // order; the export and the cross-check are released at once.
+    let export_first = held.clone().with_export_first(true);
+    assert_eq!(paths_take(&export_first, day, monday), [false, true, true]);
+    assert!(export_first.note_exported(day).expect("exported"));
+    assert_eq!(paths_take(&export_first, day, monday), [true, true, true]);
     assert!(Path::new(&s.path("day-repair")).exists());
 }

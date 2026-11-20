@@ -1182,6 +1182,17 @@ fn stopped(day: NaiveDate, at: &str, reason: StopReason) -> ExportOutcome {
     ExportOutcome::Stopped(reason)
 }
 
+/// Counts and logs an attempt stopped because the day is held (Quote 63):
+/// once, as `outcome="held_day"`, never also as `stopped`. O(1).
+fn held_stop(day: NaiveDate, at: &str) -> ExportOutcome {
+    metrics::counter!("tv_brutex_export_runs_total", "outcome" => "held_day").increment(1);
+    info!(
+        %day, at,
+        "brutex export: day HELD (Quote 63), not exported until its repair is verified"
+    );
+    ExportOutcome::Stopped(StopReason::Held)
+}
+
 /// Whether the volume can take the next partition: free bytes at or above
 /// `floor_for_total(total)` plus `expected_bytes` (the partition's on-disk
 /// size, a bound on its gzip). An unread volume is "no" (the export is
@@ -1498,10 +1509,10 @@ impl DailyExporter {
         let started_ist_nanos = super::now_ist_nanos();
         let clock = std::time::Instant::now();
         // Quote 63: a held day writes no object, manifest or DONE, forced or
-        // not (`crate::held_days`). At most two small file reads.
+        // not (`crate::held_days`). At most two small file reads. Counted once,
+        // as `held_day` (not also as `stopped`).
         if crate::off_worker::off_worker(|| self.archiver.held_days.is_held(day)) {
-            metrics::counter!("tv_brutex_export_runs_total", "outcome" => "held_day").increment(1);
-            return Ok(stopped(day, "held_day", StopReason::Held));
+            return Ok(held_stop(day, "start"));
         }
         if self.is_sealed(day).await? {
             metrics::counter!("tv_brutex_export_runs_total", "outcome" => "skipped_done")
@@ -1529,6 +1540,12 @@ impl DailyExporter {
         for table in export_tables() {
             if !(opts.keep_going)() {
                 return Ok(stopped(day, table, StopReason::Window));
+            }
+            // Quote 63: a `.hold` written while this export runs (the
+            // feed-time page) stops it before the next table (one small file
+            // read per table; a table already placed stays placed).
+            if crate::off_worker::off_worker(|| self.archiver.held_days.is_held(day)) {
+                return Ok(held_stop(day, table));
             }
             match self.export_table(table, day, &mut reasons, opts).await {
                 Ok(TableStep::Done(t)) => results.push(*t),
