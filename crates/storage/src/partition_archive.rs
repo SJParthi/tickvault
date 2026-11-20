@@ -127,6 +127,8 @@ mod drop_tally;
 pub mod daily_export;
 // 2026-11-15: the ordered export in time slices, header written once.
 mod sliced_export;
+// Daily-universe Quote 63 (2026-11-20): held days out of every pass.
+mod held_day_filter;
 
 use hour_path::{
     HOUR_PATH_TABLES, TICK_SPILL_TABLES, hot_hour_floor, hour_window_for,
@@ -1517,6 +1519,11 @@ pub struct ArchiveRunSummary {
     /// latch: a held partition is retried by the next day's pass, and the
     /// hold itself is bounded by [`MAX_CROSSVERIFY_HOLD_DAYS`].
     pub held_unverified: u32,
+    /// Partitions HELD this run because their IST day is held (daily-universe
+    /// Quote 63: `held_days` or a `.hold` file, until the repair writes its `.done`).
+    /// Not a failure and not work tonight: nothing is copied or dropped and
+    /// the drain-hold backlog does not count them.
+    pub held_day: u32,
     /// Depth partitions HELD this run because the after-close deferred-depth
     /// pass still has rows of their hour to write back (DA-13d; since PR AA
     /// step 2, the hour's after-close marks, read by the snapshot gate). Not
@@ -1896,6 +1903,9 @@ pub struct PartitionArchiver {
     /// session's export opening; owner Quote 60): the archiver never sorts
     /// there. [`daily_export::in_trading_day_window_now`] in production.
     trading_window_now: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
+    /// Days held out of every pass (daily-universe Quote 63):
+    /// `cfg.held_days` plus the `.hold` / `.done` state files.
+    held_days: crate::held_days::HeldDays,
 }
 
 /// How the archiver reads a table's spill folder (PR AA review).
@@ -2156,6 +2166,7 @@ impl PartitionArchiver {
                 snapshot_gate::process_depth_ack_bound_trusted,
             ),
             trading_window_now: std::sync::Arc::new(daily_export::in_trading_day_window_now),
+            held_days: crate::held_days::HeldDays::from_config(cfg),
         }))
     }
 
@@ -2173,6 +2184,7 @@ impl PartitionArchiver {
         cfg: PartitionRetentionConfig,
         audit: PartitionArchiveAuditWriter,
     ) -> Result<Self> {
+        let held_days = crate::held_days::HeldDays::from_config(&cfg);
         Ok(Self {
             exec_url,
             exp_url,
@@ -2212,6 +2224,7 @@ impl PartitionArchiver {
                 snapshot_gate::process_depth_ack_bound_trusted,
             ),
             trading_window_now: std::sync::Arc::new(daily_export::in_trading_day_window_now),
+            held_days,
         })
     }
 
@@ -2589,7 +2602,7 @@ impl PartitionArchiver {
                             *hours,
                             &rows,
                             now_ist,
-                            |p| !held_by_crossverify(p),
+                            |p| !held_by_crossverify(p) && self.backlog_counts_held(table, p),
                             &mut sizes,
                         );
                     }
@@ -2689,6 +2702,7 @@ impl PartitionArchiver {
         // PR AA step 2: the quiesce-busy series exists from the first pass, so
         // the first hold is a visible change rather than a new series.
         snapshot_gate::count_quiesce_busy_held(0);
+        held_day_filter::count_held_day(0);
         self.ensure_audit_table().await;
         self.clean_temp_dir();
 
@@ -2883,6 +2897,9 @@ impl PartitionArchiver {
         // table with an older backlog cannot starve a newer one out of the
         // per-run budget entirely. See `fair_share_worklist` for the measured
         // incident this replaces.
+        // Quote 63 held days first: a held partition takes no slot and is not
+        // counted as backlog (`held_day_filter`).
+        let worklist = self.apply_held_days(worklist, &mut summary);
         // Cross-verification hold BEFORE the per-run cap, so a held partition
         // never consumes budget a verified one could have used.
         let worklist = self.apply_crossverify_hold(worklist, &mut summary);
@@ -3161,6 +3178,7 @@ impl PartitionArchiver {
             failed = summary.failed,
             rows_archived = summary.rows_archived,
             held_unverified = summary.held_unverified,
+            held_day = summary.held_day,
             held_by_gate = summary.held_by_gate,
             stopped_at_deadline = summary.stopped_at_deadline,
             tables_wal_not_applied = summary.tables_wal_not_applied,

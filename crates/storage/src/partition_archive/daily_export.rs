@@ -1115,6 +1115,10 @@ pub enum StopReason {
     /// Less than the disk floor plus the next partition's size is free (or
     /// the volume could not be read). The caller waits before trying again.
     Disk,
+    /// The day is held (daily-universe Quote 63): nothing is exported until its
+    /// repair writes `.done`. Not an attempt; the scheduler skips a held day
+    /// before calling, so this answers only a hold written in between.
+    Held,
 }
 
 impl StopReason {
@@ -1124,6 +1128,7 @@ impl StopReason {
         match self {
             Self::Window => "window",
             Self::Disk => "disk",
+            Self::Held => "held_day",
         }
     }
 }
@@ -1492,6 +1497,12 @@ impl DailyExporter {
         let started = now_ist_text();
         let started_ist_nanos = super::now_ist_nanos();
         let clock = std::time::Instant::now();
+        // Quote 63: a held day writes no object, manifest or DONE, forced or
+        // not (`crate::held_days`). At most two small file reads.
+        if crate::off_worker::off_worker(|| self.archiver.held_days.is_held(day)) {
+            metrics::counter!("tv_brutex_export_runs_total", "outcome" => "held_day").increment(1);
+            return Ok(stopped(day, "held_day", StopReason::Held));
+        }
         if self.is_sealed(day).await? {
             metrics::counter!("tv_brutex_export_runs_total", "outcome" => "skipped_done")
                 .increment(1);

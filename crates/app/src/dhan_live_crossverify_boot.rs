@@ -1531,19 +1531,22 @@ fn day_start_ist_nanos_of(day: chrono::NaiveDate) -> i64 {
 /// `MAX_CROSSVERIFY_HOLD_DAYS` days before `today` with no day marker and no
 /// refused marker, oldest first, because the oldest is the next the S3 archive
 /// releases unverified. Whatever today's own marker says. Older days are not
-/// checked: the archive no longer waits for them. Pure, O(hold days).
+/// checked: the archive no longer waits for them. A day `is_held` (daily-universe
+/// Quote 63: `held_days` or a `.hold` file, until its repair `.done`) is
+/// skipped. Pure, O(hold days).
 #[must_use]
 pub fn past_days_to_check(
     today: chrono::NaiveDate,
     is_trading_day: impl Fn(chrono::NaiveDate) -> bool,
     is_recorded: impl Fn(chrono::NaiveDate) -> bool,
     is_refused: impl Fn(chrono::NaiveDate) -> bool,
+    is_held: impl Fn(chrono::NaiveDate) -> bool,
 ) -> Vec<chrono::NaiveDate> {
     let max = tickvault_storage::partition_archive::MAX_CROSSVERIFY_HOLD_DAYS;
     (1..=max)
         .rev()
         .filter_map(|age| today.checked_sub_signed(chrono::TimeDelta::try_days(age)?))
-        .filter(|d| is_trading_day(*d) && !is_recorded(*d) && !is_refused(*d))
+        .filter(|d| is_trading_day(*d) && !is_recorded(*d) && !is_refused(*d) && !is_held(*d))
         .collect()
 }
 
@@ -1676,11 +1679,25 @@ async fn run_past_days(
     tried: &mut Vec<chrono::NaiveDate>,
 ) -> bool {
     let calendar = Arc::clone(&deps.calendar);
+    // Quote 63: a held day is not checked until its repair `.done`. At most
+    // two small file reads per past day.
+    let held_days = tickvault_storage::held_days::process_held_days();
     let days = past_days_to_check(
         pass_day,
         |d| calendar.is_trading_day(d),
         |d| daily_marker_exists(CROSSVERIFY_MARKER_TASK, d),
         |d| daily_marker_exists(CROSSVERIFY_REFUSED_MARKER_TASK, d),
+        |d| {
+            let held = tickvault_storage::off_worker::off_worker(|| held_days.is_held(d));
+            if held {
+                info!(
+                    day = %d,
+                    "Dhan 1-minute cross-verification: a HELD past day (Quote 63) is not \
+                     checked until its repair is verified"
+                );
+            }
+            held
+        },
     );
     for day in days {
         // O(1) EXEMPT: at most MAX_CROSSVERIFY_HOLD_DAYS (3) entries.
@@ -7170,7 +7187,7 @@ mod tests {
     #[test]
     fn test_past_days_to_check_last_chance_first() {
         let today = chrono::NaiveDate::from_ymd_opt(2026, 10, 30).unwrap_or_default();
-        let all = past_days_to_check(today, |_| true, |_| false, |_| false);
+        let all = past_days_to_check(today, |_| true, |_| false, |_| false, |_| false);
         let max = tickvault_storage::partition_archive::MAX_CROSSVERIFY_HOLD_DAYS;
         assert_eq!(all.len(), usize::try_from(max).unwrap_or(0));
         assert!(all.windows(2).all(|w| w[0] < w[1]), "oldest first: {all:?}");
@@ -7182,11 +7199,21 @@ mod tests {
         assert!(!all.contains(&today));
         let yesterday = today.pred_opt().unwrap_or_default();
         let two_back = yesterday.pred_opt().unwrap_or_default();
-        let skip = past_days_to_check(today, |d| d != two_back, |d| d == yesterday, |_| false);
+        let skip = past_days_to_check(
+            today,
+            |d| d != two_back,
+            |d| d == yesterday,
+            |_| false,
+            |_| false,
+        );
         assert!(!skip.contains(&two_back), "not a trading day");
         assert!(!skip.contains(&yesterday), "already recorded");
-        let refused = past_days_to_check(today, |_| true, |_| false, |d| d == yesterday);
+        let refused = past_days_to_check(today, |_| true, |_| false, |d| d == yesterday, |_| false);
         assert!(!refused.contains(&yesterday), "refused days are not re-run");
+        // Quote 63: a held day is skipped; the others still run.
+        let held = past_days_to_check(today, |_| true, |_| false, |_| false, |d| d == yesterday);
+        assert!(!held.contains(&yesterday), "held days are not checked");
+        assert_eq!(held.len() + 1, all.len());
     }
 
     /// 51g: a past day's worst case is every attempt at its worst plus the

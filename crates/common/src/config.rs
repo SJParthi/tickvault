@@ -2527,6 +2527,17 @@ pub struct PartitionRetentionConfig {
     /// Never deletes or overwrites.
     #[serde(default)]
     pub brutex_export_enabled: bool,
+    /// IST days (`YYYY-MM-DD`) HELD out of the archiver (day, hour and
+    /// pressure passes, for `ticks`, `tick_quotes`, `feed_aux_packets` and
+    /// `candles_*`), the Brutex export (forced and last-chance runs too) and
+    /// the cross-check past-day catch-up, until a verified repair writes
+    /// `data/state/day-repair/<day>.done` (daily-universe Quote 63,
+    /// 2026-11-20). Empty by default; `config/base.toml` lists 2026-11-20.
+    /// Never set `archive_enabled = false` to hold a day: that path drops
+    /// partitions without a copy. Each entry must parse as a date (checked
+    /// in [`ApplicationConfig::validate`]).
+    #[serde(default)]
+    pub held_days: Vec<String>,
     /// Internal marker: this config drives a DISK-PRESSURE archive pass.
     ///
     /// NOT a config knob. `#[serde(skip)]` means no TOML can set it and an
@@ -2585,6 +2596,7 @@ impl Default for PartitionRetentionConfig {
                 default_daily_free_target_fallback_session_bytes(),
             drain_hold_counts_archive: true,
             brutex_export_enabled: false,
+            held_days: Vec::new(),
             under_disk_pressure: false,
         }
     }
@@ -3228,6 +3240,13 @@ impl ApplicationConfig {
         parse_time("trading.market_open_time", &self.trading.market_open_time)?;
         parse_time("trading.market_close_time", &self.trading.market_close_time)?;
         parse_time("trading.order_cutoff_time", &self.trading.order_cutoff_time)?;
+        // Daily-universe Quote 63 (2026-11-20): a held day that is not a date
+        // would hold nothing, so it is refused at boot rather than ignored.
+        for entry in &self.partition_retention.held_days {
+            if chrono::NaiveDate::parse_from_str(entry.trim(), "%Y-%m-%d").is_err() {
+                bail!("partition_retention.held_days entry is not a YYYY-MM-DD date: '{entry}'");
+            }
+        }
         parse_time(
             "trading.data_collection_start",
             &self.trading.data_collection_start,
@@ -5225,6 +5244,26 @@ mod tests {
 
     // `test_default_valkey_password_is_empty_string` DELETED in #O4
     // (2026-05-24) along with the `default_valkey_password` helper.
+
+    /// Daily-universe Quote 63 (2026-11-20): `held_days` defaults empty,
+    /// parses a list, and validation refuses an entry that is not a date.
+    #[test]
+    fn test_partition_retention_held_days_default_parse_and_validate() {
+        let from_toml: PartitionRetentionConfig =
+            toml::from_str("").expect("empty section must parse via defaults");
+        assert!(from_toml.held_days.is_empty());
+        assert!(PartitionRetentionConfig::default().held_days.is_empty());
+        let set: PartitionRetentionConfig =
+            toml::from_str("held_days = [\"2026-11-20\"]\n").expect("held_days parses");
+        assert_eq!(set.held_days, vec!["2026-11-20".to_string()]);
+
+        let mut config = make_valid_config();
+        config.partition_retention.held_days = vec!["2026-11-20".to_string()];
+        assert!(config.validate().is_ok());
+        config.partition_retention.held_days = vec!["2026-13-40".to_string()];
+        let msg = config.validate().unwrap_err().to_string();
+        assert!(msg.contains("partition_retention.held_days"), "{msg}");
+    }
 
     #[test]
     fn test_validate_url_empty_rest_api_base_url_rejected() {

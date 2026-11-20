@@ -239,6 +239,9 @@ pub mod partition_manager;
 // row-count- and size-verified; gated on [partition_retention]
 // archive_enabled (serde default false).
 pub mod partition_archive;
+// Daily-universe Quote 63 (2026-11-20): days held out of the archiver, the
+// Brutex export and the cross-check catch-up until a verified repair.
+pub mod held_days;
 pub mod s3_cold;
 /// Read-only fetch of a published brutex strategy (rule brutex-strategy-host-2026-10-29.md).
 pub mod strategy_recipe_fetch;

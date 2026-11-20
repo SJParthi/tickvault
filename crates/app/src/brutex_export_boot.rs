@@ -604,6 +604,58 @@ pub fn oldest_window_day(session_day: NaiveDate) -> Option<NaiveDate> {
     session_day.checked_sub_signed(chrono::TimeDelta::days(CATCH_UP_DAYS - 1))
 }
 
+/// The date a past `day`'s catch-up window and force age are counted from
+/// (daily-universe Quote 63): the day itself, or, for a day a verified repair
+/// released ([`tickvault_storage::held_days::HeldDays::released_days`]), the
+/// later of the day and its `.done` date, so a repair finished more than six
+/// days after the day still exports. Pure, O(released).
+#[must_use]
+pub fn eligibility_day(day: NaiveDate, released: &[(NaiveDate, NaiveDate)]) -> NaiveDate {
+    released
+        .iter()
+        .find(|(d, _)| *d == day)
+        .map_or(day, |(_, done_on)| day.max(*done_on))
+}
+
+/// The days visited for `session_day` ([`visit_order`]) plus every day a
+/// repair released whose own date has left the window but whose
+/// [`eligibility_day`] is still inside it (Quote 63), placed right after the
+/// session day (they are the oldest). A `.done` dated after the session day
+/// (a clock step) adds nothing. Pure, O(released).
+#[must_use]
+pub fn visit_order_with_released(
+    session_day: NaiveDate,
+    released: &[(NaiveDate, NaiveDate)],
+) -> Vec<NaiveDate> {
+    let mut days = visit_order(session_day);
+    let Some(oldest) = oldest_window_day(session_day) else {
+        return days;
+    };
+    let extra: Vec<NaiveDate> = released
+        .iter()
+        .filter(|(day, done_on)| *day < oldest && *done_on >= oldest && *done_on <= session_day)
+        .map(|(day, _)| *day)
+        .collect();
+    days.splice(1..1, extra);
+    days
+}
+
+/// Whether the "left the window with no DONE" report is wanted for `day`
+/// (Quote 63): never for a `held` day (the hold keeps it back on purpose),
+/// nor for a released day still inside its window counted from its `.done`
+/// date. Pure, O(released).
+#[must_use]
+pub fn left_window_report_wanted(
+    day: NaiveDate,
+    session_day: NaiveDate,
+    held: bool,
+    released: &[(NaiveDate, NaiveDate)],
+) -> bool {
+    !held
+        && oldest_window_day(session_day)
+            .is_none_or(|oldest| eligibility_day(day, released) < oldest)
+}
+
 /// What survives a panic of the export loop (2026-11-14 third review): the
 /// per-day state, and the day an export is running for with its state (its
 /// attempt already counted). Shared between the supervising task and each
@@ -807,14 +859,22 @@ async fn past_reasons(exporter: &DailyExporter, day: NaiveDate) -> Vec<String> {
 /// Reports, once per process, every session day of the last
 /// [`LEFT_WINDOW_LOOKBACK_DAYS`] past the window that has no DONE. `true`
 /// when every day could be checked (a failed HEAD is retried next poll).
+/// A day `wanted` refuses ([`left_window_report_wanted`]: held, or released
+/// and still inside its window from its `.done`) is skipped, not reported.
 async fn report_days_left_window(
     ex: &DailyExporter,
     session_day: NaiveDate,
     reported: &mut std::collections::HashSet<NaiveDate>,
+    wanted: impl Fn(NaiveDate) -> bool,
 ) -> bool {
     let mut all_checked = true;
     for day in days_leaving_window(session_day) {
         if reported.contains(&day) {
+            continue;
+        }
+        // Quote 63: a held day, or a released day still inside its window
+        // counted from its `.done`, is not a missed export.
+        if !wanted(day) {
             continue;
         }
         match ex.is_sealed(day).await {
@@ -852,6 +912,10 @@ async fn run_export_loop(
     let high_water = cfg.pressure_high_water_pct;
     let floor = move |total: u64| export_floor_bytes(total, high_water);
     let mut exporter: Option<DailyExporter> = None;
+    // Quote 63: the held days this loop skips (config plus `.hold` / `.done`
+    // files), and the held days already logged in this process.
+    let held_days = tickvault_storage::held_days::HeldDays::from_config(&cfg);
+    let mut held_logged: std::collections::HashSet<NaiveDate> = std::collections::HashSet::new();
     // A respawn after a panic starts from the booked state (the panicked
     // run counted as a failed attempt), never from scratch.
     let mut days: HashMap<NaiveDate, DayState> = std::mem::take(&mut lock_carry(&carry).days);
@@ -883,14 +947,24 @@ async fn run_export_loop(
             continue;
         };
         let (session_day, ssecs) = session_day_of(date, secs);
-        days.retain(|d, _| *d >= session_day - chrono::TimeDelta::days(CATCH_UP_DAYS));
+        // Quote 63: days a repair released are visited while their window,
+        // counted from the `.done` date, still holds them. One folder listing.
+        let released = tickvault_storage::off_worker::off_worker(|| held_days.released_days());
+        let visit = visit_order_with_released(session_day, &released);
+        days.retain(|d, _| {
+            *d >= session_day - chrono::TimeDelta::days(CATCH_UP_DAYS) || visit.contains(d)
+        });
+        let left_wanted = |d: NaiveDate| {
+            let held = tickvault_storage::off_worker::off_worker(|| held_days.is_held(d));
+            left_window_report_wanted(d, session_day, held, &released)
+        };
         if left_checked != Some(session_day)
-            && report_days_left_window(ex, session_day, &mut left_reported).await
+            && report_days_left_window(ex, session_day, &mut left_reported, left_wanted).await
         {
             left_checked = Some(session_day);
         }
         let mut session_pending = false;
-        for day in visit_order(session_day) {
+        for day in visit {
             // Re-checked before every day: a catch-up run never starts a
             // day once the trading-day window has closed on it.
             if !export_window_open_now() {
@@ -901,6 +975,22 @@ async fn run_export_loop(
             };
             let is_today = day == session_day;
             if is_today && ssecs < open {
+                continue;
+            }
+            // Quote 63: a held day is skipped before anything is counted: no
+            // attempt, no DONE check, no objects, and it never holds the box
+            // (it never sets `session_pending`). Forced and last-chance runs
+            // included. At most two small file reads.
+            if tickvault_storage::off_worker::off_worker(|| held_days.is_held(day)) {
+                if held_logged.insert(day) {
+                    metrics::counter!("tv_brutex_export_runs_total", "outcome" => "held_day")
+                        .increment(1);
+                    info!(
+                        %day,
+                        "brutex daily export: day HELD (Quote 63) — not exported until its \
+                         repair is verified; the box is not kept up for it"
+                    );
+                }
                 continue;
             }
             // Past the horizon the session day is a catch-up day (no hold).
@@ -933,7 +1023,9 @@ async fn run_export_loop(
             let now_unix = chrono::Utc::now().timestamp();
             // The session day past its horizon keeps its hard gates (it is
             // never forced: it becomes a past day tomorrow).
-            let forced = !is_today && past_day_forced(day, session_day);
+            // A released day counts its age from its `.done` date (Quote 63).
+            let eligible = eligibility_day(day, &released);
+            let forced = !is_today && past_day_forced(eligible, session_day);
             let reasons = if is_today {
                 today_reasons(ex, &exec_url, day, ssecs).await
             } else {
@@ -942,7 +1034,7 @@ async fn run_export_loop(
             let step = if is_session_day {
                 session_day_step(ssecs, open, *state, now_unix, &reasons)
             } else {
-                let last_chance = last_window_chance(day, session_day);
+                let last_chance = last_window_chance(eligible, session_day);
                 let blocked = blocks_even_forced(&reasons, ssecs >= SECS_PER_DAY, last_chance);
                 // While the session day waits, a past day not at its last
                 // chance does not start (2026-11-15 audit, exportflow-1).
@@ -1030,6 +1122,11 @@ async fn run_export_loop(
                         Ok(ExportOutcome::Stopped(StopReason::Disk)) => {
                             // Too little disk: not an attempt; wait.
                             apply_run_end(state, RunEnd::StoppedDisk, now_unix);
+                        }
+                        Ok(ExportOutcome::Stopped(StopReason::Held)) => {
+                            // Held between the check above and the run (Quote 63):
+                            // not an attempt; the next poll skips the day.
+                            apply_run_end(state, RunEnd::StoppedWindow, now_unix);
                         }
                         Err(err) => {
                             apply_run_end(state, RunEnd::Failed, now_unix);
@@ -1315,6 +1412,107 @@ mod tests {
     /// FIRST. Corrected 2026-11-15 (audit exportflow-1): visiting it first
     /// alone did not keep a catch-up backlog behind it; the loop also passes
     /// the session day's pending state to [`yield_to_session_day`].
+    fn nd(s: &str) -> NaiveDate {
+        NaiveDate::parse_from_str(s, "%Y-%m-%d").expect("date")
+    }
+
+    /// Regression (daily-universe Quote 63, 2026-11-20): a held day released
+    /// by a repair `.done` counts its catch-up window and force age from the
+    /// `.done` date, so a repair finished days later still exports, and the
+    /// release does not make it a last-chance forced run at once.
+    #[test]
+    fn test_regression_held_day_export_eligibility_from_done() {
+        let released = [(nd("2026-11-20"), nd("2026-11-25"))];
+        // Without the release, 20 Nov has left the window of 1 Dec.
+        assert!(!visit_order(nd("2026-12-01")).contains(&nd("2026-11-20")));
+        // With it, 20 Nov is visited (right after the session day) while the
+        // window counted from 25 Nov holds it, and not after.
+        let visit = visit_order_with_released(nd("2026-12-01"), &released);
+        assert_eq!(visit.first(), Some(&nd("2026-12-01")));
+        assert_eq!(visit.get(1), Some(&nd("2026-11-20")));
+        assert_eq!(visit.len(), CATCH_UP_DAYS as usize + 1);
+        assert!(
+            !visit_order_with_released(nd("2026-12-02"), &released).contains(&nd("2026-11-20"))
+        );
+        // Still inside the ordinary window: not added twice.
+        let inside = visit_order_with_released(nd("2026-11-24"), &released);
+        assert_eq!(inside.iter().filter(|d| **d == nd("2026-11-20")).count(), 1);
+        // A `.done` dated after the session day (a clock step) adds nothing.
+        assert!(
+            !visit_order_with_released(nd("2026-12-01"), &[(nd("2026-11-20"), nd("2026-12-05"))])
+                .contains(&nd("2026-11-20"))
+        );
+        // On 26 Nov, 20 Nov counted from its own date is the oldest day of the
+        // window (a last-chance forced run); counted from 25 Nov it is not.
+        let all_sessions = |_: NaiveDate| true;
+        assert!(last_window_chance_with(
+            nd("2026-11-20"),
+            nd("2026-11-26"),
+            all_sessions
+        ));
+        let eligible = eligibility_day(nd("2026-11-20"), &released);
+        assert_eq!(eligible, nd("2026-11-25"));
+        assert!(!last_window_chance_with(
+            eligible,
+            nd("2026-11-26"),
+            all_sessions
+        ));
+        assert!(
+            nd("2026-11-26").signed_duration_since(eligible).num_days() < PAST_DAY_FORCE_AFTER_DAYS
+        );
+    }
+
+    #[test]
+    fn test_eligibility_day_and_visit_order_with_released_leave_other_days_alone() {
+        let released = [(nd("2026-11-20"), nd("2026-11-25"))];
+        assert_eq!(
+            eligibility_day(nd("2026-11-19"), &released),
+            nd("2026-11-19")
+        );
+        // A `.done` dated before its own day never moves the day earlier.
+        assert_eq!(
+            eligibility_day(nd("2026-11-20"), &[(nd("2026-11-20"), nd("2026-11-18"))]),
+            nd("2026-11-20")
+        );
+        assert_eq!(
+            visit_order_with_released(nd("2026-11-24"), &[]),
+            visit_order(nd("2026-11-24"))
+        );
+    }
+
+    #[test]
+    fn test_left_window_report_wanted_skips_held_and_released_inside_window() {
+        let released = [(nd("2026-11-20"), nd("2026-11-25"))];
+        // Held: never reported as a missed export.
+        assert!(!left_window_report_wanted(
+            nd("2026-11-20"),
+            nd("2026-11-27"),
+            true,
+            &[]
+        ));
+        // Released, still inside its window from the `.done` date.
+        assert!(!left_window_report_wanted(
+            nd("2026-11-20"),
+            nd("2026-11-27"),
+            false,
+            &released
+        ));
+        // Released and past that window: reported like any other day.
+        assert!(left_window_report_wanted(
+            nd("2026-11-20"),
+            nd("2026-12-02"),
+            false,
+            &released
+        ));
+        // An ordinary day past the window.
+        assert!(left_window_report_wanted(
+            nd("2026-11-18"),
+            nd("2026-11-27"),
+            false,
+            &[]
+        ));
+    }
+
     #[test]
     fn test_visit_order_is_session_day_first_then_oldest_first() {
         let d = NaiveDate::from_ymd_opt(2026, 11, 14).expect("date");
@@ -1752,10 +1950,13 @@ mod tests {
         for want in [
             "today_reasons(ex, &exec_url, day, ssecs)",
             "past_reasons(ex, day)",
-            "past_day_forced(day, session_day)",
+            "past_day_forced(eligible, session_day)",
+            "let eligible = eligibility_day(day, &released);",
+            "for day in visit {",
+            "visit_order_with_released(session_day, &released)",
             "ready(&reasons)",
             "blocks_even_forced(&reasons, ssecs >= SECS_PER_DAY, last_chance)",
-            "let last_chance = last_window_chance(day, session_day);",
+            "let last_chance = last_window_chance(eligible, session_day);",
             "let running = RunningFlag::set();",
             "drop(running);",
             "c.running = days.get(&day)",
