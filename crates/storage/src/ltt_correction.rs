@@ -1405,18 +1405,57 @@ pub struct ControllerCounts {
     pub publishes: u32,
 }
 
+/// How far before a PUBLISHED Muhurat session the reversion guard (and the
+/// feed-time page's trade-time window) starts watching: 15 min, as
+/// 09:15-15:30 widens to 09:00-15:40.
+pub const MUHURAT_GUARD_LEAD_SECS: u32 = 15 * 60;
+/// How far after a published Muhurat session they keep watching: 10 min.
+pub const MUHURAT_GUARD_TAIL_SECS: u32 = 10 * 60;
+
 /// True when an IST receipt is inside the guard's window: 09:00–15:40 IST,
-/// or the Muhurat window on a calendar Muhurat date. Cold (once per verdict).
+/// or the PUBLISHED Muhurat session of a calendar Muhurat date, widened by
+/// [`MUHURAT_GUARD_LEAD_SECS`] / [`MUHURAT_GUARD_TAIL_SECS`] (review fix
+/// 2026-11-21: the fixed 18:00–19:30 window missed an afternoon or late
+/// session, so its reversion page and auto-hold never fired). A Muhurat
+/// date with no published times falls back to 18:00–19:30. Cold (once per
+/// verdict): one calendar probe, two only on a date with no published
+/// session.
 fn in_guard_window(receipt_nanos: i64) -> bool {
     let secs = receipt_ist_secs(receipt_nanos);
     let sod = secs.rem_euclid(SECS_PER_DAY) as u32;
     if (TICK_PERSIST_START_SECS_OF_DAY_IST..TICK_PERSIST_END_SECS_OF_DAY_IST).contains(&sod) {
         return true;
     }
-    (MUHURAT_PERSIST_START_SECS_OF_DAY_IST..MUHURAT_PERSIST_END_SECS_OF_DAY_IST).contains(&sod)
-        && ist_day_date(secs.div_euclid(SECS_PER_DAY))
-            .and_then(tickvault_common::market_hours::installed_calendar_says_muhurat)
-            == Some(true)
+    let Some(date) = ist_day_date(secs.div_euclid(SECS_PER_DAY)) else {
+        return false;
+    };
+    muhurat_guard_contains(
+        sod,
+        tickvault_common::market_hours::installed_muhurat_session_secs(date),
+        || tickvault_common::market_hours::installed_calendar_says_muhurat(date),
+    )
+}
+
+/// The Muhurat half of [`in_guard_window`], pure: `published` is the date's
+/// published session (IST seconds of day, end exclusive), `says_muhurat`
+/// asks whether the date is a Muhurat date at all (only asked when no session
+/// is published; `None` = no calendar, which watches nothing extra). O(1).
+#[must_use]
+fn muhurat_guard_contains(
+    sod: u32,
+    published: Option<(u32, u32)>,
+    says_muhurat: impl FnOnce() -> Option<bool>,
+) -> bool {
+    match published {
+        Some((start, end)) => (start.saturating_sub(MUHURAT_GUARD_LEAD_SECS)
+            ..end.saturating_add(MUHURAT_GUARD_TAIL_SECS))
+            .contains(&sod),
+        None => {
+            (MUHURAT_PERSIST_START_SECS_OF_DAY_IST..MUHURAT_PERSIST_END_SECS_OF_DAY_IST)
+                .contains(&sod)
+                && says_muhurat() == Some(true)
+        }
+    }
 }
 
 /// The live drain's reversion guard (scope lock 2026-11-21, noise lock

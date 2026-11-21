@@ -1085,3 +1085,44 @@ fn test_regression_2026_11_21_counter_labels_come_from_as_str() {
     publish_ltt_counters();
     assert!(COUNTER_HANDLES.get().is_some());
 }
+
+#[test]
+fn test_regression_2026_11_21_guard_watches_the_published_muhurat_session() {
+    // Regression: 2026-11-21 review — `in_guard_window` used a fixed
+    // 18:00–19:30 Muhurat window, so a published session outside it (here
+    // 17:00–18:15) never got a reversion page or its auto-hold.
+    let h = |hh: u32, mm: u32| hh * 3_600 + mm * 60;
+    let published = Some((h(17, 0), h(18, 15)));
+    let never_asked = || -> Option<bool> { panic!("asked although a session is published") };
+    assert!(muhurat_guard_contains(h(17, 10), published, never_asked));
+    assert!(
+        muhurat_guard_contains(h(16, 45), published, never_asked),
+        "15 min lead"
+    );
+    assert!(!muhurat_guard_contains(h(16, 44), published, never_asked));
+    assert!(
+        muhurat_guard_contains(h(18, 24), published, never_asked),
+        "10 min tail"
+    );
+    assert!(
+        !muhurat_guard_contains(h(18, 25), published, never_asked),
+        "end exclusive"
+    );
+    assert!(
+        !muhurat_guard_contains(h(19, 0), published, never_asked),
+        "the fixed window no longer applies to a published session"
+    );
+    // No published times: the fixed 18:00–19:30 window, only on a Muhurat date.
+    assert!(muhurat_guard_contains(h(18, 30), None, || Some(true)));
+    assert!(!muhurat_guard_contains(h(17, 10), None, || Some(true)));
+    assert!(!muhurat_guard_contains(h(18, 30), None, || Some(false)));
+    assert!(
+        !muhurat_guard_contains(h(18, 30), None, || None),
+        "no calendar"
+    );
+    // The feed-time page widens the published session by the same amounts.
+    assert_eq!(
+        (MUHURAT_GUARD_LEAD_SECS, MUHURAT_GUARD_TAIL_SECS),
+        (900, 600)
+    );
+}
