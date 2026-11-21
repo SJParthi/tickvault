@@ -67,8 +67,17 @@
 //! - The detector only guards against Dhan reverting: [`LttController`] pages
 //!   once per segment per IST day (DHAN-FEED-TIME-01,
 //!   `source = "dhan_time_format_reverted"`) on a `Normal` verdict, and never
-//!   changes the correction. `[dhan_feed] ltt_utc_autocorrect` governs only
-//!   that guard (`off`, `shadow` = warn, `act` = page).
+//!   changes the correction. In `act` the page also auto-holds its day
+//!   (daily-universe Quote 63): the drain's 30 s feed-time scan reads
+//!   [`ControllerCounts::reversion_pages`] and hands the day to the latch
+//!   thread, which writes the `.hold` off the drain. `[dhan_feed]
+//!   ltt_utc_autocorrect` governs only that guard (`off`, `shadow` = warn,
+//!   `act` = page and hold).
+//! - Honest limit: [`utc_verdict`] has an upper bound (receipt + 5 s) and no
+//!   lower bound or day check, by design. So if Dhan ever reverts, EVERY
+//!   print more than about 5.5 h behind its receipt, any day (yesterday's
+//!   trade on an illiquid contract's first packet included), is shifted
+//!   +5.5 h wrongly until the day is held; only fresh prints stay raw.
 //! - The boot load ([`install_at_boot`]) reads nothing, so no day is held from
 //!   replay. The table, record, record writer and notice below are DORMANT
 //!   (no production path writes or reads them) and go in a follow-up PR.
@@ -255,13 +264,31 @@ pub enum LttRefusal {
 }
 
 impl LttRefusal {
-    /// The `reason` label of the refusal counter.
+    /// Every refusal reason, in counter order.
+    pub const ALL: [Self; 3] = [Self::Receipt, Self::Band, Self::Cap];
+
+    /// The `reason` label of the refusal counter (the one source of the label:
+    /// [`publish_ltt_counters`] registers its handles from it).
     #[must_use]
+    // TEST-EXEMPT: covered by test_regression_2026_11_21_counter_labels_come_from_as_str
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Receipt => "receipt",
             Self::Band => "band",
             Self::Cap => "cap",
+        }
+    }
+}
+
+impl LttRefusalCounts {
+    /// The count for one reason. O(1).
+    #[must_use]
+    // TEST-EXEMPT: covered by test_regression_2026_11_21_counter_labels_come_from_as_str
+    pub const fn get(&self, refusal: LttRefusal) -> u64 {
+        match refusal {
+            LttRefusal::Receipt => self.receipt,
+            LttRefusal::Band => self.band,
+            LttRefusal::Cap => self.cap,
         }
     }
 }
@@ -386,18 +413,46 @@ pub fn unstamped_count() -> u64 {
     UNSTAMPED.load(Ordering::Relaxed)
 }
 
+/// The refusal counter's name.
+pub const LTT_REFUSED_COUNTER: &str = "tv_dhan_ltt_correction_refused_total";
+/// The unstamped counter's name.
+pub const LTT_UNSTAMPED_COUNTER: &str = "tv_dhan_ltt_unstamped_total";
+
+/// The four counter handles, resolved once (the labels come from
+/// [`LttRefusal::as_str`], so they cannot drift from the reasons).
+struct LttCounterHandles {
+    refused: [metrics::Counter; 3],
+    unstamped: metrics::Counter,
+}
+
+static COUNTER_HANDLES: OnceLock<LttCounterHandles> = OnceLock::new();
+
+fn counter_handles() -> &'static LttCounterHandles {
+    COUNTER_HANDLES.get_or_init(|| LttCounterHandles {
+        refused: LttRefusal::ALL
+            .map(|r| metrics::counter!(LTT_REFUSED_COUNTER, "reason" => r.as_str())),
+        unstamped: metrics::counter!(LTT_UNSTAMPED_COUNTER),
+    })
+}
+
 /// Publishes the refusal and unstamped counts to local `/metrics`
 /// (`tv_dhan_ltt_correction_refused_total{reason}`, `tv_dhan_ltt_unstamped_total`;
-/// no alarm, filter or EMF name). Cold: the live controller calls it once a
-/// minute of receipts, never per packet.
-// TEST-EXEMPT: covered by test_controller_publishes_once_a_minute_of_receipts
+/// no alarm, filter or EMF name). The first call resolves the four handles
+/// (the lane calls it once when it builds the guard, so the series exist at 0
+/// from then); later calls set four values and allocate nothing. Cold: the
+/// live controller calls it once a minute of receipts, never per packet.
+///
+/// The counts are DISPATCHES, not distinct packets: a WAL refold or catch-up,
+/// the after-close depth pass and the offline replay dispatch through the same
+/// path, so a packet dispatched again is counted again.
+// TEST-EXEMPT: covered by test_controller_publishes_once_a_minute_of_receipts and test_regression_2026_11_21_counter_labels_come_from_as_str
 pub fn publish_ltt_counters() {
     let c = refusal_counts();
-    metrics::counter!("tv_dhan_ltt_correction_refused_total", "reason" => "receipt")
-        .absolute(c.receipt);
-    metrics::counter!("tv_dhan_ltt_correction_refused_total", "reason" => "band").absolute(c.band);
-    metrics::counter!("tv_dhan_ltt_correction_refused_total", "reason" => "cap").absolute(c.cap);
-    metrics::counter!("tv_dhan_ltt_unstamped_total").absolute(unstamped_count());
+    let h = counter_handles();
+    for (handle, refusal) in h.refused.iter().zip(LttRefusal::ALL) {
+        handle.absolute(c.get(refusal));
+    }
+    h.unstamped.absolute(unstamped_count());
 }
 
 // ---------------------------------------------------------------------------
@@ -599,19 +654,12 @@ impl LttTable {
 // ---------------------------------------------------------------------------
 
 // ⚠ DORMANT since 2026-11-21: nothing in production publishes a table (the
-// boot load reads nothing and the controller never arms), so `ANY_HELD` stays
-// false and `any_receipt_day_held` returns false. Deleted in the follow-up PR.
+// boot load reads nothing, the controller never arms, and `install_table` was
+// deleted 2026-11-21), so `ANY_HELD` stays false and `any_receipt_day_held`
+// returns false. Deleted in the follow-up PR.
 static ANY_HELD: AtomicBool = AtomicBool::new(false);
 static TABLE: LazyLock<ArcSwap<LttTable>> =
     LazyLock::new(|| ArcSwap::from_pointee(LttTable::empty()));
-
-/// Publishes `table` to every reader. Cold (boot, and a change on the drain).
-// TEST-EXEMPT: covered by test_held_days_are_read_by_receipt and test_install_at_boot_reads_nothing_and_holds_nothing
-pub fn install_table(table: LttTable) {
-    let held = table.any_held();
-    TABLE.store(Arc::new(table));
-    ANY_HELD.store(held, Ordering::Release);
-}
 
 /// A copy of the published table (cold).
 #[must_use]
@@ -1010,7 +1058,7 @@ pub fn install_at_boot(_dir: &Path, mode: LttUtcAutocorrect) {
 
 /// [`install_at_boot`] over [`LTT_RECORD_DIR`] with the configured mode
 /// (the one main.rs call).
-// TEST-EXEMPT: covered by one-line main.rs wrapper over install_at_boot; load path covered by test_append_and_load_record_dir
+// TEST-EXEMPT: one-line main.rs wrapper over install_at_boot, which test_install_at_boot_reads_nothing_and_holds_nothing covers (it loads nothing since 2026-11-21)
 pub fn install_at_boot_from(config: &tickvault_common::config::ApplicationConfig) {
     install_at_boot(
         Path::new(LTT_RECORD_DIR),
@@ -1056,18 +1104,9 @@ pub struct RecordAck {
 /// The notice sender the app hands in (it wraps the Telegram service).
 pub type LttNoticeFn = Arc<dyn Fn(String) + Send + Sync>;
 
+// DORMANT: nothing sets it since 2026-11-21 (`install_notice` deleted); the
+// dormant record writer reads it. Deleted in the follow-up PR.
 static NOTICE: OnceLock<LttNoticeFn> = OnceLock::new();
-
-/// Installs the process-wide notice sender (main.rs, once the Telegram
-/// service exists; it is built after the lane starts). A record writer with no
-/// sender of its own uses this one. Once per process.
-// TEST-EXEMPT: covered by process OnceLock setter; sender path covered by test_record_writer_thread_acks_intents_and_sends_one_notice_a_day
-pub fn install_notice(notice: LttNoticeFn) {
-    if NOTICE.set(notice).is_err() {
-        // A second install in one process: the first sender stands.
-        tracing::debug!("ltt correction notice sender already installed");
-    }
-}
 
 /// The drain's end of the record writer.
 ///
@@ -1357,6 +1396,11 @@ pub struct ControllerCounts {
     pub normal_verdicts: u32,
     /// Reversion reports logged (at most one per segment per IST day).
     pub reversion_reports: u32,
+    /// Reversion PAGES (`act` mode only): each one auto-holds its day
+    /// through the drain's feed-time latch thread (daily-universe Quote 63).
+    pub reversion_pages: u32,
+    /// The IST day number of the latest reversion page (0 before any).
+    pub last_reversion_day: i64,
     /// Counter publishes (once a minute of receipts).
     pub publishes: u32,
 }
@@ -1380,9 +1424,9 @@ fn in_guard_window(receipt_nanos: i64) -> bool {
 /// NSE stock spot prints. A `Utc` verdict is the normal state and does
 /// nothing. The first `Normal` verdict per segment per IST day, with a receipt
 /// at or after [`DHAN_LTT_UTC_FROM_RECEIPT_NANOS`] and inside the guard window,
-/// logs one coded line: an `error!` (`act`, pages DHAN-FEED-TIME-01) or a
-/// `warn!` (`shadow`). It never writes a record and never changes the
-/// correction. Single owner, O(1) per frame and per vote; never blocks.
+/// logs one coded line: an `error!` (`act`, pages DHAN-FEED-TIME-01 and the
+/// app then holds the day) or a `warn!` (`shadow`). It never writes a record
+/// and never changes the correction. The latch is in RAM, one per process. Single owner, O(1) per frame and per vote; never blocks.
 #[derive(Debug)]
 pub struct LttController {
     mode: LttUtcAutocorrect,
@@ -1479,6 +1523,10 @@ impl LttController {
         }
         self.reported[seg] = true;
         self.counts.reversion_reports = self.counts.reversion_reports.saturating_add(1);
+        if self.mode == LttUtcAutocorrect::Act {
+            self.counts.reversion_pages = self.counts.reversion_pages.saturating_add(1);
+            self.counts.last_reversion_day = self.day;
+        }
         self.report_reversion(segment);
     }
 
@@ -1492,8 +1540,9 @@ impl LttController {
                 segment = segment_label(segment),
                 "Dhan trade times look like the old IST format again on {}. Since 20 Nov 2026 \
                  Dhan sends UTC and we add 5 h 30 min; prints that would land in the future \
-                 are left unchanged and counted. Check the Dhan feed; hold the day if prices \
-                 were stored wrong.",
+                 are left unchanged and counted, but older prints are shifted wrongly. Today is \
+                 held out of the archive and the export until it is repaired; raw data is \
+                 kept. Check the Dhan feed.",
                 segment_label(segment)
             ),
             LttUtcAutocorrect::Shadow => warn!(

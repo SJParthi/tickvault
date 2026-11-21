@@ -35,6 +35,15 @@ fn dhat_utc_ltt_correction_dispatch_is_zero_alloc() {
     let zero = packet(4, QUOTE_PACKET_SIZE, 14, 2, 0);
     tickvault_core::parser::prewarm_dispatcher_counters();
     let _ = tickvault_core::parser::dispatch_frame(&confirmed, RECEIPT);
+    // Outside the measured window: the corrected path really corrects.
+    match tickvault_core::parser::dispatch_frame(&confirmed, RECEIPT) {
+        Ok(tickvault_core::parser::ParsedFrame::Tick(t)) => {
+            assert_eq!(t.exchange_timestamp, 1_795_152_600 + 19_800);
+        }
+        other => panic!("not a tick: {other:?}"),
+    }
+    let refused_before = tickvault_storage::ltt_correction::refusal_counts();
+    let unstamped_before = tickvault_storage::ltt_correction::unstamped_count();
     let (_, blocks) = dhat_support::measure_with_phantom_retry(
         0,
         0,
@@ -56,5 +65,21 @@ fn dhat_utc_ltt_correction_dispatch_is_zero_alloc() {
     assert_eq!(
         blocks, 0,
         "the trade-time correction must not allocate on the dispatch path"
+    );
+    // Non-vacuity (2026-11-21 review): every path the header names ran inside
+    // the window, read from the process counters (outside the window).
+    let refused = tickvault_storage::ltt_correction::refusal_counts();
+    assert!(
+        refused.cap.saturating_sub(refused_before.cap) >= 10_000,
+        "the cap refusal (IST-epoch print) ran: {refused:?}"
+    );
+    assert!(
+        refused.band.saturating_sub(refused_before.band) >= 10_000,
+        "the band refusal (raw 0) ran: {refused:?}"
+    );
+    assert!(
+        tickvault_storage::ltt_correction::unstamped_count().saturating_sub(unstamped_before)
+            >= 10_000,
+        "the unstamped path ran"
     );
 }

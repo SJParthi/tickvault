@@ -14,7 +14,8 @@
 //!   a correction on a frame whose receipt is not a WAL stamp;
 //! - [`LiveIngest::ltt_observe`]: one vote per fresh index tick or NSE stock
 //!   spot print, on Dhan's RAW trade time, live frames only (never replay), for
-//!   the reversion guard (pages DHAN-FEED-TIME-01 once per segment per day).
+//!   the reversion guard (pages DHAN-FEED-TIME-01 once per segment per day;
+//!   in `act` the drain's feed-time scan then holds that day, Quote 63).
 //!
 //! [`replay_held`] is DORMANT since 2026-11-21: no day is ever held (the boot
 //! step reads no record), so it always returns false. Deleted in the
@@ -30,6 +31,7 @@ use tickvault_core::parser::types::{ParseError, ParsedFrame};
 use tickvault_core::websocket::pool_supervisor::CapturedFrame;
 use tickvault_storage::ltt_correction::{
     LttController, RecordWriterHandle, SEGMENT_IDX_I, SEGMENT_NSE_EQ, any_receipt_day_held,
+    publish_ltt_counters,
 };
 use tracing::error;
 
@@ -68,7 +70,8 @@ pub(super) fn dispatch_main_feed_packet(
 impl LiveIngest {
     /// Installs the production reversion guard in `mode` (scope lock
     /// 2026-11-21). `_writer` is ignored (the record writer is retired; the
-    /// builder always passes `None`).
+    /// builder always passes `None`). In `act` a reversion page also holds its
+    /// day (the drain's feed-time scan hands it to the latch thread).
     #[must_use]
     // TEST-EXEMPT: covered by test_regression_ist_epoch_index_prints_page_the_reversion_guard_once (app/tests)
     pub fn with_ltt_correction(
@@ -77,6 +80,9 @@ impl LiveIngest {
         _writer: Option<RecordWriterHandle>,
     ) -> Self {
         self.ltt = LttController::new(mode);
+        // Registers the refusal and unstamped counters at their current
+        // values (0 at boot) so the series exist before the first live frame.
+        publish_ltt_counters();
         self
     }
 
@@ -90,7 +96,7 @@ impl LiveIngest {
     /// Once per main-feed frame, before its packets are dispatched. Only a
     /// live frame with a WAL receipt stamp counts. O(1).
     #[inline]
-    // TEST-EXEMPT: covered by test_regression_2026_11_20_the_live_drain_arms_after_a_durable_intent (app/tests)
+    // TEST-EXEMPT: covered by test_regression_2026_11_20_utc_index_prints_never_page_and_are_corrected and test_frames_without_a_wal_stamp_or_from_replay_never_vote (app/tests)
     pub(super) fn ltt_on_live_frame(&mut self, frame: &CapturedFrame) {
         if frame.connection_index == u8::MAX {
             return;
@@ -162,6 +168,19 @@ mod tests {
         }
         assert_eq!(ctl.counts().votes, 0);
         assert_eq!(ctl.counts().reversion_reports, 0);
+    }
+
+    #[test]
+    fn test_regression_2026_11_21_building_the_guard_registers_its_counters() {
+        // Regression: 2026-11-21 review — the refusal and unstamped counters
+        // first appeared at the first live frame, so a down lane or a boot
+        // replay showed no series. Building the guard now registers them.
+        let src = include_str!("ltt_feed.rs");
+        let start = src.find("fn with_ltt_correction(").expect("builder");
+        let body = &src[start..start + src[start..].find("\n    }\n").expect("end")];
+        let built = body.find("LttController::new(mode);").expect("guard built");
+        let published = body.find("publish_ltt_counters();").expect("registered");
+        assert!(built < published, "{body}");
     }
 
     #[test]

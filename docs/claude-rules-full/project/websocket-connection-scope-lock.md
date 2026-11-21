@@ -9660,7 +9660,7 @@ REJECT (adds to the section above): any per-contract, per-socket or order-depend
 
 This supersedes the 2026-11-20 rows on: the armed record, deciding in replay, the other-day limit, the unconfirmed segment, the midnight carry and removing the switch. The +19,800 s offset, the receipt + 5 s cap, the dispatcher threading guard and raw bytes unchanged stand.
 
-**Honest limits.** Assumed: a trade from 19 Nov delivered after the cutover is also UTC-encoded (to verify on a 20 Nov raw frame before deploy). If Dhan reverts, fresh prints exceed the cap and stay raw (correct), but same-day prints about 5.5 to 6.6 h old are shifted wrongly until the day is held. Unknown: whether any frame received between 19 Nov 15:40 and 20 Nov 08:31 IST straddles the cutover (check the WAL receipts read-only).
+**Honest limits.** Assumed: a trade from 19 Nov delivered after the cutover is also UTC-encoded (to verify on a 20 Nov raw frame before deploy). If Dhan reverts, fresh prints exceed the cap and stay raw (correct), but EVERY print more than about 5.5 h behind its receipt, any day (yesterday's trade carried by an illiquid contract's first packet, a print days old), is shifted +5.5 h wrongly until the day is held; the cap is an upper bound only, with no lower bound or day check, by design. In `act` the reversion page auto-holds the day within 30 s (noise lock §2.24-a, Quote 63). Unknown: whether any frame received between 19 Nov 15:40 and 20 Nov 08:31 IST straddles the cutover (check the WAL receipts read-only).
 
 **REJECT:**
 - any offset other than +19,800 s;

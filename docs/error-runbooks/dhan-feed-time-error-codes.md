@@ -32,14 +32,18 @@ and "Before Monday if checks pass (Recommended)". So:
 - Guards kept: a plausible receipt, `0` and out-of-band values stay raw, and the
   result is never after receipt + 5 s. A refusal leaves the raw time and is
   counted on `tv_dhan_ltt_correction_refused_total{reason="receipt"|"band"|"cap"}`
-  (local `/metrics` only). A frame with no WAL receipt stamp is never corrected
-  and is counted on `tv_dhan_ltt_unstamped_total`.
+  (local `/metrics` only, registered at 0 when the lane builds the guard). A
+  frame with no WAL receipt stamp is never corrected and is counted on
+  `tv_dhan_ltt_unstamped_total`. Both count DISPATCHES: a packet dispatched
+  again by a WAL catch-up, the after-close depth pass or the offline replay is
+  counted again.
 - No detector arming, no record file, no daily notice, no replay hold. Leftover
   `data/state/ltt-correction/*.rec` files are ignored and kept.
 - The detector now only watches for Dhan reverting to IST epoch and pages
   DHAN-FEED-TIME-01 `source="dhan_time_format_reverted"` (below).
 - `[dhan_feed] ltt_utc_autocorrect` now governs only that guard: `off` = no
-  detector, `shadow` = coded `warn!` only, `act` (default) = page. It never
+  detector, `shadow` = coded `warn!` only, `act` (default) = page and hold the
+  day. It never
   switches the correction off; rolling the correction back is a code change
   behind a dated owner quote.
 
@@ -61,30 +65,39 @@ The section below describes the 2026-11-20 design and is kept as history.
   segment the detector did not vote on (options) is corrected only for prints
   within 120 s of receipt.
 - Switch: `[dhan_feed] ltt_utc_autocorrect = "act" | "shadow" | "off"`
-  (default `act`; `off` is the full rollback, no correction at all).
+  (default `act`; 2026-11-20 text: `off` was the full rollback. ⚠ Since
+  2026-11-21 no value switches the correction; see above.)
 
 ## DHAN-FEED-TIME-01 — trade times still wrong (PAGES)
 
 **Severity:** High. **Auto-triage:** never (operator verdict).
 
-Fires at most once per cause per IST day, inside 09:15–15:30 IST (or the
-published Muhurat window), from the live drain only:
+Causes `prices_outside_session` and `no_candles` fire at most once per cause
+per IST day, inside 09:15–15:30 IST (or the published Muhurat window), from
+the live drain only. The 2026-11-21 reason `dhan_time_format_reverted` has its
+own window and latch (its row below; noise lock §2.24-a):
 
 | cause | meaning |
 |---|---|
 | `prices_outside_session` | In two 30 s scans in a row, at least 20 live index ticks and at least half carried a time (after the correction) outside the session or more than 5 minutes from receipt. |
 | `no_candles` | 20 scans in a row (10 minutes) with main-feed frames arriving and no candle sealed. |
-| `dhan_time_format_reverted` (2026-11-21, noise lock §2.24-a) | `source` of this cause. The reversion guard read 100 fresh index or NSE stock prints (3 distinct instruments, at least 99% agreeing) whose raw trade time is IST epoch again, with a receipt on or after 2026-11-20 inside 09:00–15:40 IST (or the Muhurat window). At most once per segment per IST day, live drain only. Not written by the page thread, so no `.hold` is written for it. |
+| `dhan_time_format_reverted` (2026-11-21, noise lock §2.24-a) | `source` of this cause. The reversion guard read 100 fresh index or NSE stock prints (3 distinct instruments, at least 99% agreeing) whose raw trade time is IST epoch again, with a receipt on or after 2026-11-20 inside 09:00–15:40 IST (or the Muhurat window). At most once per segment per IST day per process (the latch is in RAM, so a restart can page again), live drain only. The day is auto-held too (`act` only): the 30 s feed-time scan hands it to the same writer thread within 30 s. |
 
-The day is written to `data/state/held-days/<date>.hold`, so the archiver, the
-Brutex export and the cross-check catch-up skip it until a verified repair.
+For every reason the day is written to `data/state/held-days/<date>.hold`
+(daily-universe Quote 63; for `dhan_time_format_reverted` within 30 s of the
+page, `act` mode only), so the archiver, the Brutex export and the cross-check
+catch-up skip it until a verified repair. If the hold write fails, a
+`DHAN-LTT-02` `feed_time_hold_write_failed` line says so: write the file by
+hand.
 
 **Triage:**
 0. (2026-11-21) `dhan_time_format_reverted`: Dhan is sending IST epoch again.
    Fresh prints are left raw by the cap (correct IST) and counted as `cap`;
-   same-day prints about 5.5–6.6 h old get shifted wrongly. Hold the day by
-   hand (`data/state/held-days/<date>.hold`), tell Dhan, and decide a code
-   change with the owner.
+   every print more than about 5.5 h behind its receipt, any day (yesterday's
+   trade on an illiquid contract's first packet included), is shifted +5.5 h
+   wrongly. The day is auto-held; check `data/state/held-days/<date>.hold`
+   exists (write it by hand if a `feed_time_hold_write_failed` line says it
+   could not). Tell Dhan, and decide a code change with the owner.
 1. ⚠ CHANGED 2026-11-21: the correction no longer arms; it applies from the
    cutover by itself. Check `tv_dhan_ltt_correction_refused_total` (a high
    `cap` count means prints are already IST epoch or the box clock is more
@@ -145,10 +158,12 @@ steps; it may or may not have corrected that day's prices.
 ## Honest limits
 
 > ⚠ CHANGED 2026-11-21: the first two limits below are gone (the correction
-> needs no votes and holds no day). Now: if Dhan reverts, same-day prints
-> about 5.5–6.6 h old are shifted wrongly until the day is held by hand; a
-> restart can page the reversion a second time the same day (the latch is in
-> memory); the offline live-fill replay tool reads no record and needs none.
+> needs no votes and holds no day). Now: if Dhan reverts, every print more
+> than about 5.5 h behind its receipt, any day, is shifted wrongly (fresh
+> prints stay raw by the cap); the reversion page auto-holds the day within
+> 30 s (`act`), so those rows stay out of the archive and the export until
+> repaired; a restart can page the reversion a second time the same day (the
+> latch is in memory; the second hold is a no-op); the offline live-fill replay tool reads no record and needs none.
 
 - (2026-11-20) The detector needs live votes, so the first seconds after a mid-day flip are
   folded uncorrected (those minutes are what cause A pages on).

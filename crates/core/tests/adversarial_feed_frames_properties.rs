@@ -362,6 +362,38 @@ fn kind_of(code: u8) -> &'static str {
     }
 }
 
+/// Independent model of the permanent Dhan UTC trade-time rule (scope lock
+/// 2026-11-21): a stamped dispatch adds exactly +19,800 s to a Ticker, Quote or
+/// Full trade time when the receipt is at or after 2026-11-20 00:00 IST and
+/// inside the plausible receipt band, the raw time is inside the exchange band,
+/// and the result is at most receipt + 5 s (IST); otherwise the raw time stays.
+/// Written from the rule text, not from `ltt_correction`, so the reference
+/// stays independent. (Regression 2026-11-21: the reference predated the rule
+/// and failed on the ~4% of random receipts past the cutover.)
+fn ref_utc_ltt(raw: u64, recv: i64) -> u64 {
+    const CUTOVER_NANOS: i64 = 1_795_113_000_000_000_000;
+    const MAX_RECEIPT_NANOS: i64 = 2_524_608_000_000_000_000;
+    if !(CUTOVER_NANOS..=MAX_RECEIPT_NANOS).contains(&recv) {
+        return raw;
+    }
+    if !(1_600_000_000..=2_524_608_000).contains(&raw) {
+        return raw;
+    }
+    let receipt_utc_secs = recv.div_euclid(1_000_000_000) as u64;
+    // raw + 19,800 <= receipt_ist (= receipt_utc + 19,800) + 5
+    if raw > receipt_utc_secs + 5 {
+        return raw;
+    }
+    raw + 19_800
+}
+
+/// Applies [`ref_utc_ltt`] to a tick canon's `ltt` field, if it has one.
+fn ref_apply_utc_ltt(m: &mut BTreeMap<&'static str, u64>, recv: i64) {
+    if let Some(ltt) = m.get_mut("ltt") {
+        *ltt = ref_utc_ltt(*ltt, recv);
+    }
+}
+
 /// Reference decode of one packet starting at `b[0]` (trailing bytes ignored,
 /// exactly as the per-code parsers only check a minimum length).
 fn ref_decode(b: &[u8], recv: i64) -> Result<Canon, RefErr> {
@@ -394,6 +426,7 @@ fn ref_decode(b: &[u8], recv: i64) -> Result<Canon, RefErr> {
     for (name, off, width) in payload_layout(code) {
         m.insert(name, read_le(b, off, width));
     }
+    ref_apply_utc_ltt(&mut m, recv);
     Ok((kind, m))
 }
 
@@ -690,6 +723,7 @@ impl GenPkt {
         for ((name, _, width), v) in payload_layout(self.code).into_iter().zip(&self.values) {
             m.insert(name, v & mask(width));
         }
+        ref_apply_utc_ltt(&mut m, recv);
         (kind, m)
     }
 }
@@ -1578,5 +1612,32 @@ fn depth_200_row_count_edges_are_exact() {
                 })
             );
         }
+    }
+}
+
+#[test]
+fn test_regression_2026_11_21_reference_models_the_utc_ltt_rule() {
+    // Regression: 2026-11-21 — the reference decoder predated the permanent
+    // UTC rule and every property failed on the ~4% of random receipts at or
+    // after 2026-11-20 00:00 IST. Pin the four outcomes deterministically.
+    let receipt: i64 = 1_795_152_600 * 1_000_000_000; // 2026-11-20 11:00 IST
+    let mut ticker = [0_u8; 16];
+    ticker[0] = 2;
+    ticker[1..3].copy_from_slice(&16_u16.to_le_bytes());
+    let cases = [
+        (receipt, 1_795_152_600_u32, 1_795_152_600_u64 + 19_800), // corrected
+        (receipt, 1_795_152_600 + 19_800, 1_795_152_600 + 19_800), // cap: IST epoch stays
+        (receipt, 0, 0),                                          // band
+        (
+            receipt - 2 * 86_400 * 1_000_000_000,
+            1_795_000_000,
+            1_795_000_000,
+        ), // pre-cutover
+    ];
+    for (recv, raw, want) in cases {
+        ticker[12..16].copy_from_slice(&raw.to_le_bytes());
+        let got = canon_of(&dispatch_frame(&ticker, recv).expect("ticker"));
+        assert_eq!(got.1.get("ltt"), Some(&want), "raw {raw} recv {recv}");
+        assert_eq!(Ok(got), ref_decode(&ticker, recv), "raw {raw} recv {recv}");
     }
 }

@@ -1577,20 +1577,27 @@ impl FrameSilenceFastPath {
     }
 }
 
-/// What the Dhan trade-time correction does (scope lock 2026-11-20, "DHAN
-/// TRADE TIME SENT AS UTC"). On 2026-11-20 Dhan sent every Last Trade Time as
-/// UTC epoch (19,800 s early under the documented IST rule).
+/// What the Dhan trade-time REVERSION GUARD does (`[dhan_feed]
+/// ltt_utc_autocorrect`).
+///
+/// ⚠ CHANGED 2026-11-21 (scope lock "DHAN LIVE LTT IS UTC EPOCH FROM RECEIPT
+/// 2026-11-20 00:00 IST"; Dhan ticket #6684672): from WAL receipt 2026-11-20
+/// 00:00 IST every Dhan Last Trade Time gets exactly +19,800 s, ALWAYS, in the
+/// core dispatcher. No value of this switch turns that correction off or on
+/// (a config that switches the correction is a scope-lock REJECT); rolling it
+/// back is a code change behind a fresh dated quote. The switch governs only
+/// the guard that watches for Dhan going back to IST epoch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LttUtcAutocorrect {
-    /// No detection and no correction at all, not even from an earlier
-    /// day's armed record (the full rollback).
+    /// No reversion guard. The +19,800 s correction is still applied.
     Off,
-    /// The detector runs and logs what it would arm; nothing new is armed.
-    /// Days an earlier `act` run armed are still corrected on replay, so a
-    /// replay matches what the live run wrote.
+    /// The guard runs and logs a coded warning on a reversion; no page, no
+    /// hold. The correction is still applied.
     Shadow,
-    /// The detector arms a correction from a saved record. The default.
+    /// The guard pages `DHAN-FEED-TIME-01` on a reversion and the day is
+    /// auto-held (daily-universe Quote 63). The default. The correction is
+    /// applied as in every mode.
     #[default]
     Act,
 }

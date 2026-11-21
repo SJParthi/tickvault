@@ -1001,3 +1001,145 @@ fn wrong_day_repeats_do_not_allocate_per_tick() {
         stats.total_blocks
     );
 }
+
+/// The POST-CUTOVER drain (2026-11-21 review): from WAL receipt 2026-11-20
+/// 00:00 IST every Dhan trade time is UTC epoch and the dispatcher adds
+/// +19,800 s, which is the permanent production state. Every gate above runs
+/// with August receipts and the inert reversion guard, so none of this
+/// branch's per-frame and per-tick drain work ran under the profiler:
+/// `LttController::on_frame` (its once-a-minute counter publish and its day
+/// roll), `LttController::observe` and `LttDetector::vote` on every live index
+/// and NSE stock print, and the corrected dispatch.
+///
+/// This window builds the production guard (`act`), drives WAL-stamped
+/// frames of 3 index + 3 NSE stock Quote packets with UTC raw times and
+/// receipts from 2026-11-20 10:00 IST, one second apart, for 2,500 frames
+/// (about 42 minutes, so the publish fires about 41 times inside the window),
+/// and holds the same block budget as the frame gate above. It also asserts
+/// the votes, verdicts and publishes moved inside the window, so the window
+/// is not empty. MEASURED 2026-11-21 (x86 dev container): 0 blocks, 0 bytes.
+#[test]
+fn post_cutover_frame_drain_with_reversion_guard_does_not_allocate() {
+    let _serial = DHAT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    use tickvault_app::dhan_feed_stack::{counters, drain_main_feed_frame};
+    use tickvault_common::config::LttUtcAutocorrect;
+    use tickvault_core::websocket::pool_budget::DhanEndpointType;
+    use tickvault_core::websocket::pool_supervisor::CapturedFrame;
+
+    /// 2026-11-20 10:00:00 IST as UTC epoch seconds.
+    const START_UTC_SECS: i64 = 1_795_152_600 - 3_600;
+    const SIDS: [(u8, u32); 6] = [
+        (0, 13),
+        (0, 25),
+        (0, 51),
+        (1, 2_885),
+        (1, 1_333),
+        (1, 1_594),
+    ];
+    const WARMUP_FRAMES: u64 = 4;
+    const FRAMES: u64 = 2_500;
+
+    fn quote_packet(segment: u8, security_id: u32, ltp: f32, ltt: u32) -> Vec<u8> {
+        let mut buf = vec![0u8; 50];
+        buf[0] = 4; // RESPONSE_CODE_QUOTE
+        buf[1..3].copy_from_slice(&50u16.to_le_bytes());
+        buf[3] = segment;
+        buf[4..8].copy_from_slice(&security_id.to_le_bytes());
+        buf[8..12].copy_from_slice(&ltp.to_le_bytes());
+        buf[14..18].copy_from_slice(&ltt.to_le_bytes());
+        buf
+    }
+
+    fn receipt_nanos(n: u64) -> i64 {
+        (START_UTC_SECS + i64::try_from(n).expect("fits")) * 1_000_000_000
+    }
+
+    /// Dhan's raw UTC trade time for frame `n` (receipt second, UTC epoch).
+    fn raw_utc(n: u64) -> u32 {
+        u32::try_from(START_UTC_SECS + i64::try_from(n).expect("fits")).expect("fits")
+    }
+
+    fn frame(n: u64) -> CapturedFrame {
+        let mut bytes = Vec::with_capacity(50 * SIDS.len());
+        for (segment, sid) in SIDS {
+            bytes.extend_from_slice(&quote_packet(
+                segment,
+                sid,
+                100.0 + (n % 97) as f32 * 0.05,
+                raw_utc(n),
+            ));
+        }
+        CapturedFrame {
+            seq: 100 + n,
+            endpoint: DhanEndpointType::MainFeed,
+            connection_index: (n % 4) as u8,
+            received_at: std::time::Instant::now(),
+            received_at_nanos: receipt_nanos(n),
+            wal_backed: true,
+            bytes: bytes.into(),
+        }
+    }
+
+    let c = counters();
+    let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8)
+        .with_ltt_correction(LttUtcAutocorrect::Act, None);
+    let corrected_first = raw_utc(0) + 19_800;
+    ingest
+        .spot_prices()
+        .reset_for_trading_day(tickvault_app::spot_price_store::ist_day_of(corrected_first));
+    // Warm first-key inserts, the guard's first publish and metrics
+    // registration outside DHAT.
+    for n in 0..WARMUP_FRAMES {
+        let out = drain_main_feed_frame(&mut ingest, &frame(n), receipt_nanos(n), 1_000, c);
+        assert_eq!(out.folded, 6, "warm-up frame {n} folded: {out:?}");
+    }
+    let frames: Vec<CapturedFrame> = (WARMUP_FRAMES..WARMUP_FRAMES + FRAMES).map(frame).collect();
+    let before = ingest.ltt_controller().counts();
+
+    let mut measured_folded = 0u64;
+    let profiler = dhat::Profiler::builder().testing().build();
+    for (n, f) in (WARMUP_FRAMES..).zip(&frames) {
+        let out = drain_main_feed_frame(&mut ingest, f, receipt_nanos(n), 1_000 + n, c);
+        measured_folded += out.folded;
+    }
+    let stats = dhat::HeapStats::get();
+    drop(profiler);
+
+    // Not empty: every new drain step ran inside the window.
+    let after = ingest.ltt_controller().counts();
+    assert_eq!(measured_folded, FRAMES * 6);
+    assert_eq!(
+        after.votes - before.votes,
+        FRAMES * 6,
+        "every index and NSE stock print voted"
+    );
+    assert!(
+        after.utc_verdicts > before.utc_verdicts,
+        "the detector decided inside the window: {before:?} -> {after:?}"
+    );
+    assert!(
+        after.publishes >= before.publishes + 40,
+        "the once-a-minute counter publish ran inside the window: {before:?} -> {after:?}"
+    );
+    assert_eq!(after.reversion_reports, 0, "UTC prints never page");
+    // The corrected time is what was stored for the last index print.
+    let last = WARMUP_FRAMES + FRAMES - 1;
+    assert_eq!(
+        ingest
+            .spot_prices()
+            .latest_exchange_secs(13, tickvault_common::types::ExchangeSegment::IdxI),
+        Some(raw_utc(last) + 19_800),
+        "the dispatcher corrected the trade time"
+    );
+
+    assert!(
+        stats.total_blocks <= MAX_BLOCKS,
+        "PER-TICK ALLOCATION ON THE POST-CUTOVER FRAME SEAM.\n\n\
+         {FRAMES} frames x 6 packets allocated {} blocks ({} bytes); the budget \
+         is {MAX_BLOCKS}. This window covers the trade-time reversion guard \
+         (per-frame publish and day roll, per-print vote) and the corrected \
+         dispatch, which no other gate profiles.",
+        stats.total_blocks,
+        stats.total_bytes
+    );
+}

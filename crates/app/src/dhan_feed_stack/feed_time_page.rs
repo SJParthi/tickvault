@@ -20,6 +20,12 @@
 //! thread: the once-a-day latch and the day's hold marker are written THERE,
 //! never on the drain (§2.24 REJECT "persisting the latch on the drain"). A
 //! restart restores the latch, so a cause never pages twice in a day.
+//!
+//! ⚠ ADDED 2026-11-21 (noise lock §2.24-a, daily-universe Quote 63): the
+//! trade-time reversion guard pages through its own `error!`; each 30 s scan
+//! reads the guard's page count and hands that day to the same writer thread,
+//! which writes the day's `.hold` (no latch marker; the guard's latch is in
+//! RAM). See [`FeedTimePage::hold_after_reversion_page`].
 
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 
@@ -58,6 +64,10 @@ pub(super) enum Cause {
     PricesOutsideSession,
     /// Frames arriving and no candle sealed for 10 minutes.
     NoCandles,
+    /// The trade-time reversion guard paged (noise lock §2.24-a): its own
+    /// `error!` is the page; this cause only carries the day to the writer
+    /// thread for the hold (daily-universe Quote 63). No latch marker.
+    FormatReverted,
 }
 
 impl Cause {
@@ -65,6 +75,7 @@ impl Cause {
         match self {
             Self::PricesOutsideSession => 0,
             Self::NoCandles => 1,
+            Self::FormatReverted => 2,
         }
     }
 
@@ -72,13 +83,17 @@ impl Cause {
         match self {
             Self::PricesOutsideSession => "prices_outside_session",
             Self::NoCandles => "no_candles",
+            Self::FormatReverted => "dhan_time_format_reverted",
         }
     }
 
-    const fn task(self) -> &'static str {
+    /// The daily latch marker (causes A and B; the reversion guard keeps its
+    /// own latch in RAM, so it writes none).
+    const fn task(self) -> Option<&'static str> {
         match self {
-            Self::PricesOutsideSession => TASK_CAUSE_A,
-            Self::NoCandles => TASK_CAUSE_B,
+            Self::PricesOutsideSession => Some(TASK_CAUSE_A),
+            Self::NoCandles => Some(TASK_CAUSE_B),
+            Self::FormatReverted => None,
         }
     }
 }
@@ -208,6 +223,10 @@ pub(super) struct FeedTimePage {
     restored_day: i64,
     restored: [bool; 2],
     persist: Option<SyncSender<(NaiveDate, Cause)>>,
+    /// Reversion pages already handed to the writer (the guard's count).
+    reversion_pages_seen: u32,
+    /// The last day a reversion hold was handed off (once per day).
+    reversion_held_day: i64,
 }
 
 fn restore_latch(day: i64) -> [bool; 2] {
@@ -222,7 +241,9 @@ fn restore_latch(day: i64) -> [bool; 2] {
 
 fn run_persist(rx: &Receiver<(NaiveDate, Cause)>) {
     while let Ok((date, cause)) = rx.recv() {
-        if let Err(err) = crate::daily_task_marker::try_write_daily_marker(cause.task(), date) {
+        if let Some(task) = cause.task()
+            && let Err(err) = crate::daily_task_marker::try_write_daily_marker(task, date)
+        {
             error!(
                 code = ErrorCode::DhanLtt02RecordUnsettled.code_str(),
                 source = "feed_time_latch_write_failed",
@@ -268,6 +289,8 @@ impl FeedTimePage {
             restored_day: day,
             restored,
             persist,
+            reversion_pages_seen: 0,
+            reversion_held_day: i64::MIN,
         }
     }
 
@@ -315,6 +338,30 @@ impl FeedTimePage {
         for cause in fired.into_iter().flatten() {
             self.fire(day, cause);
         }
+        let ltt = ingest.ltt.counts();
+        self.hold_after_reversion_page(ltt.reversion_pages, ltt.last_reversion_day);
+    }
+
+    /// Holds the day of a reversion page (daily-universe Quote 63; noise lock
+    /// §2.24-a): when the guard's page count rose since the last scan, hands
+    /// `day` to the writer thread once (it writes the `.hold`, off the drain).
+    /// Logs no page of its own: the guard's `error!` was the page. O(1), one
+    /// `try_send`, no allocation. Returns true when it handed the day off.
+    // TEST-EXEMPT: covered by test_regression_2026_11_21_a_reversion_page_holds_its_day_once
+    pub(super) fn hold_after_reversion_page(&mut self, pages: u32, day: i64) -> bool {
+        if pages == self.reversion_pages_seen {
+            return false;
+        }
+        self.reversion_pages_seen = pages;
+        if day == self.reversion_held_day {
+            return false;
+        }
+        let Some(date) = ist_day_date(day) else {
+            return false;
+        };
+        self.reversion_held_day = day;
+        self.hand_off(date, Cause::FormatReverted);
+        true
     }
 
     fn fire(&mut self, day: i64, cause: Cause) {
@@ -327,6 +374,7 @@ impl FeedTimePage {
                 Cause::PricesOutsideSession =>
                     "most index prices carry a time outside market hours (after our correction)",
                 Cause::NoCandles => "no candle has formed for 10 minutes while prices arrive",
+                Cause::FormatReverted => "Dhan trade times look like the old IST format again",
             }
         );
         if let Some(index) = self.restored.get_mut(cause.index()) {
@@ -335,6 +383,10 @@ impl FeedTimePage {
         let Some(date) = ist_day_date(day) else {
             return;
         };
+        self.hand_off(date, cause);
+    }
+
+    fn hand_off(&self, date: NaiveDate, cause: Cause) {
         if let Some(tx) = &self.persist
             && tx.try_send((date, cause)).is_err()
         {
@@ -463,6 +515,67 @@ mod tests {
         assert_eq!(
             ep.scan(DAY + 1, true, [false; 2], t3)[0],
             Some(Cause::PricesOutsideSession)
+        );
+    }
+
+    fn page_with(tx: Option<SyncSender<(NaiveDate, Cause)>>) -> FeedTimePage {
+        FeedTimePage {
+            episode: FeedTimeEpisode::new(DAY, [false; 2]),
+            restored_day: DAY,
+            restored: [false; 2],
+            persist: tx,
+            reversion_pages_seen: 0,
+            reversion_held_day: i64::MIN,
+        }
+    }
+
+    #[test]
+    fn test_regression_2026_11_21_a_reversion_page_holds_its_day_once() {
+        // Regression: 2026-11-21 review — a reversion page (noise lock
+        // §2.24-a) told the owner the day was held, and nothing held it
+        // (daily-universe Quote 63). The scan now hands the page's day to
+        // the writer thread, once a day, with no latch marker.
+        let (tx, rx) = sync_channel(PERSIST_DEPTH);
+        let mut page = page_with(Some(tx));
+        let date = ist_day_date(DAY).expect("date");
+        assert!(!page.hold_after_reversion_page(0, 0), "no page yet");
+        assert!(rx.try_recv().is_err());
+        assert!(page.hold_after_reversion_page(1, DAY));
+        assert_eq!(rx.try_recv().ok(), Some((date, Cause::FormatReverted)));
+        // Unchanged count: nothing more.
+        assert!(!page.hold_after_reversion_page(1, DAY));
+        // The second segment pages the same day: already held.
+        assert!(!page.hold_after_reversion_page(2, DAY));
+        assert!(rx.try_recv().is_err());
+        // A page on the next day holds that day.
+        assert!(page.hold_after_reversion_page(3, DAY + 1));
+        assert_eq!(
+            rx.try_recv().ok(),
+            Some((ist_day_date(DAY + 1).expect("date"), Cause::FormatReverted))
+        );
+        // The hold carries no latch marker and names the reason.
+        assert_eq!(Cause::FormatReverted.task(), None);
+        assert_eq!(Cause::FormatReverted.label(), "dhan_time_format_reverted");
+        assert_eq!(Cause::PricesOutsideSession.task(), Some(TASK_CAUSE_A));
+        // With no writer thread it still advances and never panics.
+        let mut lonely = page_with(None);
+        assert!(lonely.hold_after_reversion_page(1, DAY));
+    }
+
+    #[test]
+    fn test_scan_reads_the_guard_page_count_for_the_hold() {
+        // The scan, the only caller, wires the guard's page count and day in.
+        let src = include_str!("feed_time_page.rs");
+        let scan = &src[src
+            .find("pub(super) fn scan(&mut self, ingest")
+            .expect("scan")..];
+        let scan = &scan[..scan.find("\n    }\n").expect("end")];
+        assert!(scan.contains("let ltt = ingest.ltt.counts();"), "{scan}");
+        assert!(
+            scan.contains(
+                "self.hold_after_reversion_page(ltt.reversion_pages, ltt.last_reversion_day);"
+            ),
+            "{scan}"
         );
     }
 

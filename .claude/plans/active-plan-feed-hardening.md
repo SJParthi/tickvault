@@ -688,8 +688,8 @@ Dhan support, ticket #6684672, 21 Nov 2026: the Live LTT changed from IST-based 
 - Boot: `install_at_boot*` becomes a no-op with one log line; `ACTIVE` stays false, so `any_receipt_day_held` returns false and replay is never held. A leftover `.rec` file is ignored, never deleted.
 - `crates/app/src/dhan_feed_stack/ltt_feed.rs`: the record writer and the daily notice are not started.
 - `crates/core/src/parser/dispatcher.rs`: `dispatch_frame_uncounted_unstamped` stays raw and also counts on `tv_dhan_ltt_unstamped_total` (local only).
-- Reversion guard: `LttController::observe` keeps `classify_vote` and `LttDetector`, on raw, live, WAL-stamped `IDX_I` / `NSE_EQ` prints only. A `Utc` verdict does nothing. The first `Normal` verdict per segment per IST day, with receipt at or after the cutover and inside 09:00–15:40 IST (Muhurat-aware), logs one coded `error!` with `code = DHAN-FEED-TIME-01`, `source = "dhan_time_format_reverted"`, broker named. The latch is two bools, cleared at the day roll. The guard never writes a record and never changes the correction.
-- `[dhan_feed] ltt_utc_autocorrect`: parsing unchanged (no `common` code edit); it governs only the guard (`off` = no detector, `shadow` = coded `warn!`, `act` = page). Rolling the correction back is a code change behind a fresh dated quote.
+- Reversion guard: `LttController::observe` keeps `classify_vote` and `LttDetector`, on raw, live, WAL-stamped `IDX_I` / `NSE_EQ` prints only. A `Utc` verdict does nothing. The first `Normal` verdict per segment per IST day, with receipt at or after the cutover and inside 09:00–15:40 IST (Muhurat-aware), logs one coded `error!` with `code = DHAN-FEED-TIME-01`, `source = "dhan_time_format_reverted"`, broker named. The latch is two bools, cleared at the day roll. (2026-11-21 review: in `act` the page also auto-holds its day; `ControllerCounts::reversion_pages` and `last_reversion_day` are read by the drain's 30 s feed-time scan, which hands the day to the latch thread.) The guard never writes a record and never changes the correction.
+- `[dhan_feed] ltt_utc_autocorrect`: parsing unchanged (no `common` code edit); it governs only the guard (`off` = no detector, `shadow` = coded `warn!`, `act` = page and hold). Rolling the correction back is a code change behind a fresh dated quote.
 
 ## Edge Cases (Item UTC-PERMANENT)
 - Pre-cutover receipts (old WAL replay, receipt `0`, v1/v2 records) are byte-identical to before.
@@ -700,7 +700,7 @@ Dhan support, ticket #6684672, 21 Nov 2026: the Live LTT changed from IST-based 
 - A frame with no WAL receipt stamp: never corrected (as before).
 
 ## Failure Modes (Item UTC-PERMANENT)
-- Dhan reverts to IST epoch: fresh prints exceed the cap and stay raw (correct IST) and are counted; the guard pages once per segment per day; same-day prints about 5.5 to 6.6 h old are shifted wrongly. Remedy: a manual `.hold`; auto-hold of a reversion day is a follow-up after the trade-safety PR lands.
+- Dhan reverts to IST epoch: fresh prints exceed the cap and stay raw (correct IST) and are counted; the guard pages once per segment per day; every print more than about 5.5 h behind its receipt, any day, is shifted wrongly; in `act` the page auto-holds the day within 30 s (2026-11-21 review). (Was: "a manual `.hold`; auto-hold is a follow-up"; done in this PR after the review.)
 - A restart can page a second time that day (the latch is in RAM; Limitation).
 - 20 Nov WAL segments still waiting would replay corrected `ts` next to the wrong stored rows; DEDUP starts with `ts`, so both copies would survive. Order: copy, drop the 20 Nov partitions (Quote 63), then replay or rebuild.
 - Unknown: main-feed frames received between 19 Nov 15:40 and 20 Nov 08:31 IST would straddle the cutover. Check the WAL receipts read-only before deploy.
@@ -718,7 +718,8 @@ Dhan support, ticket #6684672, 21 Nov 2026: the Live LTT changed from IST-based 
 Revert the PR. ITEM UTC-FIX in `act` mode then re-arms daily after its votes, a known, bounded failure. A day run under a wrong mode gets a `.hold`. No table, config schema, Terraform or data change.
 
 ## Observability (Item UTC-PERMANENT)
-- Local refusal counters by reason (band, cap, receipt), and `tv_dhan_ltt_unstamped_total`; local `/metrics` only, registered at 0.
+- Local refusal counters by reason (band, cap, receipt), and `tv_dhan_ltt_unstamped_total`; local `/metrics` only. Registered when the lane builds the guard (`with_ltt_correction` calls `publish_ltt_counters`, which resolves the four handles once; 0 at boot), then updated once a minute of live WAL-stamped receipts. They count DISPATCHES, so a WAL catch-up, the after-close depth pass or the offline replay counts a packet again; refusals counted during a boot replay show at the first live frame's minute publish. (Corrected 2026-11-21, review: this line said "registered at 0" before any code did.)
+- A reversion page in `act` auto-holds its day (feed-time scan → `tv-feed-time-latch` → `.hold`; noise lock §2.24-a, Quote 63).
 - The reversion page rides the existing `DHAN-FEED-TIME-01` alarm (filter matches the code and `ERROR`; no Terraform change).
 - The daily notice is retired (noise lock §2.24-a).
 - No new alarm, filter or EMF name.

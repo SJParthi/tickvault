@@ -419,6 +419,12 @@ locals {
     # arrive, inside the session. At most once per cause per IST day (the
     # latch is saved off the drain); the day is auto-held from the archive and
     # the export. ok_recovery = false: §2.24 forbids a recovery page.
+    # 2026-11-21 (noise lock §2.24-a, owner card "Yes, always UTC
+    # (Recommended)"; daily-universe Quote 63): a THIRD reason pages through
+    # the same filter, source = "dhan_time_format_reverted" (Dhan went back to
+    # IST epoch): once per segment per IST day per process, 09:00-15:40 IST,
+    # and its day is auto-held too (the drain's feed-time scan hands it to the
+    # latch thread within 30 s). No terraform change was needed.
     "dhan-feed-time-01" = {
       pattern     = "{ $.code = \"DHAN-FEED-TIME-01\" && $.level = \"ERROR\" }"
       period      = 300
@@ -426,7 +432,7 @@ locals {
       eval        = 1
       dta         = 1
       ok_recovery = false # 2026-11-21: §2.24 forbids a recovery page
-      desc        = "DHAN-FEED-TIME-01 = Dhan's live trade times look wrong during the session even after the 5 h 30 min correction (cause=prices_outside_session), or no candle formed for 10 minutes while prices arrive (cause=no_candles). Today is auto-held out of the archive and the export; raw frames are kept. Once per cause per day, no recovery page. Runbook: docs/error-runbooks/dhan-feed-time-error-codes.md"
+      desc        = "DHAN-FEED-TIME-01 = Dhan's live trade times look wrong during the session even after the 5 h 30 min correction (cause=prices_outside_session), or no candle formed for 10 minutes while prices arrive (cause=no_candles), or Dhan switched its trade times back to the old IST format (source=dhan_time_format_reverted; prints older than about 5.5 h are then shifted wrongly). In every case today is auto-held out of the archive and the export (within 30 s for the format reason); raw frames are kept. Once per cause per day (format reason: once per segment per day per process), no recovery page. Runbook: docs/error-runbooks/dhan-feed-time-error-codes.md"
     }
     # WAL-SUSPEND-01 (added 2026-07-10, W2 PR#6 — audit follow-up row 10):
     # a QuestDB table's WAL apply is SUSPENDED (post disk-full / apply

@@ -1019,3 +1019,69 @@ fn test_regression_review_a_record_day_older_than_the_window_is_held() {
         "other days are not"
     );
 }
+
+// --- 2026-11-21 review fixes -------------------------------------------------
+
+#[test]
+fn test_regression_2026_11_21_reversion_page_counts_act_only_with_its_day() {
+    // Regression: 2026-11-21 review — the reversion page did not hold its
+    // day. The app holds the day it reads from `reversion_pages` and
+    // `last_reversion_day`, so both must move in `act` and only in `act`.
+    let t = RECEIPT_1100_UTC_SECS;
+    let mut act = LttController::new(LttUtcAutocorrect::Act);
+    guard_frames(&mut act, t, 3, SEGMENT_IDX_I, false);
+    assert_eq!(act.counts().reversion_reports, 1);
+    assert_eq!(act.counts().reversion_pages, 1);
+    assert_eq!(
+        act.counts().last_reversion_day,
+        receipt_ist_day(receipt(t)),
+        "the page names the receipt's IST day"
+    );
+    guard_frames(&mut act, t + 100, 2, SEGMENT_NSE_EQ, false);
+    assert_eq!(act.counts().reversion_pages, 2, "one per segment");
+    guard_frames(&mut act, t + 86_400, 2, SEGMENT_IDX_I, false);
+    assert_eq!(act.counts().reversion_pages, 3);
+    assert_eq!(
+        act.counts().last_reversion_day,
+        receipt_ist_day(receipt(t + 86_400))
+    );
+    // Shadow logs a warning (counted as a report), never a page or a hold.
+    let mut shadow = LttController::new(LttUtcAutocorrect::Shadow);
+    guard_frames(&mut shadow, t, 3, SEGMENT_IDX_I, false);
+    assert_eq!(shadow.counts().reversion_reports, 1);
+    assert_eq!(shadow.counts().reversion_pages, 0);
+    assert_eq!(shadow.counts().last_reversion_day, 0);
+    // A UTC day never pages.
+    let mut utc = LttController::new(LttUtcAutocorrect::Act);
+    guard_frames(&mut utc, t, 3, SEGMENT_IDX_I, true);
+    assert_eq!(utc.counts().reversion_pages, 0);
+}
+
+#[test]
+fn test_regression_2026_11_21_counter_labels_come_from_as_str() {
+    // Regression: 2026-11-21 review — `as_str` had no caller and the counter
+    // labels were typed separately, so the two could drift.
+    let labels: Vec<&str> = LttRefusal::ALL.iter().map(|r| r.as_str()).collect();
+    assert_eq!(labels, ["receipt", "band", "cap"]);
+    let c = LttRefusalCounts {
+        receipt: 1,
+        band: 2,
+        cap: 3,
+    };
+    assert_eq!(LttRefusal::ALL.map(|r| c.get(r)), [1, 2, 3]);
+    // The publish resolves its handles from `as_str` and types no label.
+    let src = include_str!("ltt_correction.rs");
+    let start = src.find("fn counter_handles()").expect("counter_handles");
+    let body = &src[start..start + src[start..].find("\n}\n").expect("end")];
+    assert!(body.contains("\"reason\" => r.as_str()"), "{body}");
+    for label in labels {
+        assert!(
+            !src.contains(&format!("\"reason\" => \"{label}\"")),
+            "a literal `{label}` label is back"
+        );
+    }
+    // Twice: the second call reuses the resolved handles.
+    publish_ltt_counters();
+    publish_ltt_counters();
+    assert!(COUNTER_HANDLES.get().is_some());
+}

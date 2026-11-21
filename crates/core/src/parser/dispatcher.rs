@@ -246,6 +246,11 @@ pub fn raw_last_trade_time(packet: &[u8]) -> Option<u32> {
 /// cutover. Called from the Ticker, Quote and Full arms of
 /// `dispatch_parsed_header`, pinned by
 /// `test_apply_ltt_correction_sits_in_all_three_dispatcher_arms`.
+///
+/// The refusal and unstamped counters count DISPATCHES, not distinct packets:
+/// the live drain, a WAL refold or catch-up, the after-close depth pass and the
+/// offline live-fill replay all dispatch through here, so a packet dispatched
+/// again by one of them is counted again. Read them as "refusals seen".
 // DHAN-LTT: correction threaded through the dispatcher (guard pinned).
 #[inline]
 fn apply_ltt_correction(
