@@ -2102,6 +2102,39 @@ a spin or busy-wait that keeps a core busy (the card said "no extra CPU core
 used"); an unpark per tick instead of per idle-to-busy edge; an allocation or
 lock on the drain's offer path; reusing this lift for any other change.
 
+### §28.7 — TRADE-SAFETY SWITCH: no new paper entries while today's Dhan feed-time alarm is on (owner-approved 2026-11-21)
+
+**The owner authorization (2026-11-21).** Asked on a decision card: *"Build the
+trade-safety switch? It would stop new paper trades while Dhan's prices have
+the wrong time, so a day like 20 Nov can't open bad trades. It touches the
+order path, which needs your written OK first. Exits and real-order locks
+stay as they are."*, the owner tapped **"Yes, after this merges
+(Recommended)"**, whose text read: *"Merge today's clock fix first. Then build
+the switch as its own small change: while the clock alarm is on, no new
+trades; exits still allowed. Recorded in the rules with today's date."* It
+followed the 2026-11-20 incident, when Dhan sent every Last Trade Time as UTC
+and no candle formed until about 2:52 PM.
+
+**What this lift allows, and only this.** A process-wide, IST-day-keyed flag
+set when `DHAN-FEED-TIME-01` fires (cause A or B, noise lock §2.24) or when
+that day's alarm marker is present or unreadable at start. While it is set for
+the current IST day, the paper path refuses NEW entries: (A) in
+`LiveFillChain::decide` before an order is held, (B) for an entry already held
+when it fires, (C) as a backstop in the order runtime's paper `execute`, and
+(D) the morning self-test entry is skipped, not failed. Exits always pass. One
+atomic load per decision, no allocation, nothing on the frame drain beyond one
+store when the alarm fires. Every refusal writes Decision and Reject rows to
+`live_order_events`; one coded `warn!` on the edge; local `/metrics` only.
+
+**REJECT:** blocking or delaying an exit; reusing `RiskEngine::trigger_halt`
+(it blocks exits and pages); a second `error!` with `DHAN-FEED-TIME-01` (it
+would page twice); any change to what an indicator, strategy or the fill model
+decides; touching the OMS `dry_run` hardcode, the exit-order lockout or
+`[live_fill] enabled`; a lock or allocation on the frame drain; a new page,
+alarm, filter or EMF name; a flag that survives into the next IST day; failing
+open when the marker cannot be read at start; reusing this lift for any other
+change.
+
 ## §31.1 — Constituent → Dhan `security_id` mapping contract (LOCKED 2026-06-06)
 
 > **Authority for Sub-PR #4.** This is the precise, fail-closed mapping the

@@ -582,6 +582,93 @@ This plan converts hope into bounded, tested, alarmed guarantees. It does NOT pr
   - Done tests: test_regression_2026_11_20_nifty_example_is_corrected_to_receipt_time, proptest_correction_obeys_every_guard, proptest_live_and_replay_agree_for_every_packet_or_the_day_is_held, test_live_and_replay_agree_on_a_fixed_flip_and_flip_back, test_controller_arms_from_one_past_every_dispatched_receipt, test_a_change_pending_at_ist_midnight_is_voided, test_the_detector_freezes_after_eight_entries_a_day, test_dispatcher_corrects_ticker_quote_and_full_only_while_armed (core/tests/ltt_correction_dispatch.rs), dhat_armed_ltt_correction_dispatch_is_zero_alloc (core/tests/dhat_ltt_correction.rs), test_regression_2026_11_20_the_live_drain_arms_after_a_durable_intent (app/tests/ltt_correction_drain.rs), bench dispatch_frame/ticker_ltt_armed
   - Tests: correction property tests, live-vs-replay identity with crash injection, the named 2026-11-20 regressions, DHAT 0 blocks, dispatch_frame/ticker_ltt_armed bench
   - Rules: scope lock 2026-11-20, daily-universe Quote 63, noise lock §2.24; design in the UTC addendum below
+- [ ] ITEM UTC-SAFETY — trade-safety switch: while today's DHAN-FEED-TIME-01 alarm is on, the paper path opens no new entries; exits always pass (daily-universe §28.7, owner card "Yes, after this merges (Recommended)", 2026-11-21)
+  - Files: crates/app/src/trade_safety.rs (new), crates/app/src/lib.rs, crates/app/src/daily_task_marker.rs (`marker_state`), crates/app/src/dhan_feed_stack/feed_time_page.rs, crates/app/src/live_fill/chain.rs, crates/app/src/live_fill/mod.rs, crates/app/src/order_runtime_live_fill.rs, crates/app/src/order_runtime.rs, crates/app/src/live_fill_report/build.rs, crates/app/tests/trade_safety_wiring_guard.rs (new), crates/app/tests/dhat_live_fill.rs, CLAUDE.md
+  - Tests: trade_safety unit tests (same/next/earlier day, causes reset on a new day, chain day equals ist_day_number_now), chain entry refused with Decision+Reject rows and exit sent, held entry refused at fill, runtime backstop `refused:feed_time_alarm`, self-test skipped not failed, fire engages before the hand-off, marker Present/Unreadable/Absent at chain start, proptest against an oracle, dhat_live_fill with the switch set, trade_safety_wiring_guard (bite-tested)
+  - Rules: daily-universe §28.7; noise lock §2.24 (no second DHAN-FEED-TIME-01 error); design: Design / Edge Cases / Failure Modes / Test Plan / Rollback / Observability in the UTC-SAFETY addendum below
+
+---
+
+## ITEM UTC-SAFETY — DESIGN ADDENDUM (added 2026-11-21, owner card "Yes, after this merges (Recommended)")
+
+
+## Design (Item UTC-SAFETY)
+0. Rule file first (Blocker). Add §28.7 to docs/claude-rules-full/project/daily-universe-scope-expansion-2026-05-27.md, with a dated owner quote and REJECT rows, plus one bullet in the auto-loaded stub. §28.6 forbids changing what the chain decides. No code lands before this.
+1. New file `crates/app/src/trade_safety.rs`, registered in lib.rs:
+   - Two statics: `FEED_TIME_BLOCK_DAY: AtomicI64 = i64::MIN` and `FEED_TIME_BLOCK_CAUSES: AtomicU8` (cause A = 1, cause B = 2).
+   - `engage(day, cause_bit)`: `fetch_max(day, Release)` on the day. If the day moved forward, reset the cause bits to `cause_bit`; otherwise `fetch_or` the bit.
+   - `entries_blocked_on(day) -> Option<u8>`: one Acquire load and a compare.
+   - Cost: O(1), no lock, no allocation. Because the switch is keyed by IST day, it ends by itself at the day roll. It is not cleared at 16:00.
+2. Strict marker reader: add `daily_task_marker::marker_state(task, date) -> Present | Absent | Unreadable`. Leave `daily_marker_exists` unchanged.
+3. Writers. All run on the drain's 30 s arm, at most a few times a day, never per tick.
+   - `FeedTimePage::fire`: `engage(day, cause)` is the FIRST statement, before the `error!` and before the `try_send` to tv-feed-time-latch. A failed marker write or a refused hand-off then still blocks entries in this process. Add the field `trade_safety_engaged = true` to the existing `error!`.
+   - `start()` and `scan()`'s day-change branch: call `engage` for each restored bit.
+4. Readers. A request to exit always passes at every gate.
+   - Chain start (`live_fill::start_chain`, mod.rs, cold): read both `feed-time-page-a/-b` markers with `marker_state`. `Present` or `Unreadable` calls `engage(today, bit)`. This covers a chain that starts before the drain's `start()`.
+   - Gate A, `LiveFillChain::decide`, directly after chain.rs:1413: `if intent.kind != IntentKind::Exit && trade_safety::entries_blocked_on(self.day).is_some()`, then increment `counters.entries_blocked_feed_time`, call `refuse_unplaced(intent, Some(bar), REASON_FEED_TIME_ALARM)` and return. Add `pub const REASON_FEED_TIME_ALARM = "feed_time_alarm"` beside :101. This runs on the tv-live-fill thread, not the drain. The day comes from the wall clock, never from trade times.
+   - Gate B, `on_finished` → `Finished::Filled` (:1620): an entry that was already held when the alarm fired gets a seq-2 Reject for its quantity, the same shape as the Tainted arm.
+   - Gate C, `order_runtime_live_fill::execute` beside :466 (backstop): `!x.exit && blocked(ist_day_now)` → `reject("refused:feed_time_alarm")`. The `refused:` prefix makes the LF-7 report count it as rejected.
+   - Gate D, `start_self_test_entry` (order_runtime.rs:2141): skip the entry and log the outcome as `skipped_feed_time_alarm`. It must not count as a self-test failure. Assumed: check how that function reports its outcome.
+5. Unchanged: the OMS `dry_run` hardcode, the exit-order lockout, `[live_fill] enabled = false`, `select_engine` (still returns None), indicator/strategy, `LiveFillChain::new`'s signature, `LiveFillTap::offer`, and main.rs (zero lines added).
+
+## Edge Cases (Item UTC-SAFETY)
+- Cause A at 09:20, then cause B: the bits OR together and the day stays.
+- Alarm yesterday, entry today: the day differs, so the entry goes through.
+- Midnight while a drain hold keeps the process up: the switch clears at the roll.
+- Clock steps back a day: `fetch_max` never lowers the day, so an earlier day reads as not blocked.
+- Exit larger than the position: unchanged, `clamp_exit` handles it.
+- Muhurat day: the same IST-day key applies.
+- Alarm fires mid-fill: Gate B refuses the held entry, and Gate C catches an Execute already queued.
+- Marker torn, or folder unreadable at chain start: entries are blocked (fail closed). The drain's own `restore_latch` stays fail-open, as today.
+
+## Failure Modes (Item UTC-SAFETY)
+- The marker write fails in `fire`: entries are already blocked in RAM, so only a restart that day loses the block. Limit, accepted.
+- The latch thread fails to spawn: blocked anyway, because `engage` comes before the hand-off.
+- Engage delay: about 60 s for cause A, 10 min for cause B. Entries between the fault and the page go through.
+- Latent today: no engine runs in production.
+- REJECT traps:
+  - A second `error!` with DHAN-FEED-TIME-01 re-pages through error-code-alarms.tf:423 (§2.24). The new log must be `warn!`.
+  - Do not use `RiskEngine::trigger_halt`: it blocks exits, sends a Critical page, and is cleared at 16:00.
+  - A new `LiveFillChain::new` parameter breaks the replay isolation guard and the dhat callers.
+- Whether `.hold` days should block too needs an owner decision; not included.
+
+## Test Plan (Item UTC-SAFETY)
+- `trade_safety` unit tests: same day / next day / earlier day; `fetch_max` stays monotonic; cause bits reset on a new day; a test that `ist_day_number_now()` equals the chain's day formula.
+- Chain: an entry is refused with Decision and Reject rows plus the counter; an exit is sent; a held entry is refused in Filled.
+- `execute`: an entry gets `refused:feed_time_alarm`; an exit is placed. Self-test is skipped, not failed.
+- `feed_time_page`: `fire` engages before the hand-off, and still engages with the persist channel None; `start` with today's marker engages.
+- Chain start: `Present`, `Unreadable` and `Absent` markers, from a temp dir.
+- Proptest: random intents, days and engages against an oracle. No entry is sent on a blocked day, and exits match a run with the switch off.
+- DHAT: `dhat_live_fill` (C)/(D) re-run with the switch set; order-free steps stay at 0 blocks; a drain window around `fire` adds no allocation.
+- Guard `crates/app/tests/trade_safety_wiring_guard.rs`, a source scan, bite-tested:
+  - `engage` comes before `error!` in `fire`;
+  - gates A–D each sit inside `!Exit` / `!x.exit` and before their order build;
+  - the new log is never `error!`.
+
+## Rollback (Item UTC-SAFETY)
+Revert the PR. There is no table, config, Terraform or data change. The `live_order_events` Reject rows already written stay, as audit history.
+
+## Observability (Item UTC-SAFETY)
+- Every refusal writes Decision and Reject rows to `live_order_events`, reason `feed_time_alarm` or `refused:feed_time_alarm`.
+- Metrics, registered at 0 with handles resolved once in `CounterPublisher` (mod.rs), local `/metrics` only:
+  - counter `tv_live_fill_entries_blocked_feed_time_total`;
+  - gauge `tv_trade_safety_entries_blocked`, 0/1.
+- One coded `warn!` on the edge into blocked, `source = "trade_safety_entries_blocked"`, carrying the causes and the day.
+- Add `entries_blocked` to the LF-7 daily report.
+- No new page, alarm, filter or EMF name.
+- Docs: a CLAUDE.md O(1) table row for `trade_safety.rs`, and a dated note on the `feed_time_page` row.
+
+## Files (Item UTC-SAFETY)
+- docs/claude-rules-full/project/daily-universe-scope-expansion-2026-05-27.md (§28.7)
+- .claude/rules/project/daily-universe-scope-expansion-2026-05-27.md (stub bullet)
+- crates/app/src/trade_safety.rs (new), crates/app/src/lib.rs
+- crates/app/src/daily_task_marker.rs (`marker_state`)
+- crates/app/src/dhan_feed_stack/feed_time_page.rs
+- crates/app/src/live_fill/chain.rs, crates/app/src/live_fill/mod.rs
+- crates/app/src/order_runtime_live_fill.rs, crates/app/src/order_runtime.rs
+- crates/app/src/live_fill_report/build.rs (`entries_blocked` field)
+- crates/app/tests/trade_safety_wiring_guard.rs (new), crates/app/tests/dhat_live_fill.rs
+- CLAUDE.md
 
 ---
 
