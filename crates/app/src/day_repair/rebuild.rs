@@ -763,7 +763,7 @@ pub async fn export_lines(
     mut take: impl FnMut(&str) -> anyhow::Result<()>,
 ) -> anyhow::Result<u64> {
     let mut waited = std::time::Duration::ZERO;
-    let mut step = std::time::Duration::from_secs(1);
+    let mut step = EXPORT_BUSY_FIRST_WAIT;
     let mut resp = loop {
         let resp = client
             .get(exp_url)
@@ -779,7 +779,7 @@ pub async fn export_lines(
         if status.as_u16() == 429 && waited < EXPORT_BUSY_MAX_WAIT {
             tokio::time::sleep(step).await;
             waited += step;
-            step = (step * 2).min(std::time::Duration::from_secs(15));
+            step = (step * 2).min(EXPORT_BUSY_MAX_STEP);
             continue;
         }
         bail!("export {sql} returned {status}: {body}");
@@ -817,6 +817,10 @@ pub async fn export_lines(
 
 /// How long [`export_lines`] waits out QuestDB's export connection limit.
 const EXPORT_BUSY_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(120); // APPROVED: this IS the named constant the rule asks for
+/// The first wait after a 429 in [`export_lines`]; doubles each time.
+const EXPORT_BUSY_FIRST_WAIT: std::time::Duration = std::time::Duration::from_secs(1); // APPROVED: this IS the named constant the rule asks for
+/// The longest single wait after a 429 in [`export_lines`].
+const EXPORT_BUSY_MAX_STEP: std::time::Duration = std::time::Duration::from_secs(15); // APPROVED: this IS the named constant the rule asks for
 
 /// `SELECT capture_seq ...` through `/exp` into `out`. O(rows).
 ///
