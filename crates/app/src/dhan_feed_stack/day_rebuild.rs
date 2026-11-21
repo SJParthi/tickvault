@@ -474,6 +474,71 @@ mod live_fold_tests {
         );
     }
 
+    fn packet(code: u8, len: u16, segment: u8, id: u32, body: &[u8]) -> Vec<u8> {
+        let mut p = vec![0u8; usize::from(len)];
+        p[0] = code;
+        p[1..3].copy_from_slice(&len.to_le_bytes());
+        p[3] = segment;
+        p[4..8].copy_from_slice(&id.to_le_bytes());
+        let n = body.len().min(p.len().saturating_sub(8));
+        p[8..8 + n].copy_from_slice(&body[..n]);
+        p
+    }
+
+    /// Non-tick packets reach the aux path, an order-update frame is walked,
+    /// a truncated tail is abandoned and counted, never folded.
+    #[test]
+    fn test_non_tick_packets_and_a_truncated_tail_are_counted() {
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
+        let day_start = u32::try_from(DAY_START_UTC + 19_800).expect("u32");
+        ingest.begin_past_day_refold(day_start, day_start + 8 * 3_600 + 31 * 60);
+        let receipt = (DAY_START_UTC + 10 * 3_600) * 1_000_000_000;
+        let mut frame = packet(5, 12, 2, 4_242, &9_000i32.to_le_bytes());
+        let mut prev = 24_100.5f32.to_le_bytes().to_vec();
+        prev.extend_from_slice(&0i32.to_le_bytes());
+        frame.extend(packet(6, 16, 0, 13, &prev));
+        let (_, tick) = nifty_at(10 * 3_600 + 5, 24_000.0);
+        frame.extend_from_slice(&tick);
+        // A Ticker header that promises 16 bytes with only 10 left.
+        frame.extend_from_slice(&packet(2, 16, 0, 13, &[])[..10]);
+        let mut out = WalRefoldOutcome::default();
+        ingest.refold_past_day_segment(
+            &[(
+                1u64,
+                receipt,
+                WalEndpoint::MainFeed,
+                bytes::Bytes::from(frame),
+            )],
+            &[],
+            &mut out,
+        );
+        assert_eq!(out.non_tick, 2, "{out:?}");
+        assert_eq!(out.refolded, 1, "{out:?}");
+        assert_eq!(out.unparseable, 1, "{out:?}");
+        assert_eq!(out.abandoned_bytes, 10, "{out:?}");
+        // An order-update frame goes through the same walk as a main-feed one;
+        // an unknown code with no length to skip abandons the rest.
+        let mut out = WalRefoldOutcome::default();
+        let unknown = vec![99u8, 0, 0, 0, 1, 0, 0, 0];
+        ingest.refold_past_day_segment(
+            &[(
+                2u64,
+                receipt,
+                WalEndpoint::OrderUpdate,
+                bytes::Bytes::from(unknown),
+            )],
+            &[],
+            &mut out,
+        );
+        assert_eq!(out.refolded, 0, "{out:?}");
+        assert!(
+            out.unparseable + out.unknown_skipped + out.undecodable >= 1,
+            "{out:?}"
+        );
+        let rows = ingest.flush_past_day_rows();
+        assert!(rows <= 4, "rows handed over: {rows}");
+    }
+
     /// A restart gap inside the day: the bucket open across it is withheld
     /// (as a live mid-session boot withholds it), never written short.
     #[test]

@@ -1273,8 +1273,8 @@ async fn finish_box(env: &str) {
 
 /// `dry`: every guard and object, printed; nothing changes. Exit 3 when
 /// `apply` would refuse.
-async fn dry_report(
-    io: &mut prod_io::ProdIo,
+async fn dry_report<I: RepairIo>(
+    io: &mut I,
     root: &Path,
     wal_dir: &Path,
     day: NaiveDate,
@@ -1743,6 +1743,94 @@ mod prod_io {
                 format!("{outcome}: {detail}")
             };
             self.audit.append_and_flush(&row)
+        }
+    }
+    /// The adapter's pure helpers (2026-11-21).
+    #[cfg(test)]
+    mod helper_tests {
+        use super::*;
+
+        #[test]
+        fn test_hex_decode_and_base64_match_known_vectors() {
+            assert_eq!(hex_decode("00ff10"), Some(vec![0, 255, 16]));
+            assert_eq!(hex_decode(""), Some(Vec::new()));
+            assert_eq!(hex_decode("abc"), None);
+            assert_eq!(hex_decode("zz"), None);
+            // RFC 4648 test vectors.
+            for (raw, b64) in [
+                ("", ""),
+                ("f", "Zg=="),
+                ("fo", "Zm8="),
+                ("foo", "Zm9v"),
+                ("foob", "Zm9vYg=="),
+                ("fooba", "Zm9vYmE="),
+                ("foobar", "Zm9vYmFy"),
+            ] {
+                assert_eq!(base64(raw.as_bytes()), b64, "{raw}");
+            }
+            // The SHA-256 of nothing, as S3 writes it.
+            let sha =
+                hex_decode("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+                    .expect("hex");
+            assert_eq!(base64(&sha), "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=");
+        }
+
+        #[test]
+        fn test_record_outcome_and_step_mappings() {
+            let obj = QuarantinedObject {
+                object: "ticks/2026-11-20T09".to_owned(),
+                s3_key: "quarantine/x".to_owned(),
+                rows: None,
+                bytes: 12,
+                sha256_hex: "ab".to_owned(),
+                reused: false,
+            };
+            let rec = to_record(&obj);
+            assert_eq!(
+                (rec.key.as_str(), rec.rows, rec.bytes),
+                ("quarantine/x", 0, 12)
+            );
+            for (o, want) in [
+                (QuarantineOutcome::Refused { reason: "r" }, "refused (r)"),
+                (
+                    QuarantineOutcome::Kept {
+                        stage: "s",
+                        detail: "d".to_owned(),
+                    },
+                    "kept at s: d",
+                ),
+                (QuarantineOutcome::Copied(obj.clone()), "not dropped"),
+                (
+                    QuarantineOutcome::Dropped(obj.clone()),
+                    "dropped unexpectedly",
+                ),
+            ] {
+                let e = format!("{:#}", outcome_error("p", o));
+                assert!(e.starts_with("p: ") && e.contains(want), "{e}");
+            }
+            let steps = [
+                Step::Enumerate,
+                Step::Copy,
+                Step::Drop,
+                Step::Move,
+                Step::Rebuild,
+                Step::Verify,
+                Step::Done,
+            ];
+            let mapped: std::collections::BTreeSet<String> = steps
+                .iter()
+                .map(|s| format!("{:?}", audit_step(*s)))
+                .collect();
+            assert_eq!(
+                mapped.len(),
+                steps.len(),
+                "each step maps to its own audit step"
+            );
+            assert_eq!(audit_outcome("failed"), DayRepairOutcome::Failed);
+            assert_eq!(audit_outcome("unfinished"), DayRepairOutcome::Failed);
+            assert_eq!(audit_outcome("copied"), DayRepairOutcome::Copied);
+            assert_eq!(audit_outcome("dropped"), DayRepairOutcome::Dropped);
+            assert_eq!(audit_outcome("listed"), DayRepairOutcome::Ok);
         }
     }
 }
@@ -2322,6 +2410,36 @@ mod tests {
             }
         }
         panic!("never finished");
+    }
+
+    /// `dry` lists and judges and changes nothing: no copy, drop or move,
+    /// and a waiting 20 Nov WAL segment turns the verdict into a refusal.
+    #[test]
+    fn test_dry_report_lists_judges_and_changes_nothing() {
+        let (root, remote, files) = setup(3, 2);
+        let wal = root.join("data/ws_wal");
+        let mut io = FakeIo {
+            remote: &remote,
+            root: root.clone(),
+            fail_at: None,
+            calls: 0,
+        };
+        let code = block_on(dry_report(&mut io, &root, &wal, nov20())).expect("dry");
+        assert_eq!(code, EXIT_OK);
+        let r = remote.borrow();
+        assert!(r.copies.is_empty(), "dry copied nothing");
+        assert_eq!(r.partitions.len(), 3, "dry dropped nothing");
+        assert_eq!(r.rebuilds, 0);
+        drop(r);
+        for f in &files {
+            assert!(root.join(f).exists(), "dry moved nothing: {}", f.display());
+        }
+        std::fs::create_dir_all(&wal).expect("wal dir");
+        let (start, _) = rebuild::day_receipt_bounds_nanos(nov20()).expect("bounds");
+        std::fs::write(wal.join(format!("ws-frames-{:020}.wal", start + 1)), b"").expect("seg");
+        let code = block_on(dry_report(&mut io, &root, &wal, nov20())).expect("dry");
+        assert_eq!(code, EXIT_REFUSED);
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

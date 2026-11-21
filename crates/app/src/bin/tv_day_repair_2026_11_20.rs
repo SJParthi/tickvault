@@ -137,6 +137,8 @@ struct Instance {
 struct Run {
     conf: aws_config::SdkConfig,
     http: reqwest::Client,
+    /// The GitHub API base (`GITHUB_API`; a local stub in tests).
+    github_api: String,
     mode: Mode,
     sha: String,
     repo: String,
@@ -217,7 +219,7 @@ impl Run {
 
     async fn gh_get(&self, path: &str) -> Result<serde_json::Value, String> {
         self.http
-            .get(format!("{GITHUB_API}{path}"))
+            .get(format!("{}{path}", self.github_api))
             .bearer_auth(&self.gh_token)
             .header("Accept", "application/vnd.github+json")
             .header("User-Agent", "tv-day-repair-2026-11-20")
@@ -553,6 +555,7 @@ async fn real_main(args: &[String]) -> Result<Vec<String>, (String, Vec<String>)
     let mut run = Run {
         conf,
         http: reqwest::Client::new(),
+        github_api: GITHUB_API.to_owned(),
         mode,
         sha,
         repo,
@@ -680,5 +683,240 @@ mod tests {
     async fn test_real_main_refuses_bad_input_before_any_aws_call() {
         let r = real_main(&args(&["bin", "--mode", "dry", "--sha", "nope"])).await;
         assert!(r.is_err_and(|(why, log)| why.contains("--sha") && log.is_empty()));
+    }
+}
+
+/// The GitHub checks against a local stub API (2026-11-21): busy deploys,
+/// the dry-run-on-this-commit rule, the error arm, and the report file.
+#[cfg(test)]
+mod github_stub_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const SHA: &str = "d1b4835470000000000000000000000000000000";
+
+    /// A stub that answers each request path from `routes` (first substring
+    /// match; no match answers 404) and records the paths.
+    async fn stub(
+        routes: Vec<(String, u16, String)>,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = std::sync::Arc::clone(&seen);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut req = Vec::new();
+                let mut part = [0u8; 4096];
+                while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut part).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => req.extend_from_slice(&part[..n]),
+                    }
+                }
+                let head = String::from_utf8_lossy(&req).into_owned();
+                let path = head
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split(' ').nth(1))
+                    .unwrap_or_default()
+                    .to_owned();
+                let auth_ok = head
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer tok");
+                log.lock().expect("lock").push(path.clone());
+                let (status, body) = if auth_ok {
+                    routes
+                        .iter()
+                        .find(|(k, _, _)| path.contains(k.as_str()))
+                        .map_or((404, String::from("{}")), |(_, s, b)| (*s, b.clone()))
+                } else {
+                    (401, String::from("{}"))
+                };
+                let reply = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(reply.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    fn run(github_api: String, mode: Mode, token: &str) -> Run {
+        let conf = aws_config::SdkConfig::builder()
+            .behavior_version(aws_config::BehaviorVersion::latest())
+            .region(aws_config::Region::new(REGION))
+            .build();
+        Run {
+            conf,
+            http: reqwest::Client::new(),
+            github_api,
+            mode,
+            sha: SHA.to_owned(),
+            repo: "o/r".to_owned(),
+            gh_token: token.to_owned(),
+            log: Vec::new(),
+            keep_alive_before: None,
+            keep_alive_set: false,
+        }
+    }
+
+    fn total(n: u64) -> String {
+        format!("{{\"total_count\":{n}}}")
+    }
+
+    #[tokio::test]
+    async fn test_busy_deploys_names_each_busy_workflow_and_status() {
+        let mut routes = vec![(
+            "deploy-aws.yml/runs?status=in_progress".to_owned(),
+            200,
+            total(1),
+        )];
+        routes.push((
+            "postmerge-catchup.yml/runs?status=queued".to_owned(),
+            200,
+            total(2),
+        ));
+        routes.push(("/runs?status=".to_owned(), 200, total(0)));
+        let (api, seen) = stub(routes).await;
+        let busy = run(api, Mode::Dry, "tok")
+            .busy_deploys()
+            .await
+            .expect("busy");
+        assert_eq!(
+            busy,
+            vec![
+                "deploy-aws.yml has 1 run(s) in_progress".to_owned(),
+                "postmerge-catchup.yml has 2 run(s) queued".to_owned(),
+            ]
+        );
+        // Three workflows, five statuses each.
+        assert_eq!(seen.lock().expect("lock").len(), 15);
+    }
+
+    #[tokio::test]
+    async fn test_dry_run_rule_needs_a_successful_dry_run_on_this_commit() {
+        let path = format!("{WORKFLOW_FILE}/runs?head_sha={SHA}&status=success");
+        let with_dry = String::from(
+            "{\"workflow_runs\":[{\"display_title\":\"day-repair-2026-11-20 (verify)\"},{\"display_title\":\"day-repair-2026-11-20 (dry)\"}]}",
+        );
+        let (api, seen) = stub(vec![(path.clone(), 200, with_dry)]).await;
+        assert!(
+            run(api, Mode::Apply, "tok")
+                .dry_run_succeeded_on_this_commit()
+                .await
+                .expect("ok")
+        );
+        assert!(seen.lock().expect("lock")[0].contains(&format!("head_sha={SHA}")));
+        let only_verify = String::from(
+            "{\"workflow_runs\":[{\"display_title\":\"day-repair-2026-11-20 (verify)\"}]}",
+        );
+        let (api, _) = stub(vec![(path.clone(), 200, only_verify)]).await;
+        assert!(
+            !run(api, Mode::Apply, "tok")
+                .dry_run_succeeded_on_this_commit()
+                .await
+                .expect("ok")
+        );
+        let (api, _) = stub(vec![(path, 200, String::from("{}"))]).await;
+        assert!(
+            !run(api, Mode::Apply, "tok")
+                .dry_run_succeeded_on_this_commit()
+                .await
+                .expect("ok")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_gh_get_reports_status_and_bad_json() {
+        let (api, _) = stub(vec![
+            ("/bad".to_owned(), 200, String::from("not json")),
+            ("/ok".to_owned(), 200, String::from("{\"a\":1}")),
+        ])
+        .await;
+        let r = run(api.clone(), Mode::Dry, "tok");
+        assert_eq!(r.gh_get("/ok").await.expect("ok")["a"], 1);
+        assert!(r.gh_get("/bad").await.expect_err("json").contains("/bad"));
+        assert!(r.gh_get("/missing").await.expect_err("404").contains("404"));
+        // A wrong token is refused by the API and named.
+        let e = run(api, Mode::Dry, "nope")
+            .gh_get("/ok")
+            .await
+            .expect_err("401");
+        assert!(e.contains("401"), "{e}");
+        // A busy-deploy check that cannot read GitHub refuses (never "not busy").
+        let (api, _) = stub(vec![]).await;
+        assert!(run(api, Mode::Dry, "tok").busy_deploys().await.is_err());
+    }
+
+    #[test]
+    fn test_say_logs_and_write_report_writes_the_log() {
+        let mut r = run(String::new(), Mode::Dry, "tok");
+        r.say("first line");
+        r.say(String::from("second"));
+        assert_eq!(r.log, vec!["first line".to_owned(), "second".to_owned()]);
+        let dir = std::env::temp_dir().join(format!(
+            "tv-day-repair-report-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("report.md");
+        write_report(Some(path.display().to_string()), true, &r.log);
+        let body = std::fs::read_to_string(&path).expect("report");
+        assert!(body.starts_with("# Day repair 2026-11-20: OK"));
+        assert!(body.contains("first line\nsecond\n"));
+        write_report(Some(path.display().to_string()), false, &[]);
+        assert!(
+            std::fs::read_to_string(&path)
+                .expect("report")
+                .contains("REFUSED OR FAILED")
+        );
+        // No path: nothing written; an unwritable path only warns.
+        write_report(None, true, &r.log);
+        write_report(
+            Some(dir.join("no/such/dir/r.md").display().to_string()),
+            true,
+            &r.log,
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_keep_alive_value_is_an_ist_instant_hours_ahead() {
+        let v = Run::keep_alive_value(9);
+        assert!(v.ends_with("+05:30"), "{v}");
+        let at =
+            chrono::NaiveDateTime::parse_from_str(&v[..19], "%Y-%m-%dT%H:%M:%S").expect("parse");
+        let ahead = (at - now_ist()).num_minutes();
+        assert!((539..=540).contains(&ahead), "{ahead}");
+        let past = Run::keep_alive_value(-1);
+        let at =
+            chrono::NaiveDateTime::parse_from_str(&past[..19], "%Y-%m-%dT%H:%M:%S").expect("parse");
+        assert!(at < now_ist());
+    }
+
+    #[tokio::test]
+    async fn test_real_main_needs_repository_and_token_after_local_checks() {
+        // A Saturday-evening-shaped call that passes the local checks still
+        // refuses without GITHUB_REPOSITORY and GH_TOKEN (cleared here for
+        // this process's test thread only by reading, never writing, env).
+        if std::env::var("GITHUB_REPOSITORY").is_ok() || std::env::var("GH_TOKEN").is_ok() {
+            return;
+        }
+        let local = local_refusal(Some("dry"), SHA, "", now_ist());
+        let r = real_main(&["bin", "--mode", "dry", "--sha", SHA].map(String::from)).await;
+        match local {
+            // Inside a closed window the local refusal answers first.
+            Err(why) => assert!(r.is_err_and(|(e, _)| e == why)),
+            Ok(_) => assert!(r.is_err_and(|(e, _)| e.contains("GITHUB_REPOSITORY"))),
+        }
     }
 }

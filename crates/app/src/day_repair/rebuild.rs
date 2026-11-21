@@ -883,7 +883,7 @@ pub fn verify_findings(r: &VerifyReading, rep: &RebuildReport, day: NaiveDate) -
 ///
 /// # Errors
 /// Any query failure, a suspended table, or the apply wait running out.
-// TEST-EXEMPT: QuestDB queries; verify_findings, which judges the reading, is unit-tested.
+// TEST-EXEMPT: builds the client and URL, then read_verify_at (stub-server tested).
 pub async fn read_verify(
     config: &ApplicationConfig,
     day: NaiveDate,
@@ -894,11 +894,24 @@ pub async fn read_verify(
         "http://{}:{}/exec",
         config.questdb.host, config.questdb.http_port
     );
-    wait_applied(&client, &url).await?;
+    read_verify_at(&client, &url, day).await
+}
+
+/// [`read_verify`] against one `/exec` URL: the apply wait, then the reads.
+///
+/// # Errors
+/// Any query failure, a suspended table, or the apply wait running out.
+pub async fn read_verify_at(
+    client: &reqwest::Client,
+    exec_url: &str,
+    day: NaiveDate,
+) -> anyhow::Result<VerifyReading> {
+    let url = exec_url;
+    wait_applied(client, url).await?;
     let d = day.format("%Y-%m-%d").to_string();
     let nifty = exec_dataset(
-        &client,
-        &url,
+        client,
+        url,
         &format!(
             "SELECT count(), min(ts), max(ts) FROM candles_1m WHERE ts IN '{d}' \
              AND security_id = 13 AND segment = 'IDX_I'"
@@ -918,29 +931,29 @@ pub async fn read_verify(
         nifty_1m_first: cell(1),
         nifty_1m_last: cell(2),
         candles_1m_before_open: exec_count(
-            &client,
-            &url,
+            client,
+            url,
             &format!(
                 "SELECT count() FROM candles_1m WHERE ts IN '{d}' AND ts < '{d}T09:15:00.000000Z'"
             ),
         )
         .await?,
-        ticks_before_0900: offset_fingerprint(&client, &url, day).await?,
+        ticks_before_0900: offset_fingerprint(client, url, day).await?,
         ticks_rows: exec_count(
-            &client,
-            &url,
+            client,
+            url,
             &format!("SELECT count() FROM ticks WHERE ts IN '{d}'"),
         )
         .await?,
         quote_rows: exec_count(
-            &client,
-            &url,
+            client,
+            url,
             &format!("SELECT count() FROM tick_quotes WHERE ts IN '{d}'"),
         )
         .await?,
         aux_rows: exec_count(
-            &client,
-            &url,
+            client,
+            url,
             &format!("SELECT count() FROM feed_aux_packets WHERE ts IN '{d}'"),
         )
         .await?,
@@ -1172,5 +1185,197 @@ mod tests {
         std::fs::write(root.join("data/spill/seals_v4-2026-11-20.bin"), b"x").expect("file");
         assert_eq!(spill_files(&root).difference(&before).count(), 1);
         std::fs::remove_dir_all(&root).ok();
+    }
+}
+
+/// The QuestDB reads of the verify gate against a local stub `/exec` server
+/// (2026-11-21): the apply wait, the NIFTY read, the counts and the error
+/// arms, with no real database.
+#[cfg(test)]
+mod stub_exec_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// What the stub answers: a status, a body, keyed on a substring of the
+    /// decoded SQL (first match wins; the last entry is the fallback).
+    type Script = Vec<(&'static str, u16, String)>;
+
+    fn percent_decode(s: &str) -> String {
+        let b = s.as_bytes();
+        let mut out = Vec::with_capacity(b.len());
+        let mut i = 0;
+        while i < b.len() {
+            match b[i] {
+                b'+' => {
+                    out.push(b' ');
+                    i += 1;
+                }
+                b'%' if i + 2 < b.len() => {
+                    let hex = std::str::from_utf8(&b[i + 1..i + 3]).unwrap_or("00");
+                    out.push(u8::from_str_radix(hex, 16).unwrap_or(b'?'));
+                    i += 3;
+                }
+                c => {
+                    out.push(c);
+                    i += 1;
+                }
+            }
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// Starts a stub that answers every request from `script` and returns
+    /// its `/exec` URL plus the SQL it saw.
+    async fn stub(script: Script) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = std::sync::Arc::clone(&seen);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut req = Vec::new();
+                let mut part = [0u8; 4096];
+                while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut part).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => req.extend_from_slice(&part[..n]),
+                    }
+                }
+                let head = String::from_utf8_lossy(&req).into_owned();
+                let line = head.lines().next().unwrap_or_default().to_owned();
+                let query = line
+                    .split("query=")
+                    .nth(1)
+                    .and_then(|q| q.split([' ', '&']).next())
+                    .map(percent_decode)
+                    .unwrap_or_default();
+                log.lock().expect("lock").push(query.clone());
+                let (status, body) = script
+                    .iter()
+                    .find(|(k, _, _)| query.contains(k))
+                    .or(script.last())
+                    .map(|(_, s, b)| (*s, b.clone()))
+                    .unwrap_or((200, String::from("{}")));
+                let reply = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(reply.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        (format!("http://{addr}/exec"), seen)
+    }
+
+    fn wal(rows: &[(&str, bool, i64, i64)]) -> String {
+        let data: Vec<String> = rows
+            .iter()
+            .map(|(n, s, w, q)| format!("[\"{n}\",{s},{w},{q}]"))
+            .collect();
+        format!(
+            "{{\"columns\":[{{\"name\":\"name\",\"type\":\"STRING\"}},{{\"name\":\"suspended\",\"type\":\"BOOLEAN\"}},{{\"name\":\"writerTxn\",\"type\":\"LONG\"}},{{\"name\":\"sequencerTxn\",\"type\":\"LONG\"}}],\"dataset\":[{}]}}",
+            data.join(",")
+        )
+    }
+
+    fn count(n: u64) -> String {
+        format!("{{\"dataset\":[[{n}]]}}")
+    }
+
+    fn nov20() -> NaiveDate {
+        NaiveDate::from_ymd_opt(2026, 11, 20).expect("date")
+    }
+
+    fn client() -> reqwest::Client {
+        reqwest::Client::new()
+    }
+
+    #[tokio::test]
+    async fn test_read_verify_at_reads_every_number_after_the_apply_wait() {
+        let (url, seen) = stub(vec![
+            ("wal_tables", 200, wal(&[("ticks", false, 7, 7), ("market_depth", false, 1, 9)])),
+            (
+                "security_id = 13",
+                200,
+                String::from(
+                    "{\"dataset\":[[375,\"2026-11-20T09:15:00.000000Z\",\"2026-11-20T15:29:00.000000Z\"]]}",
+                ),
+            ),
+            ("ts < '2026-11-20T09:15", 200, count(0)),
+            ("out_of_window_tick", 200, count(2)),
+            ("FROM ticks", 200, count(800)),
+            ("FROM tick_quotes", 200, count(100)),
+            ("FROM feed_aux_packets", 200, count(40)),
+            ("", 500, String::from("unexpected")),
+        ])
+        .await;
+        let r = read_verify_at(&client(), &url, nov20())
+            .await
+            .expect("reading");
+        assert_eq!(
+            r,
+            VerifyReading {
+                nifty_1m_count: 375,
+                nifty_1m_first: "2026-11-20T09:15:00.000000Z".to_owned(),
+                nifty_1m_last: "2026-11-20T15:29:00.000000Z".to_owned(),
+                candles_1m_before_open: 0,
+                ticks_before_0900: 2,
+                ticks_rows: 800,
+                quote_rows: 100,
+                aux_rows: 40,
+            }
+        );
+        let seen = seen.lock().expect("lock").clone();
+        // The apply wait runs first; market_depth (not a held kind) lagging
+        // does not hold it.
+        assert!(seen[0].contains("wal_tables"), "{seen:?}");
+        assert_eq!(seen.len(), 7, "{seen:?}");
+    }
+
+    #[tokio::test]
+    async fn test_read_verify_at_refuses_a_suspended_held_table() {
+        let (url, _) = stub(vec![(
+            "wal_tables",
+            200,
+            wal(&[("candles_1m", true, 3, 3)]),
+        )])
+        .await;
+        let e = read_verify_at(&client(), &url, nov20())
+            .await
+            .expect_err("suspended");
+        assert!(format!("{e:#}").contains("WAL-suspended"), "{e:#}");
+    }
+
+    #[tokio::test]
+    async fn test_exec_dataset_error_arms_and_first_count_shapes() {
+        let (url, _) = stub(vec![
+            ("bad_status", 400, String::from("{\"error\":\"no\"}")),
+            ("not_json", 200, String::from("<html>")),
+            ("no_dataset", 200, String::from("{\"columns\":[]}")),
+            ("neg", 200, String::from("{\"dataset\":[[-4]]}")),
+            ("", 200, count(9)),
+        ])
+        .await;
+        let c = client();
+        let e = exec_dataset(&c, &url, "bad_status").await.expect_err("400");
+        assert!(format!("{e:#}").contains("400"), "{e:#}");
+        assert!(exec_dataset(&c, &url, "not_json").await.is_err());
+        let e = exec_dataset(&c, &url, "no_dataset")
+            .await
+            .expect_err("no dataset");
+        assert!(format!("{e:#}").contains("no dataset"), "{e:#}");
+        assert_eq!(exec_count(&c, &url, "neg").await.expect("neg"), 0);
+        assert_eq!(exec_count(&c, &url, "anything").await.expect("count"), 9);
+        assert_eq!(offset_fingerprint(&c, &url, nov20()).await.expect("fp"), 9);
+        // Nothing listening: the request itself fails with the query named.
+        let e = exec_dataset(&c, "http://127.0.0.1:1/exec", "SELECT 1")
+            .await
+            .expect_err("refused");
+        assert!(format!("{e:#}").contains("SELECT 1"), "{e:#}");
     }
 }
