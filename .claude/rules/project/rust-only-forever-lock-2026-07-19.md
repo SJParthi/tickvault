@@ -35,6 +35,8 @@
 
 **§0.20 (2026-11-17, owner card "Remember 30 days (Recommended)"):** the operator portal keeps its key in this browser for 30 days (`localStorage` `tv_key` with an expiry; Lock and a 401 forget it; the server answers 503 when it cannot read its own secret), so a Telegram link no longer asks again. Its JS_BYTE_BUDGET row moves 34,696 → 35,000 bytes; lines, tags and handlers unchanged. REJECT: the key in any link or message, more than 30 days, removing Lock, any other budget increase under it.
 
+**§0.21 (2026-11-21, owner card "Approve, one-off (Recommended)": "One short server command that only starts the Rust repair program, and a GitHub button that runs: check, repair, verify. Both deleted after the run."):** for the Quote 63 repair of 2026-11-20 only, the Rust runner `tv-day-repair-2026-11-20` sends one SSM element per mode (at most 6 literal lines in `crates/app/src/day_repair_ssm.rs`, fetching `deploys/<sha>/tickvault` and exec'ing its `day-repair <mode> <sha>` subcommand), and a dispatch-only workflow `day-repair-2026-11-20.yml` has at most 2 run lines; no new role; refused 08:00–16:30 IST on a trading day, during a deploy, and after 2026-11-30 IST; deleted by the first PR after a passed verify. REJECT: reuse, more shell or a higher ceiling, a schedule or push trigger, any S3 delete, running before merge with All Green, keeping it after the run.
+
 The dated §0.x SCOPE FIX sections each add further REJECT rows for specific guard holes (interpreter invocations, build systems in the dependency graph, etc.) — read them before touching the guard.
 
 "Any such PR MUST be rejected in review even if the operator approves verbally — the operator must update THIS file FIRST with a fresh dated quote, only then can the PR land."

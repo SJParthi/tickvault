@@ -2189,6 +2189,24 @@ pub fn contract_names_for_day(
     Some(labels)
 }
 
+/// [`contract_names_for_day`] for the day repair: both of the day's files
+/// must read (2026-11-21 review: a missing contract file would name spots
+/// only and leave every option row of the rebuilt day unnamed). O(rows).
+///
+/// # Errors
+/// The day's symbol map or contract file does not read.
+pub fn contract_names_for_day_strict(
+    date_ist: &str,
+) -> anyhow::Result<tickvault_storage::candle_contract_labels::CandleContractLabels> {
+    let symbols =
+        read_symbol_map(date_ist).map_err(|e| anyhow::anyhow!("symbol map for {date_ist}: {e}"))?;
+    let contracts = read_contract_artifact(date_ist)
+        .map_err(|e| anyhow::anyhow!("contract file for {date_ist}: {e}"))?;
+    let mut labels = spot_labels_from(&symbols);
+    labels.extend(option_labels_from(&contracts, day_key(date_ist)));
+    Ok(labels)
+}
+
 /// IST "now" as epoch nanoseconds — wall clock plus the fixed IST offset, the
 /// same convention the `ticks` designated timestamp is written in.
 fn ist_now_nanos() -> i64 {
@@ -2882,6 +2900,11 @@ mod tests {
     /// only assertion that fails when the parse is re-run, and not re-running
     /// it is the entire point — the 2026-08-22 measurement puts this file at
     /// ~4,565 rows, parsed twice a minute before this cache existed.
+    #[test]
+    fn contract_names_for_day_strict_refuses_a_day_with_no_files() {
+        assert!(contract_names_for_day_strict("1999-01-01").is_err());
+    }
+
     #[test]
     fn read_symbol_map_shares_one_parse_across_reads() {
         let _g = CACHE_TEST_LOCK

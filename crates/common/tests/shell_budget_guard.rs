@@ -1640,7 +1640,11 @@ fn retired_one_off_tools_stay_deleted() {
 /// in code or in a comment, must be here. SHRINK-ONLY: a listed file that no
 /// longer carries a marker must leave in the same PR, and adding a file needs
 /// a dated operator quote in the rust-only lock first. Measured 2026-10-26.
-const SSM_SENDER_FILES: &[&str] = &["crates/aws-lambdas/src/operator_control.rs"];
+const SSM_SENDER_FILES: &[&str] = &[
+    "crates/app/src/bin/tv_day_repair_2026_11_20.rs",
+    "crates/app/src/day_repair_ssm.rs",
+    "crates/aws-lambdas/src/operator_control.rs",
+];
 
 /// What marks a file as an SSM shell sender: the two shell document names,
 /// the SDK call, the CLI verb, and the API action name.
@@ -2036,6 +2040,9 @@ const WORKFLOW_RUN_LINE_BUDGET: &[(&str, usize)] = &[
     (".github/workflows/claude-integration.yml", 17),
     (".github/workflows/claude-mobile-command.yml", 2),
     (".github/workflows/claude-triage-loop.yml", 6),
+    // One-off (rust-only lock §0.21): build the runner, run it. Deleted after
+    // the 2026-11-20 repair verifies.
+    (".github/workflows/day-repair-2026-11-20.yml", 2),
     (".github/workflows/dep-freshness-nightly.yml", 82),
     (".github/workflows/deploy-aws-after-close.yml", 58),
     // 2026-10-20: 643 → 642, the two deploy `systemctl enable` lines became one;
@@ -2870,4 +2877,42 @@ fn nextest_flaky_self_test() {
     assert_eq!(parse_version("0.9.131"), Some((0, 9, 131)));
     assert_eq!(parse_version("0.9"), None);
     assert_eq!(parse_version("0.9.1.2"), None);
+}
+
+/// The 2026-11-20 day repair's one SSM shell element (rust-only lock §0.21,
+/// owner-approved 2026-11-21: at most 6 lines). Measured exactly; deleted
+/// with the runner and the workflow by the first PR after a passed verify.
+const DAY_REPAIR_SSM_SHELL_SOURCES: &[(&str, usize, usize)] =
+    &[("crates/app/src/day_repair_ssm.rs", 3, 251)];
+
+#[test]
+fn day_repair_ssm_shell_never_grows() {
+    let names: Vec<&str> = DAY_REPAIR_SSM_SHELL_SOURCES.iter().map(|r| r.0).collect();
+    assert_sorted_unique(&names, "DAY_REPAIR_SSM_SHELL_SOURCES");
+    let mut report = Vec::new();
+    let mut over = Vec::new();
+    for (path, max_lines, max_bytes) in DAY_REPAIR_SSM_SHELL_SOURCES {
+        assert!(*max_lines <= 6, "§0.21 allows at most 6 lines");
+        let src = read_text(path)
+            .unwrap_or_else(|| panic!("day repair shell source `{path}` is gone: remove its row"));
+        let region = production_region(&src);
+        // Anti-vacuity: the file still carries the one command.
+        assert!(
+            region.contains("day-repair"),
+            "`{path}`: the box command is gone; the row is stale"
+        );
+        let lits = rust_string_literals(region)
+            .unwrap_or_else(|| panic!("`{path}`: unterminated literal or comment"));
+        let (lines, bytes) = literal_lines_and_bytes(&lits);
+        report.push(format!("    (\"{path}\", {lines}, {bytes}),"));
+        if lines > *max_lines || bytes > *max_bytes {
+            over.push((path.to_string(), lines, *max_lines, bytes, *max_bytes));
+        }
+    }
+    assert!(
+        over.is_empty(),
+        "the day repair's SSM shell grew (path, lines, ceiling, bytes, ceiling): {over:?}. \
+         Do the step in the Rust `day-repair` subcommand instead. Measured now:\n{}",
+        report.join("\n")
+    );
 }
