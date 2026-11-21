@@ -118,7 +118,6 @@ mod ltt_feed;
 // Noise lock §2.24: the DHAN-FEED-TIME-01 page.
 mod feed_time_page;
 use frame_tally::FrameTally;
-pub use ltt_feed::install_ltt_notice;
 use std::time::Instant;
 
 use secrecy::ExposeSecret;

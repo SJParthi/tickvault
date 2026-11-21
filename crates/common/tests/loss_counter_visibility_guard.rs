@@ -185,6 +185,10 @@ const UNREACHABLE_ALLOWLIST: &[(&str, &str)] = &[
         "local /metrics only since 2026-11-11: operator Quote 53 (card \"Trim CloudWatch metrics\") ships to CloudWatch only the metrics an alarm reads, and no kept alarm reads this one (docs/audits/2026-11-alarm-review.md). It was EMF-shipped before that and is still registered on the box's local /metrics. A gauge of refused sequence numbers; it was charted on the deleted dashboard only.",
     ),
     (
+        "tv_dhan_ltt_correction_refused_total",
+        "NOT A LOSS COUNTER (added 2026-11-21, scope lock \"DHAN LIVE LTT IS UTC EPOCH FROM RECEIPT 2026-11-20 00:00 IST\"). It counts trade times the +19,800 s correction LEFT RAW (reason=receipt|band|cap): the tick and its row are still written, only the time is not shifted. Raw 0 and sentinels land on `band` in normal operation, so a series would chart healthy traffic. The one event it can signal that matters, Dhan reverting to IST epoch (`cap`), pages through DHAN-FEED-TIME-01 `source=dhan_time_format_reverted` from the reversion guard, never from this counter. Local /metrics only by the scope lock (no EMF name, filter or alarm).",
+    ),
+    (
         "tv_dhan_ws_dial_failed_total",
         "local /metrics only since 2026-11-11: operator Quote 53 (card \"Trim CloudWatch metrics\") ships to CloudWatch only the metrics an alarm reads, and no kept alarm reads this one (docs/audits/2026-11-alarm-review.md). It was EMF-shipped before that and is still registered on the box's local /metrics. A socket that never comes back is paged by the socket-parked and no-live-sockets pages.",
     ),

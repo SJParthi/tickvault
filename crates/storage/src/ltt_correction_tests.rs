@@ -62,7 +62,7 @@ fn test_receipt_ist_day_and_date_round_trip() {
     assert_eq!(ist_day_date(i64::MAX), None);
 }
 
-// --- the guard ---------------------------------------------------------------
+// --- the guard (DORMANT since 2026-11-21: `correction_verdict`) --------------
 
 #[test]
 fn test_regression_2026_11_20_nifty_example_is_corrected_to_receipt_time() {
@@ -632,367 +632,333 @@ fn test_detector_needs_votes_distinct_instruments_and_agreement() {
     assert_eq!(det, LttDetector::new());
 }
 
-// --- the controller -------------------------------------------------------------
+// --- the permanent UTC rule (scope lock 2026-11-21) ----------------------------
 
-struct Rig {
-    ctl: LttController,
-    cmds: Receiver<RecordCmd>,
-    acks: Sender<RecordAck>,
-    written: Vec<(i64, RecordLine)>,
-}
-
-fn noop_publish(_: LttTable) {}
-
-impl Rig {
-    fn new(mode: LttUtcAutocorrect) -> Self {
-        let (tx, cmds) = crossbeam_channel::bounded(64);
-        let (acks, ack_rx) = crossbeam_channel::bounded(16);
-        let ctl = LttController::with_table(
-            mode,
-            Some(RecordWriterHandle::from_channels(tx, ack_rx)),
-            LttTable::empty(),
-            noop_publish,
-        );
-        Self {
-            ctl,
-            cmds,
-            acks,
-            written: Vec::new(),
-        }
-    }
-
-    /// The record writer: writes every queued line and acks intents.
-    fn pump(&mut self, durable: bool) {
-        while let Ok(cmd) = self.cmds.try_recv() {
-            if durable {
-                self.written.push((cmd.day, cmd.line));
-            }
-            if cmd.line.kind.is_intent() {
-                self.acks
-                    .send(RecordAck {
-                        day: cmd.day,
-                        id: cmd.line.id,
-                        kind: cmd.line.kind,
-                        durable,
-                    })
-                    .expect("ack");
-            }
-        }
-    }
-
-    /// One frame of `n` index ticks from distinct instruments.
-    fn frame(&mut self, utc_secs: i64, utc: bool) {
-        let r = receipt(utc_secs);
-        self.ctl.on_frame(r);
-        for i in 0..5u64 {
-            let raw = if utc {
-                raw_utc(utc_secs)
-            } else {
-                raw_normal(utc_secs)
-            };
-            self.ctl.observe(SEGMENT_IDX_I, i, raw, r);
-        }
-    }
-
-    fn replay_table(&self) -> LttTable {
-        let mut by_day: std::collections::BTreeMap<i64, DayRecord> = Default::default();
-        for (day, line) in &self.written {
-            by_day.entry(*day).or_default().apply(line);
-        }
-        let mut table = LttTable::empty();
-        for (day, record) in &by_day {
-            table.install_day(*day, record);
-        }
-        table
-    }
-}
+/// 2026-11-23 (Monday) 09:20:00 IST as UTC epoch seconds.
+const MON_0920_UTC_SECS: i64 = 1_795_113_000 + 3 * 86_400 + 9 * 3_600 + 20 * 60;
 
 #[test]
-fn test_controller_arms_from_one_past_every_dispatched_receipt() {
-    let mut rig = Rig::new(LttUtcAutocorrect::Act);
-    let t = RECEIPT_1100_UTC_SECS;
-    for s in 0..20 {
-        rig.frame(t + s, true);
-    }
-    // The intent is queued; nothing is armed until it is durable.
-    assert_eq!(rig.ctl.counts().armed, 0);
-    assert!(!rig.ctl.table().any_entry());
-    rig.pump(true);
-    rig.frame(t + 20, true);
-    assert_eq!(rig.ctl.counts().armed, 1);
-    let day = receipt_ist_day(receipt(t));
-    let armed = rig.ctl.table().day(day).expect("day").entries()[0];
+fn test_cutover_constant_is_2026_11_20_midnight_ist() {
+    let cutover = DHAN_LTT_UTC_FROM_RECEIPT_NANOS;
+    assert_eq!(cutover % NANOS, 0);
+    let utc = chrono::DateTime::from_timestamp(cutover / NANOS, 0).expect("in range");
+    assert_eq!(utc.to_rfc3339(), "2026-11-19T18:30:00+00:00");
+    assert_eq!(receipt_ist_day(cutover), date_ist_day(d("2026-11-20")));
+    assert_eq!(receipt_ist_day(cutover - 1), date_ist_day(d("2026-11-19")));
     assert_eq!(
-        armed.from_nanos,
-        receipt(t + 19) + 1,
-        "past the last dispatched receipt"
-    );
-    assert_eq!(armed.segment, SEGMENT_IDX_I);
-    rig.pump(true);
-    let kinds: Vec<RecordKind> = rig.written.iter().map(|(_, l)| l.kind).collect();
-    assert_eq!(kinds, vec![RecordKind::Entry, RecordKind::Armed]);
-    assert_eq!(rig.replay_table(), rig.ctl.table().clone());
-    assert!(rig.ctl.open_on(SEGMENT_IDX_I));
-}
-
-#[test]
-fn test_controller_closes_on_normal_evidence_with_a_two_step_commit() {
-    let mut rig = Rig::new(LttUtcAutocorrect::Act);
-    let t = RECEIPT_1100_UTC_SECS;
-    for s in 0..20 {
-        rig.frame(t + s, true);
-    }
-    rig.pump(true);
-    for s in 20..40 {
-        rig.frame(t + s, false);
-    }
-    rig.pump(true);
-    rig.frame(t + 40, false);
-    assert_eq!(rig.ctl.counts().closed, 1);
-    assert!(!rig.ctl.open_on(SEGMENT_IDX_I));
-    rig.pump(true);
-    let kinds: Vec<RecordKind> = rig.written.iter().map(|(_, l)| l.kind).collect();
-    assert_eq!(
-        kinds,
-        vec![
-            RecordKind::Entry,
-            RecordKind::Armed,
-            RecordKind::Close,
-            RecordKind::Closed
-        ]
-    );
-    assert_eq!(rig.replay_table(), rig.ctl.table().clone());
-}
-
-#[test]
-fn test_a_failed_intent_is_voided_and_never_armed() {
-    let mut rig = Rig::new(LttUtcAutocorrect::Act);
-    let t = RECEIPT_1100_UTC_SECS;
-    for s in 0..20 {
-        rig.frame(t + s, true);
-    }
-    rig.pump(false);
-    rig.frame(t + 20, true);
-    assert_eq!(rig.ctl.counts().armed, 0);
-    assert_eq!(rig.ctl.counts().intents_failed, 1);
-    rig.pump(true);
-    assert_eq!(
-        rig.written.last().map(|(_, l)| l.kind),
-        Some(RecordKind::Void)
+        receipt_ist_secs(cutover).rem_euclid(86_400),
+        0,
+        "IST midnight"
     );
 }
 
 #[test]
-fn test_shadow_and_off_write_nothing() {
-    for mode in [LttUtcAutocorrect::Shadow, LttUtcAutocorrect::Off] {
-        let mut rig = Rig::new(mode);
-        for s in 0..40 {
-            rig.frame(RECEIPT_1100_UTC_SECS + s, true);
-        }
-        rig.pump(true);
-        assert!(rig.written.is_empty(), "{mode:?}");
-        assert!(!rig.ctl.table().any_entry());
-    }
-}
-
-#[test]
-fn test_a_change_pending_at_ist_midnight_is_voided() {
-    let mut rig = Rig::new(LttUtcAutocorrect::Act);
-    let day = date_ist_day(d("2026-11-21"));
-    let midnight_utc = day * 86_400 - IST_OFFSET_SECS;
-    for s in 0..20 {
-        rig.frame(midnight_utc - 30 + s, true);
-    }
-    // The next frame is past IST midnight: the pending intent is voided for
-    // the old day and the detector starts over.
-    rig.frame(midnight_utc + 1, true);
-    rig.pump(true);
-    let kinds: Vec<(i64, RecordKind)> = rig.written.iter().map(|(d, l)| (*d, l.kind)).collect();
-    assert_eq!(
-        kinds,
-        vec![(day - 1, RecordKind::Entry), (day - 1, RecordKind::Void)]
-    );
-    assert!(!rig.ctl.table().any_entry());
-}
-
-#[test]
-fn test_the_detector_freezes_after_eight_entries_a_day() {
-    let mut rig = Rig::new(LttUtcAutocorrect::Act);
-    let mut s = RECEIPT_1100_UTC_SECS;
-    for _ in 0..10 {
-        for _ in 0..20 {
-            rig.frame(s, true);
-            s += 1;
-        }
-        rig.pump(true);
-        // The first normal frame applies the arm; 20 frames close it.
-        for _ in 0..20 {
-            rig.frame(s, false);
-            s += 1;
-        }
-        rig.pump(true);
-    }
-    rig.frame(s, false);
-    rig.pump(true);
-    assert_eq!(rig.ctl.counts().armed, 8);
-    assert!(rig.ctl.counts().frozen);
-    assert_eq!(rig.replay_table(), rig.ctl.table().clone());
-}
-
-#[test]
-fn test_a_restart_continues_an_open_entry() {
+fn test_utc_verdict_guards() {
     let r = receipt(RECEIPT_1100_UTC_SECS);
-    let day = receipt_ist_day(r);
-    let mut table = LttTable::empty();
-    assert!(table.arm(day, entry(0, SEGMENT_IDX_I, r, i64::MAX)));
-    let (tx, cmds) = crossbeam_channel::bounded(64);
-    let (_acks, ack_rx) = crossbeam_channel::bounded::<RecordAck>(16);
-    let mut ctl = LttController::with_table(
-        LttUtcAutocorrect::Act,
-        Some(RecordWriterHandle::from_channels(tx, ack_rx)),
-        table,
-        noop_publish,
+    assert_eq!(
+        utc_verdict(RAW_UTC_1100, r),
+        Ok(RAW_UTC_1100 + LTT_UTC_OFFSET_SECS)
     );
-    ctl.on_frame(r + NANOS);
-    assert!(ctl.open_on(SEGMENT_IDX_I));
-    // A UTC verdict proposes nothing new on the open segment.
-    for i in 0..100u64 {
-        ctl.observe(
-            SEGMENT_IDX_I,
-            i % 5,
-            raw_utc(RECEIPT_1100_UTC_SECS + 1),
-            r + NANOS,
-        );
+    // The band: 0, the sentinels and anything outside the exchange band.
+    for raw in [0, 1, MIN_PLAUSIBLE_LTT - 1, MAX_PLAUSIBLE_LTT + 1, u32::MAX] {
+        assert_eq!(utc_verdict(raw, r), Err(LttRefusal::Band), "{raw}");
     }
-    assert!(cmds.try_recv().is_err());
-}
-
-// --- live vs replay identity, with crash injection ---------------------------
-
-#[derive(Debug, Clone)]
-struct Step {
-    jitter_ms: i64,
-    pump: bool,
-    stale_secs: i64,
-}
-
-fn step() -> impl Strategy<Value = Step> {
-    (-900i64..900, prop::bool::weighted(0.3), 0i64..400).prop_map(
-        |(jitter_ms, pump, stale_secs)| Step {
-            jitter_ms,
-            pump,
-            stale_secs,
-        },
-    )
-}
-
-/// Drives the live controller through `phases` (UTC or normal, in frames)
-/// with jittered receipts and a record writer that runs at random steps, then
-/// rebuilds the table from the lines written up to `crash_at` and checks that
-/// every packet dispatched by then gets the same decision (or its day is
-/// held). Returns `(armed, closed, packets compared)`.
-fn check_identity(phases: &[(bool, usize)], steps: &[Step], crash_at: usize) -> (u32, u32, usize) {
-    let mut rig = Rig::new(LttUtcAutocorrect::Act);
-    // (step index, segment, raw, receipt, live result)
-    let mut decisions: Vec<(usize, u8, u32, i64, Option<u32>)> = Vec::new();
-    let mut lines_at_step: Vec<usize> = Vec::new();
-    let mut base = RECEIPT_1100_UTC_SECS * 1_000;
-    let mut idx = 0usize;
-    'outer: for &(utc, len) in phases {
-        for _ in 0..len {
-            let Some(s) = steps.get(idx) else {
-                break 'outer;
-            };
-            base += 1_000;
-            let ms = base + s.jitter_ms;
-            let r = ms * 1_000_000;
-            // The drain: the frame first (it may apply an acked change), then
-            // each packet is dispatched (corrected) and voted on.
-            rig.ctl.on_frame(r);
-            let secs = ms.div_euclid(1_000);
-            for i in 0..5u64 {
-                let raw = if utc { raw_utc(secs) } else { raw_normal(secs) };
-                let live = rig.ctl.table().correct(raw, SEGMENT_IDX_I, r);
-                decisions.push((idx, SEGMENT_IDX_I, raw, r, live));
-                rig.ctl.observe(SEGMENT_IDX_I, i, raw, r);
-            }
-            // An option print on an unconfirmed segment, possibly stale.
-            let opt_secs = secs - s.stale_secs;
-            let opt_raw = if utc {
-                raw_utc(opt_secs)
-            } else {
-                raw_normal(opt_secs)
-            };
-            let live = rig.ctl.table().correct(opt_raw, 2, r);
-            decisions.push((idx, 2, opt_raw, r, live));
-            if s.pump {
-                rig.pump(true);
-            }
-            lines_at_step.push(rig.written.len());
-            idx += 1;
-        }
-    }
-    let crash = crash_at.min(lines_at_step.len().saturating_sub(1));
-    let kept = lines_at_step.get(crash).copied().unwrap_or(0);
-    let mut by_day: std::collections::BTreeMap<i64, DayRecord> = Default::default();
-    for (day, line) in &rig.written[..kept] {
-        by_day.entry(*day).or_default().apply(line);
-    }
-    let mut replay = LttTable::empty();
-    for (day, record) in &by_day {
-        replay.install_day(*day, record);
-    }
-    let mut compared = 0usize;
-    for &(at, seg, raw, r, live) in &decisions {
-        if at > crash || replay.receipt_day_held(r) {
-            continue;
-        }
-        assert_eq!(replay.correct(raw, seg, r), live, "step {at} seg {seg}");
-        compared += 1;
-    }
-    let counts = rig.ctl.counts();
-    (counts.armed, counts.closed, compared)
+    // An implausible receipt (not a real WAL stamp).
+    assert_eq!(
+        utc_verdict(RAW_UTC_1100, i64::MAX),
+        Err(LttRefusal::Receipt)
+    );
+    // The cap is exactly receipt + 5 s.
+    assert_eq!(
+        utc_verdict(RAW_UTC_1100 + 5, r),
+        Ok(RAW_UTC_1100 + 5 + LTT_UTC_OFFSET_SECS)
+    );
+    assert_eq!(utc_verdict(RAW_UTC_1100 + 6, r), Err(LttRefusal::Cap));
+    assert_eq!(LttRefusal::Receipt.as_str(), "receipt");
+    assert_eq!(LttRefusal::Band.as_str(), "band");
+    assert_eq!(LttRefusal::Cap.as_str(), "cap");
 }
 
 #[test]
-fn test_live_and_replay_agree_on_a_fixed_flip_and_flip_back() {
-    // Non-vacuity: this scenario arms twice and closes once, with jittered
-    // (reordered) receipts and a writer that runs every third frame.
-    let steps: Vec<Step> = (0..400)
-        .map(|i| Step {
-            jitter_ms: (i as i64 * 397) % 1_700 - 850,
-            pump: i % 3 == 0,
-            stale_secs: (i as i64 * 53) % 400,
-        })
-        .collect();
-    let phases = [(false, 30), (true, 40), (false, 40), (true, 40)];
-    let (armed, closed, compared) = check_identity(&phases, &steps, 399);
-    assert_eq!((armed, closed), (2, 1), "the scenario must arm and close");
-    assert!(compared > 500, "{compared} packets compared");
-    // A crash in the middle compares fewer packets, never a different answer.
-    for crash in [0, 37, 71, 72, 73, 110, 111] {
-        let _ = check_identity(&phases, &steps, crash);
-    }
+fn test_regression_print_two_days_old_corrected() {
+    // Monday 09:20 IST receipt; Dhan's last trade was Friday 20 Nov 15:29 IST,
+    // sent as plain UTC. The old guard refused anything older than the previous
+    // day's session; Dhan says every Live LTT is UTC, so it is corrected.
+    let friday_1529_utc = 1_795_113_000 + 15 * 3_600 + 29 * 60;
+    let raw = raw_utc(friday_1529_utc);
+    let local = LttRefusals::new();
+    let out = corrected_ltt_with(raw, receipt(MON_0920_UTC_SECS), &local);
+    assert_eq!(out, raw + LTT_UTC_OFFSET_SECS);
+    assert_eq!(
+        i64::from(out).rem_euclid(86_400),
+        15 * 3_600 + 29 * 60,
+        "15:29 IST"
+    );
+    assert_eq!(
+        i64::from(out).div_euclid(86_400),
+        date_ist_day(d("2026-11-20"))
+    );
+    assert_eq!(local.snapshot(), LttRefusalCounts::default());
+    // A print three weeks old is corrected the same way.
+    let old = raw_utc(friday_1529_utc - 21 * 86_400);
+    assert_eq!(
+        corrected_ltt_with(old, receipt(MON_0920_UTC_SECS), &local),
+        old + LTT_UTC_OFFSET_SECS
+    );
+}
+
+#[test]
+fn test_regression_2026_11_20_first_packet_corrected_without_warm_up() {
+    // 2026-11-20 08:31:22 IST, the box's first NIFTY packet: corrected with no
+    // detector warm-up and no record.
+    let first_utc = 1_795_113_000 + 8 * 3_600 + 31 * 60 + 22;
+    let out = corrected_ltt(raw_utc(first_utc), SEGMENT_IDX_I, receipt(first_utc));
+    assert_eq!(out, raw_utc(first_utc) + LTT_UTC_OFFSET_SECS);
+    assert_eq!(i64::from(out).rem_euclid(86_400), 8 * 3_600 + 31 * 60 + 22);
+}
+
+fn total(c: LttRefusalCounts) -> u64 {
+    c.receipt + c.band + c.cap
+}
+
+/// A raw time and a receipt at or after the cutover: near the receipt (both
+/// encodings), anywhere in the band, or anything at all.
+fn post_cutover_case() -> impl Strategy<Value = (u32, i64)> {
+    let near =
+        (0i64..400 * 86_400, -40_000i64..40_000, 0i64..NANOS).prop_map(|(after, delta, sub)| {
+            let r_secs = DHAN_LTT_UTC_FROM_RECEIPT_NANOS / NANOS + after;
+            let raw = u32::try_from((r_secs + delta).clamp(0, i64::from(u32::MAX))).unwrap_or(0);
+            (raw, r_secs * NANOS + sub)
+        });
+    let wild = (any::<u32>(), DHAN_LTT_UTC_FROM_RECEIPT_NANOS..=i64::MAX);
+    prop_oneof![4 => near, 1 => wild]
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(256))]
+    #![proptest_config(ProptestConfig::with_cases(4096))]
 
-    /// For every packet, the replay (a table rebuilt from the record lines
-    /// written up to a crash point) decides exactly as the live table did when
-    /// the packet was dispatched — or the day is held.
+    /// Every receipt before 2026-11-20 00:00 IST (0, negatives and the old WAL
+    /// included), every raw `u32` and every segment: byte-identical to before
+    /// (the raw value) and nothing counted.
     #[test]
-    fn proptest_live_and_replay_agree_for_every_packet_or_the_day_is_held(
-        phases in prop::collection::vec((any::<bool>(), 10usize..40), 1..6),
-        steps in prop::collection::vec(step(), 400),
-        crash_at in 0usize..400,
+    fn proptest_pre_cutover_is_byte_identical(
+        raw in any::<u32>(),
+        segment in any::<u8>(),
+        r in prop_oneof![
+            i64::MIN..DHAN_LTT_UTC_FROM_RECEIPT_NANOS,
+            (DHAN_LTT_UTC_FROM_RECEIPT_NANOS - 400 * 86_400 * NANOS)..DHAN_LTT_UTC_FROM_RECEIPT_NANOS,
+            Just(0i64),
+            Just(-1i64),
+            Just(DHAN_LTT_UTC_FROM_RECEIPT_NANOS - 1),
+        ],
     ) {
-        let (armed, closed, _compared) = check_identity(&phases, &steps, crash_at);
-        // A close always follows its own arm (and the per-packet identity is
-        // asserted inside `check_identity`).
-        prop_assert!(closed <= armed, "closed {} > armed {}", closed, armed);
-        prop_assert!(armed <= MAX_ENTRIES_PER_DAY as u32);
+        let local = LttRefusals::new();
+        prop_assert_eq!(corrected_ltt_with(raw, r, &local), raw);
+        prop_assert_eq!(corrected_ltt(raw, segment, r), raw);
+        prop_assert_eq!(local.snapshot(), LttRefusalCounts::default());
     }
+
+    /// Every receipt at or after the cutover: the result is exactly raw +
+    /// 19,800 and no later than receipt + 5 s, or it is raw and exactly one
+    /// refusal counter grew by one. The process function agrees.
+    #[test]
+    fn proptest_post_cutover_exact_or_refused(
+        (raw, r) in post_cutover_case(),
+        segment in any::<u8>(),
+    ) {
+        let local = LttRefusals::new();
+        let out = corrected_ltt_with(raw, r, &local);
+        let after = local.snapshot();
+        if total(after) == 0 {
+            prop_assert_eq!(Some(out), raw.checked_add(LTT_UTC_OFFSET_SECS));
+            prop_assert!(i64::from(out) <= receipt_ist_secs(r) + RECEIPT_FUTURE_CAP_SECS);
+            prop_assert!(utc_verdict(raw, r).is_ok());
+        } else {
+            prop_assert_eq!(out, raw);
+            prop_assert_eq!(total(after), 1);
+            let refusal = utc_verdict(raw, r).err();
+            let expected = match refusal {
+                Some(LttRefusal::Receipt) => LttRefusalCounts { receipt: 1, ..Default::default() },
+                Some(LttRefusal::Band) => LttRefusalCounts { band: 1, ..Default::default() },
+                Some(LttRefusal::Cap) => LttRefusalCounts { cap: 1, ..Default::default() },
+                None => LttRefusalCounts::default(),
+            };
+            prop_assert_eq!(after, expected);
+        }
+        prop_assert_eq!(corrected_ltt(raw, segment, r), out);
+    }
+}
+
+#[test]
+fn test_post_cutover_proptest_strategy_reaches_every_outcome() {
+    // Non-vacuity: the generator reaches a correction and each refusal.
+    use proptest::strategy::ValueTree;
+    use proptest::test_runner::TestRunner;
+    let mut runner = TestRunner::deterministic();
+    let strategy = post_cutover_case();
+    let (mut ok, mut band, mut cap, mut rec) = (0, 0, 0, 0);
+    for _ in 0..4_096 {
+        let (raw, r) = strategy.new_tree(&mut runner).expect("tree").current();
+        match utc_verdict(raw, r) {
+            Ok(_) => ok += 1,
+            Err(LttRefusal::Band) => band += 1,
+            Err(LttRefusal::Cap) => cap += 1,
+            Err(LttRefusal::Receipt) => rec += 1,
+        }
+    }
+    assert!(
+        ok > 100 && band > 10 && cap > 100 && rec > 10,
+        "{ok} {band} {cap} {rec}"
+    );
+}
+
+// --- the reversion guard (noise lock §2.24-a) -----------------------------------
+
+/// `windows` vote windows (20 frames of 5 distinct index or stock prints).
+fn guard_frames(ctl: &mut LttController, start_utc_secs: i64, windows: i64, seg: u8, utc: bool) {
+    for s in 0..windows * 20 {
+        let t = start_utc_secs + s;
+        let r = receipt(t);
+        ctl.on_frame(r);
+        for i in 0..5u64 {
+            let raw = if utc { raw_utc(t) } else { raw_normal(t) };
+            ctl.observe(seg, i, raw, r);
+        }
+    }
+}
+
+#[test]
+fn test_regression_ist_epoch_fresh_print_stays_raw_counted_and_pages_once_per_segment_per_day() {
+    // Dhan reverts to IST epoch: a fresh print is refused by the cap, left raw
+    // (which is then the right IST time), and counted.
+    let t = RECEIPT_1100_UTC_SECS;
+    let raw = raw_normal(t);
+    let local = LttRefusals::new();
+    assert_eq!(corrected_ltt_with(raw, receipt(t), &local), raw);
+    assert_eq!(
+        local.snapshot(),
+        LttRefusalCounts {
+            cap: 1,
+            ..Default::default()
+        }
+    );
+    let before = refusal_counts().cap;
+    assert_eq!(corrected_ltt(raw, SEGMENT_IDX_I, receipt(t)), raw);
+    assert!(refusal_counts().cap > before, "the process counter moved");
+
+    // The guard pages once per segment per IST day.
+    let mut ctl = LttController::new(LttUtcAutocorrect::Act);
+    guard_frames(&mut ctl, t, 3, SEGMENT_IDX_I, false);
+    assert_eq!(ctl.counts().normal_verdicts, 3);
+    assert_eq!(ctl.counts().reversion_reports, 1, "once for index prints");
+    guard_frames(&mut ctl, t + 100, 2, SEGMENT_NSE_EQ, false);
+    assert_eq!(ctl.counts().reversion_reports, 2, "once for stock prints");
+    guard_frames(&mut ctl, t + 200, 2, SEGMENT_IDX_I, false);
+    assert_eq!(ctl.counts().reversion_reports, 2, "not again the same day");
+    // The next IST day, same time: once more.
+    guard_frames(&mut ctl, t + 86_400, 2, SEGMENT_IDX_I, false);
+    assert_eq!(ctl.counts().reversion_reports, 3);
+}
+
+#[test]
+fn test_utc_verdict_never_pages() {
+    let mut ctl = LttController::new(LttUtcAutocorrect::Act);
+    guard_frames(&mut ctl, RECEIPT_1100_UTC_SECS, 5, SEGMENT_IDX_I, true);
+    guard_frames(
+        &mut ctl,
+        RECEIPT_1100_UTC_SECS + 200,
+        5,
+        SEGMENT_NSE_EQ,
+        true,
+    );
+    assert_eq!(ctl.counts().utc_verdicts, 10);
+    assert_eq!(ctl.counts().normal_verdicts, 0);
+    assert_eq!(ctl.counts().reversion_reports, 0);
+}
+
+#[test]
+fn test_guard_off_never_pages() {
+    let mut ctl = LttController::new(LttUtcAutocorrect::Off);
+    guard_frames(&mut ctl, RECEIPT_1100_UTC_SECS, 3, SEGMENT_IDX_I, false);
+    assert_eq!(ctl.counts().votes, 0);
+    assert_eq!(ctl.counts().reversion_reports, 0);
+    let mut inert = LttController::inert();
+    guard_frames(&mut inert, RECEIPT_1100_UTC_SECS, 3, SEGMENT_IDX_I, false);
+    assert_eq!(inert.counts(), ControllerCounts::default());
+    // Shadow logs a warn once (counted) and never an error.
+    let mut shadow = LttController::new(LttUtcAutocorrect::Shadow);
+    guard_frames(&mut shadow, RECEIPT_1100_UTC_SECS, 3, SEGMENT_IDX_I, false);
+    assert_eq!(shadow.counts().reversion_reports, 1);
+}
+
+#[test]
+fn test_guard_is_quiet_before_the_cutover_and_outside_the_window() {
+    let mut ctl = LttController::new(LttUtcAutocorrect::Act);
+    // 2026-11-19 11:00 IST: a normal day before the change.
+    guard_frames(
+        &mut ctl,
+        RECEIPT_1100_UTC_SECS - 86_400,
+        3,
+        SEGMENT_IDX_I,
+        false,
+    );
+    assert_eq!(ctl.counts().normal_verdicts, 3);
+    assert_eq!(ctl.counts().reversion_reports, 0, "before the cutover");
+    // 2026-11-20 16:00 IST: after the capture window.
+    guard_frames(
+        &mut ctl,
+        RECEIPT_1100_UTC_SECS + 5 * 3_600,
+        3,
+        SEGMENT_IDX_I,
+        false,
+    );
+    assert_eq!(ctl.counts().reversion_reports, 0, "outside 09:00–15:40");
+    // Unknown segments never vote.
+    guard_frames(&mut ctl, RECEIPT_1100_UTC_SECS, 3, 2, false);
+    assert!(in_guard_window(receipt(RECEIPT_1100_UTC_SECS)));
+    assert!(!in_guard_window(receipt(RECEIPT_1100_UTC_SECS + 5 * 3_600)));
+}
+
+#[test]
+fn test_controller_publishes_once_a_minute_of_receipts() {
+    let mut ctl = LttController::new(LttUtcAutocorrect::Act);
+    let minute = (RECEIPT_1100_UTC_SECS / 60) * 60;
+    ctl.on_frame(receipt(minute));
+    ctl.on_frame(receipt(minute + 30));
+    assert_eq!(ctl.counts().publishes, 1);
+    ctl.on_frame(receipt(minute + 60));
+    assert_eq!(ctl.counts().publishes, 2);
+    ctl.on_frame(0); // not a WAL stamp: ignored
+    assert_eq!(ctl.counts().publishes, 2);
+    let mut inert = LttController::inert();
+    inert.on_frame(receipt(minute));
+    assert_eq!(inert.counts().publishes, 0);
+}
+
+#[test]
+fn test_install_at_boot_reads_nothing_and_holds_nothing() {
+    // A leftover record with a dangling intent (it held the day before
+    // 2026-11-21) is ignored and kept.
+    let scratch = Scratch::new("boot-ignored");
+    let r = receipt(RECEIPT_1100_UTC_SECS);
+    let day = receipt_ist_day(r);
+    append_line(
+        &scratch.0,
+        day,
+        &RecordLine {
+            kind: RecordKind::Entry,
+            id: 0,
+            segment: 0,
+            nanos: r,
+        },
+    )
+    .expect("append");
+    install_at_boot(&scratch.0, LttUtcAutocorrect::Act);
+    assert!(!any_receipt_day_held(std::iter::once(r)));
+    assert_eq!(current_table(), LttTable::empty());
+    assert!(record_path(&scratch.0, day).expect("path").exists(), "kept");
+    assert_eq!(BOOT_REPORT.get().map(|b| b.mode), Some("act"));
+    log_boot_summary();
 }
 
 #[test]
