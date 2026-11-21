@@ -932,6 +932,48 @@ pub fn rebuilt_covers_dropped(lines: &[ProgressLine], rep: &RebuildReport) -> Op
     })
 }
 
+/// One `KEY=value` from the output of `systemctl show <unit> -p Environment
+/// --value`: space-separated assignments, an assignment holding a space
+/// quoted whole (`"KEY=a b"`). `None` when the key is absent or empty. Pure,
+/// O(text).
+#[must_use]
+pub fn unit_environment_value(text: &str, key: &str) -> Option<String> {
+    let mut words = Vec::new();
+    let mut cur = String::new();
+    let mut quoted = false;
+    for c in text.trim().chars() {
+        match c {
+            '"' => quoted = !quoted,
+            c if c.is_whitespace() && !quoted => {
+                if !cur.is_empty() {
+                    words.push(std::mem::take(&mut cur));
+                }
+            }
+            c => cur.push(c),
+        }
+    }
+    if !cur.is_empty() {
+        words.push(cur);
+    }
+    words
+        .into_iter()
+        .filter_map(|w| w.split_once('=').map(|(k, v)| (k.to_owned(), v.to_owned())))
+        .filter(|(k, v)| k == key && !v.trim().is_empty())
+        .map(|(_, v)| v.trim().to_owned())
+        .next_back()
+}
+
+/// The environment name the repair runs under: this process's own
+/// (`TV_ENVIRONMENT` / `ENVIRONMENT`, already checked by the storage
+/// crate), else the app unit's. Only `[a-zA-Z0-9-]` is accepted (it names a
+/// bucket and an SSM path). Pure.
+#[must_use]
+pub fn repair_environment(process: Option<String>, unit: Option<String>) -> Option<String> {
+    process
+        .or(unit)
+        .filter(|e| !e.is_empty() && e.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))
+}
+
 /// One line to stdout (the SSM output) and the log.
 fn say(line: &str) {
     use std::io::Write as _;
@@ -1152,11 +1194,27 @@ pub async fn run_cli(args: &[String]) -> i32 {
 async fn run_mode(mode: Mode) -> anyhow::Result<i32> {
     std::env::set_current_dir(APP_DIR).with_context(|| format!("cd {APP_DIR}"))?;
     let root = PathBuf::from(".");
-    let env = crate::boot_helpers::resolve_config_env();
-    let config: tickvault_common::config::ApplicationConfig =
+    // The SSM shell runs as root with none of the app unit's environment
+    // (2026-11-21, first dry run: "no cold bucket resolves"), so the
+    // environment name is read from the unit itself when this process has
+    // none, and the cold bucket is named from it when the config has none.
+    let (_, unit_env_text) = systemctl(&["show", APP_UNIT, "-p", "Environment", "--value"]);
+    let env = repair_environment(
+        tickvault_storage::s3_cold::runtime_environment(),
+        unit_environment_value(&unit_env_text, "TV_ENVIRONMENT"),
+    )
+    .context("no environment name: TV_ENVIRONMENT is set neither here nor on the app unit")?;
+    let mut config: tickvault_common::config::ApplicationConfig =
         crate::boot_helpers::layered_config_figment(&env)
             .extract()
             .context("load the configuration")?;
+    if config.partition_retention.archive_bucket.trim().is_empty() {
+        config.partition_retention.archive_bucket = format!("tv-{env}-cold");
+    }
+    say(&format!(
+        "environment {env}, cold bucket {}",
+        config.partition_retention.archive_bucket
+    ));
     let calendar =
         tickvault_common::trading_calendar::TradingCalendar::from_config(&config.trading)?;
     let now = now_ist();
@@ -1838,6 +1896,36 @@ mod prod_io {
 #[cfg(test)]
 mod dropped_rows_tests {
     use super::*;
+
+    /// 2026-11-21 first dry run: the SSM shell had no TV_ENVIRONMENT, so the
+    /// name comes from the app unit, read the way systemd prints it.
+    #[test]
+    fn test_unit_environment_value_and_repair_environment() {
+        let text = "RUST_LOG=info TV_ENVIRONMENT=prod \"NOTE=a b\" AWS_CONFIG_FILE=/dev/null\n";
+        assert_eq!(
+            unit_environment_value(text, "TV_ENVIRONMENT").as_deref(),
+            Some("prod")
+        );
+        assert_eq!(unit_environment_value(text, "NOTE").as_deref(), Some("a b"));
+        assert_eq!(unit_environment_value(text, "MISSING"), None);
+        assert_eq!(
+            unit_environment_value("TV_ENVIRONMENT=", "TV_ENVIRONMENT"),
+            None
+        );
+        assert_eq!(unit_environment_value("", "TV_ENVIRONMENT"), None);
+        // A later assignment wins, as in systemd.
+        assert_eq!(
+            unit_environment_value("TV_ENVIRONMENT=a TV_ENVIRONMENT=b", "TV_ENVIRONMENT")
+                .as_deref(),
+            Some("b")
+        );
+        let s = |v: &str| Some(v.to_owned());
+        assert_eq!(repair_environment(s("dev"), s("prod")), s("dev"));
+        assert_eq!(repair_environment(None, s("prod")), s("prod"));
+        assert_eq!(repair_environment(None, None), None);
+        assert_eq!(repair_environment(None, s("../etc")), None);
+        assert_eq!(repair_environment(s(""), s("prod")), None);
+    }
 
     #[test]
     fn test_keep_alive_target_never_shortens_and_releases_to_now() {
