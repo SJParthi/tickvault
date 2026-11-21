@@ -190,7 +190,14 @@ rules:
       A live order was refused by the fail-closed readiness gate (no probe,
       stale probe, invalid Dhan dataPlan/segment, or low token headroom).
       Never auto-action — the operator must confirm the Dhan data plan,
-      Derivative segment and token before orders are re-enabled.
+      Derivative segment and token before orders are re-enabled. EXCEPTION
+      (2026-11-21, plan item UTC-SAFETY): a warn line with
+      source="trade_safety_entries_blocked" is the trade-safety switch, not
+      the readiness gate — today's DHAN-FEED-TIME-01 page fired, so paper
+      entries are blocked for the rest of the IST day (exits still go out).
+      No plan, segment or token action; see
+      docs/error-runbooks/order-readiness-error-codes.md §1a, then follow the
+      feed-time runbook docs/error-runbooks/dhan-feed-time-error-codes.md.
 
   # =======================================================================
   # MILESTONE 2 — full ErrorCode coverage (48 new rules, total 54 codes)

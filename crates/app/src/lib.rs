@@ -286,6 +286,10 @@ pub mod strategy_dry_run;
 /// resend through `LiveSubscriptionCommand::Resubscribe` (plan item 3b). Off by
 /// default (`[dhan_universe] subscribe_reconcile_auto_resubscribe`).
 pub mod subscribe_reconcile;
+/// The trade-safety switch: while today's DHAN-FEED-TIME-01 alarm is on, the
+/// paper path opens no new entries; exits always pass (plan item UTC-SAFETY,
+/// daily-universe §28.7).
+pub mod trade_safety;
 // The one-off 2026-10-22 rebuild (plan item 66, Quotes 32/33/34): its pure
 // module, box subcommand and SSM shell were DELETED 2026-10-29 after the
 // 2026-10-28 run, per rust-only lock §0.13 (`shell_budget_guard.rs`

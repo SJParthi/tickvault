@@ -37,6 +37,17 @@
 //!   each waking a consumer task PARKED in `recv()` on another thread (the
 //!   `notify_one` path), (E2) a ring nobody drains filled to its 64 slots
 //!   and refused past them (`send_output`'s full branch): 0 blocks.
+//! * (D2, plan item UTC-SAFETY) the held-order day with the trade-safety
+//!   switch SET for the chain's day, a paper position open when it went on:
+//!   10,000 no-change engages and reads at 0 blocks (one changing engage
+//!   first, before the profiled window; this binary installs no tracing
+//!   subscriber and no metrics recorder, so even that edge's `warn!` and
+//!   gauge are no-ops here: the changing edge's log and metric allocation is
+//!   NOT measured), then every step that moves no order at 0 blocks, order
+//!   steps within the same per-order ceiling, entries refused, no entry
+//!   Execute, and the exit of the open position sent. `FeedTimePage::fire`
+//!   has no DHAT window (it runs at most twice a day, cold, beside its own
+//!   `error!`). (C) asks for no order, so the switch adds nothing there.
 //!
 //! One profiler per process (dhat constraint), so one `#[test]`.
 //!
@@ -676,6 +687,128 @@ fn dhat_live_fill_tap_drain_and_chain_per_tick_paths_allocate_nothing() {
          steps, worst {worst_order_step_per_order} blocks per order; {c:?}"
     );
 
+    // ---------------- (D2) the trade-safety switch set (plan item UTC-SAFETY) ----------------
+    // The same held-order day with today's feed-time alarm on for the chain's
+    // day: the gates are one Acquire load and a compare, a no-change engage
+    // is a load and a compare, and every step that moves no order still
+    // allocates 0 blocks. Entries are refused (Decision + Reject rows: order
+    // rows, per order) and the exit of the position held when the switch went
+    // on goes out (2026-11-21 review finding 7: the day used to hold no
+    // position, so no exit was ever exercised). The process switch is used:
+    // this binary runs one test. Honest scope (review finding 4): no tracing
+    // subscriber and no metrics recorder are installed here, so the engage
+    // edge's `warn!` and gauge cost nothing in this binary; the edge's real
+    // log and metric allocation (a few times a day, cold) is not measured.
+    let mut chain2 = held_order_chain();
+    let (cmd_tx2, mut cmd_rx2) = frame_ring::<PaperCmd>(64);
+    let mut d2 = OrderDay::new();
+    // Warm until an entry filled and was reported (a paper position is open)
+    // and no order is held, so the switch goes on over an open position.
+    let mut warm2 = 0u32;
+    while warm2 < 120 || d2.held_lots <= 0 || chain2.held_orders() > 0 {
+        d2.second(&mut chain2, &cmd_tx2, &ev_tx, &mut drops, &mut cmd_rx2);
+        warm2 += 1;
+        assert!(
+            warm2 < 3_600,
+            "no paper position opened in an hour of warm-up"
+        );
+    }
+    let day = chain2.day();
+    let switch = &tickvault_app::trade_safety::FEED_TIME_BLOCK;
+    // The one changing engage (both causes), before the profiled window, so
+    // every engage inside it is a no-change engage.
+    assert!(tickvault_app::trade_safety::engage(
+        switch,
+        day,
+        tickvault_app::trade_safety::CAUSE_PRICES_OUTSIDE_SESSION
+            | tickvault_app::trade_safety::CAUSE_NO_CANDLES
+    ));
+    let (s_bytes, s_blocks) = dhat_support::measure_with_phantom_retry(
+        0,
+        0,
+        || {},
+        || {
+            for i in 0..10_000u64 {
+                let bit = if i % 2 == 0 {
+                    tickvault_app::trade_safety::CAUSE_PRICES_OUTSIDE_SESSION
+                } else {
+                    tickvault_app::trade_safety::CAUSE_NO_CANDLES
+                };
+                let _ = tickvault_app::trade_safety::engage(switch, day, bit);
+                std::hint::black_box(switch.entries_blocked_on(day));
+                std::hint::black_box(chain2.entries_blocked());
+            }
+        },
+    );
+    assert_eq!(
+        (s_bytes, s_blocks),
+        (0, 0),
+        "a no-change engage or a read of the trade-safety switch allocated {s_bytes} bytes / \
+         {s_blocks} blocks"
+    );
+    assert!(
+        chain2.entries_blocked(),
+        "the switch is on for the chain's day"
+    );
+    let sent_before = chain2.counters().sent;
+    let mut zero_steps2 = 0u64;
+    let mut order_steps2 = 0u64;
+    let mut worst_zero_step2 = 0u64;
+    let mut worst_order_step2 = 0u64;
+    let entries_before = d2.entry_executes;
+    let exits_before = d2.exit_executes;
+    for _ in 0..(30 * 60) {
+        let moved_before = d2.order_moves(&chain2);
+        let before = dhat::HeapStats::get();
+        d2.second(&mut chain2, &cmd_tx2, &ev_tx, &mut drops, &mut cmd_rx2);
+        let after = dhat::HeapStats::get();
+        let blocks = after.total_blocks - before.total_blocks;
+        let moved = d2.order_moves(&chain2) - moved_before;
+        if moved == 0 {
+            zero_steps2 += 1;
+            worst_zero_step2 = worst_zero_step2.max(blocks);
+        } else {
+            order_steps2 += 1;
+            worst_order_step2 = worst_order_step2.max(blocks.div_ceil(moved));
+        }
+    }
+    let c2 = chain2.counters();
+    assert_eq!(
+        worst_zero_step2, 0,
+        "with the switch set, a step that moved no order allocated {worst_zero_step2} blocks"
+    );
+    assert!(
+        worst_order_step2 <= ORDER_STEP_MAX_BLOCKS,
+        "with the switch set, an order step allocated {worst_order_step2} blocks per order"
+    );
+    assert!(
+        zero_steps2 > 1_000 && order_steps2 > 5,
+        "{zero_steps2} / {order_steps2}"
+    );
+    assert!(
+        c2.entries_blocked_feed_time > 5,
+        "entries were refused: {c2:?}"
+    );
+    assert_eq!(
+        d2.entry_executes - entries_before,
+        0,
+        "no entry Execute with the switch set"
+    );
+    let exits2 = d2.exit_executes - exits_before;
+    assert!(
+        exits2 >= 1,
+        "the exit of the open position went out with the switch set: {c2:?}"
+    );
+    eprintln!(
+        "dhat_live_fill (D2): switch set over an open position, {zero_steps2} order-free \
+         steps at 0 blocks; {order_steps2} order steps (the exit's included), worst \
+         {worst_order_step2} blocks per order; {} entries blocked, {} Executes sent after \
+         ({exits2} exits, 0 entries); the engage edge's log and gauge are not measured \
+         (no subscriber or recorder in this binary)",
+        c2.entries_blocked_feed_time,
+        c2.sent - sent_before
+    );
+
     // ---------------- (E) the counter publish and the command ring ----------------
     // The ring is read the way production reads it (LF-9 hardening): the
     // order runtime AWAITS `FrameRingReceiver::recv`, which clears the
@@ -801,6 +934,10 @@ struct OrderDay {
     late_fill_prints: u64,
     marks_sent: u64,
     held_lots: i32,
+    /// Entry (not exit) Executes the chain handed out.
+    entry_executes: u64,
+    /// Exit Executes the chain handed out.
+    exit_executes: u64,
     out: Vec<ChainOutput>,
 }
 
@@ -817,6 +954,8 @@ impl OrderDay {
             late_fill_prints: 0,
             marks_sent: 0,
             held_lots: 0,
+            entry_executes: 0,
+            exit_executes: 0,
             out: Vec::with_capacity(4_096),
         }
     }
@@ -964,6 +1103,11 @@ impl OrderDay {
                     let _ = send_output(o, cmd_tx, ev_tx, drops);
                 }
                 ChainOutput::Cmd(PaperCmd::Execute(x)) => {
+                    if x.exit {
+                        self.exit_executes += 1;
+                    } else {
+                        self.entry_executes += 1;
+                    }
                     let lot = i32::try_from(x.lot_size.max(1)).unwrap_or(1);
                     let lots = i32::try_from(x.filled_qty).unwrap_or(0) / lot;
                     self.held_lots += match x.side {

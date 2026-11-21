@@ -47,7 +47,7 @@ and pass it with --compare <file>.
 Files (sha-256):
 6ce9cf66495624ebcb911f31c5a27ce57f715ed89eff509e50e09bcf9337a043  events.csv
 2238434a92191b1dcb07ff9eb68c14b572983c7a228648bdf13b199f286ff417  decisions.csv
-7392efbd51e7dfa98a524b18d7bb0dddec0e6ed99835072b13f16b64cbb8d6f5  report-2026-11-18.json
+b1fdd8dfde92c2e6e50e8af7fbf3c877ad7e305b8cf7e16eff20be7f588bf4b8  report-2026-11-18.json
 df242ac2d699f1e4ca2d7a6e570ca543e9a7e615bf59b7db312f8b90b384bc99  orders-2026-11-18.csv
 26c29adc4d69fba4ebdb10c32bd992ef5dfebf3ff9f5d08003758efb7781e96e  fill-seconds-2026-11-18.csv
 24bcfdfe70ca34288eae1bea6949d098e1be38374b18178dcde7c40e9f0e83b0  latency-2026-11-18.csv

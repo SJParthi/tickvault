@@ -2502,3 +2502,247 @@ fn test_fold_flags_a_counter_restart_as_stale_and_restarted() {
     assert!(stats.cumulative_restarted);
     assert!(stats.stale_packet);
 }
+
+// ---------------------------------------------------------------------------
+// Trade-safety switch (plan item UTC-SAFETY, daily-universe §28.7)
+// ---------------------------------------------------------------------------
+
+fn leaked_switch() -> &'static crate::trade_safety::SafetySwitch {
+    Box::leak(Box::new(crate::trade_safety::SafetySwitch::new()))
+}
+
+fn feed_time_rejects(out: &[ChainOutput]) -> Vec<(i32, Option<i64>)> {
+    out.iter()
+        .filter_map(|o| match o {
+            ChainOutput::Event(e)
+                if e.event == LiveOrderEventKind::Reject
+                    && e.reason.as_deref() == Some(REASON_FEED_TIME_ALARM) =>
+            {
+                Some((e.seq, e.remainder_qty))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Gate A: while the switch is on for the chain's day, an entry is refused
+/// with a Decision row then a Reject row `feed_time_alarm`, counted; no
+/// paper order is sent. On the next day the same engine trades again.
+#[test]
+fn test_feed_time_alarm_refuses_an_entry_with_decision_and_reject_rows() {
+    let safety = leaked_switch();
+    let mut c = chain(emitting(), true);
+    c.use_safety_switch(safety);
+    assert!(!c.entries_blocked());
+    assert!(safety.engage(c.day(), crate::trade_safety::CAUSE_PRICES_OUTSIDE_SESSION));
+    assert!(c.entries_blocked());
+    let mut f = Feed::new();
+    f.drive(&mut c, (OPEN, OPEN + 125, 2), rising, 1_000);
+    let ev = events(&f.out);
+    assert_eq!(
+        ev,
+        vec![
+            (LiveOrderEventKind::Decision, 0, None),
+            (
+                LiveOrderEventKind::Reject,
+                1,
+                Some(REASON_FEED_TIME_ALARM.to_owned())
+            ),
+        ]
+    );
+    assert!(executions(&f.out).is_empty());
+    assert_eq!(c.counters().entries_blocked_feed_time, 1);
+    assert_eq!(c.counters().refused, 1);
+    assert_eq!(c.counters().sent, 0);
+    // The switch for ANOTHER day blocks nothing on this one.
+    let other = leaked_switch();
+    assert!(other.engage(c.day() + 1, crate::trade_safety::CAUSE_NO_CANDLES));
+    let mut c = chain(emitting(), true);
+    c.use_safety_switch(other);
+    let mut f = Feed::new();
+    f.drive(&mut c, (OPEN, OPEN + 125, 2), rising, 1_000);
+    assert_eq!(executions(&f.out).len(), 1, "yesterday's alarm is over");
+    assert_eq!(c.counters().entries_blocked_feed_time, 0);
+}
+
+/// An exit always passes: the entry fills before the alarm, the alarm fires,
+/// and the exit of that position still goes out.
+#[test]
+fn test_feed_time_alarm_lets_the_exit_out() {
+    let safety = leaked_switch();
+    let engine = EntryThenExit {
+        entry_lots: 10,
+        exit_lots: 10,
+        ..EntryThenExit::default()
+    };
+    let mut c =
+        LiveFillChain::new(engine, setup(true), params(), (OPEN - 600) * NS).expect("chain");
+    c.use_safety_switch(safety);
+    let mut f = Feed::new();
+    f.drive(&mut c, (OPEN, OPEN + 150, 0), rising, 1_000);
+    let x = executions(&f.out);
+    assert_eq!(x.len(), 1, "the entry filled before the alarm: {x:?}");
+    assert!(!x[0].exit);
+    assert!(safety.engage(c.day(), crate::trade_safety::CAUSE_NO_CANDLES));
+    f.drive(&mut c, (OPEN + 150, OPEN + 300, 4), rising, 1_000);
+    let x = executions(&f.out);
+    assert_eq!(x.len(), 2, "{x:?}");
+    assert!(x[1].exit, "the exit went out with the alarm on");
+    assert_eq!(x[1].side, Side::Sell);
+    assert!(feed_time_rejects(&f.out).is_empty());
+    assert_eq!(c.counters().entries_blocked_feed_time, 0);
+}
+
+/// Gate B: an entry still HELD (waiting for volume) when the alarm fires is
+/// refused when it finishes, for its whole quantity, with a seq-2 Reject.
+#[test]
+fn test_feed_time_alarm_refuses_an_entry_already_held() {
+    let safety = leaked_switch();
+    let mut s = setup(true);
+    s.contracts.get_mut(&key()).expect("spec").lot_size = 50;
+    let engine = EntryThenExit {
+        entry_lots: 10,
+        exit_lots: 0,
+        ..EntryThenExit::default()
+    };
+    let mut c = LiveFillChain::new(engine, s, params(), (OPEN - 600) * NS).expect("chain");
+    c.use_safety_switch(safety);
+    let mut f = Feed::new();
+    // 8 shares a second, 2 of them ours: 500 shares wait in the book.
+    let mut sec = OPEN;
+    while c.held_orders() == 0 && sec < OPEN + 200 {
+        f.drive(&mut c, (sec, sec + 1, 0), rising, 8);
+        sec += 1;
+    }
+    assert_eq!(c.held_orders(), 1, "the entry is held");
+    assert!(safety.engage(c.day(), crate::trade_safety::CAUSE_PRICES_OUTSIDE_SESSION));
+    f.drive(&mut c, (sec, sec + 90, 4), rising, 8);
+    assert_eq!(c.held_orders(), 0);
+    assert!(executions(&f.out).iter().all(|x| x.exit), "no entry sent");
+    assert_eq!(feed_time_rejects(&f.out), vec![(2, Some(500))]);
+    assert_eq!(c.counters().entries_blocked_feed_time, 1);
+    assert_eq!(c.counters().sent, 0);
+}
+
+/// Entries on odd bars, exits on even bars, one lot each. TEST DOUBLE.
+#[derive(Debug, Default)]
+struct Alternating {
+    bars: usize,
+    cols: Vec<String>,
+}
+
+impl StrategyEngine for Alternating {
+    fn configure(
+        &mut self,
+        _recipe: &Recipe,
+        _params: Option<&ParamSnapshot>,
+        _universe: &[InstrumentKey],
+    ) -> Result<(), Refusal> {
+        self.bars = 0;
+        Ok(())
+    }
+    fn on_tick(&mut self, _tick: &TickInput, _out: &mut IntentSink) {}
+    fn on_bar(&mut self, bar: &BarInput, out: &mut IntentSink) {
+        self.bars += 1;
+        let mut i = intent(bar.key, Side::Buy);
+        i.qty_lots = 1;
+        if self.bars.is_multiple_of(2) {
+            i.kind = IntentKind::Exit;
+            i.side = Side::Sell;
+        }
+        out.push(i);
+    }
+    fn value_columns(&self) -> &[String] {
+        &self.cols
+    }
+    fn bar_values(&self, _key: InstrumentKey, _tf: u8, _out: &mut [f64]) -> bool {
+        false
+    }
+}
+
+/// Runs the alternating engine for `secs` seconds from the open, engaging
+/// `safety` at `engage_at` seconds after the open. Returns the outputs, and
+/// how many entry Executes appeared after the switch went on.
+fn run_alternating(
+    safety: &'static crate::trade_safety::SafetySwitch,
+    engage_at: Option<i64>,
+    secs: i64,
+    vol: u32,
+) -> (Vec<ChainOutput>, ChainCounters, usize) {
+    let mut c = LiveFillChain::new(
+        Alternating::default(),
+        setup(true),
+        params(),
+        (OPEN - 600) * NS,
+    )
+    .expect("chain");
+    c.use_safety_switch(safety);
+    let mut f = Feed::new();
+    let mut entries_after = 0usize;
+    let mut engaged = false;
+    for s in OPEN..OPEN + secs {
+        if engage_at == Some(s - OPEN) {
+            assert!(safety.engage(c.day(), crate::trade_safety::CAUSE_PRICES_OUTSIDE_SESSION));
+            engaged = true;
+        }
+        let before = f.out.len();
+        f.drive(
+            &mut c,
+            (s, s + 1, 0),
+            |x| rising(x) + ((x % 7) as f32) * 0.05,
+            vol,
+        );
+        if engaged {
+            entries_after += executions(&f.out[before..])
+                .iter()
+                .filter(|x| !x.exit)
+                .count();
+        }
+    }
+    (f.out, c.counters(), entries_after)
+}
+
+proptest::proptest! {
+    #![proptest_config(proptest::prelude::ProptestConfig::with_cases(12))]
+    /// Against the oracle "after the switch goes on, no entry is sent, every
+    /// refusal is counted, and an exit is never refused for it; with the
+    /// switch never on, the run is identical to one with no switch at all".
+    #[test]
+    fn proptest_feed_time_switch_blocks_entries_only_from_its_moment(
+        engage_at in proptest::option::of(0i64..420),
+        vol in proptest::sample::select(vec![8u32, 40, 1_000]),
+    ) {
+        let secs = 420;
+        let (out, counters, entries_after) =
+            run_alternating(leaked_switch(), engage_at, secs, vol);
+        proptest::prop_assert_eq!(entries_after, 0);
+        let rejects = feed_time_rejects(&out).len() as u64;
+        proptest::prop_assert_eq!(rejects, counters.entries_blocked_feed_time);
+        // Every feed-time Reject belongs to an ENTRY decision.
+        let entry_signals: std::collections::HashSet<i64> = out
+            .iter()
+            .filter_map(|o| match o {
+                ChainOutput::Event(e) if e.event == LiveOrderEventKind::Decision
+                    && e.side == LiveOrderSide::Buy => Some(e.signal_id),
+                _ => None,
+            })
+            .collect();
+        for o in &out {
+            if let ChainOutput::Event(e) = o
+                && e.reason.as_deref() == Some(REASON_FEED_TIME_ALARM)
+            {
+                proptest::prop_assert!(entry_signals.contains(&e.signal_id));
+            }
+        }
+        if engage_at.is_none() {
+            let (plain, plain_counters, _) = run_alternating(leaked_switch(), None, secs, vol);
+            proptest::prop_assert_eq!(events(&out), events(&plain));
+            proptest::prop_assert_eq!(executions(&out).len(), executions(&plain).len());
+            proptest::prop_assert_eq!(counters, plain_counters);
+            proptest::prop_assert_eq!(rejects, 0);
+        }
+        if engage_at == Some(0) {
+            proptest::prop_assert!(executions(&out).iter().all(|x| x.exit));
+        }
+    }
+}

@@ -85,6 +85,11 @@ pub struct Counts {
     pub recheck_incomplete: u64,
     pub recheck_unavailable: u64,
     pub recheck_skipped: u64,
+    /// Entries refused because that day's feed-time alarm was on (plan item
+    /// UTC-SAFETY): the chain's `feed_time_alarm` and the runtime's
+    /// `refused:feed_time_alarm` Rejects. Also counted under skipped or
+    /// rejected.
+    pub entries_blocked: u64,
 }
 
 /// One would-be order.
@@ -338,6 +343,33 @@ fn runtime_reject(reason: Option<&str>, built: bool) -> bool {
         || (built && r == "exit_without_position")
 }
 
+/// Whether a Reject reason is the trade-safety switch's (plan item
+/// UTC-SAFETY): the chain's `feed_time_alarm` (Gates A and B) or the
+/// runtime's `refused:feed_time_alarm` (Gate C). O(1).
+fn is_feed_time_block(reason: Option<&str>) -> bool {
+    matches!(
+        reason,
+        Some(crate::live_fill::chain::REASON_FEED_TIME_ALARM | "refused:feed_time_alarm")
+    )
+}
+
+/// Whether a row is a trade-safety refusal of a held order whose share is
+/// KNOWN (plan item UTC-SAFETY, 2026-11-21 review finding 5): the chain's
+/// Gate B Reject (`feed_time_alarm`, `seq` 2) of an order the fill model
+/// priced to the end, which the chain marks by writing the model price on the
+/// row. An entry cut the moment the switch went on
+/// (`PendingBook::block_entries`) carries no model price: its share up to the
+/// cut is not recorded, so it stays unknown, and so does a Gate B order the
+/// model priced at nothing (no model price) — both Honest limits, read as
+/// `recheck_unavailable:shared_volume_unknown` on a later overlapping order.
+/// O(1).
+fn feed_time_block_share_known(r: &EventRow) -> bool {
+    r.event == "reject"
+        && r.seq >= 2
+        && r.reason.as_deref() == Some(crate::live_fill::chain::REASON_FEED_TIME_ALARM)
+        && r.model_price_paise.is_some()
+}
+
 /// The rows sorted the way the report groups them: by signal, then seq,
 /// time and event. O(rows log rows).
 fn sorted_rows(rows: &[EventRow]) -> Vec<&EventRow> {
@@ -480,7 +512,8 @@ pub fn held_share_known(rows: &[EventRow]) -> BTreeMap<i64, bool> {
                             || why.starts_with(FILL_MODEL_REFUSED_PREFIX)
                             || why == crate::live_fill::PAPER_QUEUE_FULL_REASON
                     })
-            });
+            })
+            || group.iter().any(|r| feed_time_block_share_known(r));
         out.insert(group[0].signal_id, worked_out);
     }
     out
@@ -532,6 +565,9 @@ pub fn build_report(
             "rejected" => counts.rejected += 1,
             "orphaned_by_restart" => counts.orphaned_by_restart += 1,
             _ => counts.skipped += 1,
+        }
+        if reject.is_some_and(|r| is_feed_time_block(r.reason.as_deref())) {
+            counts.entries_blocked += 1;
         }
         if let Some(r) = reject {
             let e = rejects.entry(reject_key(r.reason.as_deref())).or_default();

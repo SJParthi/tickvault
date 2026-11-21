@@ -219,6 +219,9 @@ pub(super) const LIVE_FILL_EXIT_RETRY_CAPACITY: usize =
 pub(super) const LIVE_FILL_EXIT_RETRY_MAX_ATTEMPTS: u32 = 3_600;
 /// Counter of exit resends (local `/metrics` only).
 pub(super) const LIVE_FILL_EXIT_RETRIES_COUNTER: &str = "tv_live_fill_exit_retries_total";
+/// The Reject reason when today's feed-time alarm blocks an entry the chain
+/// had already queued (Gate C, plan item UTC-SAFETY).
+pub(super) const FEED_TIME_ALARM_REJECT: &str = "refused:feed_time_alarm";
 
 /// What one place attempt came to.
 #[derive(Debug, PartialEq, Eq)]
@@ -458,6 +461,23 @@ async fn execute(
         Side::Buy => lots,
         Side::Sell => lots.saturating_neg(),
     };
+    // Gate C (plan item UTC-SAFETY, daily-universe §28.7): the backstop for
+    // an Execute already queued when today's feed-time alarm fired. No new
+    // ENTRY; an exit always passes. `refused:` makes the daily report count it
+    // as rejected. One Acquire load and a compare; a refusal also counts on
+    // the chain's entries-blocked counter (2026-11-21 review finding 3: it
+    // did not, so a flat counter hid Gate C refusals). Counted once: an entry
+    // Gate A or B refused never reaches here.
+    if !x.exit
+        && ctx
+            .safety
+            .entries_blocked_on(crate::trade_safety::ist_day_now())
+            .is_some()
+    {
+        metrics::counter!(crate::trade_safety::ENTRIES_BLOCKED_COUNTER).increment(1);
+        reject(&mut seq, FEED_TIME_ALARM_REJECT.to_owned());
+        return Placed::Done;
+    }
     // A clamped exit can only bring the position toward flat, so the halt and
     // the pre-trade limits do not apply to it (LF-6b review round 2, findings
     // 6 and 8): a daily-loss halt stops NEW risk, and refusing the order that
@@ -649,6 +669,7 @@ mod tests {
             leg_pnl_tx: None,
             live_fill_events: Some(events),
             live_fill_positions: None,
+            safety: Box::leak(Box::new(crate::trade_safety::SafetySwitch::new())),
         }
     }
 
@@ -1642,5 +1663,109 @@ mod tests {
         ));
         drop(tx);
         assert!(recv_live_fill(&mut g).await.is_none());
+    }
+
+    /// Gate C (plan item UTC-SAFETY): with today's feed-time alarm on, an
+    /// entry the chain had queued is refused `refused:feed_time_alarm` before
+    /// any order exists; the exit of a position held from before still goes
+    /// out and fills. Another day's alarm blocks nothing.
+    #[tokio::test]
+    async fn test_execute_refuses_an_entry_but_places_the_exit_while_the_alarm_is_on() {
+        // The Gate C refusal counts on the chain's counter (2026-11-21 review
+        // finding 3). A thread-local recorder: this test's runtime is
+        // single-threaded, so every step runs on this thread.
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let blocked_count = || {
+            handle
+                .render()
+                .lines()
+                .find(|l| l.starts_with(crate::trade_safety::ENTRIES_BLOCKED_COUNTER))
+                .map(str::to_owned)
+        };
+        let (tx, mut rx) = mpsc::channel(64);
+        let ctx = ctx(tx);
+        let mut oms = oms();
+        let mut risk = RiskEngine::new(2.0, 100, 1_000_000.0);
+        let mut book = BookState::new();
+        let rows = |rx: &mut mpsc::Receiver<LiveOrderEvent>| {
+            let mut v = Vec::new();
+            while let Ok(r) = rx.try_recv() {
+                v.push((r.event, r.reason));
+            }
+            v
+        };
+        // Yesterday's alarm: today's entry is booked.
+        let today = crate::trade_safety::ist_day_now();
+        assert!(
+            ctx.safety
+                .engage(today - 1, crate::trade_safety::CAUSE_NO_CANDLES)
+        );
+        let entry = PaperCmd::Execute(Box::new(execution(10, 10)));
+        handle_live_fill_cmd(&mut oms, &mut risk, &mut book, &ctx, entry).await;
+        let r = rows(&mut rx);
+        assert!(
+            r.iter().any(|(e, _)| *e == LiveOrderEventKind::Fill),
+            "{r:?}"
+        );
+        assert_eq!(
+            risk.net_lots_for_in_segment(2885, ExchangeSegment::NseEquity),
+            10
+        );
+        // Today's alarm: a second entry is refused, nothing booked.
+        assert!(
+            ctx.safety
+                .engage(today, crate::trade_safety::CAUSE_PRICES_OUTSIDE_SESSION)
+        );
+        let entry = PaperCmd::Execute(Box::new(execution(10, 10)));
+        handle_live_fill_cmd(&mut oms, &mut risk, &mut book, &ctx, entry).await;
+        let r = rows(&mut rx);
+        assert_eq!(
+            r,
+            vec![(
+                LiveOrderEventKind::Reject,
+                Some(FEED_TIME_ALARM_REJECT.to_owned())
+            )]
+        );
+        assert_eq!(
+            blocked_count().as_deref(),
+            Some("tv_live_fill_entries_blocked_feed_time_total 1"),
+            "a Gate C refusal counts once"
+        );
+        assert_eq!(
+            risk.net_lots_for_in_segment(2885, ExchangeSegment::NseEquity),
+            10
+        );
+        // The exit of the held position goes out and fills.
+        let mut exit = execution(10, 10);
+        exit.side = Side::Sell;
+        exit.exit = true;
+        handle_live_fill_cmd(
+            &mut oms,
+            &mut risk,
+            &mut book,
+            &ctx,
+            PaperCmd::Execute(Box::new(exit)),
+        )
+        .await;
+        let r = rows(&mut rx);
+        assert!(
+            r.iter().any(|(e, _)| *e == LiveOrderEventKind::Fill),
+            "{r:?}"
+        );
+        assert!(
+            r.iter()
+                .all(|(_, why)| why.as_deref() != Some(FEED_TIME_ALARM_REJECT))
+        );
+        assert_eq!(
+            risk.net_lots_for_in_segment(2885, ExchangeSegment::NseEquity),
+            0
+        );
+        assert_eq!(
+            blocked_count().as_deref(),
+            Some("tv_live_fill_entries_blocked_feed_time_total 1"),
+            "an exit is never counted"
+        );
     }
 }

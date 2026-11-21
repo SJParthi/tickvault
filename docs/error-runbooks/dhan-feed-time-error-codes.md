@@ -49,6 +49,17 @@ published Muhurat window), from the live drain only:
 The day is written to `data/state/held-days/<date>.hold`, so the archiver, the
 Brutex export and the cross-check catch-up skip it until a verified repair.
 
+**Paper entries are blocked for the rest of the IST day (since 2026-11-21, the
+trade-safety switch, daily-universe §28.7).** When this page fires, the paper
+path opens no new entries until the IST day roll; exits always go out. Nothing
+turns it off within the day, and a restart the same day keeps it (it reads the
+day's feed-time markers and the page's `.hold`). Watch it on
+`tv_trade_safety_entries_blocked` (1 while today is blocked) and
+`tv_live_fill_entries_blocked_feed_time_total` (refused entries), both local
+`/metrics` only, and one coded `warn!` `ORDER-READY-01`
+`source="trade_safety_entries_blocked"` per change (never paged). Details:
+`docs/error-runbooks/order-readiness-error-codes.md` §1a.
+
 **Triage:**
 1. Check whether the correction armed today: look for `DHAN-LTT-01`
    `source="ltt_correction_armed"` and the once-a-day Telegram notice. If it

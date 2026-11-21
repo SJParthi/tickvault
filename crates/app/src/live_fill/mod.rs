@@ -196,6 +196,7 @@ pub fn register_metrics() {
     for r in TaintReason::ALL {
         metrics::counter!(TAINT_COUNTER, "reason" => r.as_str()).increment(0);
     }
+    crate::trade_safety::register_metrics();
 }
 
 /// What the boot decided.
@@ -339,6 +340,23 @@ pub fn start_chain<E: StrategyEngine + Send + 'static>(
     events_tx: mpsc::Sender<LiveOrderEvent>,
     now_ist_ns: i64,
 ) -> anyhow::Result<()> {
+    // Plan item UTC-SAFETY: a feed-time page that fired earlier today (a
+    // restart) blocks entries from the chain's first pass, even before the
+    // drain's own page restores its latch. A torn or unreadable marker blocks
+    // too (fail closed).
+    let day = now_ist_ns.div_euclid(1_000_000_000).div_euclid(86_400);
+    engage_from_feed_time_markers(
+        &crate::trade_safety::FEED_TIME_BLOCK,
+        day,
+        crate::daily_task_marker::marker_state,
+    );
+    // The day's `.hold` file is a second record of the page: it can exist
+    // when the marker write failed (2026-11-21 review finding 2).
+    engage_from_feed_time_hold(
+        &crate::trade_safety::FEED_TIME_BLOCK,
+        day,
+        crate::trade_safety::process_feed_time_hold_bits,
+    );
     let params = ChainParams::from(config);
     let chain = LiveFillChain::new(engine, setup, params, now_ist_ns)?;
     let (tap_tx, tap_rx) = live_fill_tap_ring(config.tap_capacity);
@@ -372,6 +390,57 @@ pub fn start_chain<E: StrategyEngine + Send + 'static>(
             run_live_fill_thread(chain, ends, &tap_loss, wake);
         })?;
     Ok(())
+}
+
+/// Engages `safety` on `day` for every feed-time page marker of that day that
+/// is present, or that is there but cannot be trusted (fail closed). A day
+/// with no calendar date engages nothing. Cold: two small file reads.
+/// Returns the cause bits engaged.
+pub fn engage_from_feed_time_markers(
+    safety: &crate::trade_safety::SafetySwitch,
+    day: i64,
+    state_of: impl Fn(&str, chrono::NaiveDate) -> crate::daily_task_marker::MarkerState,
+) -> u8 {
+    let Some(date) = tickvault_storage::ltt_correction::ist_day_date(day) else {
+        return 0;
+    };
+    let mut bits = 0u8;
+    for (task, bit) in crate::trade_safety::FEED_TIME_PAGE_TASKS {
+        match state_of(task, date) {
+            crate::daily_task_marker::MarkerState::Present
+            | crate::daily_task_marker::MarkerState::Unreadable => {
+                let _changed = crate::trade_safety::engage(safety, day, bit);
+                bits |= bit;
+            }
+            crate::daily_task_marker::MarkerState::Absent => {}
+        }
+    }
+    bits
+}
+
+/// Engages `safety` on `day` for every cause bit that day's `.hold` file
+/// records for the feed-time page (`hold_bits_of`, production:
+/// `trade_safety::process_feed_time_hold_bits`: only the page's own whole hold
+/// counts). The page's writer thread writes the hold beside
+/// the daily marker, so a page whose marker write failed (or was never handed
+/// off) still blocks after a restart when the hold landed (2026-11-21 review
+/// finding 2). A day with no calendar date engages nothing. Cold: one small
+/// file read. Returns the cause bits engaged.
+pub fn engage_from_feed_time_hold(
+    safety: &crate::trade_safety::SafetySwitch,
+    day: i64,
+    hold_bits_of: impl Fn(chrono::NaiveDate) -> u8,
+) -> u8 {
+    let Some(date) = tickvault_storage::ltt_correction::ist_day_date(day) else {
+        return 0;
+    };
+    let bits = hold_bits_of(date);
+    for (_, bit) in crate::trade_safety::FEED_TIME_PAGE_TASKS {
+        if bits & bit != 0 {
+            let _changed = crate::trade_safety::engage(safety, day, bit);
+        }
+    }
+    bits
 }
 
 /// Slots of the position-report ring (LF-9 finding 2): every Execute that can
@@ -475,6 +544,9 @@ pub struct CounterPublisher {
     configured: metrics::Gauge,
     /// Whether the chain was inert (`awaiting_day_setup`) at the last pass.
     inert: bool,
+    /// `tv_live_fill_entries_blocked_feed_time_total`, resolved once (plan
+    /// item UTC-SAFETY).
+    entries_blocked: metrics::Counter,
 }
 
 impl CounterPublisher {
@@ -491,6 +563,7 @@ impl CounterPublisher {
             taints_published: t,
             configured: metrics::gauge!(ENGINE_CONFIGURED_GAUGE),
             inert: false,
+            entries_blocked: metrics::counter!(crate::trade_safety::ENTRIES_BLOCKED_COUNTER),
         }
     }
 
@@ -514,6 +587,10 @@ impl CounterPublisher {
             .increment(c.refused.saturating_sub(published.refused));
         self.late
             .increment(c.late_ticks.saturating_sub(published.late_ticks));
+        self.entries_blocked.increment(
+            c.entries_blocked_feed_time
+                .saturating_sub(published.entries_blocked_feed_time),
+        );
         for (i, counter) in self.taints.iter().enumerate() {
             counter.increment(t[i].saturating_sub(self.taints_published[i]));
         }
@@ -903,6 +980,64 @@ mod tests {
         );
         drop(tap);
         drop(link);
+    }
+
+    /// Plan item UTC-SAFETY: the chain start reads today's two feed-time
+    /// page markers from a real folder. Present or unreadable blocks entries
+    /// (fail closed); absent does not.
+    #[test]
+    fn test_engage_from_feed_time_markers_present_unreadable_and_absent() {
+        let base =
+            std::env::temp_dir().join(format!("tv_trade_safety_markers_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let day = 20_778; // 2026-11-21 IST
+        let date = tickvault_storage::ltt_correction::ist_day_date(day).expect("date");
+        let read = |t: &str, d: chrono::NaiveDate| {
+            crate::daily_task_marker::test_marker_state_in(&base, t, d)
+        };
+        // Absent (no folder at all): nothing engaged.
+        let s = Box::leak(Box::new(crate::trade_safety::SafetySwitch::new()));
+        assert_eq!(engage_from_feed_time_markers(s, day, read), 0);
+        assert_eq!(s.entries_blocked_on(day), None);
+        // Cause A present.
+        assert!(
+            crate::daily_task_marker::test_write_marker_in(&base, "feed-time-page-a", date).is_ok()
+        );
+        let s = Box::leak(Box::new(crate::trade_safety::SafetySwitch::new()));
+        assert_eq!(
+            engage_from_feed_time_markers(s, day, read),
+            crate::trade_safety::CAUSE_PRICES_OUTSIDE_SESSION
+        );
+        assert_eq!(
+            s.entries_blocked_on(day),
+            Some(crate::trade_safety::CAUSE_PRICES_OUTSIDE_SESSION)
+        );
+        // Cause B torn (an empty file): blocked too.
+        std::fs::write(base.join(format!("feed-time-page-b-{date}.marker")), b"").expect("torn");
+        let s = Box::leak(Box::new(crate::trade_safety::SafetySwitch::new()));
+        assert_eq!(engage_from_feed_time_markers(s, day, read), 3);
+        assert_eq!(s.entries_blocked_on(day), Some(3));
+        assert_eq!(s.entries_blocked_on(day + 1), None);
+        // Another day reads its own (absent) markers.
+        let s = Box::leak(Box::new(crate::trade_safety::SafetySwitch::new()));
+        assert_eq!(engage_from_feed_time_markers(s, day + 1, read), 0);
+        // A day with no calendar date engages nothing.
+        assert_eq!(engage_from_feed_time_markers(s, i64::MAX, read), 0);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The publisher moves the blocked-entries counter only; the gauge has
+    /// one writer, the switch for the wall-clock day (2026-11-21 review
+    /// finding 2), so the chain never writes it.
+    #[test]
+    fn test_counter_publisher_publishes_the_blocked_entries_counter() {
+        let mut p = CounterPublisher::new(chain::ChainCounters::default(), [0; TaintReason::COUNT]);
+        let c = chain::ChainCounters {
+            entries_blocked_feed_time: 3,
+            ..chain::ChainCounters::default()
+        };
+        p.publish(c, [0; TaintReason::COUNT]);
+        assert_eq!(p.published.entries_blocked_feed_time, 3);
     }
 }
 

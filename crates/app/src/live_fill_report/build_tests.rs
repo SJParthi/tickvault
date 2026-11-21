@@ -776,3 +776,50 @@ fn test_fill_model_refused_is_priced_against_the_stored_seconds() {
         assert!(priced_signal_ids(&rows).is_empty(), "{reason}");
     }
 }
+
+/// Regression: 2026-11-21 (review finding 5) — a held ENTRY the trade-safety
+/// switch refused when it finished (Gate B, `feed_time_alarm`, `seq` 2) was
+/// read as "finished unpriced", so every later overlapping order of its
+/// instrument read `recheck_unavailable:shared_volume_unknown` (Amber) though
+/// the chain had priced it to the end and its share was known. The chain now
+/// writes the model price on that row, and the report reads such a row as
+/// worked out. An entry cut the moment the switch went on (no model price)
+/// stays unknown (its share up to the cut is not recorded), and so do the
+/// other chain refusals.
+#[test]
+fn test_regression_2026_11_21_gate_b_feed_time_reject_with_a_model_price_is_worked_out() {
+    let gate_b = |signal: i64, model: Option<i64>| {
+        let mut reject = row(signal, 2, "reject", T10 + 70 * NS);
+        reject.reason = Some(crate::live_fill::chain::REASON_FEED_TIME_ALARM.to_owned());
+        reject.remainder_qty = Some(500);
+        reject.model_price_paise = model;
+        vec![
+            decision(signal),
+            row(signal, 1, "built", T10 + 3 * NS),
+            reject,
+        ]
+    };
+    let mut rows = gate_b(1, Some(10_050));
+    rows.extend(gate_b(2, None));
+    // A tainted refusal: unknown, as before.
+    let mut tainted = gate_b(3, None);
+    tainted[2].reason = Some("tick_dropped".to_owned());
+    rows.extend(tainted);
+    // A tainted refusal with a model price on it is still unknown (only the
+    // feed-time reason is read this way).
+    let mut tainted_priced = gate_b(4, Some(10_050));
+    tainted_priced[2].reason = Some("tick_dropped".to_owned());
+    rows.extend(tainted_priced);
+    let known = held_share_known(&rows);
+    assert_eq!(
+        known.get(&1),
+        Some(&true),
+        "Gate B priced to the end: known"
+    );
+    assert_eq!(known.get(&2), Some(&false), "cut at the switch: unknown");
+    assert_eq!(known.get(&3), Some(&false));
+    assert_eq!(known.get(&4), Some(&false));
+    // Both feed-time refusals are counted as blocked entries in the report.
+    let r = build_report(DAY, &rows, &[], ctx());
+    assert_eq!(r.counts.entries_blocked, 2);
+}

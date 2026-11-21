@@ -80,6 +80,30 @@ DHAN-LANE-03 class of fail-closed gate.
 6. Halted (`OrderPathHalted`) ⇒ see the §2 row for the halting DH/DATA code;
    `clear_order_halt` or restart AFTER the account/token is fixed.
 
+### §1a. `source = "trade_safety_entries_blocked"` — today's feed-time alarm blocks paper entries (2026-11-21)
+
+A coded `warn!` (never `error!`, never paged) carrying `ORDER-READY-01` with
+`source = "trade_safety_entries_blocked"` is NOT the readiness gate above and
+has nothing to do with the Dhan data plan, the Derivative segment or the token.
+It is the trade-safety switch (plan item UTC-SAFETY, daily-universe §28.7,
+`crates/app/src/trade_safety.rs`): today's `DHAN-FEED-TIME-01` page fired (the
+feed's trade times still look wrong after the correction), so the PAPER path
+opens no new entries for the rest of this IST day; exits still go out. It is
+logged once per change of the switch (a new day, or a second cause), with
+`ist_day` and `causes` (1 = trade times outside the session, 2 = no candles,
+3 = both).
+
+**Action: none on the plan, segment or token.** Follow the feed-time runbook,
+`docs/error-runbooks/dhan-feed-time-error-codes.md` (`DHAN-FEED-TIME-01`), for
+the page itself. The switch ends by itself at the IST day roll; nothing turns
+it off within the day. Refused entries show as `live_order_events` Reject rows
+(`feed_time_alarm`, `refused:feed_time_alarm`), and every refusal, the order
+runtime's `refused:feed_time_alarm` backstop included (since 2026-11-21), counts
+once on `tv_live_fill_entries_blocked_feed_time_total`; `tv_trade_safety_entries_blocked`
+reads 1 while today is blocked (both local `/metrics` only). The triage rule
+`order-ready-01-gate-refused-escalate` still escalates the code; for this
+source the operator's step is the feed-time runbook, never a plan or token fix.
+
 ## §2. Order-path DH / DATA policy table
 
 Per-endpoint policy, coded log, circuit-breaker interaction, and operator action

@@ -2135,6 +2135,21 @@ alarm, filter or EMF name; a flag that survives into the next IST day; failing
 open when the marker cannot be read at start; reusing this lift for any other
 change.
 
+**2026-11-21 note (review of the first build; a clarification of (B) and of
+"the marker", no new authorization).** (1) To refuse an entry already held
+(B), the chain also reads the switch once per pass (one atomic load, on the
+`tv-live-fill` thread, never the frame drain), and on the first pass with the
+switch on it cuts every held ENTRY once: a cut entry takes no more of the
+fill model's per-second share and no exit of its instrument waits behind it,
+so the exit fills as if the entry had never been held. This is the approved
+consequence of blocking that entry, not a change to what the fill model
+decides for any order that is sent. (2) The drain's `fire` does only the
+store; the switch's `warn!` and gauge run on the page's writer thread. (3)
+The start also reads the day's `.hold` file when it is the page's own (reason
+`feed-time page <cause>`), as a second record of the alarm for a page whose
+daily-marker write failed; any other hold, a hand hold included, does not
+block entries (owner decision pending).
+
 ## §31.1 — Constituent → Dhan `security_id` mapping contract (LOCKED 2026-06-06)
 
 > **Authority for Sub-PR #4.** This is the precise, fail-closed mapping the

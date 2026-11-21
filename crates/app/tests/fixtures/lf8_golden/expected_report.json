@@ -22,7 +22,8 @@
     "qty_differs": 0,
     "recheck_incomplete": 0,
     "recheck_unavailable": 0,
-    "recheck_skipped": 0
+    "recheck_skipped": 0,
+    "entries_blocked": 0
   },
   "orders": [
     {

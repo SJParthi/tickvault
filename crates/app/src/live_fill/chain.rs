@@ -102,6 +102,10 @@ pub const REASON_DAY_VOLUME_UNKNOWN: &str = "day_volume_unknown";
 /// Reason on a refusal row when the instrument's first packet of the day came
 /// after the decision candle opened, so the candle is partial.
 pub const REASON_FIRST_BAR_PARTIAL: &str = "first_bar_partial";
+/// Reason on a refusal row when today's feed-time alarm is on (plan item
+/// UTC-SAFETY, daily-universe §28.7): the trade-safety switch blocks every
+/// new ENTRY for the rest of the IST day; an exit still goes out.
+pub const REASON_FEED_TIME_ALARM: &str = "feed_time_alarm";
 
 /// Tick size, lot size and label of one tradable contract.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -290,6 +294,10 @@ pub struct ChainCounters {
     /// instrument's next trade (`note_cumulative`): each breaks the chain's
     /// bars as the fold's own restart does. Not a metric.
     pub dropped_tick_restarts: u64,
+    /// Entries refused because today's feed-time alarm is on (plan item
+    /// UTC-SAFETY): at the decision (Gate A) or when a held entry finished
+    /// (Gate B). Also counted in `refused`.
+    pub entries_blocked_feed_time: u64,
 }
 
 /// Context carried with a held order, for its rows.
@@ -406,6 +414,12 @@ pub struct LiveFillChain<E: StrategyEngine> {
     signal_next: i64,
     now_ns: i64,
     counters: ChainCounters,
+    /// The trade-safety switch the entry gates read (plan item UTC-SAFETY):
+    /// the process switch, or a test's own.
+    safety: &'static crate::trade_safety::SafetySwitch,
+    /// The chain day whose held entries were already cut by the switch
+    /// (`PendingBook::block_entries`), so the cut runs once a day.
+    entries_cut_day: i64,
 }
 
 impl<E: StrategyEngine> LiveFillChain<E> {
@@ -494,6 +508,8 @@ impl<E: StrategyEngine> LiveFillChain<E> {
             signal_next: 0,
             now_ns: now_ist_ns,
             counters: ChainCounters::default(),
+            safety: &crate::trade_safety::FEED_TIME_BLOCK,
+            entries_cut_day: i64::MIN,
             engine,
             setup,
             params,
@@ -658,6 +674,22 @@ impl<E: StrategyEngine> LiveFillChain<E> {
     #[must_use]
     pub fn day(&self) -> i64 {
         self.day
+    }
+
+    /// Whether the trade-safety switch blocks new entries on the chain's day
+    /// (plan item UTC-SAFETY). One Acquire load and a compare, no allocation.
+    #[inline]
+    #[must_use]
+    pub fn entries_blocked(&self) -> bool {
+        self.safety.entries_blocked_on(self.day).is_some()
+    }
+
+    /// Points the entry gates at a test's own switch, so a test never touches
+    /// the process switch other tests read.
+    #[cfg(test)]
+    // TEST-EXEMPT: test-only setter, exercised by every test_feed_time_alarm_* chain test
+    pub(crate) fn use_safety_switch(&mut self, safety: &'static crate::trade_safety::SafetySwitch) {
+        self.safety = safety;
     }
 
     /// The engine (tests and the thread's status line).
@@ -1129,6 +1161,15 @@ impl<E: StrategyEngine> LiveFillChain<E> {
         // Before any candle is decided: orders already held learn of this
         // pass's drops, gaps and steps; new decisions read them via `taint_of`.
         self.apply_fresh_taints();
+        // Plan item UTC-SAFETY (2026-11-21 review finding 3): on the first
+        // pass with today's feed-time alarm on, every held ENTRY is cut at
+        // once, so it takes no more share of the seconds released below and
+        // no exit of its instrument waits for it. Gate B stays the backstop.
+        // One Acquire load and a compare per pass; O(64) once a day.
+        if self.entries_cut_day != self.day && self.entries_blocked() {
+            self.entries_cut_day = self.day;
+            let _cut = self.pending.block_entries();
+        }
         self.queue.release_due(stream_ns, &mut self.released);
         for i in 0..self.released.len() {
             let bar = self.released[i];
@@ -1411,6 +1452,16 @@ impl<E: StrategyEngine> LiveFillChain<E> {
             self.refuse_unplaced(intent, Some(bar), REASON_DAY_VOLUME_UNKNOWN);
             return;
         }
+        // Gate A (plan item UTC-SAFETY, daily-universe §28.7): today's
+        // feed-time alarm is on, so no new ENTRY. An exit always passes. The
+        // day is the chain's wall-clock day, never a trade time. One Acquire
+        // load and a compare.
+        if intent.kind != IntentKind::Exit && self.entries_blocked() {
+            self.counters.entries_blocked_feed_time =
+                self.counters.entries_blocked_feed_time.saturating_add(1);
+            self.refuse_unplaced(intent, Some(bar), REASON_FEED_TIME_ALARM);
+            return;
+        }
         let nf = self.frames_secs.len();
         let fi = bar.frame_index as usize;
         if self.late_bucket[ki as usize * nf + fi] == bar.bucket_open_secs {
@@ -1615,6 +1666,43 @@ impl<E: StrategyEngine> LiveFillChain<E> {
                 reject.seq = 2;
                 reject.remainder_qty = i64::try_from(order.qty).ok();
                 reject.reason = Some(format!("fill_model_refused:{refusal}"));
+                let _queued = self.push_finished(ChainOutput::Event(Box::new(reject)));
+            }
+            // Gate B (plan item UTC-SAFETY): an ENTRY already held when
+            // today's feed-time alarm fired is refused for its whole quantity,
+            // the same shape as a tainted order. An exit always passes.
+            //
+            // The order was priced to the end, so its share is known: the row
+            // carries the model price (2026-11-21 review finding 5), which the
+            // daily report reads as "worked out".
+            Finished::Filled { order, summary, .. }
+                if !order.meta.exit && self.entries_blocked() =>
+            {
+                self.counters.refused = self.counters.refused.saturating_add(1);
+                self.counters.entries_blocked_feed_time =
+                    self.counters.entries_blocked_feed_time.saturating_add(1);
+                let mut reject = order.meta.base;
+                reject.ts_ist_nanos = self.now_ns;
+                reject.event = LiveOrderEventKind::Reject;
+                reject.seq = 2;
+                reject.remainder_qty = i64::try_from(order.qty).ok();
+                reject.model_price_paise = summary.vwap_paise;
+                reject.reason = Some(REASON_FEED_TIME_ALARM.to_owned());
+                let _queued = self.push_finished(ChainOutput::Event(Box::new(reject)));
+            }
+            // An ENTRY cut the moment the switch went on (`block_entries`):
+            // the same row shape as Gate B, with NO model price (its share up
+            // to the cut is not recorded, so the report reads it as unknown).
+            Finished::Blocked { order } => {
+                self.counters.refused = self.counters.refused.saturating_add(1);
+                self.counters.entries_blocked_feed_time =
+                    self.counters.entries_blocked_feed_time.saturating_add(1);
+                let mut reject = order.meta.base;
+                reject.ts_ist_nanos = self.now_ns;
+                reject.event = LiveOrderEventKind::Reject;
+                reject.seq = 2;
+                reject.remainder_qty = i64::try_from(order.qty).ok();
+                reject.reason = Some(REASON_FEED_TIME_ALARM.to_owned());
                 let _queued = self.push_finished(ChainOutput::Event(Box::new(reject)));
             }
             Finished::Filled {

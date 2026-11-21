@@ -122,6 +122,39 @@ fn marker_names_day(path: &Path, date_ist: NaiveDate) -> bool {
         .any(|line| line == want.as_bytes())
 }
 
+/// What a strict, fail-CLOSED reader sees at a day's marker path (plan item
+/// UTC-SAFETY). Unlike [`daily_marker_exists`], it keeps "no file" apart from
+/// "a file is there but cannot be trusted", so a safety reader can treat the
+/// second as present.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkerState {
+    /// The marker names the day.
+    Present,
+    /// No file at the path (the folder may be missing too).
+    Absent,
+    /// Something is at the path but it is not a marker naming the day: a
+    /// torn, empty, wrong-day or unreadable file, a directory, or an IO error
+    /// other than not-found.
+    Unreadable,
+}
+
+/// [`MarkerState`] of `path` for `date_ist`. At most one open and one capped
+/// read. Cold.
+fn marker_state_of(path: &Path, date_ist: NaiveDate) -> MarkerState {
+    match std::fs::symlink_metadata(path) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => MarkerState::Absent,
+        Err(_) => MarkerState::Unreadable,
+        Ok(_) if marker_names_day(path, date_ist) => MarkerState::Present,
+        Ok(_) => MarkerState::Unreadable,
+    }
+}
+
+fn marker_state_in(base: &Path, task: &str, date_ist: NaiveDate) -> MarkerState {
+    tickvault_storage::off_worker::off_worker(|| {
+        marker_state_of(&marker_path_in(base, task, date_ist), date_ist)
+    })
+}
+
 /// What a successful rename becomes, given the folder syncs. `parent_sync` is
 /// `None` when the folder already existed (its parent was not touched). A
 /// failed folder sync never undoes the rename: the final file is in place and
@@ -264,6 +297,15 @@ pub fn daily_marker_exists(task: &str, date_ist: NaiveDate) -> bool {
     marker_exists_in(Path::new(DAILY_MARKER_DIR), task, date_ist)
 }
 
+/// The strict, fail-CLOSED state of the day's marker for this task (plan
+/// item UTC-SAFETY): [`MarkerState::Unreadable`] for anything at the path
+/// that is not a marker naming the day, [`MarkerState::Absent`] only when
+/// nothing is there. [`daily_marker_exists`] is unchanged (fail-open).
+#[must_use]
+pub fn marker_state(task: &str, date_ist: NaiveDate) -> MarkerState {
+    marker_state_in(Path::new(DAILY_MARKER_DIR), task, date_ist)
+}
+
 /// "Delivered today" marker write (contents: build sha + the delivered IST
 /// date), atomic, with the default [`DAILY_MARKER_SWEEP_DAYS`] keep. Callers
 /// invoke this ONLY after a PASS outcome — never on a FAILURE-class outcome,
@@ -301,6 +343,12 @@ pub fn try_write_daily_marker_keeping(
 #[cfg(test)]
 pub(crate) fn test_marker_exists_in(base: &Path, task: &str, day: NaiveDate) -> bool {
     marker_exists_in(base, task, day)
+}
+
+#[cfg(test)]
+// TEST-EXEMPT: test-only seam, exercised by test_engage_from_feed_time_markers_present_unreadable_and_absent
+pub(crate) fn test_marker_state_in(base: &Path, task: &str, day: NaiveDate) -> MarkerState {
+    marker_state_in(base, task, day)
 }
 
 #[cfg(test)]
@@ -695,6 +743,59 @@ mod tests {
         assert!(
             !prod.contains("pub fn write_daily_marker("),
             "the unit-returning writer must stay removed"
+        );
+    }
+
+    #[test]
+    fn test_marker_state_present_absent_and_unreadable() {
+        let tmp = unique_dir();
+        let d = day("2026-11-20");
+        // No folder at all: absent (a fresh box), never unreadable.
+        assert_eq!(
+            marker_state_in(&tmp.0, "feed-time-page-a", d),
+            MarkerState::Absent
+        );
+        write_ok(&tmp.0, "feed-time-page-a", d, DAILY_MARKER_SWEEP_DAYS);
+        assert_eq!(
+            marker_state_in(&tmp.0, "feed-time-page-a", d),
+            MarkerState::Present
+        );
+        assert_eq!(
+            marker_state("feed-time-page-a-never-written-by-any-test", d),
+            MarkerState::Absent
+        );
+        // A torn / empty file: unreadable (fail closed), where the fail-open
+        // reader says absent.
+        std::fs::write(marker_path_in(&tmp.0, "feed-time-page-b", d), b"").expect("empty");
+        assert_eq!(
+            marker_state_in(&tmp.0, "feed-time-page-b", d),
+            MarkerState::Unreadable
+        );
+        assert!(!marker_exists_in(&tmp.0, "feed-time-page-b", d));
+        // Another day's line: unreadable.
+        std::fs::write(
+            marker_path_in(&tmp.0, "feed-time-page-b", d),
+            b"delivered_date_ist=2026-11-19\n",
+        )
+        .expect("wrong day");
+        assert_eq!(
+            marker_state_in(&tmp.0, "feed-time-page-b", d),
+            MarkerState::Unreadable
+        );
+        // A directory squatting on the path: unreadable.
+        let other = day("2026-11-21");
+        std::fs::create_dir_all(marker_path_in(&tmp.0, "feed-time-page-a", other)).expect("dir");
+        assert_eq!(
+            marker_state_in(&tmp.0, "feed-time-page-a", other),
+            MarkerState::Unreadable
+        );
+        // A base path that is a FILE: the stat fails with not-a-directory,
+        // which is not "not found", so unreadable.
+        let file_base = tmp.0.join("file-base");
+        std::fs::write(&file_base, b"x").expect("file base");
+        assert_eq!(
+            marker_state_in(&file_base, "feed-time-page-a", d),
+            MarkerState::Unreadable
         );
     }
 }

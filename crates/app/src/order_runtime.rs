@@ -133,6 +133,9 @@ const SELF_TEST_WINDOW_END_SECS_OF_DAY_IST: u32 = 15 * 3600;
 /// Self-test end-to-end deadline: a cycle stuck longer than this fails
 /// loudly and latches for the day (no retry storm).
 const SELF_TEST_TIMEOUT_SECS: u64 = 180;
+/// The self-test outcome when today's feed-time alarm blocks entries (plan
+/// item UTC-SAFETY): skipped, never a failure.
+const SELF_TEST_SKIPPED_FEED_TIME_ALARM: &str = "skipped_feed_time_alarm";
 /// Max marks drained per select! wake (bounds one arm's hold on the task).
 const MARK_BATCH_MAX: usize = 256;
 /// Broadcast-lag escalation threshold (mirrors the trading_pipeline
@@ -469,6 +472,7 @@ pub fn spawn_order_runtime(params: OrderRuntimeParams) -> tokio::task::JoinHandl
                 leg_pnl_tx: leg_pnl_tx.clone(),
                 live_fill_events: live_fill_events.clone(),
                 live_fill_positions: live_fill_positions.clone(),
+                safety: &crate::trade_safety::FEED_TIME_BLOCK,
             };
             let mark_rx_shared = Arc::clone(&mark_rx);
             let live_fill_shared = live_fill_rx.clone();
@@ -553,6 +557,9 @@ struct RuntimeCtx {
             crate::live_fill::chain::PositionReport,
         >,
     >,
+    /// The trade-safety switch Gates C and D read (plan item UTC-SAFETY):
+    /// the process switch in production, a test's own in tests.
+    safety: &'static crate::trade_safety::SafetySwitch,
 }
 
 // LF-6b: the live paper fill chain's arm (paper commands → dry-run OMS).
@@ -857,9 +864,9 @@ impl SelfTestState {
             code = ErrorCode::OmsGapDryRunSafety.code_str(),
             source = "selftest_skipped",
             outcome,
-            "paper self-test did not run today — no live price mark is \
-             available, so the order machinery was not exercised (this is not \
-             a failure of the machinery)"
+            "paper self-test did not run today ({outcome}: no live price mark, or \
+             today's feed-time alarm blocks entries), so the order machinery was \
+             not exercised (this is not a failure of the machinery)"
         );
         metrics::counter!("tv_paper_selftest_total", "outcome" => outcome).increment(1);
         self.phase = SelfTestPhase::Idle;
@@ -1759,7 +1766,14 @@ async fn process_mark(
         && price.is_finite()
         && price > 0.0
     {
-        start_self_test_entry(oms, self_test, mark.security_id, mark.segment_code).await;
+        start_self_test_entry(
+            oms,
+            self_test,
+            ctx.safety,
+            mark.security_id,
+            mark.segment_code,
+        )
+        .await;
         // HP-2: the entry placement changed the pending set.
         book.rebuild_pending_paper(oms);
     }
@@ -2141,9 +2155,17 @@ async fn drive_self_test_timers(
 async fn start_self_test_entry(
     oms: &mut OrderManagementSystem,
     self_test: &mut SelfTestState,
+    safety: &crate::trade_safety::SafetySwitch,
     sid: u64,
     _segment_code: u8,
 ) {
+    // Gate D (plan item UTC-SAFETY): today's feed-time alarm is on, so the
+    // self-test opens no entry. Skipped for the day, never a failure.
+    let today = ist_day_number(chrono::Utc::now().timestamp());
+    if safety.entries_blocked_on(today).is_some() {
+        self_test.skip(today, SELF_TEST_SKIPPED_FEED_TIME_ALARM);
+        return;
+    }
     let request = PlaceOrderRequest {
         security_id: sid,
         exchange_segment: tickvault_common::types::ExchangeSegment::IdxI,
@@ -2337,6 +2359,7 @@ mod tests {
             leg_pnl_tx: None,
             live_fill_events: None,
             live_fill_positions: None,
+            safety: Box::leak(Box::new(crate::trade_safety::SafetySwitch::new())),
         }
     }
 
@@ -3262,6 +3285,72 @@ mod tests {
             self_test.phase,
             SelfTestPhase::AwaitingMark,
             "a non-index mark must not pick the self-test sid (E4)"
+        );
+    }
+
+    /// Gate D (plan item UTC-SAFETY): with today's feed-time alarm on, the
+    /// index mark that would start the self-test places NO entry; the day is
+    /// skipped (latched), never failed. Without the alarm the same mark
+    /// places the entry.
+    #[tokio::test]
+    async fn test_selftest_is_skipped_not_failed_while_the_feed_time_alarm_is_on() {
+        let ctx = make_ctx();
+        let mut oms = make_oms();
+        let mut risk = make_risk();
+        let mut book = BookState::new();
+        let mut self_test = SelfTestState::new();
+        self_test.phase = SelfTestPhase::AwaitingMark;
+        self_test.started_at = std::time::Instant::now();
+        let today = ist_day_number(chrono::Utc::now().timestamp());
+        assert_eq!(today, crate::trade_safety::ist_day_now());
+        assert!(
+            ctx.safety
+                .engage(today, crate::trade_safety::CAUSE_PRICES_OUTSIDE_SESSION)
+        );
+        let index_mark = MarkUpdate {
+            security_id: 13,
+            segment_code: ExchangeSegment::IdxI.binary_code(),
+            price: 24_000.0,
+        };
+        process_mark(
+            &mut oms,
+            &mut risk,
+            &mut book,
+            &mut self_test,
+            &ctx,
+            index_mark,
+            true,
+            None,
+        )
+        .await;
+        assert_eq!(self_test.phase, SelfTestPhase::Idle, "skipped");
+        assert_eq!(self_test.last_run_day, today, "the skip latches the day");
+        assert!(
+            !book.has_pending_paper(13, ExchangeSegment::IdxI),
+            "no entry was placed"
+        );
+        // The same mark with no alarm (a fresh switch) places the entry.
+        let ctx = make_ctx();
+        let mut self_test = SelfTestState::new();
+        self_test.phase = SelfTestPhase::AwaitingMark;
+        process_mark(
+            &mut oms,
+            &mut risk,
+            &mut book,
+            &mut self_test,
+            &ctx,
+            index_mark,
+            true,
+            None,
+        )
+        .await;
+        assert!(
+            matches!(
+                self_test.phase,
+                SelfTestPhase::AwaitingEntryFill { .. } | SelfTestPhase::AwaitingCloseFill { .. }
+            ),
+            "the entry was placed (and paper-filled on the same mark): {:?}",
+            self_test.phase
         );
     }
 

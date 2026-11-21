@@ -117,6 +117,12 @@ pub enum Finished<M> {
         order: HeldOrder<M>,
         refusal: FillRefusal,
     },
+    /// An ENTRY cut by [`PendingBook::block_entries`] (the trade-safety
+    /// switch, plan item UTC-SAFETY): no order is sent. Its share of the
+    /// seconds it settled before the cut is not given back, the same as a
+    /// tainted order's (`settle_key`), so its share is NOT known to the
+    /// daily re-pricing.
+    Blocked { order: HeldOrder<M> },
 }
 
 #[derive(Debug)]
@@ -153,6 +159,9 @@ struct Slot<M> {
     /// A late price moved a settled second past the LIMIT (LF-9 review).
     late_fill_price: bool,
     tainted: Option<TaintReason>,
+    /// Cut by [`PendingBook::block_entries`]: finishes at once as
+    /// [`Finished::Blocked`], takes no further share, is never waited on.
+    blocked: bool,
 }
 
 /// Fill seconds per held order that can carry a late price while they wait
@@ -193,6 +202,7 @@ impl<M> PendingBook<M> {
                 late_widen_len: 0,
                 late_fill_price: false,
                 tainted: None,
+                blocked: false,
             })
             .collect();
         Self {
@@ -232,9 +242,32 @@ impl<M> PendingBook<M> {
         }
         self.slots
             .iter()
+            .filter(|s| !s.blocked)
             .filter_map(|s| s.order.as_ref())
             .filter(|o| o.key_index == ki && !o.reduce_only && o.side == side)
             .fold(0u64, |acc, o| acc.saturating_add(o.qty))
+    }
+
+    /// Cuts every held ENTRY (not reduce-only) at once (plan item
+    /// UTC-SAFETY, 2026-11-21 review finding 3): today's feed-time alarm is
+    /// on, so none of them will be sent. A cut entry finishes at the next
+    /// [`Self::collect_ready`] as [`Finished::Blocked`], takes no share of any
+    /// second settled after the cut, adds nothing to [`Self::held_entry_qty`],
+    /// and no exit waits for it, so an exit of the same instrument is filled
+    /// and finished exactly as if the entry had not been held from the cut on.
+    /// Exits are untouched. Returns how many it cut. O(64), no allocation.
+    pub fn block_entries(&mut self) -> usize {
+        if self.held == 0 {
+            return 0;
+        }
+        let mut cut = 0usize;
+        for slot in &mut self.slots {
+            if slot.order.as_ref().is_some_and(|o| !o.reduce_only) && !slot.blocked {
+                slot.blocked = true;
+                cut += 1;
+            }
+        }
+        cut
     }
 
     /// Holds an order. Gives it back when all [`MAX_PENDING_ORDERS`] slots are
@@ -262,6 +295,7 @@ impl<M> PendingBook<M> {
         slot.late_widen_len = 0;
         slot.late_fill_price = false;
         slot.tainted = None;
+        slot.blocked = false;
         slot.order = Some(order);
         self.per_key[ki] = self.per_key[ki].saturating_add(1);
         self.held += 1;
@@ -343,7 +377,7 @@ impl<M> PendingBook<M> {
             // whole second. A share it took BEFORE that was known is not
             // given back; the daily re-pricing reads the later orders as
             // unavailable (`held_share_known`).
-            if slot.tainted.is_some() || slot.late_price || slot.late_fill_price {
+            if slot.tainted.is_some() || slot.late_price || slot.late_fill_price || slot.blocked {
                 slot.settled = slot.seconds.len();
                 continue;
             }
@@ -529,7 +563,11 @@ impl<M> PendingBook<M> {
             let Some(o) = slot.order.as_ref() else {
                 continue;
             };
-            let ready = if slot.late_price || slot.late_fill_price || slot.tainted.is_some() {
+            let ready = if slot.blocked
+                || slot.late_price
+                || slot.late_fill_price
+                || slot.tainted.is_some()
+            {
                 true
             } else if let Some(s) = slot.trigger_sec {
                 // Second s+1's price is a candidate for s.
@@ -550,11 +588,13 @@ impl<M> PendingBook<M> {
         out.sort_unstable_by_key(|&i| slots[i].seq);
     }
 
-    /// Whether instrument `ki` holds an order inserted before `seq`. O(64).
+    /// Whether instrument `ki` holds an order inserted before `seq`, other
+    /// than an entry cut by [`Self::block_entries`] (it sends nothing, so an
+    /// exit never waits for it). O(64).
     fn earlier_held(&self, ki: u32, seq: u64) -> bool {
-        self.slots
-            .iter()
-            .any(|s| s.seq < seq && s.order.as_ref().is_some_and(|o| o.key_index == ki))
+        self.slots.iter().any(|s| {
+            s.seq < seq && !s.blocked && s.order.as_ref().is_some_and(|o| o.key_index == ki)
+        })
     }
 
     /// Finishes the order in slot `i` (from [`Self::collect_ready`]) and frees
@@ -568,6 +608,12 @@ impl<M> PendingBook<M> {
             *c = c.saturating_sub(1);
         }
         self.held = self.held.saturating_sub(1);
+        if slot.blocked {
+            slot.blocked = false;
+            slot.seconds.clear();
+            slot.gave.clear();
+            return Some(Finished::Blocked { order });
+        }
         if slot.late_price {
             return Some(Finished::LatePrice { order });
         }
@@ -2148,5 +2194,115 @@ mod tests {
             proptest::prop_assert_eq!(a, b);
             proptest::prop_assert_eq!(sa.slices(), sb.slices());
         }
+    }
+
+    /// Drives one instrument's seconds through `p` from `from` to `to`,
+    /// finishing every ready order each second. Returns, per finished order
+    /// meta, `(finish second, filled qty, vwap)` (`None` fill for an order
+    /// that finished without a fill summary).
+    /// One finished order: `(meta, finish second, Some((filled qty, vwap)))`.
+    type DoneRow = (u32, i64, Option<(u64, Option<i64>)>);
+
+    fn drive_book(p: &mut PendingBook<u32>, from: i64, to: i64, out: &mut Vec<DoneRow>) {
+        let c = clock();
+        let mut ready = Vec::with_capacity(MAX_PENDING_ORDERS);
+        for t in from..=to {
+            p.on_second(0, sec(t, 100));
+            p.collect_ready((t + 2) * NS, &c, &mut ready);
+            for &i in &ready.clone() {
+                match p.finish(i) {
+                    Some(Finished::Filled { order, summary, .. }) => {
+                        out.push((
+                            order.meta,
+                            t,
+                            Some((summary.filled_qty, summary.vwap_paise)),
+                        ));
+                    }
+                    Some(
+                        Finished::Blocked { order }
+                        | Finished::Tainted { order, .. }
+                        | Finished::LatePrice { order }
+                        | Finished::LateFillPrice { order }
+                        | Finished::Refused { order, .. },
+                    ) => out.push((order.meta, t, None)),
+                    None => {}
+                }
+            }
+        }
+    }
+
+    /// Regression: 2026-11-21 (review finding 3) — the trade-safety switch
+    /// refused a held ENTRY only when it finished, so until then it kept
+    /// taking its share of every second and an exit of the same instrument
+    /// waited for it (`earlier_held`): the blocked entry delayed and
+    /// short-filled the exit. `block_entries` now cuts it the moment the
+    /// switch goes on: from the cut, the exit is filled and finished exactly
+    /// as in a run where the entry was never held.
+    #[test]
+    fn test_regression_2026_11_21_block_entries_frees_the_exit_of_a_held_entry() {
+        const ENTRY: u32 = 1;
+        const EXIT: u32 = 2;
+        // The entry was decided ten seconds before the exit, so the cut lands
+        // in the middle of the entry's window, after it settled ten seconds.
+        let entry = || {
+            let mut e = order(0, 1_000);
+            e.decision_bar.sec = DEC - 10;
+            e.candle_open_secs = DEC - 69;
+            e.candle_end_secs = DEC - 9;
+            e.meta = ENTRY;
+            e
+        };
+        let exit = || {
+            let mut x = order(0, 50);
+            x.side = Side::Sell;
+            x.limit_paise = 1;
+            x.reduce_only = true;
+            x.meta = EXIT;
+            x
+        };
+        let run = |with_entry: bool, cut: bool| {
+            let mut p = PendingBook::<u32>::new(60, 1);
+            let mut out = Vec::new();
+            if with_entry {
+                p.insert(entry()).expect("room");
+                drive_book(&mut p, DEC - 9, DEC, &mut out);
+            }
+            p.insert(exit()).expect("room");
+            if cut {
+                assert_eq!(p.block_entries(), usize::from(with_entry));
+                assert_eq!(
+                    p.held_entry_qty(0, Side::Buy),
+                    0,
+                    "a cut entry sizes nothing"
+                );
+            }
+            drive_book(&mut p, DEC + 1, DEC + 80, &mut out);
+            assert_eq!(p.held(), 0, "every order finished: {out:?}");
+            let e = out.iter().find(|(m, ..)| *m == ENTRY).copied();
+            let x = out.iter().find(|(m, ..)| *m == EXIT).copied();
+            (e, x)
+        };
+        let (_, alone) = run(false, false);
+        let (cut_entry, with_cut) = run(true, true);
+        assert_eq!(with_cut, alone, "the exit as if the entry never existed");
+        let alone = alone.expect("the exit finished");
+        assert_eq!(alone.2.map(|f| f.0), Some(50), "it fills whole");
+        assert_eq!(
+            cut_entry.map(|(_, t, f)| (t, f)),
+            Some((DEC + 1, None)),
+            "the cut entry finishes at the next collection, unpriced"
+        );
+        // Non-vacuity: without the cut (the old Gate-B-only behaviour) the
+        // exit waits behind the entry and finishes later.
+        let (_, old) = run(true, false);
+        let old = old.expect("the exit finished");
+        assert!(old.1 > alone.1, "old {old:?} vs alone {alone:?}");
+        // Cutting twice cuts nothing more, and exits are never cut.
+        let mut p = PendingBook::<u32>::new(60, 1);
+        p.insert(exit()).expect("room");
+        assert_eq!(p.block_entries(), 0);
+        p.insert(entry()).expect("room");
+        assert_eq!(p.block_entries(), 1);
+        assert_eq!(p.block_entries(), 0);
     }
 }
