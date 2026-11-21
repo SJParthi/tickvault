@@ -1,6 +1,8 @@
-//! DHAT: the core dispatcher allocates nothing while the Dhan trade-time
-//! correction is ARMED (scope lock 2026-11-20). The unarmed path is gated by
-//! `dhat_allocation.rs`; this binary publishes an armed table first.
+//! DHAT: the core dispatcher allocates nothing while correcting Dhan trade
+//! times after the 2026-11-20 00:00 IST cutover (scope lock 2026-11-21): the
+//! corrected path, the cap refusal (an IST-epoch print), the band refusal
+//! (raw 0) and the unstamped count. Pre-cutover receipts are gated by
+//! `dhat_allocation.rs`.
 
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
@@ -8,7 +10,6 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
 mod dhat_support;
 
 use tickvault_common::constants::{QUOTE_PACKET_SIZE, TICKER_PACKET_SIZE};
-use tickvault_storage::ltt_correction::{LttEntry, LttTable, install_table, receipt_ist_day};
 
 /// 2026-11-20 11:00:00 IST as a UTC receipt.
 const RECEIPT: i64 = 1_795_152_600 * 1_000_000_000;
@@ -26,25 +27,23 @@ fn packet(code: u8, size: usize, ltt_offset: usize, segment: u8, ltt: u32) -> Ve
 }
 
 #[test]
-fn dhat_armed_ltt_correction_dispatch_is_zero_alloc() {
+fn dhat_utc_ltt_correction_dispatch_is_zero_alloc() {
     let _profiler = dhat::Profiler::builder().testing().build();
-    let mut table = LttTable::empty();
-    assert!(table.arm(
-        receipt_ist_day(RECEIPT),
-        LttEntry {
-            id: 0,
-            segment: 0,
-            from_nanos: RECEIPT - 1_000_000_000,
-            to_nanos: i64::MAX,
-        },
-    ));
-    install_table(table);
     let confirmed = packet(1, TICKER_PACKET_SIZE, 12, 0, 1_795_152_600);
     let unconfirmed = packet(4, QUOTE_PACKET_SIZE, 14, 2, 1_795_152_000);
     let normal = packet(1, TICKER_PACKET_SIZE, 12, 0, 1_795_152_600 + 19_800);
+    let zero = packet(4, QUOTE_PACKET_SIZE, 14, 2, 0);
     tickvault_core::parser::prewarm_dispatcher_counters();
-    // Warm the ArcSwap thread-local debt slot before measuring.
     let _ = tickvault_core::parser::dispatch_frame(&confirmed, RECEIPT);
+    // Outside the measured window: the corrected path really corrects.
+    match tickvault_core::parser::dispatch_frame(&confirmed, RECEIPT) {
+        Ok(tickvault_core::parser::ParsedFrame::Tick(t)) => {
+            assert_eq!(t.exchange_timestamp, 1_795_152_600 + 19_800);
+        }
+        other => panic!("not a tick: {other:?}"),
+    }
+    let refused_before = tickvault_storage::ltt_correction::refusal_counts();
+    let unstamped_before = tickvault_storage::ltt_correction::unstamped_count();
     let (_, blocks) = dhat_support::measure_with_phantom_retry(
         0,
         0,
@@ -55,12 +54,32 @@ fn dhat_armed_ltt_correction_dispatch_is_zero_alloc() {
                 assert!(tickvault_core::parser::dispatch_frame(&confirmed, r).is_ok());
                 assert!(tickvault_core::parser::dispatch_frame_uncounted(&unconfirmed, r).is_ok());
                 assert!(tickvault_core::parser::dispatch_frame(&normal, r).is_ok());
+                assert!(tickvault_core::parser::dispatch_frame(&zero, r).is_ok());
+                assert!(
+                    tickvault_core::parser::dispatch_frame_uncounted_unstamped(&confirmed, r)
+                        .is_ok()
+                );
             }
         },
     );
     assert_eq!(
         blocks, 0,
-        "the armed correction must not allocate on the dispatch path"
+        "the trade-time correction must not allocate on the dispatch path"
     );
-    install_table(LttTable::empty());
+    // Non-vacuity (2026-11-21 review): every path the header names ran inside
+    // the window, read from the process counters (outside the window).
+    let refused = tickvault_storage::ltt_correction::refusal_counts();
+    assert!(
+        refused.cap.saturating_sub(refused_before.cap) >= 10_000,
+        "the cap refusal (IST-epoch print) ran: {refused:?}"
+    );
+    assert!(
+        refused.band.saturating_sub(refused_before.band) >= 10_000,
+        "the band refusal (raw 0) ran: {refused:?}"
+    );
+    assert!(
+        tickvault_storage::ltt_correction::unstamped_count().saturating_sub(unstamped_before)
+            >= 10_000,
+        "the unstamped path ran"
+    );
 }

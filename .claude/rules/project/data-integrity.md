@@ -212,6 +212,18 @@ day `exchange_timestamp` is the corrected IST value. Raw WAL and S3 bytes are
 never changed. On every normal day nothing is armed and the rule above is
 unchanged. Switch: `[dhan_feed] ltt_utc_autocorrect` (`off` = no correction).
 
+### 2026-11-21 (SECOND) — Dhan Live LTT is UTC epoch from WAL receipt 2026-11-20 00:00 IST (permanent)
+
+From WAL receipt 2026-11-20 00:00 IST, Dhan LTT is UTC epoch, so IST = raw +
+19,800 (ticket #6684672: "UTC-based epoch is now the permanent format for all
+Live Market Feed timestamps"). Earlier receipts stay IST epoch, unchanged. The
+correction is still made to the trade time in the core dispatcher, never in the
+`ts` computation, so `ts = exchange_timestamp × 1e9` stays true; it is now a
+pure function of (raw, receipt) with no armed record, and the config switch no
+longer turns it off (scope lock §"2026-11-21"). This supersedes the "only from
+a saved, armed per-IST-day record", "on every normal day nothing is armed" and
+"`off` = no correction" wording above.
+
 ### 2026-10-27 — `tick_quotes` (repeat quotes, owner Quote 41)
 
 A main-feed packet whose exchange trade time is more than 2 s older than its

@@ -472,7 +472,7 @@ pub const ALARM_PHRASES: [(&str, &str); 87] = [
     ),
     (
         "errcode-dhan-feed-time-01",
-        "🔷 DHAN: live prices still carry the wrong time even after our fix, or no candle formed for 10 minutes — today is held for repair; raw data is kept",
+        "🔷 DHAN: live prices carry the wrong time even after our fix, Dhan switched its time format back, or no candle formed for 10 minutes — today is held for repair; raw data is kept",
     ),
     (
         "errcode-clock-skew-01",

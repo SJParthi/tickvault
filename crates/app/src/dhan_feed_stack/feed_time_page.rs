@@ -20,6 +20,12 @@
 //! thread: the once-a-day latch and the day's hold marker are written THERE,
 //! never on the drain (§2.24 REJECT "persisting the latch on the drain"). A
 //! restart restores the latch, so a cause never pages twice in a day.
+//!
+//! ⚠ ADDED 2026-11-21 (noise lock §2.24-a, daily-universe Quote 63): the
+//! trade-time reversion guard pages through its own `error!`; each 30 s scan
+//! reads the guard's page count and hands that day to the same writer thread,
+//! which writes the day's `.hold` (no latch marker; the guard's latch is in
+//! RAM). See [`FeedTimePage::hold_after_reversion_page`].
 
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 
@@ -43,12 +49,14 @@ pub(super) const CAUSE_A_FAR_SECS: i64 = 300;
 pub(super) const CAUSE_B_SCANS: u32 = 20;
 /// A Muhurat day's trade-time window: the published session, 15 min before
 /// and 10 min after (as 09:15-15:30 widens to 09:00-15:40).
-const MUHURAT_WINDOW_LEAD_SECS: u32 = 15 * 60;
-const MUHURAT_WINDOW_TAIL_SECS: u32 = 10 * 60;
+/// One source with the reversion guard's window (review fix 2026-11-21).
+const MUHURAT_WINDOW_LEAD_SECS: u32 = tickvault_storage::ltt_correction::MUHURAT_GUARD_LEAD_SECS;
+const MUHURAT_WINDOW_TAIL_SECS: u32 = tickvault_storage::ltt_correction::MUHURAT_GUARD_TAIL_SECS;
 /// Daily-marker task names (one per cause), kept 7 days.
 const TASK_CAUSE_A: &str = "feed-time-page-a";
 const TASK_CAUSE_B: &str = "feed-time-page-b";
-/// Hand-offs the writer thread can hold (two a day at most).
+/// Hand-offs the writer thread can hold (at most three a day: causes A and
+/// B, and one reversion hold).
 const PERSIST_DEPTH: usize = 4;
 
 /// Which cause fired.
@@ -58,6 +66,10 @@ pub(super) enum Cause {
     PricesOutsideSession,
     /// Frames arriving and no candle sealed for 10 minutes.
     NoCandles,
+    /// The trade-time reversion guard paged (noise lock §2.24-a): its own
+    /// `error!` is the page; this cause only carries the day to the writer
+    /// thread for the hold (daily-universe Quote 63). No latch marker.
+    FormatReverted,
 }
 
 impl Cause {
@@ -65,6 +77,7 @@ impl Cause {
         match self {
             Self::PricesOutsideSession => 0,
             Self::NoCandles => 1,
+            Self::FormatReverted => 2,
         }
     }
 
@@ -72,13 +85,17 @@ impl Cause {
         match self {
             Self::PricesOutsideSession => "prices_outside_session",
             Self::NoCandles => "no_candles",
+            Self::FormatReverted => "dhan_time_format_reverted",
         }
     }
 
-    const fn task(self) -> &'static str {
+    /// The daily latch marker (causes A and B; the reversion guard keeps its
+    /// own latch in RAM, so it writes none).
+    const fn task(self) -> Option<&'static str> {
         match self {
-            Self::PricesOutsideSession => TASK_CAUSE_A,
-            Self::NoCandles => TASK_CAUSE_B,
+            Self::PricesOutsideSession => Some(TASK_CAUSE_A),
+            Self::NoCandles => Some(TASK_CAUSE_B),
+            Self::FormatReverted => None,
         }
     }
 }
@@ -208,6 +225,16 @@ pub(super) struct FeedTimePage {
     restored_day: i64,
     restored: [bool; 2],
     persist: Option<SyncSender<(NaiveDate, Cause)>>,
+    /// Reversion pages already seen (the guard's count).
+    reversion_pages_seen: u32,
+    /// The last day a reversion hold was handed off (once per day).
+    reversion_held_day: i64,
+    /// A reversion page's day not yet handed off (writer missing or full):
+    /// every later scan tries again (review fix 2026-11-21).
+    reversion_pending_day: Option<i64>,
+    /// `(IST day, cause bits)` of hand-off failures already logged, so a
+    /// retry every 30 s logs once per cause per day.
+    handoff_failures_logged: (i64, u8),
 }
 
 fn restore_latch(day: i64) -> [bool; 2] {
@@ -222,7 +249,9 @@ fn restore_latch(day: i64) -> [bool; 2] {
 
 fn run_persist(rx: &Receiver<(NaiveDate, Cause)>) {
     while let Ok((date, cause)) = rx.recv() {
-        if let Err(err) = crate::daily_task_marker::try_write_daily_marker(cause.task(), date) {
+        if let Some(task) = cause.task()
+            && let Err(err) = crate::daily_task_marker::try_write_daily_marker(task, date)
+        {
             error!(
                 code = ErrorCode::DhanLtt02RecordUnsettled.code_str(),
                 source = "feed_time_latch_write_failed",
@@ -258,16 +287,40 @@ impl FeedTimePage {
         let day = super::ist_day_number_now();
         let restored = restore_latch(day);
         let (tx, rx) = sync_channel(PERSIST_DEPTH);
-        let persist = std::thread::Builder::new()
+        let persist = match std::thread::Builder::new()
             .name("tv-feed-time-latch".to_string())
             .spawn(move || run_persist(&rx))
-            .ok()
-            .map(|_| tx);
+        {
+            Ok(_) => Some(tx),
+            Err(err) => {
+                // Review fix 2026-11-21: this was silent, and every later
+                // hold hand-off then did nothing (noise lock §2.24-a).
+                error!(
+                    code = ErrorCode::DhanLtt02RecordUnsettled.code_str(),
+                    source = "feed_time_writer_missing",
+                    %err,
+                    "Could not start the feed-time page's writer; a feed-time page today                      cannot hold its day. Write data/state/held-days/<date>.hold by hand if                      one fires."
+                );
+                None
+            }
+        };
+        Self::with_writer(day, restored, persist)
+    }
+
+    fn with_writer(
+        day: i64,
+        restored: [bool; 2],
+        persist: Option<SyncSender<(NaiveDate, Cause)>>,
+    ) -> Self {
         Self {
             episode: FeedTimeEpisode::new(day, restored),
             restored_day: day,
             restored,
             persist,
+            reversion_pages_seen: 0,
+            reversion_held_day: i64::MIN,
+            reversion_pending_day: None,
+            handoff_failures_logged: (i64::MIN, 0),
         }
     }
 
@@ -315,19 +368,61 @@ impl FeedTimePage {
         for cause in fired.into_iter().flatten() {
             self.fire(day, cause);
         }
+        let ltt = ingest.ltt.counts();
+        self.hold_after_reversion_page(ltt.reversion_pages, ltt.last_reversion_day);
     }
 
+    /// Holds the day of a reversion page (daily-universe Quote 63; noise lock
+    /// §2.24-a): when the guard's page count rose since the last scan, hands
+    /// `day` to the writer thread once (it writes the `.hold`, off the drain).
+    /// A hand-off that fails (writer missing, queue full) is logged as
+    /// DHAN-LTT-02 and tried again at the next scan; the day is marked held
+    /// only once it was handed off. Logs no page of its own: the guard's
+    /// `error!` was the page. O(1), one `try_send`, no allocation. Returns
+    /// true when it handed the day off.
+    // TEST-EXEMPT: covered by test_regression_2026_11_21_a_reversion_page_holds_its_day_once
+    pub(super) fn hold_after_reversion_page(&mut self, pages: u32, day: i64) -> bool {
+        if pages != self.reversion_pages_seen {
+            self.reversion_pages_seen = pages;
+            if day != self.reversion_held_day {
+                self.reversion_pending_day = Some(day);
+            }
+        }
+        let Some(pending) = self.reversion_pending_day else {
+            return false;
+        };
+        let Some(date) = ist_day_date(pending) else {
+            self.reversion_pending_day = None;
+            return false;
+        };
+        if !self.hand_off(pending, date, Cause::FormatReverted) {
+            return false;
+        }
+        self.reversion_held_day = pending;
+        self.reversion_pending_day = None;
+        true
+    }
+
+    /// Pages cause A or B. The reversion guard pages through its own
+    /// `error!` (§2.24-a REJECT: "a second DHAN-FEED-TIME-01 line from the
+    /// hold hand-off"), so `FormatReverted` never reaches here.
     fn fire(&mut self, day: i64, cause: Cause) {
+        debug_assert!(
+            cause != Cause::FormatReverted,
+            "fire takes causes A and B only"
+        );
+        let what = match cause {
+            Cause::PricesOutsideSession => {
+                "most index prices carry a time outside market hours (after our correction)"
+            }
+            Cause::NoCandles => "no candle has formed for 10 minutes while prices arrive",
+            Cause::FormatReverted => return,
+        };
         error!(
             code = ErrorCode::DhanFeedTime01TradeTimesWrong.code_str(),
             cause = cause.label(),
-            "Dhan feed times look wrong during the session: {}. Today is held out of the \
-             archive and the export until it is repaired; raw data is kept.",
-            match cause {
-                Cause::PricesOutsideSession =>
-                    "most index prices carry a time outside market hours (after our correction)",
-                Cause::NoCandles => "no candle has formed for 10 minutes while prices arrive",
-            }
+            "Dhan feed times look wrong during the session: {what}. Today is held out of the \
+             archive and the export until it is repaired; raw data is kept."
         );
         if let Some(index) = self.restored.get_mut(cause.index()) {
             *index = true;
@@ -335,16 +430,45 @@ impl FeedTimePage {
         let Some(date) = ist_day_date(day) else {
             return;
         };
-        if let Some(tx) = &self.persist
-            && tx.try_send((date, cause)).is_err()
-        {
-            error!(
-                code = ErrorCode::DhanLtt02RecordUnsettled.code_str(),
-                source = "feed_time_persist_refused",
-                cause = cause.label(),
-                "The feed-time page could not hand today's latch and hold to its writer."
-            );
+        self.hand_off(day, date, cause);
+    }
+
+    /// Hands `date` to the writer thread. Returns true when it was queued; a
+    /// failure logs one DHAN-LTT-02 line per cause per day.
+    fn hand_off(&mut self, day: i64, date: NaiveDate, cause: Cause) -> bool {
+        let queued = match &self.persist {
+            Some(tx) => tx.try_send((date, cause)).is_ok(),
+            None => false,
+        };
+        if queued {
+            return true;
         }
+        let bit = 1u8 << cause.index();
+        if self.handoff_failures_logged.0 != day {
+            self.handoff_failures_logged = (day, 0);
+        }
+        if self.handoff_failures_logged.1 & bit != 0 {
+            return false;
+        }
+        self.handoff_failures_logged.1 |= bit;
+        let source = if self.persist.is_some() {
+            "feed_time_persist_refused"
+        } else {
+            "feed_time_writer_missing"
+        };
+        let what = match cause {
+            Cause::FormatReverted => "the day's hold",
+            Cause::PricesOutsideSession | Cause::NoCandles => "today's latch and hold",
+        };
+        error!(
+            code = ErrorCode::DhanLtt02RecordUnsettled.code_str(),
+            source,
+            cause = cause.label(),
+            %date,
+            "The feed-time page could not hand {what} to its writer. Write \
+             data/state/held-days/<date>.hold by hand before the evening archive runs."
+        );
+        false
     }
 }
 
@@ -463,6 +587,112 @@ mod tests {
         assert_eq!(
             ep.scan(DAY + 1, true, [false; 2], t3)[0],
             Some(Cause::PricesOutsideSession)
+        );
+    }
+
+    fn page_with(tx: Option<SyncSender<(NaiveDate, Cause)>>) -> FeedTimePage {
+        FeedTimePage::with_writer(DAY, [false; 2], tx)
+    }
+
+    #[test]
+    fn test_regression_2026_11_21_a_reversion_page_holds_its_day_once() {
+        // Regression: 2026-11-21 review — a reversion page (noise lock
+        // §2.24-a) told the owner the day was held, and nothing held it
+        // (daily-universe Quote 63). The scan now hands the page's day to
+        // the writer thread, once a day, with no latch marker.
+        let (tx, rx) = sync_channel(PERSIST_DEPTH);
+        let mut page = page_with(Some(tx));
+        let date = ist_day_date(DAY).expect("date");
+        assert!(!page.hold_after_reversion_page(0, 0), "no page yet");
+        assert!(rx.try_recv().is_err());
+        assert!(page.hold_after_reversion_page(1, DAY));
+        assert_eq!(rx.try_recv().ok(), Some((date, Cause::FormatReverted)));
+        // Unchanged count: nothing more.
+        assert!(!page.hold_after_reversion_page(1, DAY));
+        // The second segment pages the same day: already held.
+        assert!(!page.hold_after_reversion_page(2, DAY));
+        assert!(rx.try_recv().is_err());
+        // A page on the next day holds that day.
+        assert!(page.hold_after_reversion_page(3, DAY + 1));
+        assert_eq!(
+            rx.try_recv().ok(),
+            Some((ist_day_date(DAY + 1).expect("date"), Cause::FormatReverted))
+        );
+        // The hold carries no latch marker and names the reason.
+        assert_eq!(Cause::FormatReverted.task(), None);
+        assert_eq!(Cause::FormatReverted.label(), "dhan_time_format_reverted");
+        assert_eq!(Cause::PricesOutsideSession.task(), Some(TASK_CAUSE_A));
+        // With no writer thread nothing is handed off: it is not marked
+        // held and every later scan tries again (review fix 2026-11-21: it
+        // used to return true and mark the day held silently).
+        let mut lonely = page_with(None);
+        assert!(!lonely.hold_after_reversion_page(1, DAY));
+        assert!(!lonely.hold_after_reversion_page(1, DAY), "retried");
+        assert_eq!(lonely.reversion_pending_day, Some(DAY));
+        assert_ne!(lonely.reversion_held_day, DAY);
+        assert_eq!(
+            lonely.handoff_failures_logged,
+            (DAY, 1 << Cause::FormatReverted.index()),
+            "the failure is logged once per cause per day"
+        );
+    }
+
+    #[test]
+    fn test_regression_2026_11_21_a_full_writer_queue_holds_on_the_next_scan() {
+        // A hand-off refused by a full queue is tried again at the next scan
+        // and the day is held once there is room.
+        let (tx, rx) = sync_channel(1);
+        tx.try_send((ist_day_date(DAY).expect("date"), Cause::NoCandles))
+            .expect("fill");
+        let mut page = page_with(Some(tx));
+        assert!(!page.hold_after_reversion_page(1, DAY), "queue full");
+        assert_eq!(page.reversion_pending_day, Some(DAY));
+        assert!(rx.try_recv().is_ok(), "drain the earlier hand-off");
+        assert!(
+            page.hold_after_reversion_page(1, DAY),
+            "handed off on retry"
+        );
+        assert_eq!(
+            rx.try_recv().ok(),
+            Some((ist_day_date(DAY).expect("date"), Cause::FormatReverted))
+        );
+        assert_eq!(page.reversion_pending_day, None);
+        assert!(!page.hold_after_reversion_page(1, DAY), "once a day");
+    }
+
+    #[test]
+    fn test_fire_is_never_called_with_the_reversion_cause() {
+        // §2.24-a REJECT: no second DHAN-FEED-TIME-01 line from the hold
+        // hand-off. Only the scan's A/B loop calls `fire`, and the reversion
+        // cause is handed off through `hold_after_reversion_page`.
+        let src = include_str!("feed_time_page.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("tests")];
+        let calls: Vec<&str> = prod
+            .match_indices("self.fire(")
+            .map(|(i, _)| &prod[i..prod[i..].find(';').map_or(prod.len(), |e| i + e)])
+            .collect();
+        assert_eq!(calls, vec!["self.fire(day, cause)"], "{calls:?}");
+        assert!(!prod.contains("fire(day, Cause::FormatReverted)"));
+        let scan = &prod[prod
+            .find("pub(super) fn scan(&mut self, ingest")
+            .expect("scan")..];
+        assert!(scan.contains("for cause in fired.into_iter().flatten()"));
+    }
+
+    #[test]
+    fn test_scan_reads_the_guard_page_count_for_the_hold() {
+        // The scan, the only caller, wires the guard's page count and day in.
+        let src = include_str!("feed_time_page.rs");
+        let scan = &src[src
+            .find("pub(super) fn scan(&mut self, ingest")
+            .expect("scan")..];
+        let scan = &scan[..scan.find("\n    }\n").expect("end")];
+        assert!(scan.contains("let ltt = ingest.ltt.counts();"), "{scan}");
+        assert!(
+            scan.contains(
+                "self.hold_after_reversion_page(ltt.reversion_pages, ltt.last_reversion_day);"
+            ),
+            "{scan}"
         );
     }
 

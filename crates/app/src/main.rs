@@ -4771,7 +4771,6 @@ async fn build_shared_infra(
         NotificationService::spawn_episode_ticker(&notifier);
         notifier
     };
-    tickvault_app::dhan_feed_stack::install_ltt_notice(&notifier); // §2.24: one notice a day
     // Boot bubble (2026-07-09): declare which feed lines the checklist
     // shows as pending from its first page.
     notifier.set_boot_expectations(config.feeds.dhan_enabled);

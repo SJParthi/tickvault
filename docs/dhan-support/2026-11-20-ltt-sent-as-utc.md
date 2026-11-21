@@ -83,3 +83,31 @@ The same instruments on 19 November 2026 had a Last Trade Time within about a se
 Thank you,
 Parthiban Subramanian
 Client ID `1106656882`
+
+---
+
+## Dhan's answer (received 2026-11-21)
+
+**Ticket:** #6684672. **Received:** 21 Nov 2026, 10:35 UTC (16:05 IST). Verbatim as relayed to us (the `...` marks text left out of the relay, not ours):
+
+> "Yes, the Live LTT timestamp format has been changed from IST-based epoch to UTC-based epoch effective 20th November 2026. ... The change was implemented on 20th November. However, an exact implementation timestamp is not available. ... Yes, this change is part of an API restructuring exercise. ... The restructuring was carried out to standardise the timestamp format across all API endpoints. Please note that UTC-based epoch is now the permanent format for all Live Market Feed timestamps. ... As of now, there are no further changes planned regarding the timestamp format. Please note that these changes were implemented before the market opened on 20th November."
+
+### What it settles
+
+| Question | Status | Dhan's words |
+|---|---|---|
+| Was it a deliberate change or a fault? (our Q1) | **Verified: deliberate change** | "changed from IST-based epoch to UTC-based epoch effective 20th November 2026" |
+| When did it start? | **Verified: before the market opened on 20 Nov; no exact time** | "implemented before the market opened on 20th November" / "an exact implementation timestamp is not available" |
+| Which format from Mon 23 Nov? (our Q2) | **Verified: UTC epoch, permanent** | "UTC-based epoch is now the permanent format for all Live Market Feed timestamps" |
+| Was it part of a wider change? | **Verified: yes, an API restructuring** | "part of an API restructuring exercise ... to standardise the timestamp format across all API endpoints" |
+| Will it change again? | **Verified: none planned** | "As of now, there are no further changes planned regarding the timestamp format" |
+| Will the documentation be updated? (part of our Q3) | **Unknown** | not stated in the relayed text |
+| Do other time fields change (depth, order update, historical)? (rest of our Q3) | **Unknown** | "across all API endpoints" suggests other endpoints were also moved to UTC; historical data was already UTC epoch. Not checked yet for order update or depth (depth sockets are switched off) |
+| Was any non-time field changed? (our Q4) | **Unknown** | not stated in the relayed text; on 20 Nov prices, volumes and the book looked normal (our own check) |
+
+### What we did with it
+
+- Owner decisions (cards, 2026-11-21): **"Yes, always UTC (Recommended)"** and **"Before Monday if checks pass (Recommended)"**.
+- Rule: `.claude/rules/project/websocket-connection-scope-lock.md` §"2026-11-21" (full text in `docs/claude-rules-full/project/`). From a WAL receipt of 2026-11-20 00:00 IST every Live Market Feed trade time gets exactly +19,800 s; earlier receipts are unchanged; a page fires if Dhan ever goes back to IST epoch (noise lock §2.24-a).
+- Dated notes added to `docs/dhan-ref/03-live-market-feed-websocket.md` (Section 10 note 1) and `docs/dhan-ref/08-annexure-enums.md` §12b. The original documentation text is kept.
+- No reply needed to close the ticket. A follow-up question on the documentation and on the order update time field can be sent if the owner wants.

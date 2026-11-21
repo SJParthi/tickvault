@@ -5597,3 +5597,26 @@ Why: on 20 Nov 2026 Dhan sent trade times as UTC (see `websocket-connection-scop
 Code `DHAN-FEED-TIME-01` for both page causes (one `error_code_alerts` entry, period 300 s, threshold 1, no `ok_actions`). The latch is per cause per IST day and is persisted off the drain. When a cause fires, that day is auto-held (daily-universe Quote 63).
 
 **REJECT (§2.24):** firing outside the session gate or from replay; judging cause A on Dhan's raw time; more than once per cause per IST day; `ok_actions` or a recovery page; fewer than 20 ticks or 2 scans for A, or under 10 minutes for B; a per-instrument or per-connection dimension; persisting the latch on the drain; more than one notice a day; paging the correction's own coded warnings.
+
+### §2.24-a — 2026-11-21: the daily notice is retired; a third reason pages if Dhan goes back to IST epoch
+
+Dhan confirmed the Live Market Feed trade time is UTC epoch permanently from 20 Nov 2026 (ticket #6684672; `websocket-connection-scope-lock.md` §"2026-11-21"). Owner card (2026-11-21), verbatim: **"Yes, always UTC (Recommended)"** — the correction is always on from 20 Nov and "the detector only as a reversion guard that pages".
+
+- The daily "time correction switched on" notice of §2.24 is retired: the correction no longer arms, so there is nothing to announce.
+- A third reason on `DHAN-FEED-TIME-01`, `source = "dhan_time_format_reverted"`: the reversion guard sees an IST-epoch (`Normal`) verdict on raw, live, WAL-stamped prints. At most once per segment per IST day, live drain only, 09:00–15:40 IST (or the published Muhurat window), broker named. Same `error_code_alerts` entry and filter (`$.code = "DHAN-FEED-TIME-01" && $.level = "ERROR"`), no `ok_actions`, no new alarm, filter or EMF name. With `[dhan_feed] ltt_utc_autocorrect = "shadow"` it is a coded `warn!` only; with `off` there is no guard.
+- Causes A and B of §2.24 are unchanged.
+- **The day is auto-held**, as §2.24 and daily-universe Quote 63 ("A future day on which the feed-time page fires is auto-held", owner card "Yes, hold that day (Recommended)") require: in `act` mode the drain's 30 s feed-time scan reads the guard's page count and hands that day to the same `tv-feed-time-latch` writer thread, which writes `data/state/held-days/<date>.hold` off the drain (one `try_send` on the scan, no allocation). The guard's own `error!` is the only page; the hand-off logs nothing unless the hold cannot be handed off or written (`DHAN-LTT-02`, log only). `shadow` and `off` never hold.
+
+**§2.24 rows that do NOT apply to `dhan_time_format_reverted`** (corrected 2026-11-21, review; basis: the owner card "Yes, always UTC (Recommended)" of 2026-11-21, which approved "the detector only as a reversion guard that pages" with this design, and Quote 63 for the hold). Every other §2.24 row binds it:
+
+| §2.24 row | For this reason instead |
+|---|---|
+| The session gate 09:15–15:30 IST (REJECT "firing outside the session gate") | 09:00–15:40 IST, or the Muhurat window (a reversion is visible from the first packet, and the capture window is where wrong rows are stored) |
+| "The latch is per cause per IST day and is persisted off the drain"; REJECT "more than once per cause per IST day" | One latch per SEGMENT (index, NSE stock) per IST day, held in RAM: at most once per segment per IST day **per process**; a restart can page again that day (the second hold is a no-op) |
+| REJECT "judging cause A on Dhan's raw time" | This reason judges Dhan's RAW trade time by design (it must see the format Dhan sent); causes A and B still judge the corrected time |
+
+Limitation: the per-segment latch is in RAM, so a restart can page a second time that day. The hold is written up to 30 s after the page (one scan); a process that dies inside those 30 s writes no hold, and the next start pages and holds again only if the reversion is still visible.
+
+**Note (2026-11-21, review fix, no rule change):** "the Muhurat window" in this section is the PUBLISHED session of a calendar Muhurat date, from 15 minutes before its start to 10 minutes after its end (the same widening the feed-time page uses for causes A and B); only a Muhurat date with no published times falls back to 18:00–19:30 IST. The first code judged a fixed 18:00–19:30, which missed an afternoon or late session. A hold the scan cannot hand off (writer thread missing, queue full) logs one `DHAN-LTT-02` line per cause per day, is not counted as held, and is tried again at every 30 s scan; a writer thread that never started logs `DHAN-LTT-02` (`feed_time_writer_missing`) at the drain's start.
+
+**REJECT (§2.24-a):** more than once per segment per IST day per process; firing outside the 09:00–15:40 IST window (or the Muhurat window) or from replay; a page on a `Utc` verdict; a reversion page in `act` mode that does not hand its day to the hold writer; a second `DHAN-FEED-TIME-01` line from the hold hand-off (its failures log `DHAN-LTT-02` only); writing the hold on the drain's per-frame or per-tick path; a new alarm, filter, `ok_actions` or EMF name for it; bringing back the daily notice without a fresh dated quote.

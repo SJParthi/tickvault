@@ -582,6 +582,147 @@ This plan converts hope into bounded, tested, alarmed guarantees. It does NOT pr
   - Done tests: test_regression_2026_11_20_nifty_example_is_corrected_to_receipt_time, proptest_correction_obeys_every_guard, proptest_live_and_replay_agree_for_every_packet_or_the_day_is_held, test_live_and_replay_agree_on_a_fixed_flip_and_flip_back, test_controller_arms_from_one_past_every_dispatched_receipt, test_a_change_pending_at_ist_midnight_is_voided, test_the_detector_freezes_after_eight_entries_a_day, test_dispatcher_corrects_ticker_quote_and_full_only_while_armed (core/tests/ltt_correction_dispatch.rs), dhat_armed_ltt_correction_dispatch_is_zero_alloc (core/tests/dhat_ltt_correction.rs), test_regression_2026_11_20_the_live_drain_arms_after_a_durable_intent (app/tests/ltt_correction_drain.rs), bench dispatch_frame/ticker_ltt_armed
   - Tests: correction property tests, live-vs-replay identity with crash injection, the named 2026-11-20 regressions, DHAT 0 blocks, dispatch_frame/ticker_ltt_armed bench
   - Rules: scope lock 2026-11-20, daily-universe Quote 63, noise lock §2.24; design in the UTC addendum below
+- [ ] ITEM UTC-SAFETY — trade-safety switch: while today's DHAN-FEED-TIME-01 alarm is on, the paper path opens no new entries; exits always pass (daily-universe §28.7, owner card "Yes, after this merges (Recommended)", 2026-11-21)
+  - Files: crates/app/src/trade_safety.rs (new), crates/app/src/lib.rs, crates/app/src/daily_task_marker.rs (`marker_state`), crates/app/src/dhan_feed_stack/feed_time_page.rs, crates/app/src/live_fill/chain.rs, crates/app/src/live_fill/mod.rs, crates/app/src/order_runtime_live_fill.rs, crates/app/src/order_runtime.rs, crates/app/src/live_fill_report/build.rs, crates/app/tests/trade_safety_wiring_guard.rs (new), crates/app/tests/dhat_live_fill.rs, CLAUDE.md
+  - Tests: trade_safety unit tests (same/next/earlier day, causes reset on a new day, chain day equals ist_day_number_now), chain entry refused with Decision+Reject rows and exit sent, held entry refused at fill, runtime backstop `refused:feed_time_alarm`, self-test skipped not failed, fire engages before the hand-off, marker Present/Unreadable/Absent at chain start, proptest against an oracle, dhat_live_fill with the switch set, trade_safety_wiring_guard (bite-tested)
+  - Rules: daily-universe §28.7; noise lock §2.24 (no second DHAN-FEED-TIME-01 error); design: Design / Edge Cases / Failure Modes / Test Plan / Rollback / Observability in the UTC-SAFETY addendum below
+- [ ] ITEM UTC-PERMANENT — Dhan Live LTT is UTC epoch from WAL receipt 2026-11-20 00:00 IST: always add exactly +19,800 s as a pure function of (raw, receipt), no armed record; the detector stays only as a reversion guard that pages (scope lock §"2026-11-21", noise lock §2.24-a; Dhan ticket #6684672; owner cards "Yes, always UTC (Recommended)" and "Before Monday if checks pass (Recommended)", 2026-11-21)
+  - Files: docs/claude-rules-full/project/websocket-connection-scope-lock.md and its stub, docs/claude-rules-full/project/dhan-rest-only-noise-lock-2026-07-14.md and its stub, .claude/rules/project/data-integrity.md, docs/dhan-ref/03-live-market-feed-websocket.md, docs/dhan-ref/08-annexure-enums.md, .claude/rules/dhan/live-market-feed.md, .claude/rules/dhan/annexure-enums.md, .claude/rules/project/historical-candles-cross-verify.md, docs/dhan-support/2026-11-20-ltt-sent-as-utc.md, docs/dhan-support/README.md (step 1, rules first); crates/storage/src/ltt_correction.rs (+ ltt_correction_tests.rs; `DHAN_LTT_UTC_FROM_RECEIPT_NANOS`, `corrected_ltt`, `utc_verdict`, refusal counters by reason, `install_at_boot*` a no-op, `LttController::observe` reversion guard), crates/app/src/dhan_feed_stack/ltt_feed.rs (no record writer, no notice), crates/core/src/parser/dispatcher.rs (comment, `tv_dhan_ltt_unstamped_total` on the unstamped path), crates/core/tests/ltt_correction_dispatch.rs, crates/app/tests/ltt_correction_drain.rs, crates/core/tests/dhat_ltt_correction.rs, the `dispatch_frame/ticker_ltt_armed` bench, .github/workflows/ci.yml test lists (step 2 and 3); CLAUDE.md `ltt_correction` / dispatcher / feed_time_page rows and docs/error-runbooks/dhan-feed-time-error-codes.md (step 4). ⚠ CORRECTED 2026-11-21 (review): this list said "Not touched: feed_time_page.rs" and named `crates/storage/tests/dhat_ltt_correction.rs`; both were wrong. Also changed: crates/app/src/dhan_feed_stack/feed_time_page.rs (`Cause::FormatReverted`, `hold_after_reversion_page`, retried hold hand-off, `feed_time_writer_missing`), crates/storage/tests/ltt_reversion_guard_muhurat_window.rs (new), crates/common/src/config.rs (docs), config/base.toml, deploy/aws/terraform/error-code-alarms.tf, crates/aws-lambdas/src/telegram_webhook.rs, .claude/triage/error-rules.yaml, crates/core/src/notification/events.rs (`CustomStatusUrgent` deleted), crates/core/tests/notification_variant_dispatch_guard.rs, crates/core/tests/adversarial_feed_frames_properties.rs, crates/common/tests/loss_counter_visibility_guard.rs, crates/app/tests/dhat_live_ingest_seam.rs. Not touched: trade_safety*.rs, live_fill/*, order_runtime*.rs, daily_task_marker.rs; main.rs and dhan_feed_stack.rs zero added lines
+  - Tests: proptest_pre_cutover_is_byte_identical, proptest_post_cutover_exact_or_refused, test_regression_2026_11_20_first_packet_corrected_without_warm_up, test_regression_print_two_days_old_corrected, test_regression_ist_epoch_fresh_print_stays_raw_counted_and_pages_once_per_segment_per_day, test_utc_verdict_never_pages, test_guard_off_never_pages, test_apply_ltt_correction_sits_in_all_three_dispatcher_arms (source scan, bite-tested), dhat_ltt_correction (0 blocks), test_regression_2026_11_21_guard_watches_the_published_muhurat_session, test_regression_reversion_page_follows_the_published_muhurat_session (bite-tested), test_regression_2026_11_21_a_reversion_page_holds_its_day_once, test_regression_2026_11_21_a_full_writer_queue_holds_on_the_next_scan, test_fire_is_never_called_with_the_reversion_cause
+  - Rules: scope lock §"2026-11-21", noise lock §2.24-a, data-integrity 2026-11-21 (SECOND); design: Design / Edge Cases / Failure Modes / Test Plan / Rollback / Observability in the UTC-PERMANENT addendum below
+
+---
+
+## ITEM UTC-SAFETY — DESIGN ADDENDUM (added 2026-11-21, owner card "Yes, after this merges (Recommended)")
+
+
+## Design (Item UTC-SAFETY)
+0. Rule file first (Blocker). Add §28.7 to docs/claude-rules-full/project/daily-universe-scope-expansion-2026-05-27.md, with a dated owner quote and REJECT rows, plus one bullet in the auto-loaded stub. §28.6 forbids changing what the chain decides. No code lands before this.
+1. New file `crates/app/src/trade_safety.rs`, registered in lib.rs:
+   - Two statics: `FEED_TIME_BLOCK_DAY: AtomicI64 = i64::MIN` and `FEED_TIME_BLOCK_CAUSES: AtomicU8` (cause A = 1, cause B = 2).
+   - `engage(day, cause_bit)`: `fetch_max(day, Release)` on the day. If the day moved forward, reset the cause bits to `cause_bit`; otherwise `fetch_or` the bit.
+   - `entries_blocked_on(day) -> Option<u8>`: one Acquire load and a compare.
+   - Cost: O(1), no lock, no allocation. Because the switch is keyed by IST day, it ends by itself at the day roll. It is not cleared at 16:00.
+2. Strict marker reader: add `daily_task_marker::marker_state(task, date) -> Present | Absent | Unreadable`. Leave `daily_marker_exists` unchanged.
+3. Writers. All run on the drain's 30 s arm, at most a few times a day, never per tick.
+   - `FeedTimePage::fire`: `engage(day, cause)` is the FIRST statement, before the `error!` and before the `try_send` to tv-feed-time-latch. A failed marker write or a refused hand-off then still blocks entries in this process. Add the field `trade_safety_engaged = true` to the existing `error!`.
+   - `start()` and `scan()`'s day-change branch: call `engage` for each restored bit.
+4. Readers. A request to exit always passes at every gate.
+   - Chain start (`live_fill::start_chain`, mod.rs, cold): read both `feed-time-page-a/-b` markers with `marker_state`. `Present` or `Unreadable` calls `engage(today, bit)`. This covers a chain that starts before the drain's `start()`.
+   - Gate A, `LiveFillChain::decide`, directly after chain.rs:1413: `if intent.kind != IntentKind::Exit && trade_safety::entries_blocked_on(self.day).is_some()`, then increment `counters.entries_blocked_feed_time`, call `refuse_unplaced(intent, Some(bar), REASON_FEED_TIME_ALARM)` and return. Add `pub const REASON_FEED_TIME_ALARM = "feed_time_alarm"` beside :101. This runs on the tv-live-fill thread, not the drain. The day comes from the wall clock, never from trade times.
+   - Gate B, `on_finished` → `Finished::Filled` (:1620): an entry that was already held when the alarm fired gets a seq-2 Reject for its quantity, the same shape as the Tainted arm.
+   - Gate C, `order_runtime_live_fill::execute` beside :466 (backstop): `!x.exit && blocked(ist_day_now)` → `reject("refused:feed_time_alarm")`. The `refused:` prefix makes the LF-7 report count it as rejected.
+   - Gate D, `start_self_test_entry` (order_runtime.rs:2141): skip the entry and log the outcome as `skipped_feed_time_alarm`. It must not count as a self-test failure. Assumed: check how that function reports its outcome.
+5. Unchanged: the OMS `dry_run` hardcode, the exit-order lockout, `[live_fill] enabled = false`, `select_engine` (still returns None), indicator/strategy, `LiveFillChain::new`'s signature, `LiveFillTap::offer`, and main.rs (zero lines added).
+
+## Edge Cases (Item UTC-SAFETY)
+- Cause A at 09:20, then cause B: the bits OR together and the day stays.
+- Alarm yesterday, entry today: the day differs, so the entry goes through.
+- Midnight while a drain hold keeps the process up: the switch clears at the roll.
+- Clock steps back a day: `fetch_max` never lowers the day, so an earlier day reads as not blocked.
+- Exit larger than the position: unchanged, `clamp_exit` handles it.
+- Muhurat day: the same IST-day key applies.
+- Alarm fires mid-fill: Gate B refuses the held entry, and Gate C catches an Execute already queued.
+- Marker torn, or folder unreadable at chain start: entries are blocked (fail closed). The drain's own `restore_latch` stays fail-open, as today.
+
+## Failure Modes (Item UTC-SAFETY)
+- The marker write fails in `fire`: entries are already blocked in RAM, so only a restart that day loses the block. Limit, accepted.
+- The latch thread fails to spawn: blocked anyway, because `engage` comes before the hand-off.
+- Engage delay: about 60 s for cause A, 10 min for cause B. Entries between the fault and the page go through.
+- Latent today: no engine runs in production.
+- REJECT traps:
+  - A second `error!` with DHAN-FEED-TIME-01 re-pages through error-code-alarms.tf:423 (§2.24). The new log must be `warn!`.
+  - Do not use `RiskEngine::trigger_halt`: it blocks exits, sends a Critical page, and is cleared at 16:00.
+  - A new `LiveFillChain::new` parameter breaks the replay isolation guard and the dhat callers.
+- Whether `.hold` days should block too needs an owner decision; not included.
+
+## Test Plan (Item UTC-SAFETY)
+- `trade_safety` unit tests: same day / next day / earlier day; `fetch_max` stays monotonic; cause bits reset on a new day; a test that `ist_day_number_now()` equals the chain's day formula.
+- Chain: an entry is refused with Decision and Reject rows plus the counter; an exit is sent; a held entry is refused in Filled.
+- `execute`: an entry gets `refused:feed_time_alarm`; an exit is placed. Self-test is skipped, not failed.
+- `feed_time_page`: `fire` engages before the hand-off, and still engages with the persist channel None; `start` with today's marker engages.
+- Chain start: `Present`, `Unreadable` and `Absent` markers, from a temp dir.
+- Proptest: random intents, days and engages against an oracle. No entry is sent on a blocked day, and exits match a run with the switch off.
+- DHAT: `dhat_live_fill` (C)/(D) re-run with the switch set; order-free steps stay at 0 blocks; a drain window around `fire` adds no allocation.
+- Guard `crates/app/tests/trade_safety_wiring_guard.rs`, a source scan, bite-tested:
+  - `engage` comes before `error!` in `fire`;
+  - gates A–D each sit inside `!Exit` / `!x.exit` and before their order build;
+  - the new log is never `error!`.
+
+## Rollback (Item UTC-SAFETY)
+Revert the PR. There is no table, config, Terraform or data change. The `live_order_events` Reject rows already written stay, as audit history.
+
+## Observability (Item UTC-SAFETY)
+- Every refusal writes Decision and Reject rows to `live_order_events`, reason `feed_time_alarm` or `refused:feed_time_alarm`.
+- Metrics, registered at 0 with handles resolved once in `CounterPublisher` (mod.rs), local `/metrics` only:
+  - counter `tv_live_fill_entries_blocked_feed_time_total`;
+  - gauge `tv_trade_safety_entries_blocked`, 0/1.
+- One coded `warn!` on the edge into blocked, `source = "trade_safety_entries_blocked"`, carrying the causes and the day.
+- Add `entries_blocked` to the LF-7 daily report.
+- No new page, alarm, filter or EMF name.
+- Docs: a CLAUDE.md O(1) table row for `trade_safety.rs`, and a dated note on the `feed_time_page` row.
+
+## Files (Item UTC-SAFETY)
+- docs/claude-rules-full/project/daily-universe-scope-expansion-2026-05-27.md (§28.7)
+- .claude/rules/project/daily-universe-scope-expansion-2026-05-27.md (stub bullet)
+- crates/app/src/trade_safety.rs (new), crates/app/src/lib.rs
+- crates/app/src/daily_task_marker.rs (`marker_state`)
+- crates/app/src/dhan_feed_stack/feed_time_page.rs
+- crates/app/src/live_fill/chain.rs, crates/app/src/live_fill/mod.rs
+- crates/app/src/order_runtime_live_fill.rs, crates/app/src/order_runtime.rs
+- crates/app/src/live_fill_report/build.rs (`entries_blocked` field)
+- crates/app/tests/trade_safety_wiring_guard.rs (new), crates/app/tests/dhat_live_fill.rs
+- CLAUDE.md
+
+---
+
+## ITEM UTC-PERMANENT — DESIGN ADDENDUM (added 2026-11-21, owner cards "Yes, always UTC (Recommended)" and "Before Monday if checks pass (Recommended)")
+
+Dhan support, ticket #6684672, 21 Nov 2026: the Live LTT changed from IST-based to UTC-based epoch effective 20 Nov 2026, before the market opened, as part of an API restructuring, and "UTC-based epoch is now the permanent format for all Live Market Feed timestamps". So the per-day armed record of ITEM UTC-FIX is no longer needed: the correction becomes a fixed rule by WAL receipt. Ships only on All Green before Mon 23 Nov 08:30 IST; otherwise ITEM UTC-FIX stays in place. The dormant record, arming and notice code (about 1,255 lines) is deleted in a follow-up PR.
+
+## Design (Item UTC-PERMANENT)
+- `crates/storage/src/ltt_correction.rs`: `pub const DHAN_LTT_UTC_FROM_RECEIPT_NANOS: i64 = 1_795_113_000_000_000_000;` (receipt 2026-11-19T18:30Z = 2026-11-20 00:00 IST). `corrected_ltt(raw, segment, receipt)` returns `raw` when `receipt` is before it (pre-cutover, `0` and negatives); otherwise `utc_verdict(raw, receipt)`, which returns the corrected value or `raw` and counts the refusal.
+- Kept guards: plausible receipt, the raw band (so `0` and out-of-band values stay raw), `checked_add(19_800)`, and the receipt + 5 s cap (the reversion firewall). Refusals are counted on relaxed `AtomicU64`s by reason (band, cap, receipt).
+- Removed guards: the previous-day-session limit and the unconfirmed-fresh-print limit. Dhan says every Live LTT is UTC, so a print two or more days old also needs +19,800 s.
+- Cost per packet: one `i64` compare before the cutover; after it about five compares, plus one relaxed add on the refused branch only. No `ArcSwap`, no allocation, no new dependency.
+- Boot: `install_at_boot*` becomes a no-op with one log line; `ACTIVE` stays false, so `any_receipt_day_held` returns false and replay is never held. A leftover `.rec` file is ignored, never deleted.
+- `crates/app/src/dhan_feed_stack/ltt_feed.rs`: the record writer and the daily notice are not started.
+- `crates/core/src/parser/dispatcher.rs`: `dispatch_frame_uncounted_unstamped` stays raw and also counts on `tv_dhan_ltt_unstamped_total` (local only).
+- Reversion guard: `LttController::observe` keeps `classify_vote` and `LttDetector`, on raw, live, WAL-stamped `IDX_I` / `NSE_EQ` prints only. A `Utc` verdict does nothing. The first `Normal` verdict per segment per IST day, with receipt at or after the cutover and inside 09:00–15:40 IST (Muhurat-aware), logs one coded `error!` with `code = DHAN-FEED-TIME-01`, `source = "dhan_time_format_reverted"`, broker named. The latch is two bools, cleared at the day roll. (2026-11-21 review: in `act` the page also auto-holds its day; `ControllerCounts::reversion_pages` and `last_reversion_day` are read by the drain's 30 s feed-time scan, which hands the day to the latch thread.) The guard never writes a record and never changes the correction.
+- `[dhan_feed] ltt_utc_autocorrect`: parsing unchanged (no `common` code edit); it governs only the guard (`off` = no detector, `shadow` = coded `warn!`, `act` = page and hold). Rolling the correction back is a code change behind a fresh dated quote.
+
+## Edge Cases (Item UTC-PERMANENT)
+- Pre-cutover receipts (old WAL replay, receipt `0`, v1/v2 records) are byte-identical to before.
+- 20 Nov first NIFTY packet at 08:31:22 IST: corrected, with no warm-up and no record.
+- A pre-open snapshot carrying yesterday's 15:29 trade, a Monday print of a Friday trade, an illiquid option two days old: all corrected.
+- Assumed: a trade from 19 Nov delivered after the cutover is also UTC-encoded. Verify on a 20 Nov raw frame for a contract whose last trade was 19 Nov before deploy.
+- Our clock more than 5 s behind: a fresh print is refused, stays raw (5.5 h early), routes to `tick_quotes`, and is counted.
+- A frame with no WAL receipt stamp: never corrected (as before).
+
+## Failure Modes (Item UTC-PERMANENT)
+- Dhan reverts to IST epoch: fresh prints exceed the cap and stay raw (correct IST) and are counted; the guard pages once per segment per day; every print more than about 5.5 h behind its receipt, any day, is shifted wrongly; in `act` the page auto-holds the day within 30 s (2026-11-21 review). (Was: "a manual `.hold`; auto-hold is a follow-up"; done in this PR after the review.)
+- A restart can page a second time that day (the latch is in RAM; Limitation).
+- 20 Nov WAL segments still waiting would replay corrected `ts` next to the wrong stored rows; DEDUP starts with `ts`, so both copies would survive. Order: copy, drop the 20 Nov partitions (Quote 63), then replay or rebuild.
+- Unknown: main-feed frames received between 19 Nov 15:40 and 20 Nov 08:31 IST would straddle the cutover. Check the WAL receipts read-only before deploy.
+- Not ready by Mon 23 Nov 08:30 IST: do not deploy; ITEM UTC-FIX re-arms each day after its votes (known, bounded).
+
+## Test Plan (Item UTC-PERMANENT)
+- `proptest_pre_cutover_is_byte_identical`: for every raw `u32`, every segment and every receipt in `[i64::MIN, cutover)`, output equals raw; `dispatch_frame` gives the same bytes as the unstamped path for generated Ticker/Quote/Full frames.
+- `proptest_post_cutover_exact_or_refused`: for receipt at or after the cutover, either output = raw + 19,800 and at most receipt + 5 s, or output = raw and exactly one refusal counter grew by 1.
+- Regressions: the 20 Nov first packet; a print two days old; an IST-epoch fresh print stays raw, is counted, and pages once per segment per day; a `Utc` verdict never pages; `off` never pages.
+- New source-scan guard: `apply_ltt_correction` sits in all three dispatcher arms (bite-tested).
+- Rewrite `crates/core/tests/ltt_correction_dispatch.rs`, `crates/app/tests/ltt_correction_drain.rs`, the `ltt_feed.rs` tests, `dhat_ltt_correction.rs` (0 blocks), the `dispatch_frame/ticker_ltt_armed` bench (same key, no `install_table`) and the `ci.yml` test lists. Arm, record and notice tests are marked dormant and deleted in the follow-up.
+- Run `cargo test -p tickvault-storage`, `-p tickvault-core`, `-p tickvault-app`, and `-p tickvault-common` for the rule-file guards.
+
+## Rollback (Item UTC-PERMANENT)
+Revert the PR. ITEM UTC-FIX in `act` mode then re-arms daily after its votes, a known, bounded failure. A day run under a wrong mode gets a `.hold`. No table, config schema, Terraform or data change.
+
+## Observability (Item UTC-PERMANENT)
+- Local refusal counters by reason (band, cap, receipt), and `tv_dhan_ltt_unstamped_total`; local `/metrics` only. Registered when the lane builds the guard (`with_ltt_correction` calls `publish_ltt_counters`, which resolves the four handles once; 0 at boot), then updated once a minute of live WAL-stamped receipts. They count DISPATCHES, so a WAL catch-up, the after-close depth pass or the offline replay counts a packet again; refusals counted during a boot replay show at the first live frame's minute publish. (Corrected 2026-11-21, review: this line said "registered at 0" before any code did.)
+- A reversion page in `act` auto-holds its day (feed-time scan → `tv-feed-time-latch` → `.hold`; noise lock §2.24-a, Quote 63).
+- The reversion page rides the existing `DHAN-FEED-TIME-01` alarm (filter matches the code and `ERROR`; no Terraform change).
+- The daily notice is retired (noise lock §2.24-a).
+- No new alarm, filter or EMF name.
 
 ---
 

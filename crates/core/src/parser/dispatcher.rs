@@ -195,9 +195,11 @@ pub fn dispatch_frame_uncounted(
 
 /// [`dispatch_frame_uncounted`] for a frame whose receipt is NOT a WAL stamp
 /// (the live drain's `now - queued` fallback). Identical parse; the Dhan
-/// trade-time correction is never applied (scope lock 2026-11-20: "never
-/// applied to a frame without a WAL receipt stamp"), because a replay of that
-/// record would carry no receipt and could not reproduce the decision.
+/// trade-time correction is never applied (scope lock 2026-11-20, kept by the
+/// 2026-11-21 rule: "never applied to a frame without a WAL receipt stamp"),
+/// because a replay of that record would carry no receipt and could not
+/// reproduce the decision. Each Ticker, Quote or Full packet left raw this way
+/// is counted on `tv_dhan_ltt_unstamped_total` (local `/metrics` only).
 ///
 /// # Performance
 /// O(1) — header parse + single packet parse. No heap allocation.
@@ -232,9 +234,23 @@ pub fn raw_last_trade_time(packet: &[u8]) -> Option<u32> {
     Some(u32::from_le_bytes(bytes))
 }
 
-/// Applies the Dhan trade-time correction to one parsed tick (scope lock
-/// 2026-11-20). The ONLY place a trade time is corrected: every consumer reads
-/// the tick after this. O(1); one atomic load on a day with nothing armed.
+/// Applies the Dhan trade-time correction to one parsed tick. The ONLY place a
+/// trade time is corrected: every consumer reads the tick after this.
+///
+/// ⚠ CHANGED 2026-11-21 (scope lock "DHAN LIVE LTT IS UTC EPOCH FROM RECEIPT
+/// 2026-11-20 00:00 IST"): for a WAL-stamped frame the correction is a pure
+/// function of `(raw, receipt)`: receipts before the cutover are unchanged,
+/// from it exactly +19,800 s under the band and the receipt + 5 s cap. A frame
+/// with no WAL receipt stamp is never corrected and is counted
+/// (`tv_dhan_ltt_unstamped_total`). O(1), no allocation; one compare before the
+/// cutover. Called from the Ticker, Quote and Full arms of
+/// `dispatch_parsed_header`, pinned by
+/// `test_apply_ltt_correction_sits_in_all_three_dispatcher_arms`.
+///
+/// The refusal and unstamped counters count DISPATCHES, not distinct packets:
+/// the live drain, a WAL refold or catch-up, the after-close depth pass and the
+/// offline live-fill replay all dispatch through here, so a packet dispatched
+/// again by one of them is counted again. Read them as "refusals seen".
 // DHAN-LTT: correction threaded through the dispatcher (guard pinned).
 #[inline]
 fn apply_ltt_correction(
@@ -248,6 +264,8 @@ fn apply_ltt_correction(
             tick.exchange_segment_code,
             received_at_nanos,
         );
+    } else {
+        tickvault_storage::ltt_correction::note_unstamped();
     }
 }
 
@@ -1316,8 +1334,18 @@ mod uncounted_dispatch_tests {
             let counted = format!("{:?}", dispatch_frame(&bytes, received_at_nanos));
             let uncounted = format!("{:?}", dispatch_frame_uncounted(&bytes, received_at_nanos));
             prop_assert_eq!(&counted, &uncounted);
-            // Nothing is armed in this test process, so the unstamped entry
-            // point parses identically too (scope lock 2026-11-20).
+        }
+
+        /// Before the 2026-11-20 00:00 IST cutover (old WAL, receipt 0,
+        /// negatives) the stamped and unstamped paths give the same bytes for
+        /// every generated frame (scope lock 2026-11-21).
+        #[test]
+        fn test_pre_cutover_stamped_dispatch_matches_unstamped(
+            bytes in prop_oneof![known_packet(), proptest::collection::vec(any::<u8>(), 0..200)],
+            received_at_nanos in i64::MIN
+                ..tickvault_storage::ltt_correction::DHAN_LTT_UTC_FROM_RECEIPT_NANOS,
+        ) {
+            let counted = format!("{:?}", dispatch_frame(&bytes, received_at_nanos));
             let unstamped =
                 format!("{:?}", dispatch_frame_uncounted_unstamped(&bytes, received_at_nanos));
             prop_assert_eq!(counted, unstamped);
@@ -1380,5 +1408,49 @@ mod uncounted_dispatch_tests {
             count_packets_by_response_code(code, 0);
             count_packets_by_response_code(code, 3);
         }
+    }
+
+    /// The correction must sit in the Ticker, Quote and Full arms of
+    /// `dispatch_parsed_header`, each arm calling `apply_ltt_correction`
+    /// with the arm's own tick before it is returned (scope lock 2026-11-21).
+    #[test]
+    fn test_apply_ltt_correction_sits_in_all_three_dispatcher_arms() {
+        let src = include_str!("dispatcher.rs");
+        let body_start = src
+            .find("fn dispatch_parsed_header(")
+            .expect("dispatch_parsed_header exists");
+        let body = &src[body_start..];
+        let body = &body[..body.find("\n}\n").expect("function end")];
+        for (arm, parse) in [
+            (
+                "RESPONSE_CODE_INDEX_TICKER | RESPONSE_CODE_TICKER =>",
+                "parse_ticker_packet(",
+            ),
+            ("RESPONSE_CODE_QUOTE =>", "parse_quote_packet("),
+            ("RESPONSE_CODE_FULL =>", "parse_full_packet("),
+        ] {
+            let at = body
+                .find(arm)
+                .unwrap_or_else(|| panic!("arm {arm} missing"));
+            let rest = &body[at + arm.len()..];
+            let arm_end = rest.find("        RESPONSE_CODE_").unwrap_or(rest.len());
+            let arm_body = &rest[..arm_end];
+            let p = arm_body
+                .find(parse)
+                .unwrap_or_else(|| panic!("{arm}: no {parse}"));
+            let c = arm_body
+                .find("apply_ltt_correction(&mut tick, received_at_nanos, wal_stamped);")
+                .unwrap_or_else(|| panic!("{arm}: no apply_ltt_correction"));
+            let ok = arm_body.find("Ok(ParsedFrame::").expect("arm returns");
+            assert!(
+                p < c && c < ok,
+                "{arm}: parse, correct, return in that order"
+            );
+        }
+        assert_eq!(
+            body.matches("apply_ltt_correction(").count(),
+            3,
+            "exactly the three tick arms"
+        );
     }
 }

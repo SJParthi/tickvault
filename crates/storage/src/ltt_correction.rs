@@ -47,16 +47,50 @@
 //! [`MAX_ENTRIES_PER_DAY`] compares. No allocation. The detector and the
 //! controller are O(1) per vote and per frame. Record reads and writes are
 //! cold (boot, and a few lines on a day the correction arms).
+//!
+//! # ⚠ CHANGED 2026-11-21 (scope lock "DHAN LIVE LTT IS UTC EPOCH FROM RECEIPT 2026-11-20 00:00 IST")
+//!
+//! Dhan support (ticket #6684672, 21 Nov 2026) confirmed the change was
+//! deliberate, made before the open on 20 Nov, part of an API restructure and
+//! permanent. Owner cards "Yes, always UTC (Recommended)" and "Before Monday if
+//! checks pass (Recommended)". So the correction is no longer armed by a
+//! detector or read from a record:
+//!
+//! - [`corrected_ltt`] is a pure function of `(raw, receipt)`: a receipt
+//!   before [`DHAN_LTT_UTC_FROM_RECEIPT_NANOS`] (2026-11-20 00:00 IST) returns
+//!   `raw` unchanged (one compare); at or after it [`utc_verdict`] adds exactly
+//!   +19,800 s under the plausible-receipt check, the raw band and the
+//!   receipt + 5 s cap. A refusal leaves `raw` and is counted by reason
+//!   ([`refusal_counts`]). Live and replay decide identically from the WAL
+//!   receipt; a frame with no receipt stamp is never corrected (the caller
+//!   does not ask) and is counted ([`note_unstamped`]).
+//! - The detector only guards against Dhan reverting: [`LttController`] pages
+//!   once per segment per IST day (DHAN-FEED-TIME-01,
+//!   `source = "dhan_time_format_reverted"`) on a `Normal` verdict, and never
+//!   changes the correction. In `act` the page also auto-holds its day
+//!   (daily-universe Quote 63): the drain's 30 s feed-time scan reads
+//!   [`ControllerCounts::reversion_pages`] and hands the day to the latch
+//!   thread, which writes the `.hold` off the drain. `[dhan_feed]
+//!   ltt_utc_autocorrect` governs only that guard (`off`, `shadow` = warn,
+//!   `act` = page and hold).
+//! - Honest limit: [`utc_verdict`] has an upper bound (receipt + 5 s) and no
+//!   lower bound or day check, by design. So if Dhan ever reverts, EVERY
+//!   print more than about 5.5 h behind its receipt, any day (yesterday's
+//!   trade on an illiquid contract's first packet included), is shifted
+//!   +5.5 h wrongly until the day is held; only fresh prints stay raw.
+//! - The boot load ([`install_at_boot`]) reads nothing, so no day is held from
+//!   replay. The table, record, record writer and notice below are DORMANT
+//!   (no production path writes or reads them) and go in a follow-up PR.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, OnceLock};
 
 use arc_swap::ArcSwap;
 use chrono::NaiveDate;
-use crossbeam_channel::{Receiver, Sender, TrySendError};
+use crossbeam_channel::{Receiver, Sender};
 use tickvault_common::config::LttUtcAutocorrect;
 use tickvault_common::constants::{
     MUHURAT_PERSIST_END_SECS_OF_DAY_IST, MUHURAT_PERSIST_START_SECS_OF_DAY_IST,
@@ -71,6 +105,11 @@ use crate::ws_frame_spill::{WAL_RECEIPT_UNKNOWN_NANOS, plausible_receipt_nanos};
 /// The one offset this module ever applies (scope lock 2026-11-20 REJECT:
 /// "any offset other than +19,800 s").
 pub const LTT_UTC_OFFSET_SECS: u32 = 19_800;
+/// The first WAL receipt (UTC nanoseconds) from which Dhan's Live Market Feed
+/// trade time is UTC epoch: 2026-11-20 00:00:00 IST = 2026-11-19T18:30:00Z
+/// (scope lock 2026-11-21; Dhan ticket #6684672). Earlier receipts stay IST
+/// epoch and are never changed.
+pub const DHAN_LTT_UTC_FROM_RECEIPT_NANOS: i64 = 1_795_113_000_000_000_000;
 /// Where the per-day records live.
 pub const LTT_RECORD_DIR: &str = "data/state/ltt-correction";
 /// At most this many entries a day; past it the detector freezes with a
@@ -161,6 +200,9 @@ const fn slot_index(day: i64) -> usize {
 
 /// The corrected trade time, or `None` when the correction must not apply.
 ///
+/// ⚠ DORMANT since 2026-11-21: only the dormant [`LttTable::correct`] calls
+/// it; [`corrected_ltt`] uses [`utc_verdict`]. Deleted in the follow-up PR.
+///
 /// `confirmed` is true when an entry that covers this receipt confirmed the
 /// packet's own segment. O(1), no allocation; the previous-day Muhurat probe
 /// (one installed-calendar lookup) runs only for a corrected time on the
@@ -203,6 +245,214 @@ pub fn correction_verdict(raw: u32, receipt_nanos: i64, confirmed: bool) -> Opti
         return None;
     }
     Some(corrected)
+}
+
+// ---------------------------------------------------------------------------
+// The permanent UTC rule (scope lock 2026-11-21)
+// ---------------------------------------------------------------------------
+
+/// Why a trade time at or after the cutover was left raw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LttRefusal {
+    /// The receipt is outside the plausible band (not a real WAL stamp).
+    Receipt,
+    /// The raw time is `0`, a sentinel, or outside the exchange band.
+    Band,
+    /// `raw + 19,800` would be more than 5 s after the receipt: the print is
+    /// already IST epoch (Dhan reverted) or our clock is behind.
+    Cap,
+}
+
+impl LttRefusal {
+    /// Every refusal reason, in counter order.
+    pub const ALL: [Self; 3] = [Self::Receipt, Self::Band, Self::Cap];
+
+    /// The `reason` label of the refusal counter (the one source of the label:
+    /// [`publish_ltt_counters`] registers its handles from it).
+    #[must_use]
+    // TEST-EXEMPT: covered by test_regression_2026_11_21_counter_labels_come_from_as_str
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Receipt => "receipt",
+            Self::Band => "band",
+            Self::Cap => "cap",
+        }
+    }
+}
+
+impl LttRefusalCounts {
+    /// The count for one reason. O(1).
+    #[must_use]
+    // TEST-EXEMPT: covered by test_regression_2026_11_21_counter_labels_come_from_as_str
+    pub const fn get(&self, refusal: LttRefusal) -> u64 {
+        match refusal {
+            LttRefusal::Receipt => self.receipt,
+            LttRefusal::Band => self.band,
+            LttRefusal::Cap => self.cap,
+        }
+    }
+}
+
+/// Refusal counts by reason. Relaxed atomics, one add on the refused branch
+/// only; never on the corrected path.
+#[derive(Debug, Default)]
+pub struct LttRefusals {
+    receipt: AtomicU64,
+    band: AtomicU64,
+    cap: AtomicU64,
+}
+
+/// A copy of [`LttRefusals`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LttRefusalCounts {
+    pub receipt: u64,
+    pub band: u64,
+    pub cap: u64,
+}
+
+impl LttRefusals {
+    /// All counts at zero.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            receipt: AtomicU64::new(0),
+            band: AtomicU64::new(0),
+            cap: AtomicU64::new(0),
+        }
+    }
+
+    /// Counts one refusal. O(1), one relaxed add, no allocation.
+    #[inline]
+    // TEST-EXEMPT: covered by proptest_post_cutover_exact_or_refused
+    pub fn note(&self, refusal: LttRefusal) {
+        let cell = match refusal {
+            LttRefusal::Receipt => &self.receipt,
+            LttRefusal::Band => &self.band,
+            LttRefusal::Cap => &self.cap,
+        };
+        cell.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The counts now.
+    #[must_use]
+    // TEST-EXEMPT: covered by proptest_post_cutover_exact_or_refused
+    pub fn snapshot(&self) -> LttRefusalCounts {
+        LttRefusalCounts {
+            receipt: self.receipt.load(Ordering::Relaxed),
+            band: self.band.load(Ordering::Relaxed),
+            cap: self.cap.load(Ordering::Relaxed),
+        }
+    }
+}
+
+static REFUSALS: LttRefusals = LttRefusals::new();
+static UNSTAMPED: AtomicU64 = AtomicU64::new(0);
+
+/// The UTC rule for a receipt at or after the cutover: `raw + 19,800` when it
+/// passes every guard, else why it does not. Pure, O(1) (about five compares),
+/// no allocation. The guards: a plausible receipt; `raw` inside the exchange
+/// band (so `0` and the sentinels stay raw); the add cannot overflow; and the
+/// result is at most [`RECEIPT_FUTURE_CAP_SECS`] after the receipt (the
+/// reversion firewall: an IST-epoch print fails it). No day or session check:
+/// Dhan says every Live LTT is UTC, so a print two days old needs it too.
+#[inline]
+// TEST-EXEMPT: covered by test_utc_verdict_guards and proptest_post_cutover_exact_or_refused
+pub fn utc_verdict(raw: u32, receipt_nanos: i64) -> Result<u32, LttRefusal> {
+    if plausible_receipt_nanos(receipt_nanos) == WAL_RECEIPT_UNKNOWN_NANOS {
+        return Err(LttRefusal::Receipt);
+    }
+    if !(MIN_PLAUSIBLE_LTT..=MAX_PLAUSIBLE_LTT).contains(&raw) {
+        return Err(LttRefusal::Band);
+    }
+    let Some(corrected) = raw.checked_add(LTT_UTC_OFFSET_SECS) else {
+        return Err(LttRefusal::Band);
+    };
+    if i64::from(corrected) > receipt_ist_secs(receipt_nanos) + RECEIPT_FUTURE_CAP_SECS {
+        return Err(LttRefusal::Cap);
+    }
+    Ok(corrected)
+}
+
+/// [`corrected_ltt`] counting refusals into `refusals` (the process counters
+/// in production, a local set in tests). O(1), no allocation.
+#[inline]
+#[must_use]
+// TEST-EXEMPT: covered by proptest_pre_cutover_is_byte_identical and proptest_post_cutover_exact_or_refused
+pub fn corrected_ltt_with(raw: u32, receipt_nanos: i64, refusals: &LttRefusals) -> u32 {
+    if receipt_nanos < DHAN_LTT_UTC_FROM_RECEIPT_NANOS {
+        return raw;
+    }
+    match utc_verdict(raw, receipt_nanos) {
+        Ok(corrected) => corrected,
+        Err(refusal) => {
+            refusals.note(refusal);
+            raw
+        }
+    }
+}
+
+/// The process-wide refusal counts.
+#[must_use]
+// TEST-EXEMPT: covered by test_regression_ist_epoch_fresh_print_stays_raw_counted_and_pages_once_per_segment_per_day
+pub fn refusal_counts() -> LttRefusalCounts {
+    REFUSALS.snapshot()
+}
+
+/// Counts one trade time the dispatcher left raw because its frame has no WAL
+/// receipt stamp. O(1), one relaxed add.
+#[inline]
+// TEST-EXEMPT: covered by test_dispatcher_corrects_ticker_quote_and_full_from_the_cutover (core/tests)
+pub fn note_unstamped() {
+    UNSTAMPED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Trade times left raw for want of a WAL receipt stamp, process-wide.
+#[must_use]
+// TEST-EXEMPT: covered by test_dispatcher_corrects_ticker_quote_and_full_from_the_cutover (core/tests)
+pub fn unstamped_count() -> u64 {
+    UNSTAMPED.load(Ordering::Relaxed)
+}
+
+/// The refusal counter's name.
+pub const LTT_REFUSED_COUNTER: &str = "tv_dhan_ltt_correction_refused_total";
+/// The unstamped counter's name.
+pub const LTT_UNSTAMPED_COUNTER: &str = "tv_dhan_ltt_unstamped_total";
+
+/// The four counter handles, resolved once (the labels come from
+/// [`LttRefusal::as_str`], so they cannot drift from the reasons).
+struct LttCounterHandles {
+    refused: [metrics::Counter; 3],
+    unstamped: metrics::Counter,
+}
+
+static COUNTER_HANDLES: OnceLock<LttCounterHandles> = OnceLock::new();
+
+fn counter_handles() -> &'static LttCounterHandles {
+    COUNTER_HANDLES.get_or_init(|| LttCounterHandles {
+        refused: LttRefusal::ALL
+            .map(|r| metrics::counter!(LTT_REFUSED_COUNTER, "reason" => r.as_str())),
+        unstamped: metrics::counter!(LTT_UNSTAMPED_COUNTER),
+    })
+}
+
+/// Publishes the refusal and unstamped counts to local `/metrics`
+/// (`tv_dhan_ltt_correction_refused_total{reason}`, `tv_dhan_ltt_unstamped_total`;
+/// no alarm, filter or EMF name). The first call resolves the four handles
+/// (the lane calls it once when it builds the guard, so the series exist at 0
+/// from then); later calls set four values and allocate nothing. Cold: the
+/// live controller calls it once a minute of receipts, never per packet.
+///
+/// The counts are DISPATCHES, not distinct packets: a WAL refold or catch-up,
+/// the after-close depth pass and the offline replay dispatch through the same
+/// path, so a packet dispatched again is counted again.
+// TEST-EXEMPT: covered by test_controller_publishes_once_a_minute_of_receipts and test_regression_2026_11_21_counter_labels_come_from_as_str
+pub fn publish_ltt_counters() {
+    let c = refusal_counts();
+    let h = counter_handles();
+    for (handle, refusal) in h.refused.iter().zip(LttRefusal::ALL) {
+        handle.absolute(c.get(refusal));
+    }
+    h.unstamped.absolute(unstamped_count());
 }
 
 // ---------------------------------------------------------------------------
@@ -403,42 +653,33 @@ impl LttTable {
 // The process-wide table
 // ---------------------------------------------------------------------------
 
-static ACTIVE: AtomicBool = AtomicBool::new(false);
+// ⚠ DORMANT since 2026-11-21: nothing in production publishes a table (the
+// boot load reads nothing, the controller never arms, and `install_table` was
+// deleted 2026-11-21), so `ANY_HELD` stays false and `any_receipt_day_held`
+// returns false. Deleted in the follow-up PR.
 static ANY_HELD: AtomicBool = AtomicBool::new(false);
 static TABLE: LazyLock<ArcSwap<LttTable>> =
     LazyLock::new(|| ArcSwap::from_pointee(LttTable::empty()));
 
-/// Publishes `table` to every reader. Cold (boot, and a change on the drain).
-// TEST-EXEMPT: covered by test_dispatcher_corrects_ticker_quote_and_full_only_while_armed (core/tests)
-pub fn install_table(table: LttTable) {
-    let active = table.any_entry();
-    let held = table.any_held();
-    TABLE.store(Arc::new(table));
-    ANY_HELD.store(held, Ordering::Release);
-    ACTIVE.store(active, Ordering::Release);
-}
-
 /// A copy of the published table (cold).
 #[must_use]
-// TEST-EXEMPT: covered by test_regression_2026_11_20_the_live_drain_arms_after_a_durable_intent (app/tests)
+// TEST-EXEMPT: covered by test_install_at_boot_reads_nothing_and_holds_nothing
 pub fn current_table() -> LttTable {
     LttTable::clone(&TABLE.load())
 }
 
 /// The trade time every consumer should read for a Ticker, Quote or Full
 /// packet. Called by the core dispatcher only for a frame whose receipt is a
-/// WAL stamp. O(1): one atomic load on a day with nothing armed anywhere.
+/// WAL stamp (scope lock 2026-11-21): a receipt before
+/// [`DHAN_LTT_UTC_FROM_RECEIPT_NANOS`] returns `raw` (one compare); at or after
+/// it, `raw + 19,800` under [`utc_verdict`], or `raw` with the refusal counted.
+/// The segment is not an input (the rule is the same for every segment).
+/// O(1), no allocation, no lock, no table read.
 #[inline]
 #[must_use]
-// TEST-EXEMPT: covered by test_dispatcher_corrects_ticker_quote_and_full_only_while_armed (core/tests)
-pub fn corrected_ltt(raw: u32, segment: u8, receipt_nanos: i64) -> u32 {
-    if !ACTIVE.load(Ordering::Acquire) {
-        return raw;
-    }
-    TABLE
-        .load()
-        .correct(raw, segment, receipt_nanos)
-        .unwrap_or(raw)
+// TEST-EXEMPT: covered by proptest_pre_cutover_is_byte_identical and test_dispatcher_corrects_ticker_quote_and_full_from_the_cutover (core/tests)
+pub fn corrected_ltt(raw: u32, _segment: u8, receipt_nanos: i64) -> u32 {
+    corrected_ltt_with(raw, receipt_nanos, &REFUSALS)
 }
 
 /// True when any receipt's IST day is held from replay. O(1) when no day is
@@ -796,13 +1037,19 @@ fn old_record_days(dir: &Path, oldest_loaded: i64) -> Vec<i64> {
 
 static BOOT_REPORT: OnceLock<BootReport> = OnceLock::new();
 
-/// Loads and publishes the records at boot, before any frame is dispatched
-/// (main.rs, right after the WAL folder is locked). Once per process.
-// TEST-EXEMPT: covered by boot wiring; load path covered by test_append_and_load_record_dir
-pub fn install_at_boot(dir: &Path, mode: LttUtcAutocorrect) {
-    let today = receipt_ist_day(now_utc_nanos());
-    let (table, report) = load_record_dir(dir, today, mode);
-    install_table(table);
+/// The boot step (main.rs, right after the WAL folder is locked). Once per
+/// process.
+///
+/// ⚠ CHANGED 2026-11-21: reads NOTHING. The correction is a pure function of
+/// `(raw, receipt)`, so no per-day record is loaded, nothing is published and
+/// no day is held from replay; a leftover `.rec` file is ignored, never
+/// deleted. It only records the guard mode for [`log_boot_summary`].
+// TEST-EXEMPT: covered by test_install_at_boot_reads_nothing_and_holds_nothing
+pub fn install_at_boot(_dir: &Path, mode: LttUtcAutocorrect) {
+    let report = BootReport {
+        mode: mode.as_str(),
+        ..BootReport::default()
+    };
     if BOOT_REPORT.set(report).is_err() {
         // A second install in one process (tests): the first report stands.
         tracing::debug!("ltt correction boot report already recorded");
@@ -811,7 +1058,7 @@ pub fn install_at_boot(dir: &Path, mode: LttUtcAutocorrect) {
 
 /// [`install_at_boot`] over [`LTT_RECORD_DIR`] with the configured mode
 /// (the one main.rs call).
-// TEST-EXEMPT: covered by one-line main.rs wrapper over install_at_boot; load path covered by test_append_and_load_record_dir
+// TEST-EXEMPT: one-line main.rs wrapper over install_at_boot, which test_install_at_boot_reads_nothing_and_holds_nothing covers (it loads nothing since 2026-11-21)
 pub fn install_at_boot_from(config: &tickvault_common::config::ApplicationConfig) {
     install_at_boot(
         Path::new(LTT_RECORD_DIR),
@@ -819,37 +1066,18 @@ pub fn install_at_boot_from(config: &tickvault_common::config::ApplicationConfig
     );
 }
 
-/// Logs what [`install_at_boot`] found (it runs before tracing exists).
-// TEST-EXEMPT: covered by boot log only; report built by test_append_and_load_record_dir
+/// Logs the boot step's one line (it runs before tracing exists).
+// TEST-EXEMPT: covered by boot log only; report built by test_install_at_boot_reads_nothing_and_holds_nothing
 pub fn log_boot_summary() {
     let Some(report) = BOOT_REPORT.get() else {
         return;
     };
     info!(
-        mode = report.mode,
-        days_with_entries = report.days_with_entries,
-        entries = report.entries,
-        damaged_lines = report.damaged_lines,
-        "Dhan trade-time correction records loaded"
+        guard_mode = report.mode,
+        "Dhan trade times are read as UTC epoch from receipt 2026-11-20 00:00 IST: +19,800 s, \
+         the same live and in replay (permanent). Per-day correction records are no longer \
+         read; the detector only watches for Dhan reverting."
     );
-    if !report.held_days.is_empty() || !report.unreadable_days.is_empty() {
-        error!(
-            code = ErrorCode::DhanLtt02RecordUnsettled.code_str(),
-            source = "ltt_record_day_held",
-            held_days = ?report.held_days,
-            unreadable_days = ?report.unreadable_days,
-            "A Dhan trade-time correction record has a change that was started but never \
-             confirmed (or cannot be read). The live run may or may not have corrected those \
-             days, so their saved frames are held from replay and stay on disk. Nothing is \
-             lost; the day needs the manual repair."
-        );
-    }
-}
-
-fn now_utc_nanos() -> i64 {
-    chrono::Utc::now()
-        .timestamp_nanos_opt()
-        .unwrap_or(WAL_RECEIPT_UNKNOWN_NANOS)
 }
 
 // ---------------------------------------------------------------------------
@@ -876,43 +1104,20 @@ pub struct RecordAck {
 /// The notice sender the app hands in (it wraps the Telegram service).
 pub type LttNoticeFn = Arc<dyn Fn(String) + Send + Sync>;
 
+// DORMANT: nothing sets it since 2026-11-21 (`install_notice` deleted); the
+// dormant record writer reads it. Deleted in the follow-up PR.
 static NOTICE: OnceLock<LttNoticeFn> = OnceLock::new();
 
-/// Installs the process-wide notice sender (main.rs, once the Telegram
-/// service exists; it is built after the lane starts). A record writer with no
-/// sender of its own uses this one. Once per process.
-// TEST-EXEMPT: covered by process OnceLock setter; sender path covered by test_record_writer_thread_acks_intents_and_sends_one_notice_a_day
-pub fn install_notice(notice: LttNoticeFn) {
-    if NOTICE.set(notice).is_err() {
-        // A second install in one process: the first sender stands.
-        tracing::debug!("ltt correction notice sender already installed");
-    }
-}
-
 /// The drain's end of the record writer.
+///
+/// ⚠ DORMANT since 2026-11-21: no production path spawns the writer (the
+/// lane's `production_writer` returns `None`). Deleted in the follow-up PR.
 #[derive(Debug)]
+// DORMANT: the fields are read only by the record-writer tests.
+#[cfg_attr(not(test), allow(dead_code))]
 pub struct RecordWriterHandle {
     tx: Sender<RecordCmd>,
     acks: Receiver<RecordAck>,
-}
-
-impl RecordWriterHandle {
-    /// A handle over caller-made channels (tests).
-    #[must_use]
-    // TEST-EXEMPT: covered by test_controller_arms_from_one_past_every_dispatched_receipt
-    pub fn from_channels(tx: Sender<RecordCmd>, acks: Receiver<RecordAck>) -> Self {
-        Self { tx, acks }
-    }
-
-    /// A handle plus the writer's end of both channels, for a test that plays
-    /// the record writer itself.
-    #[must_use]
-    // TEST-EXEMPT: covered by test_regression_2026_11_20_the_live_drain_arms_after_a_durable_intent (app/tests)
-    pub fn stub_pair() -> (Self, Receiver<RecordCmd>, Sender<RecordAck>) {
-        let (tx, cmds) = crossbeam_channel::bounded(RECORD_CMD_DEPTH);
-        let (acks_tx, acks) = crossbeam_channel::bounded(RECORD_ACK_DEPTH);
-        (Self { tx, acks }, cmds, acks_tx)
-    }
 }
 
 const RECORD_CMD_DEPTH: usize = 64;
@@ -1177,125 +1382,156 @@ impl LttDetector {
 }
 
 // ---------------------------------------------------------------------------
-// The controller (owned by the live drain)
+// The reversion guard (owned by the live drain)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PendingKind {
-    Arm,
-    Close,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Pending {
-    day: i64,
-    id: u8,
-    segment: u8,
-    kind: PendingKind,
-}
-
-/// What the controller did, for tests and counters.
+/// What the guard did, for tests and counters.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ControllerCounts {
+    /// Fresh prints voted on.
     pub votes: u64,
-    pub armed: u32,
-    pub closed: u32,
-    pub intents_failed: u32,
-    pub frozen: bool,
+    /// Windows that read as UTC (the normal state from 2026-11-20).
+    pub utc_verdicts: u32,
+    /// Windows that read as IST epoch (Dhan reverted, or a pre-cutover day).
+    pub normal_verdicts: u32,
+    /// Reversion reports logged (at most one per segment per IST day).
+    pub reversion_reports: u32,
+    /// Reversion PAGES (`act` mode only): each one auto-holds its day
+    /// through the drain's feed-time latch thread (daily-universe Quote 63).
+    pub reversion_pages: u32,
+    /// The IST day number of the latest reversion page (0 before any).
+    pub last_reversion_day: i64,
+    /// Counter publishes (once a minute of receipts).
+    pub publishes: u32,
 }
 
-/// How the controller publishes a changed table (the process table in
-/// production, a capture in tests).
-pub type PublishFn = fn(LttTable);
+/// How far before a PUBLISHED Muhurat session the reversion guard (and the
+/// feed-time page's trade-time window) starts watching: 15 min, as
+/// 09:15-15:30 widens to 09:00-15:40.
+pub const MUHURAT_GUARD_LEAD_SECS: u32 = 15 * 60;
+/// How far after a published Muhurat session they keep watching: 10 min.
+pub const MUHURAT_GUARD_TAIL_SECS: u32 = 10 * 60;
 
-/// The live drain's correction controller. Single owner, O(1) per frame and
-/// per vote; never blocks.
+/// True when an IST receipt is inside the guard's window: 09:00–15:40 IST,
+/// or the PUBLISHED Muhurat session of a calendar Muhurat date, widened by
+/// [`MUHURAT_GUARD_LEAD_SECS`] / [`MUHURAT_GUARD_TAIL_SECS`] (review fix
+/// 2026-11-21: the fixed 18:00–19:30 window missed an afternoon or late
+/// session, so its reversion page and auto-hold never fired). A Muhurat
+/// date with no published times falls back to 18:00–19:30. Cold (once per
+/// verdict): one calendar probe, two only on a date with no published
+/// session.
+fn in_guard_window(receipt_nanos: i64) -> bool {
+    let secs = receipt_ist_secs(receipt_nanos);
+    let sod = secs.rem_euclid(SECS_PER_DAY) as u32;
+    if (TICK_PERSIST_START_SECS_OF_DAY_IST..TICK_PERSIST_END_SECS_OF_DAY_IST).contains(&sod) {
+        return true;
+    }
+    let Some(date) = ist_day_date(secs.div_euclid(SECS_PER_DAY)) else {
+        return false;
+    };
+    muhurat_guard_contains(
+        sod,
+        tickvault_common::market_hours::installed_muhurat_session_secs(date),
+        || tickvault_common::market_hours::installed_calendar_says_muhurat(date),
+    )
+}
+
+/// The Muhurat half of [`in_guard_window`], pure: `published` is the date's
+/// published session (IST seconds of day, end exclusive), `says_muhurat`
+/// asks whether the date is a Muhurat date at all (only asked when no session
+/// is published; `None` = no calendar, which watches nothing extra). O(1).
+#[must_use]
+fn muhurat_guard_contains(
+    sod: u32,
+    published: Option<(u32, u32)>,
+    says_muhurat: impl FnOnce() -> Option<bool>,
+) -> bool {
+    match published {
+        Some((start, end)) => (start.saturating_sub(MUHURAT_GUARD_LEAD_SECS)
+            ..end.saturating_add(MUHURAT_GUARD_TAIL_SECS))
+            .contains(&sod),
+        None => {
+            (MUHURAT_PERSIST_START_SECS_OF_DAY_IST..MUHURAT_PERSIST_END_SECS_OF_DAY_IST)
+                .contains(&sod)
+                && says_muhurat() == Some(true)
+        }
+    }
+}
+
+/// The live drain's reversion guard (scope lock 2026-11-21, noise lock
+/// §2.24-a). It votes on Dhan's RAW trade time of live, WAL-stamped index and
+/// NSE stock spot prints. A `Utc` verdict is the normal state and does
+/// nothing. The first `Normal` verdict per segment per IST day, with a receipt
+/// at or after [`DHAN_LTT_UTC_FROM_RECEIPT_NANOS`] and inside the guard window,
+/// logs one coded line: an `error!` (`act`, pages DHAN-FEED-TIME-01 and the
+/// app then holds the day) or a `warn!` (`shadow`). It never writes a record
+/// and never changes the correction. The latch is in RAM, one per process. Single owner, O(1) per frame and per vote; never blocks.
 #[derive(Debug)]
 pub struct LttController {
     mode: LttUtcAutocorrect,
+    /// False for the inert controller (tests): it never publishes counters.
+    publishes: bool,
     detector: LttDetector,
-    table: LttTable,
-    publish: PublishFn,
-    writer: Option<RecordWriterHandle>,
     day: i64,
-    ids_used: u8,
-    open: [Option<u8>; 2],
-    shadow_open: [bool; 2],
-    pending: Option<Pending>,
-    max_receipt: i64,
+    reported: [bool; 2],
+    publish_minute: i64,
     counts: ControllerCounts,
 }
 
 impl LttController {
-    /// A controller over the published table and the record writer.
+    /// The production guard in `mode`.
     #[must_use]
-    pub fn new(mode: LttUtcAutocorrect, writer: Option<RecordWriterHandle>) -> Self {
-        Self::with_table(mode, writer, current_table(), install_table)
-    }
-
-    /// A controller over an explicit table and publisher (tests).
-    #[must_use]
-    pub fn with_table(
-        mode: LttUtcAutocorrect,
-        writer: Option<RecordWriterHandle>,
-        table: LttTable,
-        publish: PublishFn,
-    ) -> Self {
+    pub fn new(mode: LttUtcAutocorrect) -> Self {
         Self {
             mode,
+            publishes: true,
             detector: LttDetector::new(),
-            table,
-            publish,
-            writer,
             day: i64::MIN,
-            ids_used: 0,
-            open: [None; 2],
-            shadow_open: [false; 2],
-            pending: None,
-            max_receipt: i64::MIN,
+            reported: [false; 2],
+            publish_minute: i64::MIN,
             counts: ControllerCounts::default(),
         }
     }
 
-    /// What the controller has done.
+    /// The inert guard every `LiveIngest` starts with: never votes, never
+    /// reports, never publishes.
+    #[must_use]
+    // TEST-EXEMPT: covered by test_guard_off_never_pages
+    pub fn inert() -> Self {
+        Self {
+            publishes: false,
+            ..Self::new(LttUtcAutocorrect::Off)
+        }
+    }
+
+    /// What the guard has done.
     #[must_use]
     pub const fn counts(&self) -> ControllerCounts {
         self.counts
     }
 
-    /// True while an armed entry is open on `segment` today.
-    #[must_use]
-    pub fn open_on(&self, segment: u8) -> bool {
-        self.open
-            .get(usize::from(segment))
-            .is_some_and(Option::is_some)
-    }
-
-    /// The controller's table.
-    #[must_use]
-    pub const fn table(&self) -> &LttTable {
-        &self.table
-    }
-
-    /// Call once per live WAL-stamped frame, BEFORE its packets are
-    /// dispatched. Rolls the day, applies an acknowledged change, then counts
-    /// the frame's receipt. O(1).
-    // TEST-EXEMPT: covered by test_controller_arms_from_one_past_every_dispatched_receipt
+    /// Call once per live WAL-stamped frame, before its packets are
+    /// dispatched. Publishes the counters once a minute of receipts and rolls
+    /// the day. O(1).
+    // TEST-EXEMPT: covered by test_controller_publishes_once_a_minute_of_receipts
     pub fn on_frame(&mut self, receipt_nanos: i64) {
-        if self.mode == LttUtcAutocorrect::Off
-            || plausible_receipt_nanos(receipt_nanos) == WAL_RECEIPT_UNKNOWN_NANOS
-        {
+        if !self.publishes || plausible_receipt_nanos(receipt_nanos) == WAL_RECEIPT_UNKNOWN_NANOS {
+            return;
+        }
+        let minute = receipt_nanos.div_euclid(60 * NANOS_PER_SEC);
+        if minute != self.publish_minute {
+            self.publish_minute = minute;
+            self.counts.publishes = self.counts.publishes.saturating_add(1);
+            publish_ltt_counters();
+        }
+        if self.mode == LttUtcAutocorrect::Off {
             return;
         }
         let day = receipt_ist_day(receipt_nanos);
         if day != self.day {
-            self.roll_day(day);
-        }
-        if self.pending.is_some() {
-            self.poll_ack();
-        }
-        if receipt_nanos > self.max_receipt {
-            self.max_receipt = receipt_nanos;
+            self.day = day;
+            self.detector.reset();
+            self.reported = [false; 2];
         }
     }
 
@@ -1312,275 +1548,50 @@ impl LttController {
         let Some(verdict) = self.detector.vote(segment, instrument, raw, receipt_nanos) else {
             return;
         };
+        if verdict == Verdict::Utc {
+            self.counts.utc_verdicts = self.counts.utc_verdicts.saturating_add(1);
+            return;
+        }
+        self.counts.normal_verdicts = self.counts.normal_verdicts.saturating_add(1);
         let seg = usize::from(segment);
-        match (verdict, self.mode) {
-            (Verdict::Utc, LttUtcAutocorrect::Shadow) => {
-                if !self.shadow_open[seg] {
-                    self.shadow_open[seg] = true;
-                    warn!(
-                        code = ErrorCode::DhanLtt01CorrectionChanged.code_str(),
-                        source = "ltt_shadow_would_arm",
-                        segment,
-                        "Dhan trade times read 5 h 30 min early on this segment. Shadow mode: \
-                         the correction is NOT applied (switch [dhan_feed] ltt_utc_autocorrect \
-                         to act to apply it)."
-                    );
-                }
-            }
-            (Verdict::Normal, LttUtcAutocorrect::Shadow) => {
-                if self.shadow_open[seg] {
-                    self.shadow_open[seg] = false;
-                    warn!(
-                        code = ErrorCode::DhanLtt01CorrectionChanged.code_str(),
-                        source = "ltt_shadow_would_close",
-                        segment,
-                        "Dhan trade times read normal again on this segment (shadow mode)."
-                    );
-                }
-            }
-            (Verdict::Utc, LttUtcAutocorrect::Act) => {
-                if self.open[seg].is_none() && self.pending.is_none() {
-                    self.propose_arm(segment, receipt_nanos);
-                }
-            }
-            (Verdict::Normal, LttUtcAutocorrect::Act) => {
-                if let Some(id) = self.open[seg]
-                    && self.pending.is_none()
-                {
-                    self.propose_close(id, segment, receipt_nanos);
-                }
-            }
-            (_, LttUtcAutocorrect::Off) => {}
+        if receipt_nanos < DHAN_LTT_UTC_FROM_RECEIPT_NANOS
+            || self.reported[seg]
+            || !in_guard_window(receipt_nanos)
+        {
+            return;
         }
+        self.reported[seg] = true;
+        self.counts.reversion_reports = self.counts.reversion_reports.saturating_add(1);
+        if self.mode == LttUtcAutocorrect::Act {
+            self.counts.reversion_pages = self.counts.reversion_pages.saturating_add(1);
+            self.counts.last_reversion_day = self.day;
+        }
+        self.report_reversion(segment);
     }
 
-    fn roll_day(&mut self, day: i64) {
-        if let Some(pending) = self.pending.take() {
-            // A change started yesterday and never applied: void it, so the
-            // record says it never took effect (an entry never crosses IST
-            // midnight).
-            self.send_line(
-                pending.day,
-                RecordLine {
-                    kind: match pending.kind {
-                        PendingKind::Arm => RecordKind::Void,
-                        PendingKind::Close => RecordKind::CloseVoid,
-                    },
-                    id: pending.id,
-                    segment: pending.segment,
-                    nanos: 0,
-                },
-            );
-        }
-        self.day = day;
-        self.detector.reset();
-        self.shadow_open = [false; 2];
-        self.open = [None; 2];
-        self.ids_used = 0;
-        self.counts.frozen = false;
-        if let Some(slot) = self.table.day(day) {
-            self.ids_used = slot.ids_used;
-            for entry in slot.entries() {
-                if entry.to_nanos == i64::MAX
-                    && let Some(open) = self.open.get_mut(usize::from(entry.segment))
-                {
-                    *open = Some(entry.id);
-                }
-            }
-        }
-    }
-
-    fn propose_arm(&mut self, segment: u8, receipt_nanos: i64) {
-        if usize::from(self.ids_used) >= MAX_ENTRIES_PER_DAY {
-            if !self.counts.frozen {
-                self.counts.frozen = true;
-                error!(
-                    code = ErrorCode::DhanLtt02RecordUnsettled.code_str(),
-                    source = "ltt_detector_frozen",
-                    entries = self.ids_used,
-                    "The Dhan trade-time correction changed {MAX_ENTRIES_PER_DAY} times today, \
-                     so it stops changing for the rest of the day. Check the feed."
-                );
-            }
-            return;
-        }
-        let id = self.ids_used;
-        let line = RecordLine {
-            kind: RecordKind::Entry,
-            id,
-            segment,
-            nanos: receipt_nanos,
-        };
-        if self.send_line(self.day, line) {
-            self.ids_used = self.ids_used.saturating_add(1);
-            self.pending = Some(Pending {
-                day: self.day,
-                id,
-                segment,
-                kind: PendingKind::Arm,
-            });
-        } else {
-            self.counts.intents_failed = self.counts.intents_failed.saturating_add(1);
-        }
-    }
-
-    fn propose_close(&mut self, id: u8, segment: u8, receipt_nanos: i64) {
-        let line = RecordLine {
-            kind: RecordKind::Close,
-            id,
-            segment,
-            nanos: receipt_nanos,
-        };
-        if self.send_line(self.day, line) {
-            self.pending = Some(Pending {
-                day: self.day,
-                id,
-                segment,
-                kind: PendingKind::Close,
-            });
-        } else {
-            self.counts.intents_failed = self.counts.intents_failed.saturating_add(1);
-        }
-    }
-
-    fn send_line(&self, day: i64, line: RecordLine) -> bool {
-        let Some(writer) = &self.writer else {
-            return false;
-        };
-        match writer.tx.try_send(RecordCmd { day, line }) {
-            Ok(()) => true,
-            Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
-                error!(
-                    code = ErrorCode::DhanLtt02RecordUnsettled.code_str(),
-                    source = "ltt_record_queue_refused",
-                    kind = ?line.kind,
-                    id = line.id,
-                    "the trade-time correction record writer did not take a line"
-                );
-                false
-            }
-        }
-    }
-
-    fn poll_ack(&mut self) {
-        let Some(pending) = self.pending else {
-            return;
-        };
-        let Some(writer) = &self.writer else {
-            self.pending = None;
-            return;
-        };
-        let Ok(ack) = writer.acks.try_recv() else {
-            return;
-        };
-        if ack.day != pending.day || ack.id != pending.id {
-            return;
-        }
-        self.pending = None;
-        let void_kind = match pending.kind {
-            PendingKind::Arm => RecordKind::Void,
-            PendingKind::Close => RecordKind::CloseVoid,
-        };
-        if !ack.durable {
-            self.counts.intents_failed = self.counts.intents_failed.saturating_add(1);
-            // The intent may have reached the disk anyway: void it, so a
-            // replay is not held for a change that was never applied.
-            self.send_line(
-                pending.day,
-                RecordLine {
-                    kind: void_kind,
-                    id: pending.id,
-                    segment: pending.segment,
-                    nanos: 0,
-                },
-            );
-            return;
-        }
-        // The effective receipt: one past every receipt already dispatched,
-        // so live and replay split the frames at the same place.
-        let effective = self.max_receipt.saturating_add(1);
-        let seg = usize::from(pending.segment);
-        match pending.kind {
-            PendingKind::Arm => {
-                let entry = LttEntry {
-                    id: pending.id,
-                    segment: pending.segment,
-                    from_nanos: effective,
-                    to_nanos: i64::MAX,
-                };
-                if !self.table.arm(pending.day, entry) {
-                    self.send_line(
-                        pending.day,
-                        RecordLine {
-                            kind: RecordKind::Void,
-                            id: pending.id,
-                            segment: pending.segment,
-                            nanos: 0,
-                        },
-                    );
-                    return;
-                }
-                (self.publish)(self.table.clone());
-                if let Some(open) = self.open.get_mut(seg) {
-                    *open = Some(pending.id);
-                }
-                self.counts.armed = self.counts.armed.saturating_add(1);
-                self.send_line(
-                    pending.day,
-                    RecordLine {
-                        kind: RecordKind::Armed,
-                        id: pending.id,
-                        segment: pending.segment,
-                        nanos: effective,
-                    },
-                );
-                warn!(
-                    code = ErrorCode::DhanLtt01CorrectionChanged.code_str(),
-                    source = "ltt_correction_armed",
-                    segment = pending.segment,
-                    id = pending.id,
-                    from_nanos = effective,
-                    "Dhan trade times read 5 h 30 min early: correcting by +19,800 s from now \
-                     (raw data unchanged)."
-                );
-            }
-            PendingKind::Close => {
-                if !self.table.close(pending.day, pending.id, effective) {
-                    self.send_line(
-                        pending.day,
-                        RecordLine {
-                            kind: RecordKind::CloseVoid,
-                            id: pending.id,
-                            segment: pending.segment,
-                            nanos: 0,
-                        },
-                    );
-                    return;
-                }
-                (self.publish)(self.table.clone());
-                if let Some(open) = self.open.get_mut(seg) {
-                    *open = None;
-                }
-                self.counts.closed = self.counts.closed.saturating_add(1);
-                self.send_line(
-                    pending.day,
-                    RecordLine {
-                        kind: RecordKind::Closed,
-                        id: pending.id,
-                        segment: pending.segment,
-                        nanos: effective,
-                    },
-                );
-                warn!(
-                    code = ErrorCode::DhanLtt01CorrectionChanged.code_str(),
-                    source = "ltt_correction_closed",
-                    segment = pending.segment,
-                    id = pending.id,
-                    to_nanos = effective,
-                    "Dhan trade times read normal again on this segment: the correction stops \
-                     here."
-                );
-            }
+    #[cold]
+    fn report_reversion(&self, segment: u8) {
+        match self.mode {
+            LttUtcAutocorrect::Act => error!(
+                code = ErrorCode::DhanFeedTime01TradeTimesWrong.code_str(),
+                source = "dhan_time_format_reverted",
+                broker = "Dhan",
+                segment = segment_label(segment),
+                "Dhan trade times look like the old IST format again on {}. Since 20 Nov 2026 \
+                 Dhan sends UTC and we add 5 h 30 min; prints that would land in the future \
+                 are left unchanged and counted, but older prints are shifted wrongly. Today is \
+                 held out of the archive and the export until it is repaired; raw data is \
+                 kept. Check the Dhan feed.",
+                segment_label(segment)
+            ),
+            LttUtcAutocorrect::Shadow => warn!(
+                code = ErrorCode::DhanFeedTime01TradeTimesWrong.code_str(),
+                source = "dhan_time_format_reverted_shadow",
+                broker = "Dhan",
+                segment = segment_label(segment),
+                "Dhan trade times look like the old IST format again (shadow mode: logged only)."
+            ),
+            LttUtcAutocorrect::Off => {}
         }
     }
 }

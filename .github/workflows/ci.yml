@@ -967,7 +967,7 @@ jobs:
           # 2026-11-02 (recovered plan52c): production reader memory
           # allocation ratchet added with its explicit target: 9 -> 10.
           # 2026-11-21 (scope lock 2026-11-20, Dhan UTC trade times):
-          # dhat_ltt_correction added for the armed dispatcher path: 10 -> 11.
+          # dhat_ltt_correction: the permanent post-cutover UTC dispatch: 10 -> 11.
           if [ "$ran" -ne 11 ]; then
             echo "::error::core DHAT step executed $ran targets, expected 11 — a --test flag was dropped from this step (drift list vs run step mismatch)."; exit 1
           fi

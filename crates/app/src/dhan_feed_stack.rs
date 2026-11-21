@@ -118,7 +118,6 @@ mod ltt_feed;
 // Noise lock §2.24: the DHAN-FEED-TIME-01 page.
 mod feed_time_page;
 use frame_tally::FrameTally;
-pub use ltt_feed::install_ltt_notice;
 use std::time::Instant;
 
 use secrecy::ExposeSecret;
@@ -28044,12 +28043,17 @@ mod wal_refold_tests {
 
     /// A ticker packet on IDX_I, the shape the 2026-09-23 replay carried.
     fn replay_ticker(security_id: u32, ltt_ist_secs: u32) -> bytes::Bytes {
+        // Dhan sends UTC epoch from receipt 2026-11-20 00:00 IST (scope lock
+        // 2026-11-21) and every caller here stamps a receipt of "now", so the
+        // packet carries the UTC form; the dispatcher adds 19,800 s back.
+        let raw =
+            ltt_ist_secs.saturating_sub(tickvault_storage::ltt_correction::LTT_UTC_OFFSET_SECS);
         let mut p = [0u8; 16];
         p[0] = 2; // response code: ticker
         p[1] = 16; // message length
         p[4..8].copy_from_slice(&security_id.to_le_bytes());
         p[8..12].copy_from_slice(&24_000.0_f32.to_le_bytes());
-        p[12..16].copy_from_slice(&ltt_ist_secs.to_le_bytes());
+        p[12..16].copy_from_slice(&raw.to_le_bytes());
         bytes::Bytes::copy_from_slice(&p)
     }
 

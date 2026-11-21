@@ -196,10 +196,13 @@ instrument_csv_fallback_url = "https://images.dhan.co/api-data/api-scrip-master.
 max_instruments_per_connection = 5000
 max_websocket_connections = 5
 
-# Scope lock 2026-11-20 ("DHAN TRADE TIME SENT AS UTC"): on 20 Nov Dhan sent
-# every trade time 5 h 30 min early. "act" corrects it by exactly +19,800 s
-# from a saved, armed per-day record; "shadow" only logs; "off" is the full
-# rollback (no correction at all).
+# Scope lock 2026-11-21 ("DHAN LIVE LTT IS UTC EPOCH FROM RECEIPT 2026-11-20
+# 00:00 IST"; Dhan ticket #6684672): from that receipt Dhan sends every trade
+# time as UTC epoch and the app ALWAYS adds exactly +19,800 s. This switch does
+# NOT turn that correction off or on; it governs only the guard that watches
+# for Dhan going back to IST epoch: "act" pages DHAN-FEED-TIME-01 and holds the
+# day, "shadow" logs a coded warning only, "off" runs no guard. Rolling the
+# correction back is a code change behind a fresh dated quote.
 [dhan_feed]
 ltt_utc_autocorrect = "act"
 
