@@ -1,3 +1,4 @@
+#![cfg(test)]
 //! Tests for [`super`] (scope lock 2026-11-20, Dhan trade time sent as UTC).
 
 use super::*;

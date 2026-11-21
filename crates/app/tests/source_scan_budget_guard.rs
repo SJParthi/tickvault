@@ -140,6 +140,15 @@ const BUDGET: &[(&str, usize)] = &[
     // `test_hold_archive_quiesce_on_pin_cut_holds_the_in_append_commit`.
     ("dhan_feed_stack/deferred_depth_pass.rs", 4),
     ("dhan_feed_stack/feed_aux_tests.rs", 1),
+    // 2026-11-21 (scope lock "DHAN LIVE LTT IS UTC EPOCH FROM RECEIPT
+    // 2026-11-20 00:00 IST", noise lock §2.24-a): two wiring scans pinning that
+    // only the scan's A/B loop calls `fire` (so the reversion hold never logs a
+    // second DHAN-FEED-TIME-01 line) and that the scan feeds the guard's page
+    // count into the hold (the 30 s silence arm that calls `scan` cannot be
+    // staged in a unit test). Paired behaviour tests:
+    // `test_regression_2026_11_21_a_reversion_page_holds_its_day_once`,
+    // `test_regression_2026_11_21_a_full_writer_queue_holds_on_the_next_scan`.
+    ("dhan_feed_stack/feed_time_page.rs", 2),
     // 2026-11-17 (speed fix 4 CI): 2 scans (the tally and the drain), moved
     // from `dhan_feed_stack.rs` with `FrameTally`; paired behaviour tests:
     // `test_fix4_counts_equal_the_per_tick_oracle_on_every_class` and
@@ -159,6 +168,14 @@ const BUDGET: &[(&str, usize)] = &[
     // append cannot be made to fail from a unit test). Paired behaviour test:
     // `test_write_failed_tick_moves_drop_seq_note_live_fill_loss`.
     ("dhan_feed_stack/live_fill_tap_drain_tests.rs", 2),
+    // 2026-11-21 (permanent UTC trade time): one wiring scan pinning that
+    // building the reversion guard registers its two counters at 0 (the
+    // process recorder is global, so the boot order cannot be staged per
+    // test). Paired behaviour test: storage
+    // `test_regression_2026_11_21_counter_labels_come_from_as_str`
+    // (`publish_ltt_counters` publishes every refusal reason and the
+    // unstamped series).
+    ("dhan_feed_stack/ltt_feed.rs", 1),
     ("dhan_feed_stack/reserved_connections_tests.rs", 1),
     // 2026-10-28 (DT-small seed queue): 1 wiring scan, the drain's idle arm is
     // gated on `idle_work_pending()` alone, never the seed latch (the select!
