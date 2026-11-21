@@ -36,30 +36,19 @@ fn bench_quote_parse(c: &mut Criterion) {
     });
 }
 
-/// The Dhan trade-time correction ARMED (scope lock 2026-11-20): an index
-/// ticker on a confirmed segment, its time corrected by +19,800 s. Unarmed,
-/// the correction is one atomic load (the two benches above).
+/// The Dhan trade-time correction after the 2026-11-20 00:00 IST cutover
+/// (scope lock 2026-11-21): an index ticker whose raw UTC time is corrected by
+/// +19,800 s, a pure function of `(raw, receipt)` with no table. The key keeps
+/// its name ("armed" = on the corrected path). Before the cutover the
+/// correction is one compare (the two benches above use receipt 0).
 fn bench_ticker_parse_ltt_armed(c: &mut Criterion) {
-    use tickvault_storage::ltt_correction::{LttEntry, LttTable, install_table, receipt_ist_day};
     // 2026-11-20 11:00:00 IST as a UTC receipt; raw time = UTC (the 20 Nov shape).
     let receipt: i64 = 1_795_152_600 * 1_000_000_000;
-    let mut table = LttTable::empty();
-    let _armed = table.arm(
-        receipt_ist_day(receipt),
-        LttEntry {
-            id: 0,
-            segment: 0,
-            from_nanos: receipt - 1_000_000_000,
-            to_nanos: i64::MAX,
-        },
-    );
-    install_table(table);
     let mut packet = build_packet(RESPONSE_CODE_TICKER, TICKER_PACKET_SIZE, 0, 13);
     packet[12..16].copy_from_slice(&1_795_152_600u32.to_le_bytes());
     c.bench_function("dispatch_frame/ticker_ltt_armed", |b| {
         b.iter(|| dispatch_frame(black_box(&packet), black_box(receipt)));
     });
-    install_table(LttTable::empty());
 }
 
 fn bench_invalid_empty(c: &mut Criterion) {
