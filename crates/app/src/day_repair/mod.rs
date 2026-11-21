@@ -1060,13 +1060,15 @@ async fn write_keep_alive(env: &str, hours: i64) {
         .send();
     match tokio::time::timeout(KEEP_ALIVE_PUT_TIMEOUT, put).await {
         Ok(Ok(_)) => say(&format!("keep-alive-until set to {value} IST")),
-        Ok(Err(e)) => warn!(
+        // An error, not a warning: without the keep-alive the hourly curfew
+        // can stop the box in the middle of the repair.
+        Ok(Err(e)) => error!(
             code = ErrorCode::DhanLtt02RecordUnsettled.code_str(),
             source = "day_repair_keep_alive",
             error = %aws_sdk_ssm::error::DisplayErrorContext(&e),
             "day repair: could not write keep-alive-until"
         ),
-        Err(_) => warn!(
+        Err(_) => error!(
             code = ErrorCode::DhanLtt02RecordUnsettled.code_str(),
             source = "day_repair_keep_alive",
             "day repair: writing keep-alive-until timed out"
