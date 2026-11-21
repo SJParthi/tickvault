@@ -2590,6 +2590,9 @@ pub struct TickWriter {
     /// `tick_quotes` rows appended by this writer over its life (plan item
     /// M5). The buffer carries both tables, as it does `feed_aux_packets`.
     quote_rows_appended: u64,
+    /// `ticks` rows appended by this writer over its life (2026-11-21, the
+    /// day repair's verify gate compares the database with it per table).
+    tick_rows_appended: u64,
     /// B1 (2026-11-13): whether a batch may be posted now, given the tables
     /// it can hold rows for. Always [`crate::ilp_table_gate::live_tables_writable`]
     /// outside this module's tests, which hold it shut regardless of any other
@@ -2959,6 +2962,7 @@ impl TickWriter {
             aux_counters: aux_row_counters(),
             aux_rows_appended: 0,
             quote_rows_appended: 0,
+            tick_rows_appended: 0,
             table_gate: crate::ilp_table_gate::live_tables_writable,
         }
     }
@@ -3119,6 +3123,12 @@ impl TickWriter {
         self.quote_rows_appended
     }
 
+    /// `ticks` rows this writer has appended over its life. O(1).
+    #[must_use]
+    pub const fn tick_rows_appended(&self) -> u64 {
+        self.tick_rows_appended
+    }
+
     /// The shared body of the two tick appends: `to_quotes` picks the table
     /// AFTER every gate, so both tables see the same refusals.
     fn append_tick_into(
@@ -3232,6 +3242,9 @@ impl TickWriter {
                     appended
                 } else {
                     let appended = self.append_raw_row(&row);
+                    if appended.is_ok() {
+                        self.tick_rows_appended = self.tick_rows_appended.saturating_add(1);
+                    }
                     // K4 (2026-10-26): the daily conservation check's process
                     // side. One relaxed add per accepted Dhan row, O(1), no alloc.
                     if appended.is_ok() && self.feed == Feed::Dhan {
@@ -5958,6 +5971,19 @@ mod tests {
         w.append_tick_with_seq(&sample_tick(), 5).expect("append");
         assert_eq!(w.aux_rows_appended(), 0);
         assert_eq!(w.pending(), 1);
+    }
+
+    /// 2026-11-21: an in-window tick counts as one `ticks` row and no quote or
+    /// aux row; the day repair's verify gate compares the database with it.
+    #[test]
+    fn test_tick_rows_appended_counts_only_ticks_rows() {
+        let mut w = TickWriter::for_test(Feed::Dhan);
+        assert_eq!(w.tick_rows_appended(), 0);
+        w.append_tick_with_seq(&sample_tick(), 5).expect("append");
+        w.append_tick_with_seq(&sample_tick(), 6).expect("append");
+        assert_eq!(w.tick_rows_appended(), 2);
+        assert_eq!(w.quote_rows_appended(), 0);
+        assert_eq!(w.aux_rows_appended(), 0);
     }
 
     /// K4 (2026-10-26): an accepted Dhan `ticks` row is counted in the

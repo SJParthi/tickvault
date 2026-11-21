@@ -9,7 +9,6 @@ use crate::day_repair_audit_persistence::DayRepairAuditWriter;
 use crate::partition_archive::quarantine_copy::{
     QUARANTINE_PREFIX, QuarantineIo, QuarantineMode, QuarantineOutcome,
 };
-use crate::partition_archive::snapshot_gate::ArchiveIo as _;
 
 const DAY_HOUR: &str = "2026-11-20T09";
 

@@ -39,8 +39,25 @@ pub(crate) struct PastDayClose {
     /// Buckets the replay hand-over tainted (none expected after the close
     /// seals: nothing is still open).
     pub tainted: u64,
-    /// Partial bars the replay suppressed over the whole day.
+    /// Partial bars a replay hand-over suppressed. Always 0 since the
+    /// rebuild folds in live mode (kept for the report shape).
     pub suppressed: u64,
+}
+
+/// Slots sealed per slice at the day's close (2,048 x TF_COUNT bars at most,
+/// far under the seal queue), the queue drained between slices.
+const CLOSE_SEAL_SLICE_SLOTS: usize = 2_048;
+
+/// A WAL receipt (epoch nanoseconds) as IST fold seconds, or `None` when it
+/// is negative or past `u32`. O(1).
+fn receipt_fold_secs(receipt_nanos: i64) -> Option<u32> {
+    if receipt_nanos <= 0 {
+        return None;
+    }
+    let secs = receipt_nanos
+        .div_euclid(1_000_000_000)
+        .checked_add(19_800)?;
+    u32::try_from(secs).ok().filter(|s| *s > 0)
 }
 
 impl LiveIngest {
@@ -58,7 +75,15 @@ impl LiveIngest {
     ) {
         self.replaying_wal = true;
         self.aux_repeat.clear();
-        self.aggregator.set_replay_mode(true);
+        // LIVE fold semantics, not WAL-replay semantics (2026-11-21 review,
+        // critical): the repaired day's partitions are dropped, so there is no
+        // stored bar to protect, and replay mode would suppress every
+        // instrument's first bucket in every timeframe (a new slot is born
+        // partial) and skip the 09:15 first-session baseline. The live process
+        // that captured the day booted before the open, so its first bars were
+        // written; a restart inside the day is handled at the gap below, as a
+        // live mid-session boot would handle it.
+        self.aggregator.set_replay_mode(false);
         self.aggregator.seed_watermark_at_least(day_start_ist_secs);
         self.aggregator
             .set_live_capture_start(capture_start_ist_secs);
@@ -99,6 +124,13 @@ impl LiveIngest {
                 }
                 if gap_idx == frame_idx && !gap_marked_here {
                     self.mark_replay_gap();
+                    // A restart (or an unread stretch) inside the day: as a live
+                    // process booted mid-session, nothing before this receipt
+                    // was captured by the frames that follow, so a bucket that
+                    // started before it is withheld, never written short.
+                    if let Some(capture) = receipt_fold_secs(*receipt) {
+                        self.aggregator.set_live_capture_start(capture);
+                    }
                     out.gaps_marked = out.gaps_marked.saturating_add(1);
                     gap_marked_here = true;
                 }
@@ -221,11 +253,12 @@ impl LiveIngest {
         blocking_flush(|| self.flush_ticks())
     }
 
-    /// `(tick_quotes rows, feed_aux_packets rows)` this ingest's writer
-    /// appended. O(1).
+    /// `(ticks rows, tick_quotes rows, feed_aux_packets rows)` this ingest's
+    /// writer appended. O(1).
     #[must_use]
-    pub(crate) const fn past_day_row_counts(&self) -> (u64, u64) {
+    pub(crate) const fn past_day_row_counts(&self) -> (u64, u64, u64) {
         (
+            self.writer.tick_rows_appended(),
             self.writer.quote_rows_appended(),
             self.writer.aux_rows_appended(),
         )
@@ -235,24 +268,45 @@ impl LiveIngest {
     /// `cutoff_ist_secs` (past the day's last bucket), runs the day-boundary
     /// seal, then the replay hand-over, all routed to the seal writer the
     /// same way the live catch-up seal routes them. O(slots × `TF_COUNT`).
-    pub(crate) fn finish_past_day_refold(&mut self, cutoff_ist_secs: u32) -> PastDayClose {
+    pub(crate) fn finish_past_day_refold(
+        &mut self,
+        cutoff_ist_secs: u32,
+        mut pace: impl FnMut(),
+    ) -> PastDayClose {
         blocking_flush(|| self.flush_ticks());
         let sender = tickvault_storage::seal_writer_runner::global_seal_sender();
         let mut tally = SealTally::default();
-        let catch_up = self.aggregator.catch_up_seal_all(
-            cutoff_ist_secs,
-            |feed, security_id, segment_code, tf, state| {
-                route_catch_up_seal(
-                    sender,
-                    feed,
-                    security_id,
-                    segment_code,
-                    tf,
-                    state,
-                    &mut tally,
-                );
-            },
-        );
+        // In slices of `CLOSE_SEAL_SLICE_SLOTS`, the seal queue drained between
+        // them (2026-11-21 review): every open bucket of every instrument seals
+        // here at once, up to slots x TF_COUNT bars, which one burst could push
+        // past the seal queue into the spill.
+        let mut catch_up = 0_usize;
+        let mut from = 0_usize;
+        loop {
+            pace();
+            let (emitted, next) = self.aggregator.catch_up_seal_slots(
+                cutoff_ist_secs,
+                from,
+                CLOSE_SEAL_SLICE_SLOTS,
+                |feed, security_id, segment_code, tf, state| {
+                    route_catch_up_seal(
+                        sender,
+                        feed,
+                        security_id,
+                        segment_code,
+                        tf,
+                        state,
+                        &mut tally,
+                    );
+                },
+            );
+            catch_up = catch_up.saturating_add(emitted);
+            if next <= from {
+                break;
+            }
+            from = next;
+        }
+        pace();
         let close = self
             .aggregator
             .force_seal_all(|feed, security_id, segment_code, tf, state| {
@@ -314,7 +368,7 @@ mod tests {
         ingest.begin_past_day_refold(day_start, day_start + 9 * 3_600);
         assert_eq!(ingest.aggregator.watermark_secs(), day_start);
         assert!(ingest.replaying_wal);
-        assert_eq!(ingest.past_day_row_counts(), (0, 0));
+        assert_eq!(ingest.past_day_row_counts(), (0, 0, 0));
         assert_eq!(ingest.flush_past_day_rows(), 0);
     }
 
@@ -323,7 +377,7 @@ mod tests {
         let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
         let day_start = 1_795_113_000u32.saturating_add(19_800);
         ingest.begin_past_day_refold(day_start, day_start + 9 * 3_600);
-        let close = ingest.finish_past_day_refold(day_start + 16 * 3_600 + 300);
+        let close = ingest.finish_past_day_refold(day_start + 16 * 3_600 + 300, || {});
         assert_eq!(close.tainted, 0);
         assert!(!ingest.replaying_wal);
         assert!(ingest.replay_backup.is_none());
@@ -357,6 +411,99 @@ mod tests {
             out.refolded + out.lost + out.refused_wrong_day + out.undecodable + out.non_tick,
             1,
             "the one ticker packet is accounted for exactly once"
+        );
+    }
+}
+
+#[cfg(test)]
+mod live_fold_tests {
+    use super::*;
+
+    const DAY_START_UTC: i64 = 1_795_113_000; // 2026-11-20 00:00 IST
+
+    /// One Ticker packet for NIFTY (13, IDX_I) whose raw LTT is the UTC form
+    /// Dhan sent from 20 Nov; the dispatcher adds 19,800 s back.
+    fn nifty_at(ist_secs_of_day: i64, ltp: f32) -> (i64, bytes::Bytes) {
+        let utc = DAY_START_UTC + ist_secs_of_day;
+        let mut f = vec![0u8; 16];
+        f[0] = 2;
+        f[1..3].copy_from_slice(&16u16.to_le_bytes());
+        f[3] = 0;
+        f[4..8].copy_from_slice(&13u32.to_le_bytes());
+        f[8..12].copy_from_slice(&ltp.to_le_bytes());
+        f[12..16].copy_from_slice(&u32::try_from(utc).expect("u32").to_le_bytes());
+        (utc * 1_000_000_000, bytes::Bytes::from(f))
+    }
+
+    fn seals(ingest: &LiveIngest) -> u64 {
+        ingest.seals_emitted() + ingest.seals_dropped() + ingest.seals_rescued()
+    }
+
+    #[test]
+    fn test_receipt_fold_secs_adds_the_ist_offset() {
+        assert_eq!(
+            receipt_fold_secs(DAY_START_UTC * 1_000_000_000),
+            u32::try_from(DAY_START_UTC + 19_800).ok()
+        );
+        assert_eq!(receipt_fold_secs(-1), None);
+    }
+
+    /// Regression (2026-11-21 review, critical): the rebuild ran in WAL-replay
+    /// mode, where a new slot's first bucket is partial and suppressed, so the
+    /// 09:15 bar of every instrument was never written. In live fold mode the
+    /// 09:15 one-second and one-minute bars seal when the 09:16 tick arrives.
+    #[test]
+    fn test_regression_first_bucket_of_the_day_is_written_not_suppressed() {
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
+        let day_start = u32::try_from(DAY_START_UTC + 19_800).expect("u32");
+        // The live process began capturing at 08:31, before the open.
+        ingest.begin_past_day_refold(day_start, day_start + 8 * 3_600 + 31 * 60);
+        let (r1, f1) = nifty_at(9 * 3_600 + 15 * 60 + 1, 24_000.0);
+        let (r2, f2) = nifty_at(9 * 3_600 + 16 * 60 + 5, 24_010.0);
+        let frames = vec![
+            (1u64, r1, WalEndpoint::MainFeed, f1),
+            (2u64, r2, WalEndpoint::MainFeed, f2),
+        ];
+        let mut out = WalRefoldOutcome::default();
+        ingest.refold_past_day_segment(&frames, &[], &mut out);
+        assert_eq!(out.refolded, 2, "both ticks fold: {out:?}");
+        assert!(
+            seals(&ingest) >= 2,
+            "the 09:15 1s and 1m bars must seal, got {}",
+            seals(&ingest)
+        );
+    }
+
+    /// A restart gap inside the day: the bucket open across it is withheld
+    /// (as a live mid-session boot withholds it), never written short.
+    #[test]
+    fn test_a_restart_gap_withholds_the_bucket_it_cuts() {
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
+        let day_start = u32::try_from(DAY_START_UTC + 19_800).expect("u32");
+        ingest.begin_past_day_refold(day_start, day_start + 8 * 3_600 + 31 * 60);
+        let (r1, f1) = nifty_at(10 * 3_600 + 1, 24_000.0);
+        // Downtime, then the restarted process's first frame mid-minute.
+        let (r2, f2) = nifty_at(10 * 3_600 + 5 * 60 + 30, 24_050.0);
+        let (r3, f3) = nifty_at(10 * 3_600 + 6 * 60 + 2, 24_060.0);
+        let (r4, f4) = nifty_at(10 * 3_600 + 7 * 60 + 2, 24_070.0);
+        let mut out = WalRefoldOutcome::default();
+        ingest.refold_past_day_segment(&[(1u64, r1, WalEndpoint::MainFeed, f1)], &[], &mut out);
+        let before = seals(&ingest);
+        ingest.refold_past_day_segment(
+            &[
+                (2u64, r2, WalEndpoint::MainFeed, f2),
+                (3u64, r3, WalEndpoint::MainFeed, f3),
+                (4u64, r4, WalEndpoint::MainFeed, f4),
+            ],
+            &[0],
+            &mut out,
+        );
+        assert_eq!(out.gaps_marked, 1);
+        // The 10:06 minute (fully after the restart) seals at 10:07; the
+        // 10:05 minute, which started before the restart, does not count.
+        assert!(
+            seals(&ingest) > before,
+            "bars after the restart are written"
         );
     }
 }

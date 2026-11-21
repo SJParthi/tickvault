@@ -415,6 +415,99 @@ pub struct Preflight {
     pub brutex_done: bool,
     /// Index ticks stamped before 09:00 on 19, 20 and 21 Nov.
     pub fingerprints: [u64; 3],
+    /// Why the rebuild could not reproduce the day, found BEFORE anything is
+    /// copied, moved or dropped (2026-11-21 review): a 20 Nov WAL segment on
+    /// the box that is not in `raw-frames/`, no raw segment of the day, a
+    /// second copy of a segment, the day's contract files unreadable, or a
+    /// tick spill file whose name hour cannot tell 19, 20 and 21 Nov apart.
+    pub raw_problems: Vec<String>,
+}
+
+/// The names of every WAL segment on the box whose name falls on `day`
+/// (receipt day), in the WAL folder and its `replaying/`, `settling/` and
+/// `archive/` folders, sorted and deduplicated. O(files).
+#[must_use]
+pub fn local_day_segment_names(wal_dir: &Path, day: NaiveDate) -> Vec<String> {
+    let Ok(bounds) = rebuild::day_receipt_bounds_nanos(day) else {
+        return Vec::new();
+    };
+    let mut out = std::collections::BTreeSet::new();
+    for dir in [
+        wal_dir.to_path_buf(),
+        wal_dir.join("replaying"),
+        wal_dir.join("settling"),
+        wal_dir.join("archive"),
+    ] {
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in rd.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let Some(nanos) = tickvault_storage::ws_frame_spill::segment_name_nanos(name)
+                .and_then(|n| i64::try_from(n).ok())
+            else {
+                continue;
+            };
+            if rebuild::receipt_day(nanos, bounds) == rebuild::ReceiptDay::On {
+                out.insert(name.to_owned());
+            }
+        }
+    }
+    out.into_iter().collect()
+}
+
+/// The local segment names with no canonical copy among the raw-frame
+/// listing's keys. Pure, O(local + keys).
+#[must_use]
+pub fn segments_missing_from_listing(local: &[String], keys: &[(String, u64)]) -> Vec<String> {
+    let listed: std::collections::BTreeSet<&str> = keys
+        .iter()
+        .filter_map(|(k, _)| tickvault_storage::raw_frame_fetch::segment_name_of_key(k))
+        .collect();
+    local
+        .iter()
+        .filter(|n| !listed.contains(n.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// How many hours after an IST midnight a tick spill file may still hold the
+/// previous day's rows (the evening WAL drain runs until 05:00 IST; three
+/// hours more of margin).
+const SPILL_DAY_BOUNDARY_HOURS: u64 = 8;
+
+/// Tick spill files whose name hour (the hour they were WRITTEN) falls in the
+/// first [`SPILL_DAY_BOUNDARY_HOURS`] of `day` or of the day after: such a
+/// file can hold the previous day's rows, so moving it (or leaving it) by its
+/// name would put rows on the wrong side of the repair (2026-11-21 review).
+/// `hours` is [`day_unix_hours`]. O(files).
+#[must_use]
+pub fn boundary_tick_spill_files(root: &Path, hours: (u64, u64)) -> Vec<PathBuf> {
+    let next = hours.1.saturating_add(1);
+    let in_boundary = |h: u64| {
+        (h >= hours.0 && h < hours.0.saturating_add(SPILL_DAY_BOUNDARY_HOURS))
+            || (h >= next && h < next.saturating_add(SPILL_DAY_BOUNDARY_HOURS))
+    };
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir(root.join("data/spill/ticks")) else {
+        return out;
+    };
+    for entry in rd.flatten() {
+        let name = entry.file_name();
+        if entry.file_type().is_ok_and(|t| t.is_file())
+            && name
+                .to_str()
+                .and_then(tick_spill_hour)
+                .is_some_and(in_boundary)
+        {
+            out.push(Path::new("data/spill/ticks").join(name));
+        }
+    }
+    out.sort();
+    out
 }
 
 /// Why `apply` must not start (empty means go). Pure.
@@ -462,6 +555,7 @@ pub fn apply_refusals(pre: &Preflight, waiting_wal: &[PathBuf], day: &str) -> Ve
             ));
         }
     }
+    out.extend(pre.raw_problems.iter().cloned());
     out
 }
 
@@ -637,10 +731,14 @@ pub(crate) async fn run_apply<I: RepairIo>(
         .await?;
 
     // 2. Copy everything before anything is dropped or moved.
+    // The window is re-checked before every copy too (2026-11-21 review): a
+    // long copy phase on a weekday morning must stop at 08:00 like the rest.
     for p in &pre.partitions {
+        io.window_open().await?;
         ensure_copied(io, log, p).await?;
     }
     for rel in &files {
+        io.window_open().await?;
         ensure_file_copied(io, log, rel).await?;
     }
     // 3. Move the files aside BEFORE any drop (each has its verified copy
@@ -762,7 +860,8 @@ pub(crate) async fn run_verify<I: RepairIo>(
             unfinished.join("; ")
         );
     }
-    let findings = io.verify(&rep).await?;
+    let mut findings = io.verify(&rep).await?;
+    findings.extend(rebuilt_covers_dropped(log.lines(), &rep));
     if !findings.is_empty() {
         io.audit(
             Step::Verify,
@@ -789,6 +888,48 @@ pub(crate) async fn run_verify<I: RepairIo>(
     io.audit(Step::Done, DAY_OBJECT, None, "released", "")
         .await?;
     Ok(())
+}
+
+/// The tick-path tables whose rows conserve one row per packet across the
+/// repair: each packet is a `ticks`, `tick_quotes` or `feed_aux_packets` row
+/// before and after, only the table may change with the corrected time.
+const TICK_PATH_TABLES: [&str; 3] = ["ticks", "tick_quotes", "feed_aux_packets"];
+
+/// Rows the repair dropped from the tick-path tables: the FIRST recorded copy
+/// of each partition (a re-run copies its own rebuilt rows again under a
+/// later line; those are not the original day). O(lines).
+#[must_use]
+pub fn dropped_tick_path_rows(lines: &[ProgressLine]) -> u64 {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut total = 0_u64;
+    for l in lines.iter().filter(|l| l.step == Step::Copy) {
+        let table = l.object.split('/').next().unwrap_or_default();
+        if !TICK_PATH_TABLES.contains(&table) || !seen.insert(l.object.as_str()) {
+            continue;
+        }
+        if let Some(rec) = CopyRecord::decode(&l.detail) {
+            total = total.saturating_add(rec.rows);
+        }
+    }
+    total
+}
+
+/// A finding when the rebuild wrote fewer tick-path rows than the repair
+/// dropped (2026-11-21 review): rows the raw frames did not reproduce would
+/// be gone from the database and every later export. Pure.
+#[must_use]
+pub fn rebuilt_covers_dropped(lines: &[ProgressLine], rep: &RebuildReport) -> Option<String> {
+    let dropped = dropped_tick_path_rows(lines);
+    let rebuilt = rep
+        .tick_rows
+        .saturating_add(rep.quote_rows)
+        .saturating_add(rep.aux_rows);
+    (rebuilt < dropped).then(|| {
+        format!(
+            "the rebuild wrote {rebuilt} ticks + tick_quotes + feed_aux_packets rows, fewer than \
+             the {dropped} the repair dropped"
+        )
+    })
 }
 
 /// One line to stdout (the SSM output) and the log.
@@ -875,12 +1016,41 @@ fn release_app_unit() {
 /// stop the box mid-run: `now + hours`, never past Monday 23 Nov 07:30 IST
 /// (before the 08:30 start). Best effort: a failure is logged, the run goes
 /// on (the runner keeps the box up too). Cold.
+/// The keep-alive instant to write: now plus `hours`, never earlier than a
+/// later value already set (the runner's, or an earlier step's) when `hours`
+/// is positive (2026-11-21 review: a fixed Monday cap wrote a time already
+/// past and let the curfew stop the box mid-repair). `hours <= 0` releases:
+/// exactly now. `current` is `YYYY-MM-DDTHH:MM:SS`, any suffix ignored.
+/// Pure.
+#[must_use]
+pub fn keep_alive_target(now: NaiveDateTime, hours: i64, current: Option<&str>) -> NaiveDateTime {
+    let wanted = now + chrono::Duration::hours(hours.max(0));
+    if hours <= 0 {
+        return now;
+    }
+    current
+        .and_then(|c| c.get(..19))
+        .and_then(|c| NaiveDateTime::parse_from_str(c, "%Y-%m-%dT%H:%M:%S").ok())
+        .map_or(wanted, |c| c.max(wanted))
+}
+
 async fn write_keep_alive(env: &str, hours: i64) {
-    let latest = NaiveDateTime::parse_from_str("2026-11-23T07:30:00", "%Y-%m-%dT%H:%M:%S").ok();
-    let until = now_ist() + chrono::Duration::hours(hours);
-    let until = latest.map_or(until, |l| until.min(l));
-    let value = until.format("%Y-%m-%dT%H:%M:%S").to_string();
     let ssm = tickvault_core::auth::secret_manager::create_ssm_client_public().await;
+    let name = format!("/tickvault/{env}/keep-alive-until");
+    let current = if hours > 0 {
+        tokio::time::timeout(
+            KEEP_ALIVE_PUT_TIMEOUT,
+            ssm.get_parameter().name(&name).send(),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .and_then(|r| r.parameter().and_then(|p| p.value()).map(str::to_owned))
+    } else {
+        None
+    };
+    let until = keep_alive_target(now_ist(), hours, current.as_deref());
+    let value = until.format("%Y-%m-%dT%H:%M:%S").to_string();
     let put = ssm
         .put_parameter()
         .name(format!("/tickvault/{env}/keep-alive-until"))
@@ -999,21 +1169,34 @@ async fn run_mode(mode: Mode) -> anyhow::Result<i32> {
     if mode == Mode::Dry {
         return dry_report(&mut io, &root, &wal_dir, day).await;
     }
-    if mode == Mode::Apply {
-        hold_and_stop_app()?;
-    } else {
-        app_stopped()?;
+    // Apply AND verify hold and stop the app (2026-11-21 review): the app
+    // unit starts at every boot, so a box the runner started has it running.
+    if let Err(e) = hold_and_stop_app() {
+        finish_box(&env).await;
+        return Err(e);
     }
-    let Some(_wal_guard) = tickvault_storage::ws_frame_spill::lock_wal_dir(&wal_dir)
-        .context("another process owns the WAL folder")?
-    else {
-        say("REFUSED: the WAL folder lock could not be taken (unwritable folder)");
-        return Ok(EXIT_REFUSED);
+    let wal_guard = match tickvault_storage::ws_frame_spill::lock_wal_dir(&wal_dir) {
+        Ok(Some(g)) => g,
+        Ok(None) => {
+            say("REFUSED: the WAL folder lock could not be taken (unwritable folder)");
+            finish_box(&env).await;
+            return Ok(EXIT_REFUSED);
+        }
+        Err(e) => {
+            finish_box(&env).await;
+            return Err(e.context("another process owns the WAL folder"));
+        }
     };
     write_keep_alive(&env, if mode == Mode::Apply { 8 } else { 3 }).await;
     let progress_dir = root.join(DAY_REPAIR_DIR);
-    let mut log = ProgressLog::open(&ProgressLog::path_for(&progress_dir, REPAIR_DAY))
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut log = match ProgressLog::open(&ProgressLog::path_for(&progress_dir, REPAIR_DAY)) {
+        Ok(l) => l,
+        Err(e) => {
+            drop(wal_guard);
+            finish_box(&env).await;
+            return Err(anyhow::anyhow!("{e}"));
+        }
+    };
     if log.had_torn_tail() {
         say(
             "the progress file ended in a torn line (a crash mid-write); it is ignored and rewritten",
@@ -1045,26 +1228,45 @@ async fn run_mode(mode: Mode) -> anyhow::Result<i32> {
         );
     }
     chown_like_data(&root, &owned);
+    // Every way out puts the box back to normal (2026-11-21 review): the WAL
+    // folder released, the unit hold removed and the app STARTED, so a box
+    // left running (or reaching 08:00 on a session day) never sits with the
+    // app down. The held day stays held until `.done`; files are already
+    // aside before any drop, so the app replays nothing of it.
+    drop(wal_guard);
+    finish_box(&env).await;
     if let Err(ref e) = result
         && format!("{e:#}").contains(WINDOW_STOP)
     {
-        // The window closed mid-run: the files are already aside (moved
-        // before any drop), so the app may start at its usual time. The day
-        // stays held; a run in the next window resumes from the results.
-        release_app_unit();
         say(&format!(
-            "STOPPED: {e:#}; the app unit is released so the app starts on time, the day stays \
-             held, re-run in the next window to resume"
+            "STOPPED: {e:#}; the app is running again, the day stays held, re-run in the next \
+             window to resume"
         ));
         return Ok(EXIT_REFUSED);
     }
     result?;
     if mode == Mode::Verify {
-        release_app_unit();
-        write_keep_alive(&env, 0).await;
-        say("verify passed; .done written, the app unit released (left stopped)");
+        say("verify passed; .done written, the app is running again");
     }
     Ok(EXIT_OK)
+}
+
+/// Removes the unit hold, starts the app and clears the repair's keep-alive.
+/// Cold, once per run.
+async fn finish_box(env: &str) {
+    release_app_unit();
+    let (started, out) = systemctl(&["start", APP_UNIT]);
+    if started {
+        say("the app unit is started again");
+    } else {
+        error!(
+            code = ErrorCode::DhanLtt02RecordUnsettled.code_str(),
+            source = "day_repair_app_restart",
+            output = %out,
+            "day repair: could not start the app again; start it by hand"
+        );
+    }
+    write_keep_alive(env, 0).await;
 }
 
 /// `dry`: every guard and object, printed; nothing changes. Exit 3 when
@@ -1143,9 +1345,81 @@ mod prod_io {
         day: NaiveDate,
     }
 
+    impl ProdIo {
+        /// Everything the rebuild needs, checked before any copy, move or
+        /// drop (2026-11-21 review): the day's contract files, a raw segment
+        /// of the day and no second copy of one, every 20 Nov WAL segment on
+        /// the box present in `raw-frames/`, and no tick spill file whose
+        /// name hour cannot tell the days apart. A check that cannot run is a
+        /// problem too (refuse, never guess). Cold, once per run.
+        async fn raw_source_problems(&self) -> Vec<String> {
+            let mut out = Vec::new();
+            let day_text = self.day.format("%Y-%m-%d").to_string();
+            if let Err(e) = crate::dhan_contract_universe::contract_names_for_day_strict(&day_text)
+            {
+                out.push(format!("the day's contract names cannot be built: {e:#}"));
+            }
+            match tickvault_storage::s3_cold::S3Cold::load(
+                &self.config.partition_retention.archive_bucket,
+            )
+            .await
+            {
+                None => out.push("no cold bucket resolves (TV_ENVIRONMENT)".to_owned()),
+                Some(s3) => {
+                    match tickvault_storage::raw_frame_fetch::list_raw_frame_day(&s3, &day_text)
+                        .await
+                    {
+                        Err(e) => out.push(format!("the raw-frame listing failed: {e:#}")),
+                        Ok(listing) => {
+                            if listing.day_segments == 0 {
+                                out.push(format!("no raw segment under raw-frames/{day_text}/"));
+                            }
+                            if !listing.sidecars.is_empty() {
+                                out.push(format!(
+                                    "a second, different copy of a raw segment exists: {}",
+                                    listing.sidecars.join(", ")
+                                ));
+                            }
+                            let wal_dir = crate::boot_helpers::ws_wal_dir();
+                            let local = super::local_day_segment_names(&wal_dir, self.day);
+                            let missing =
+                                super::segments_missing_from_listing(&local, &listing.keys);
+                            if !missing.is_empty() {
+                                out.push(format!(
+                                "{} WAL segment(s) of {day_text} on the box are not in raw-frames/ \
+                                 (the rebuild would leave their rows out): {}",
+                                missing.len(),
+                                missing.join(", ")
+                            ));
+                            }
+                        }
+                    }
+                }
+            }
+            match super::day_unix_hours(self.day) {
+                Ok(hours) => {
+                    let boundary = super::boundary_tick_spill_files(&self.root, hours);
+                    if !boundary.is_empty() {
+                        out.push(format!(
+                            "tick spill file(s) written near a day boundary may hold another \
+                             day's rows; drain or check them first: {}",
+                            boundary
+                                .iter()
+                                .map(|p| p.display().to_string())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ));
+                    }
+                }
+                Err(e) => out.push(format!("the day's hours: {e:#}")),
+            }
+            out
+        }
+    }
+
     /// Lowercase hex to bytes; `None` on an odd length or a bad digit. Pure.
     pub(super) fn hex_decode(hex: &str) -> Option<Vec<u8>> {
-        if hex.len() % 2 != 0 {
+        if !hex.len().is_multiple_of(2) {
             return None;
         }
         (0..hex.len())
@@ -1319,11 +1593,13 @@ mod prod_io {
                 fingerprints[i] =
                     rebuild::offset_fingerprint(&self.client, &self.exec_url, d).await?;
             }
+            let raw_problems = self.raw_source_problems().await;
             Ok(Preflight {
                 partitions,
                 canonical_objects,
                 brutex_done,
                 fingerprints,
+                raw_problems,
             })
         }
 
@@ -1466,6 +1742,87 @@ mod prod_io {
             };
             self.audit.append_and_flush(&row)
         }
+    }
+}
+
+#[cfg(test)]
+mod dropped_rows_tests {
+    use super::*;
+
+    #[test]
+    fn test_keep_alive_target_never_shortens_and_releases_to_now() {
+        let now =
+            NaiveDateTime::parse_from_str("2026-11-21T20:00:00", "%Y-%m-%dT%H:%M:%S").expect("now");
+        let at = |s: &str| NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S").expect("t");
+        assert_eq!(keep_alive_target(now, 8, None), at("2026-11-22T04:00:00"));
+        // A later value (the runner's, with its offset suffix) is kept.
+        assert_eq!(
+            keep_alive_target(now, 3, Some("2026-11-22T05:00:00+05:30")),
+            at("2026-11-22T05:00:00")
+        );
+        // An earlier or unreadable value never shortens the wanted one.
+        assert_eq!(
+            keep_alive_target(now, 8, Some("2026-11-21T07:30:00")),
+            at("2026-11-22T04:00:00")
+        );
+        assert_eq!(
+            keep_alive_target(now, 8, Some("garbage")),
+            at("2026-11-22T04:00:00")
+        );
+        // A Monday run is not capped at a fixed past instant any more.
+        let monday = at("2026-11-23T20:00:00");
+        assert_eq!(
+            keep_alive_target(monday, 8, None),
+            at("2026-11-24T04:00:00")
+        );
+        // Release: exactly now, whatever was set.
+        assert_eq!(keep_alive_target(now, 0, Some("2026-11-30T00:00:00")), now);
+    }
+
+    fn copy(object: &str, rows: u64) -> ProgressLine {
+        ProgressLine {
+            step: Step::Copy,
+            object: object.to_owned(),
+            detail: CopyRecord {
+                key: format!("quarantine/{object}"),
+                sha256: "ab".repeat(32),
+                rows,
+                bytes: rows * 10,
+            }
+            .encode(),
+        }
+    }
+
+    #[test]
+    fn test_dropped_rows_count_first_copy_of_tick_path_tables_only() {
+        let lines = vec![
+            copy("ticks/2026-11-20T09", 100),
+            copy("tick_quotes/2026-11-20T09", 40),
+            copy("feed_aux_packets/2026-11-20", 7),
+            copy("candles_1m/2026-11-20", 999),
+            // A re-run's copy of its own rebuilt rows: not the original day.
+            copy("ticks/2026-11-20T09", 500),
+        ];
+        assert_eq!(dropped_tick_path_rows(&lines), 147);
+    }
+
+    #[test]
+    fn test_rebuilt_covers_dropped_flags_only_a_shortfall() {
+        let lines = vec![
+            copy("ticks/2026-11-20T09", 100),
+            copy("tick_quotes/2026-11-20T10", 50),
+        ];
+        let mut rep = RebuildReport {
+            tick_rows: 60,
+            quote_rows: 60,
+            aux_rows: 30,
+            ..RebuildReport::default()
+        };
+        assert_eq!(rebuilt_covers_dropped(&lines, &rep), None);
+        rep.aux_rows = 29;
+        let f = rebuilt_covers_dropped(&lines, &rep).expect("shortfall");
+        assert!(f.contains("149") && f.contains("150"), "{f}");
+        assert_eq!(rebuilt_covers_dropped(&[], &RebuildReport::default()), None);
     }
 }
 
@@ -1639,8 +1996,14 @@ mod tests {
             canonical_objects: vec!["questdb-partitions/ticks/2026-11-20T09.csv.gz".to_owned()],
             brutex_done: false,
             fingerprints: [0, 9_000, 0],
+            raw_problems: Vec::new(),
         };
         assert!(apply_refusals(&clean, &[], REPAIR_DAY).is_empty());
+        let raw = Preflight {
+            raw_problems: vec!["a".to_owned(), "b".to_owned()],
+            ..clean.clone()
+        };
+        assert_eq!(apply_refusals(&raw, &[], REPAIR_DAY).len(), 2);
         let done = Preflight {
             brutex_done: true,
             ..clean.clone()
@@ -1680,6 +2043,68 @@ mod tests {
         std::fs::write(wal.join("other.txt"), b"").expect("file");
         let got = waiting_wal_segments(&wal, nov20());
         assert_eq!(got, vec![wal.join("replaying").join(&on)]);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 2026-11-21 review: a 20 Nov segment the boot replay already moved to
+    /// `settling/` or `archive/` must still be found, so a segment missing from
+    /// `raw-frames/` refuses the apply before any drop.
+    #[test]
+    fn test_local_day_segments_cover_every_wal_folder_and_flag_missing_copies() {
+        let root = scratch("walall");
+        let wal = root.join("ws_wal");
+        for d in ["replaying", "settling", "archive"] {
+            std::fs::create_dir_all(wal.join(d)).expect("dir");
+        }
+        let (start, end) = rebuild::day_receipt_bounds_nanos(nov20()).expect("bounds");
+        let seg = |n: i64| format!("ws-frames-{n:020}.wal");
+        let a = seg(start + 1);
+        let b = seg(start + 3_600_000_000_000);
+        let c = seg(end - 1);
+        std::fs::write(wal.join(&a), b"").expect("seg");
+        std::fs::write(wal.join("settling").join(&b), b"").expect("seg");
+        std::fs::write(wal.join("archive").join(&c), b"").expect("seg");
+        std::fs::write(wal.join("archive").join(seg(end)), b"").expect("next day");
+        std::fs::write(wal.join("archive").join(seg(start - 1)), b"").expect("day before");
+        let local = local_day_segment_names(&wal, nov20());
+        assert_eq!(local, vec![a.clone(), b.clone(), c.clone()]);
+        let keys = vec![
+            (format!("raw-frames/2026-11-20/{a}.gz"), 10),
+            (format!("raw-frames/2026-11-20/{c}.gz"), 10),
+        ];
+        assert_eq!(segments_missing_from_listing(&local, &keys), vec![b]);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 2026-11-21 review: a tick spill file written in the first hours of a
+    /// day may hold the day before's rows, so it refuses the apply.
+    #[test]
+    fn test_boundary_tick_spill_files_flag_only_the_ambiguous_hours() {
+        let root = scratch("spillb");
+        let dir = root.join("data/spill/ticks");
+        std::fs::create_dir_all(&dir).expect("dir");
+        let hours = day_unix_hours(nov20()).expect("hours");
+        let name = |h: u64| format!("ticks-dhan-{h}.ilp");
+        for h in [
+            hours.0,
+            hours.0 + 7,
+            hours.0 + 8,
+            hours.1,
+            hours.1 + 1,
+            hours.1 + 9,
+        ] {
+            std::fs::write(dir.join(name(h)), b"x").expect("file");
+        }
+        let got = boundary_tick_spill_files(&root, hours);
+        let want: Vec<PathBuf> = {
+            let mut v: Vec<PathBuf> = [hours.0, hours.0 + 7, hours.1 + 1]
+                .iter()
+                .map(|h| PathBuf::from("data/spill/ticks").join(name(*h)))
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(got, want);
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -1802,9 +2227,11 @@ mod tests {
             r.rebuilds += 1;
             drop(r);
             self.tick()?;
+            // More rows than any copy holds, so the dropped-rows check passes.
             Ok(RebuildReport {
                 frames: 1,
                 refolded: 1,
+                tick_rows: 1_000,
                 ..RebuildReport::default()
             })
         }

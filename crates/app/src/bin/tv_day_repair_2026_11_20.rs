@@ -61,6 +61,13 @@ const RUNNER_WAIT: Duration = Duration::from_secs(5 * 3600 + 30 * 60);
 /// Last IST date any mode may run (rust-only lock §0.21).
 const LAST_RUN_DAY: (i32, u32, u32) = (2026, 11, 30);
 const IST_OFFSET_SECS: i64 = 19_800;
+/// The marker that opens the error of a runner that stopped waiting while the
+/// box still works; nothing restores the keep-alive or stops the box then.
+const STILL_RUNNING: &str = "STILL RUNNING ON THE BOX";
+
+fn is_still_running(e: &str) -> bool {
+    e.starts_with(STILL_RUNNING)
+}
 
 fn flag(args: &[String], name: &str) -> Option<String> {
     args.iter()
@@ -421,8 +428,8 @@ impl Run {
             ) {
                 if Instant::now() >= deadline {
                     return Err(format!(
-                        "the box is still {status} after this runner's wait; it keeps working \
-                         (SSM command {cmd}); run `verify` later to read the result"
+                        "{STILL_RUNNING}: the box is {status} after this runner's wait; it keeps \
+                         working (SSM command {cmd}); run `verify` later to read the result"
                     ));
                 }
                 continue;
@@ -487,9 +494,21 @@ impl Run {
                 inst.state
             ));
         }
-        let result = self.send(&inst.id).await;
-        let still_running = result.as_ref().is_err_and(|e| e.contains("still"));
-        if started_here && !still_running {
+        // A deploy may have started meanwhile (the box start can dispatch one
+        // on a weekday): never send into it (2026-11-21 review).
+        let result = match self.busy_deploys().await {
+            Ok(busy) if !busy.is_empty() => {
+                Err(format!("a deploy started after the box did: {busy:?}"))
+            }
+            Ok(_) => self.send(&inst.id).await,
+            Err(e) => Err(e),
+        };
+        let still_running = result.as_ref().is_err_and(|e| is_still_running(e));
+        // Never stop the box inside a trading-day window (the box restarts
+        // the app itself when its repair stops at 08:00), and never while the
+        // repair is still running there.
+        let in_session_window = local_refusal(Some("dry"), &self.sha, "", now_ist()).is_err();
+        if started_here && !still_running && !in_session_window {
             match self
                 .ec2()
                 .stop_instances()
@@ -550,7 +569,11 @@ async fn real_main(args: &[String]) -> Result<Vec<String>, (String, Vec<String>)
     match run.run().await {
         Ok(()) => Ok(run.log),
         Err(e) => {
-            run.keep_alive_off().await;
+            // The repair still runs on the box: its keep-alive must stand
+            // (2026-11-21 review: restoring it let the curfew stop the box).
+            if !is_still_running(&e) {
+                run.keep_alive_off().await;
+            }
             Err((e, run.log))
         }
     }
@@ -642,6 +665,15 @@ mod tests {
         assert!(local_refusal(Some("dry"), SHA, "", ist(2026, 11, 23, 9, 0)).is_err());
         // After the last run day.
         assert!(local_refusal(Some("dry"), SHA, "", ist(2026, 12, 1, 20, 0)).is_err());
+    }
+
+    #[test]
+    fn test_still_running_marker_is_only_the_runner_timeout() {
+        assert!(is_still_running(&format!(
+            "{STILL_RUNNING}: the box is InProgress"
+        )));
+        assert!(!is_still_running("the box refused or failed (see above)"));
+        assert!(!is_still_running("instance is still pending"));
     }
 
     #[tokio::test]

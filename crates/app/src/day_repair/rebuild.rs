@@ -230,6 +230,7 @@ pub struct RebuildReport {
     pub frames_after_day: u64,
     pub gaps: u64,
     pub refolded: u64,
+    pub tick_rows: u64,
     pub quote_rows: u64,
     pub aux_rows: u64,
     pub lost: u64,
@@ -261,6 +262,7 @@ macro_rules! report_fields {
             frames_after_day,
             gaps,
             refolded,
+            tick_rows,
             quote_rows,
             aux_rows,
             lost,
@@ -339,6 +341,12 @@ impl RebuildReport {
         need_zero("seal_flush_failed", self.seal_flush_failed);
         need_zero("seal_residue", self.seal_residue);
         need_zero("new_spill_files", self.new_spill_files);
+        // Frames the rebuild could not read or fold (2026-11-21 review): the
+        // original rows are dropped, so a skipped stretch is lost data.
+        need_zero("damaged_segments", self.damaged_segments);
+        need_zero("abandoned_bytes", self.abandoned_bytes);
+        need_zero("unparseable", self.unparseable);
+        need_zero("lost", self.lost);
         if self.frames == 0 {
             out.push("no frame of the day was folded".to_owned());
         }
@@ -515,8 +523,7 @@ pub async fn rebuild_day(
 ) -> anyhow::Result<RebuildReport> {
     let day_text = day.format("%Y-%m-%d").to_string();
     // The day's own contract names, never an earlier or later day's.
-    let labels = crate::dhan_contract_universe::contract_names_for_day(&day_text)
-        .with_context(|| format!("no contract names for {day_text} (symbol map missing)"))?;
+    let labels = crate::dhan_contract_universe::contract_names_for_day_strict(&day_text)?;
     let names = tickvault_storage::candle_contract_labels::publish_candle_contract_labels(labels);
     if !crate::candle_ddl_boot::run_live_table_ddl_at_boot(&config.questdb).await {
         bail!("ticks / feed_aux_packets could not be keyed; refusing to write rows");
@@ -625,8 +632,16 @@ pub async fn rebuild_day(
     .await;
     // The end-of-day seals run whatever happened, so a partial run never
     // leaves bars held only in memory; a failed run is still not finished.
+    let mut pace_err: Option<anyhow::Error> = None;
     if begun {
-        let close = ingest.finish_past_day_refold(day_start.saturating_add(CLOSE_SEAL_CUTOFF_SECS));
+        let close =
+            ingest.finish_past_day_refold(day_start.saturating_add(CLOSE_SEAL_CUTOFF_SECS), || {
+                if pace_err.is_none()
+                    && let Err(e) = off_runtime(|| pace_seals(&seals))
+                {
+                    pace_err = Some(e);
+                }
+            });
         info!(
             catch_up_bars = close.catch_up_bars,
             close_bars = close.close_bars,
@@ -638,6 +653,9 @@ pub async fn rebuild_day(
     let _flushed = ingest.flush_past_day_rows();
     let seal_totals = off_runtime(|| seals.finish())?;
     folded?;
+    if let Some(e) = pace_err {
+        return Err(e.context("the seal queue did not drain at the day's close"));
+    }
 
     report.refolded = out.refolded;
     report.lost = out.lost;
@@ -646,7 +664,8 @@ pub async fn rebuild_day(
     report.unparseable = out.unparseable;
     report.abandoned_bytes = out.abandoned_bytes;
     report.depth_frames = out.depth_frames;
-    let (quote_rows, aux_rows) = ingest.past_day_row_counts();
+    let (tick_rows, quote_rows, aux_rows) = ingest.past_day_row_counts();
+    report.tick_rows = tick_rows;
     report.quote_rows = quote_rows;
     report.aux_rows = aux_rows;
     report.seals_emitted = ingest.seals_emitted();
@@ -727,10 +746,12 @@ pub async fn exec_count(
     Ok(first_count(&exec_dataset(client, exec_url, sql).await?))
 }
 
-/// The offset fingerprint of one day: `ticks` rows of the index segment
-/// stamped before 09:00 IST (the persistence window opens at 09:00, so a
-/// correct day holds none; the 20 Nov UTC shift put the session at 03:45 to
-/// 10:00). One query. Used on 19, 20 and 21 Nov before anything changes.
+/// The offset fingerprint of one day: index ticks whose exchange time is
+/// before 09:00 IST. The `ticks` writer refuses such a tick to
+/// `feed_aux_packets` as `out_of_window_tick` (it never holds a `ticks` row
+/// before 09:00, so the first version of this query could never fire;
+/// 2026-11-21 review), so that is where the 20 Nov UTC shift (session at
+/// 03:45 to 10:00) shows. A correct day holds none. One query. Used on 19, 20 and 21 Nov before anything changes.
 ///
 /// # Errors
 /// As [`exec_dataset`].
@@ -745,8 +766,9 @@ pub async fn offset_fingerprint(
         client,
         exec_url,
         &format!(
-            "SELECT count() FROM ticks WHERE ts IN '{d}' AND segment = 'IDX_I' \
-             AND ts < '{d}T09:00:00.000000Z'"
+            "SELECT count() FROM feed_aux_packets WHERE ts IN '{d}' AND segment = 'IDX_I' \
+             AND kind = 'out_of_window_tick' AND exchange_ts >= '{d}T00:00:00.000000Z' \
+             AND exchange_ts < '{d}T09:00:00.000000Z'"
         ),
     )
     .await
@@ -839,25 +861,20 @@ pub fn verify_findings(r: &VerifyReading, rep: &RebuildReport, day: NaiveDate) -
             r.ticks_before_0900, rep.ltt_refused
         ));
     }
-    let tick_rows = r.ticks_rows.saturating_add(r.quote_rows);
-    if tick_rows < rep.refolded {
-        out.push(format!(
-            "ticks + tick_quotes hold {tick_rows} rows, under the {} the rebuild wrote",
-            rep.refolded
-        ));
-    }
-    if tick_rows > rep.refolded.saturating_add(rep.lost) {
-        out.push(format!(
-            "ticks + tick_quotes hold {tick_rows} rows, over the {} written plus {} refused \
-             (rows the drop did not remove?)",
-            rep.refolded, rep.lost
-        ));
-    }
-    if r.aux_rows < rep.aux_rows {
-        out.push(format!(
-            "feed_aux_packets holds {} rows, under the {} the rebuild wrote",
-            r.aux_rows, rep.aux_rows
-        ));
+    // Each table must hold exactly the rows the rebuild's writer appended to
+    // it (2026-11-21 review): fewer means rows did not land; more means rows
+    // the drop did not remove. Compared per table, because an out-of-window
+    // tick is folded but lands in `feed_aux_packets`, not `ticks`.
+    for (table, held, wrote) in [
+        ("ticks", r.ticks_rows, rep.tick_rows),
+        ("tick_quotes", r.quote_rows, rep.quote_rows),
+        ("feed_aux_packets", r.aux_rows, rep.aux_rows),
+    ] {
+        if held != wrote {
+            out.push(format!(
+                "{table} holds {held} rows of the day, the rebuild wrote {wrote}"
+            ));
+        }
     }
     out
 }
@@ -1091,13 +1108,24 @@ mod tests {
 
     #[test]
     fn test_verify_findings_pass_and_each_failure() {
+        // 900 ticks folded: 800 landed in `ticks`, 100 in `tick_quotes`, and
+        // the out-of-window ones in `feed_aux_packets` (the review's false
+        // alarm: the old gate compared `ticks + tick_quotes` with `refolded`).
         let rep = RebuildReport {
             frames: 10,
-            refolded: 900,
+            refolded: 940,
+            tick_rows: 800,
+            quote_rows: 100,
             aux_rows: 40,
             ..RebuildReport::default()
         };
         assert!(verify_findings(&passing_reading(), &rep, nov20()).is_empty());
+        let damaged = RebuildReport {
+            damaged_segments: 1,
+            abandoned_bytes: 512,
+            ..rep
+        };
+        assert_eq!(verify_findings(&passing_reading(), &damaged, nov20()).len(), 2);
         let shifted = VerifyReading {
             nifty_1m_first: "2026-11-20T03:45:00.000000Z".to_owned(),
             candles_1m_before_open: 300,
