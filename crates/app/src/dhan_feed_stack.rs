@@ -117,6 +117,9 @@ mod frame_tally;
 mod ltt_feed;
 // Noise lock §2.24: the DHAN-FEED-TIME-01 page.
 mod feed_time_page;
+
+// Quote 63: the one-off past-day refold behind `tickvault day-repair`.
+pub(crate) mod day_rebuild;
 use frame_tally::FrameTally;
 use std::time::Instant;
 

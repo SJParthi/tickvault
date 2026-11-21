@@ -138,6 +138,12 @@ pub const DAILY_EXPORT_TEMP_DIR: &str = "data/tmp/brutex-export";
 /// Manifest format version Brutex reads.
 pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
 
+/// Manifest format version of a released (repaired) held day (Quote 63
+/// tool, Brutex row, 2026-11-21): version 1 plus `repair_released_on` and
+/// `superseded_by_repair`. Every other day's manifest stays version 1 and
+/// byte-identical (neither field is written).
+pub const MANIFEST_SCHEMA_VERSION_REPAIRED: u32 = 2;
+
 /// The five hour-partitioned tables of the export, in manifest order.
 const HOUR_EXPORT_TABLES: [&str; 5] = [
     "ticks",
@@ -965,6 +971,91 @@ pub struct Manifest {
     pub incomplete_reasons: Vec<String>,
     pub tables: Vec<ManifestTable>,
     pub instrument_counts: ObjectRef,
+    /// The IST date (`YYYY-MM-DD`) a verified repair released this held
+    /// day (`data/state/day-repair/<day>.done`); absent on every other day.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repair_released_on: Option<String>,
+    /// Archiver copies made before the repair, left out of
+    /// `tables[].partitions`: a reader must not use them. Present (possibly
+    /// empty) only with `repair_released_on`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub superseded_by_repair: Option<Vec<SupersededCopy>>,
+}
+
+/// An archiver copy of a held-kind table (`crate::held_days::table_is_held_kind`)
+/// of a released day, recorded in `partition_archive_audit` before 00:00 IST
+/// of the repair's `.done` date (or with no readable time): it holds the rows
+/// as they were before the repair. It stays in S3 untouched (nothing is ever
+/// deleted or overwritten) and is listed here instead of in the table's
+/// partitions (Quote 63 tool, Brutex row, owner card "Point Brutex at fixed
+/// copy (Recommended)").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SupersededCopy {
+    pub table: String,
+    pub partition: String,
+    pub key: String,
+    pub rows: u64,
+    pub gzip_bytes: u64,
+    pub sha256_hex: String,
+    #[serde(rename = "copied_at_ist", serialize_with = "ser_copied_at")]
+    pub copied_at_ist_nanos: Option<i64>,
+}
+
+/// The cutoff (IST nanos, QuestDB's IST-as-UTC convention, the same as
+/// [`ArchivedRow::copied_at_ist_nanos`]) before which an archiver copy of a
+/// released day is superseded: 00:00 IST of the `.done` date. `None` for a
+/// day that is not released. Pure, O(1).
+#[must_use]
+pub fn repair_cutoff_ist_nanos(verdict: crate::held_days::HeldVerdict) -> Option<i64> {
+    match verdict {
+        crate::held_days::HeldVerdict::Released { done_on } => done_on
+            .and_hms_opt(0, 0, 0)?
+            .and_utc()
+            .timestamp_nanos_opt(),
+        crate::held_days::HeldVerdict::NotHeld | crate::held_days::HeldVerdict::Held { .. } => None,
+    }
+}
+
+/// Splits the verified archiver copies of a day into the ones the manifest
+/// lists and the ones a repair superseded. With `cutoff` `None` (not a
+/// released day) every copy is kept and nothing is superseded. Otherwise a
+/// copy is superseded when its table is a held kind, its key is not one this
+/// export placed (`placed`: `(table, key)`; a byte-identical copy at the same
+/// key is the export's own object), and it was recorded before `cutoff` or
+/// carries no readable time (an unknown time could be a pre-repair copy, so
+/// it is listed as superseded, never used as data). Keeps the input order.
+/// Pure, O(copies × log placed).
+#[must_use]
+pub(crate) fn split_superseded_by_repair(
+    archived: Vec<ArchivedRow>,
+    cutoff: Option<i64>,
+    placed: &BTreeSet<(String, String)>,
+) -> (Vec<ArchivedRow>, Vec<SupersededCopy>) {
+    let Some(cutoff) = cutoff else {
+        return (archived, Vec::new());
+    };
+    let mut kept = Vec::with_capacity(archived.len());
+    let mut superseded = Vec::new();
+    for row in archived {
+        let pre_repair = row.copied_at_ist_nanos.is_none_or(|ts| ts < cutoff);
+        if crate::held_days::table_is_held_kind(&row.table)
+            && pre_repair
+            && !placed.contains(&(row.table.clone(), row.key.clone()))
+        {
+            superseded.push(SupersededCopy {
+                table: row.table,
+                partition: row.partition,
+                key: row.key,
+                rows: row.rows,
+                gzip_bytes: row.gzip_bytes,
+                sha256_hex: row.sha256_hex,
+                copied_at_ist_nanos: row.copied_at_ist_nanos,
+            });
+        } else {
+            kept.push(row);
+        }
+    }
+    (kept, superseded)
 }
 
 /// The DONE marker body.
@@ -1510,10 +1601,22 @@ impl DailyExporter {
         let clock = std::time::Instant::now();
         // Quote 63: a held day writes no object, manifest or DONE, forced or
         // not (`crate::held_days`). At most two small file reads. Counted once,
-        // as `held_day` (not also as `stopped`).
-        if crate::off_worker::off_worker(|| self.archiver.held_days.is_held(day)) {
+        // as `held_day` (not also as `stopped`). The same read tells a
+        // released (repaired) day, whose pre-repair archiver copies the
+        // manifest lists as superseded (Quote 63 tool, Brutex row).
+        let verdict = crate::off_worker::off_worker(|| self.archiver.held_days.verdict(day));
+        if verdict.is_held() {
             return Ok(held_stop(day, "start"));
         }
+        let repair_cutoff = repair_cutoff_ist_nanos(verdict);
+        let repair_released_on = match verdict {
+            crate::held_days::HeldVerdict::Released { done_on } => {
+                Some(done_on.format("%Y-%m-%d").to_string())
+            }
+            crate::held_days::HeldVerdict::NotHeld | crate::held_days::HeldVerdict::Held { .. } => {
+                None
+            }
+        };
         if self.is_sealed(day).await? {
             metrics::counter!("tv_brutex_export_runs_total", "outcome" => "skipped_done")
                 .increment(1);
@@ -1561,6 +1664,25 @@ impl DailyExporter {
         // Read AFTER every table: a partition the archiver copied and dropped
         // while this export ran is listed from its verified audit row.
         let archived = self.archived_rows(day).await?;
+        // A released day: pre-repair archiver copies are listed apart, never
+        // merged as data (Quote 63 tool, Brutex row). O(copies × log objects).
+        let placed_keys: BTreeSet<(String, String)> = results
+            .iter()
+            .flat_map(|t| {
+                t.entry
+                    .partitions
+                    .iter()
+                    .map(|p| (t.entry.table.clone(), p.key.clone()))
+            })
+            .collect();
+        let (archived, superseded) =
+            split_superseded_by_repair(archived, repair_cutoff, &placed_keys);
+        if let Some(released_on) = repair_released_on.as_deref() {
+            info!(
+                %day, released_on, superseded = superseded.len(),
+                "brutex export: repaired day; pre-repair archiver copies listed as superseded"
+            );
+        }
         for t in &mut results {
             let cold = &self.archiver.cold;
             merge_archived(
@@ -1628,8 +1750,13 @@ impl DailyExporter {
         reasons.dedup();
         let rows: u64 = entries.iter().map(|t| t.rows).sum();
         let objects: usize = entries.iter().map(|t| t.partitions.len()).sum();
+        let repaired = repair_released_on.is_some();
         let manifest = Manifest {
-            schema_version: MANIFEST_SCHEMA_VERSION,
+            schema_version: if repaired {
+                MANIFEST_SCHEMA_VERSION_REPAIRED
+            } else {
+                MANIFEST_SCHEMA_VERSION
+            },
             day: day.format("%Y-%m-%d").to_string(),
             attempt,
             export_started_ist: started,
@@ -1638,6 +1765,8 @@ impl DailyExporter {
             incomplete_reasons: reasons.clone(),
             tables: entries,
             instrument_counts: counts_ref,
+            repair_released_on,
+            superseded_by_repair: repaired.then_some(superseded),
         };
         let body = serde_json::to_vec_pretty(&manifest).context("render the manifest")?;
         let (manifest_b64, manifest_hex) = sha256_pair(&body);
@@ -2404,8 +2533,12 @@ mod tests {
                 bytes: 1,
                 sha256_hex: "cd".into(),
             },
+            repair_released_on: None,
+            superseded_by_repair: None,
         };
         let json = serde_json::to_string(&m).expect("json");
+        // A day that was never repaired: version 1 and byte-identical to the
+        // pre-2026-11-21 manifest (neither repair field is written).
         assert_eq!(
             json,
             "{\"schema_version\":1,\"day\":\"2026-11-13\",\"attempt\":2,\
@@ -2419,6 +2552,197 @@ mod tests {
              \"copied_at_ist\":\"2026-11-13T12:00:00.123456+05:30\"}]}],\
              \"instrument_counts\":{\"key\":\"c\",\"bytes\":1,\"sha256_hex\":\"cd\"}}"
         );
+    }
+
+    /// Quote 63 tool, Brutex row: a released (repaired) day's manifest is
+    /// version 2 and names the repair date and the superseded copies.
+    #[test]
+    fn test_manifest_json_golden_for_a_repaired_day() {
+        let m = Manifest {
+            schema_version: MANIFEST_SCHEMA_VERSION_REPAIRED,
+            day: "2026-11-20".into(),
+            attempt: 1,
+            export_started_ist: "s".into(),
+            export_finished_ist: "f".into(),
+            complete: true,
+            incomplete_reasons: Vec::new(),
+            tables: Vec::new(),
+            instrument_counts: ObjectRef {
+                key: "c".into(),
+                bytes: 1,
+                sha256_hex: "cd".into(),
+            },
+            repair_released_on: Some("2026-11-22".into()),
+            superseded_by_repair: Some(vec![SupersededCopy {
+                table: "ticks".into(),
+                partition: "2026-11-20T09".into(),
+                key: "questdb-partitions/ticks/2026-11-20T09.csv.gz".into(),
+                rows: 5,
+                gzip_bytes: 9,
+                sha256_hex: "ef".into(),
+                copied_at_ist_nanos: Some(1_794_571_200_123_456_789),
+            }]),
+        };
+        let json = serde_json::to_string(&m).expect("json");
+        assert_eq!(
+            json,
+            "{\"schema_version\":2,\"day\":\"2026-11-20\",\"attempt\":1,\
+             \"export_started_ist\":\"s\",\"export_finished_ist\":\"f\",\"complete\":true,\
+             \"incomplete_reasons\":[],\"tables\":[],\
+             \"instrument_counts\":{\"key\":\"c\",\"bytes\":1,\"sha256_hex\":\"cd\"},\
+             \"repair_released_on\":\"2026-11-22\",\
+             \"superseded_by_repair\":[{\"table\":\"ticks\",\"partition\":\"2026-11-20T09\",\
+             \"key\":\"questdb-partitions/ticks/2026-11-20T09.csv.gz\",\"rows\":5,\
+             \"gzip_bytes\":9,\"sha256_hex\":\"ef\",\
+             \"copied_at_ist\":\"2026-11-13T12:00:00.123456+05:30\"}]}"
+        );
+    }
+
+    #[test]
+    fn test_repair_cutoff_ist_nanos_is_midnight_of_the_done_date_only_when_released() {
+        use crate::held_days::{HeldSource, HeldVerdict};
+        let done_on = NaiveDate::from_ymd_opt(2026, 11, 22).expect("date");
+        let want = done_on
+            .and_hms_opt(0, 0, 0)
+            .expect("midnight")
+            .and_utc()
+            .timestamp_nanos_opt();
+        assert_eq!(
+            repair_cutoff_ist_nanos(HeldVerdict::Released { done_on }),
+            want
+        );
+        // The audit's own text for 00:00 IST that day parses to the cutoff.
+        assert_eq!(parse_audit_ts("2026-11-22T00:00:00.000000Z"), want);
+        assert_eq!(repair_cutoff_ist_nanos(HeldVerdict::NotHeld), None);
+        assert_eq!(
+            repair_cutoff_ist_nanos(HeldVerdict::Held {
+                source: HeldSource::Config,
+                done_damaged: false,
+            }),
+            None
+        );
+    }
+
+    fn copy_at(table: &str, partition: &str, key: &str, ts: Option<&str>) -> ArchivedRow {
+        ArchivedRow {
+            table: table.into(),
+            partition: partition.into(),
+            key: key.into(),
+            rows: 1,
+            gzip_bytes: 9,
+            sha256_hex: "bb".into(),
+            copied_at_ist_nanos: ts.and_then(parse_audit_ts),
+        }
+    }
+
+    /// Quote 63 tool, Brutex row: on a released day only pre-repair copies of
+    /// held-kind tables are superseded; depth, post-repair copies and the
+    /// export's own key stay; an unknown time is superseded (listed, never
+    /// used); a day that is not released keeps everything.
+    #[test]
+    fn test_split_superseded_by_repair_leaves_out_only_pre_repair_held_kind_copies() {
+        let cutoff = parse_audit_ts("2026-11-22T00:00:00.000000Z");
+        let rows = vec![
+            copy_at(
+                "ticks",
+                "2026-11-20T09",
+                "t9",
+                Some("2026-11-20T16:00:00.0Z"),
+            ),
+            copy_at(
+                "ticks",
+                "2026-11-20T10",
+                "t10",
+                Some("2026-11-22T00:00:00.0Z"),
+            ),
+            copy_at(
+                "candles_1m",
+                "2026-11-20",
+                "c",
+                Some("2026-11-21T23:59:59.9Z"),
+            ),
+            copy_at(
+                "candles_1s",
+                "2026-11-20",
+                "own",
+                Some("2026-11-20T18:00:00.0Z"),
+            ),
+            copy_at(
+                "market_depth",
+                "2026-11-20T09",
+                "d",
+                Some("2026-11-20T16:00:00.0Z"),
+            ),
+            copy_at("tick_quotes", "2026-11-20T11", "q", None),
+        ];
+        let placed: BTreeSet<(String, String)> =
+            [("candles_1s".to_string(), "own".to_string())].into();
+
+        let (kept, superseded) = split_superseded_by_repair(rows.clone(), cutoff, &placed);
+        let kept_keys: Vec<&str> = kept.iter().map(|r| r.key.as_str()).collect();
+        let sup_keys: Vec<&str> = superseded.iter().map(|s| s.key.as_str()).collect();
+        assert_eq!(kept_keys, ["t10", "own", "d"]);
+        assert_eq!(sup_keys, ["t9", "c", "q"]);
+        assert_eq!(superseded[0].table, "ticks");
+        assert_eq!(superseded[0].partition, "2026-11-20T09");
+        assert_eq!(superseded[2].copied_at_ist_nanos, None);
+
+        let (kept, superseded) = split_superseded_by_repair(rows.clone(), None, &placed);
+        assert_eq!(kept, rows, "not released: every copy kept, in order");
+        assert!(superseded.is_empty());
+    }
+
+    proptest::proptest! {
+        /// Every copy lands on exactly one side, in order, and a superseded
+        /// copy is always a held-kind, not-placed, pre-repair (or untimed) one.
+        #[test]
+        fn proptest_split_superseded_by_repair_partitions_the_copies(
+            rows in proptest::collection::vec(
+                (0usize..5, proptest::option::of(0i64..200), 0u8..4), 0..40),
+            cutoff in proptest::option::of(0i64..200),
+        ) {
+            let tables = ["ticks", "tick_quotes", "feed_aux_packets", "candles_5m", "market_depth_book"];
+            let input: Vec<ArchivedRow> = rows
+                .iter()
+                .enumerate()
+                .map(|(i, (t, ts, _))| ArchivedRow {
+                    table: tables[*t].to_string(),
+                    partition: format!("p{i}"),
+                    key: format!("k{i}"),
+                    rows: 1,
+                    gzip_bytes: 1,
+                    sha256_hex: "aa".into(),
+                    copied_at_ist_nanos: *ts,
+                })
+                .collect();
+            let placed: BTreeSet<(String, String)> = rows
+                .iter()
+                .enumerate()
+                .filter(|(_, (_, _, p))| *p == 0)
+                .map(|(i, (t, _, _))| (tables[*t].to_string(), format!("k{i}")))
+                .collect();
+            let (kept, superseded) =
+                split_superseded_by_repair(input.clone(), cutoff, &placed);
+            proptest::prop_assert_eq!(kept.len() + superseded.len(), input.len());
+            for s in &superseded {
+                let c = cutoff.expect("superseded only with a cutoff");
+                proptest::prop_assert!(crate::held_days::table_is_held_kind(&s.table));
+                proptest::prop_assert!(!placed.contains(&(s.table.clone(), s.key.clone())));
+                proptest::prop_assert!(s.copied_at_ist_nanos.is_none_or(|ts| ts < c));
+            }
+            for k in &kept {
+                let superseding = cutoff.is_some_and(|c| {
+                    crate::held_days::table_is_held_kind(&k.table)
+                        && !placed.contains(&(k.table.clone(), k.key.clone()))
+                        && k.copied_at_ist_nanos.is_none_or(|ts| ts < c)
+                });
+                proptest::prop_assert!(!superseding, "kept a copy the rule supersedes: {k:?}");
+            }
+            // Order preserved on both sides.
+            let pos = |key: &str| input.iter().position(|r| r.key == key);
+            proptest::prop_assert!(kept.windows(2).all(|w| pos(&w[0].key) < pos(&w[1].key)));
+            proptest::prop_assert!(superseded.windows(2).all(|w| pos(&w[0].key) < pos(&w[1].key)));
+        }
     }
 
     #[test]
