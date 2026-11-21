@@ -1125,7 +1125,10 @@ mod tests {
             abandoned_bytes: 512,
             ..rep
         };
-        assert_eq!(verify_findings(&passing_reading(), &damaged, nov20()).len(), 2);
+        assert_eq!(
+            verify_findings(&passing_reading(), &damaged, nov20()).len(),
+            2
+        );
         let shifted = VerifyReading {
             nifty_1m_first: "2026-11-20T03:45:00.000000Z".to_owned(),
             candles_1m_before_open: 300,
