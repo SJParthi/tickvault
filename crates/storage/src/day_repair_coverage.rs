@@ -241,6 +241,27 @@ pub fn copies_under_prefix(listed: &[String], prefix: &str) -> Vec<String> {
     out
 }
 
+/// The S3 prefix every quarantine copy of `table` starts with. Pure.
+#[must_use]
+pub fn table_copy_prefix(table: &str) -> String {
+    format!(
+        "{}/partitions/{table}/",
+        crate::partition_archive::quarantine_copy::QUARANTINE_PREFIX
+    )
+}
+
+/// The partition a quarantine copy key under [`table_copy_prefix`] belongs
+/// to (`<partition>.csv.gz` or `<partition>.sha-<hex>.csv.gz`), or `None`
+/// for a key of another shape. Pure.
+#[must_use]
+pub fn partition_of_copy_key(table: &str, key: &str) -> Option<String> {
+    let rest = key.strip_prefix(&table_copy_prefix(table))?;
+    let (partition, _) = rest.split_once('.')?;
+    let prefix = partition_copy_prefix(table, partition);
+    (!partition.is_empty() && !copies_under_prefix(&[key.to_owned()], &prefix).is_empty())
+        .then(|| partition.to_owned())
+}
+
 /// Every key under `prefix` in the cold bucket (ListObjectsV2, all pages).
 ///
 /// # Errors
@@ -713,6 +734,29 @@ mod tests {
     /// quantity.
     fn tick_row(t: &str, sid: i64, ltp: &str, vol: i64, buy: i64, r: &str, seq: u64) -> String {
         format!("{t},{sid},NSE_FNO,{ltp},1,2,0.5,1.5,{vol},,,,1.25,75,{buy},9,{r},{seq}\n")
+    }
+
+    #[test]
+    fn test_table_copy_prefix_and_partition_of_copy_key() {
+        let t = table_copy_prefix("ticks");
+        assert_eq!(t, "quarantine/2026-11-20-ltt-utc-shift/partitions/ticks/");
+        assert_eq!(
+            partition_of_copy_key("ticks", &format!("{t}2026-11-20T09.csv.gz")),
+            Some("2026-11-20T09".to_owned())
+        );
+        assert_eq!(
+            partition_of_copy_key("ticks", &format!("{t}2026-11-20T09.sha-0aF.csv.gz")),
+            Some("2026-11-20T09".to_owned())
+        );
+        assert_eq!(
+            partition_of_copy_key("ticks", &format!("{t}2026-11-20T09.tmp")),
+            None
+        );
+        assert_eq!(partition_of_copy_key("ticks", &format!("{t}.csv.gz")), None);
+        assert_eq!(
+            partition_of_copy_key("tick_quotes", &format!("{t}2026-11-20T09.csv.gz")),
+            None
+        );
     }
 
     #[test]

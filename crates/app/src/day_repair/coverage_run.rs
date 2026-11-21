@@ -129,6 +129,39 @@ pub(crate) async fn run_coverage<S: CopyStore>(
             objects.push((object.clone(), key, None));
         }
     }
+    // Every quarantine copy of the three tables must belong to a partition
+    // the progress record lists: a progress file lost or replaced between
+    // runs would otherwise leave earlier-dropped partitions unread
+    // (2026-11-21 strict check).
+    let recorded: std::collections::BTreeSet<&str> =
+        copies.iter().map(|(o, _)| o.as_str()).collect();
+    for table in super::TICK_PATH_TABLES {
+        window()?;
+        let prefix = cov::table_copy_prefix(table);
+        let listed = store
+            .list(&prefix)
+            .await
+            .with_context(|| format!("list the copies of {table}"))?;
+        let mut unrecorded = std::collections::BTreeSet::new();
+        for key in &listed {
+            match cov::partition_of_copy_key(table, key) {
+                Some(p) if recorded.contains(format!("{table}/{p}").as_str()) => {}
+                Some(p) => {
+                    unrecorded.insert(format!("{table}/{p}"));
+                }
+                None => {
+                    unrecorded.insert(key.clone());
+                }
+            }
+        }
+        if !unrecorded.is_empty() {
+            findings.push(format!(
+                "the quarantine holds {} {table} copies the progress record does not list: {:?}",
+                unrecorded.len(),
+                unrecorded.iter().take(10).collect::<Vec<_>>()
+            ));
+        }
+    }
     let expected_rows: u64 = copies.iter().map(|(_, r)| r.rows).sum();
     let mut dropped = cov::CopySeqs {
         // Sized once: no doubling past ~0.5 GB on the box.
@@ -672,8 +705,12 @@ mod tests {
         )
         .await;
         let findings = got.expect("ran");
-        assert_eq!(findings.len(), 1, "{findings:?}");
-        assert!(findings[0].contains("[6]"), "{findings:?}");
+        assert_eq!(findings.len(), 2, "{findings:?}");
+        assert!(
+            findings[0].contains("does not list: [\"ticks/2026-11-20T10\"]"),
+            "{findings:?}"
+        );
+        assert!(findings[1].contains("[6]"), "{findings:?}");
     }
 
     #[tokio::test]
