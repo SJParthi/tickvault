@@ -55,12 +55,6 @@ const NO_PRODUCTION_DISPATCHER: &[&str] = &[
     "BootDeadlineMissed",
     "CrossVerify1mAborted",
     "CrossVerify1mSummary",
-    // 2026-11-21 (noise lock §2.24-a, owner card "Yes, always UTC
-    // (Recommended)"): its only producer, the Dhan trade-time daily notice,
-    // was retired with the armed correction. Not a new card: the variant
-    // predates it (2026-07-10, FIX-5) and stays for the next instant,
-    // non-SMS status message.
-    "CustomStatusUrgent",
     "EndOfDayDigest",
     "InstrumentBuildFailed",
     "IpVerificationFailed",
