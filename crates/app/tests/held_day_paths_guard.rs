@@ -176,7 +176,11 @@ fn held_day_paths_export_skips_before_any_attempt_or_object() {
     // any table is read.
     let export = read("crates/storage/src/partition_archive/daily_export.rs");
     let day_fn = body(&export, "pub async fn export_day(", "let archived = self");
-    let held = at(day_fn, "self.archiver.held_days.is_held(day)", "export_day");
+    // One verdict read gives both the hold and the release (2026-11-21, the
+    // 20 Nov repair: a released day's pre-repair archiver copies are left out).
+    let verdict = at(day_fn, "self.archiver.held_days.verdict(day)", "export_day");
+    let held = at(day_fn, "if verdict.is_held()", "export_day");
+    assert!(verdict < held);
     assert!(held < at(day_fn, "self.is_sealed(day)", "export_day"));
     assert!(held < at(day_fn, "for table in export_tables()", "export_day"));
     assert!(day_fn.contains("return Ok(held_stop(day, \"start\"));"));
