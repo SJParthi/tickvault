@@ -1941,43 +1941,44 @@ mod tests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(64))]
+            #![proptest_config(ProptestConfig::with_cases(64))]
 
-        /// Crash at any call of any step, up to three times, and the run
-        /// still ends with every partition dropped only after its verified
-        /// copy, every file moved with its bytes, one verified `.done`, and
-        /// the rebuild only ever after every drop and move.
-        #[test]
-        fn proptest_crash_and_resume_over_every_step(
-            n_parts in 0usize..5,
-            n_files in 0usize..4,
-            crash_points in proptest::collection::vec(1u32..60, 0..4),
-        ) {
-            let (root, remote, files) = setup(n_parts, n_files);
-            let payloads: Vec<Vec<u8>> = files
-                .iter()
-                .map(|f| std::fs::read(root.join(f)).expect("payload"))
-                .collect();
-            drive(&root, &remote, &crash_points);
-            let r = remote.borrow();
-            prop_assert!(r.violations.is_empty(), "{:?}", r.violations);
-            prop_assert!(r.partitions.is_empty());
-            prop_assert!(r.rebuilds >= 1);
-            for (f, want) in files.iter().zip(&payloads) {
-                prop_assert!(!root.join(f).exists());
-                let got = std::fs::read(root.join(held_target(f))).expect("held copy");
-                prop_assert_eq!(&got, want);
+            /// Crash at any call of any step, up to three times, and the run
+            /// still ends with every partition dropped only after its verified
+            /// copy, every file moved with its bytes, one verified `.done`, and
+            /// the rebuild only ever after every drop and move.
+            #[test]
+            fn proptest_crash_and_resume_over_every_step(
+                n_parts in 0usize..5,
+                n_files in 0usize..4,
+                crash_points in proptest::collection::vec(1u32..60, 0..4),
+            ) {
+                let (root, remote, files) = setup(n_parts, n_files);
+                let payloads: Vec<Vec<u8>> = files
+                    .iter()
+                    .map(|f| std::fs::read(root.join(f)).expect("payload"))
+                    .collect();
+                drive(&root, &remote, &crash_points);
+                let r = remote.borrow();
+                prop_assert!(r.violations.is_empty(), "{:?}", r.violations);
+                prop_assert!(r.partitions.is_empty());
+                prop_assert!(r.rebuilds >= 1);
+                for (f, want) in files.iter().zip(&payloads) {
+                    prop_assert!(!root.join(f).exists());
+                    let got = std::fs::read(root.join(held_target(f))).expect("held copy");
+                    prop_assert_eq!(&got, want);
+                }
+                let done_valid = matches!(
+                    tickvault_storage::held_days::read_day_marker(
+                        &root.join(DAY_REPAIR_DIR),
+                        MarkerKind::Done,
+                        nov20()
+                    ),
+                    MarkerRead::Valid { .. }
+    );
+    prop_assert!(done_valid);
+                drop(r);
+                std::fs::remove_dir_all(&root).ok();
             }
-            prop_assert!(matches!(
-                tickvault_storage::held_days::read_day_marker(
-                    &root.join(DAY_REPAIR_DIR),
-                    MarkerKind::Done,
-                    nov20()
-                ),
-                MarkerRead::Valid { .. }
-            ));
-            drop(r);
-            std::fs::remove_dir_all(&root).ok();
         }
-    }
 }

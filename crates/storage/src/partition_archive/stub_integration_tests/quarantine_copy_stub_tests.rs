@@ -1,3 +1,4 @@
+#![cfg(test)]
 //! The 20 Nov quarantine copy and drop (daily-universe Quote 63) against the
 //! archiver's stub QuestDB, ILP and S3: copy first, verify, record, then the
 //! drop through the last-moment recount; never an S3 delete, never a

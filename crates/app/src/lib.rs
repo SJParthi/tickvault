@@ -226,6 +226,7 @@ pub mod volume_semantics_probe;
 /// `tickvault day-repair`: the one-off repair of the held day 2026-11-20
 /// (daily-universe Quote 63, rust-only §0.21); deleted after the run.
 pub mod day_repair;
+pub mod day_repair_ssm;
 /// The depth-20 / depth-200 on-off switch (owner, 2026-10-21).
 pub mod depth_switch;
 /// The after-close drain hold (operator Quote 31, 2026-10-21): keeps the box
