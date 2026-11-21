@@ -766,6 +766,44 @@ rules:
       triggered once per episode, no recovery line. Never auto-fixed: the
       time source needs an operator (chronyc tracking, chronyc sources).
 
+  - name: dhan-feed-time-01-trade-times-wrong-escalate
+    match:
+      code: DHAN-FEED-TIME-01
+    action: escalate
+    runbook_path: docs/error-runbooks/dhan-feed-time-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      DHAN-FEED-TIME-01 = the live feed's trade times still look wrong after
+      the Dhan trade-time correction, or no candle formed for 10 minutes
+      while prices arrive, inside the session (noise lock 2.24). The day is
+      auto-held for the manual repair; never auto-fixed or auto-released.
+
+  - name: dhan-ltt-01-correction-changed-silence
+    match:
+      code: DHAN-LTT-01
+    action: silence
+    runbook_path: docs/error-runbooks/dhan-feed-time-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 86400
+    justification: >-
+      DHAN-LTT-01 is a warn line: the trade-time correction armed or closed
+      (or would have, in shadow mode). The once-a-day notice already told the
+      operator; noise lock 2.24 forbids paging the correction's own warnings.
+
+  - name: dhan-ltt-02-record-unsettled-silence
+    match:
+      code: DHAN-LTT-02
+    action: silence
+    runbook_path: docs/error-runbooks/dhan-feed-time-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 86400
+    justification: >-
+      DHAN-LTT-02 is log-only: a correction record line could not be saved,
+      a started change was never confirmed (that day is held from replay,
+      frames kept), the detector froze after 8 changes, or a replay stopped
+      at a held day. Nothing is lost; the runbook names the manual repair.
+
   - name: net-rtt-01-handshake-check-failed-silence
     match:
       code: NET-RTT-01

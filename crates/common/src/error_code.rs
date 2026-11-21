@@ -198,6 +198,25 @@ pub enum ErrorCode {
     /// ensured after one retry (`stage = "ensure_failed"`), is an `error!`
     /// with no CloudWatch filter.
     NetRtt01HandshakeCheckFailed,
+    /// DHAN-FEED-TIME-01: the live main feed's trade times look wrong AFTER
+    /// the trade-time correction, inside the session (09:15–15:30 IST or the
+    /// published Muhurat window). Cause A: in two 30 s scans in a row at least
+    /// 20 index ticks and at least half carried a time outside the session or
+    /// more than 5 minutes from receipt. Cause B: 10 minutes of main-feed
+    /// frames with no candle sealed. At most once per cause per IST day; the
+    /// day is auto-held from the archive and the export; pages (noise-lock
+    /// §2.24, owner cards 2026-11-20).
+    DhanFeedTime01TradeTimesWrong,
+    /// DHAN-LTT-01: the Dhan trade-time correction armed or closed (Dhan sent
+    /// trade times 5 h 30 min early, scope lock 2026-11-20), or in shadow mode
+    /// would have. A `warn!`, never pages (noise-lock §2.24 REJECT "paging the
+    /// correction's own coded warnings").
+    DhanLtt01CorrectionChanged,
+    /// DHAN-LTT-02: the trade-time correction record could not be written, a
+    /// started change was never confirmed (that day is held from replay), the
+    /// detector froze after 8 changes in a day, or a WAL replay stopped at a
+    /// held day. Log-only, never pages.
+    DhanLtt02RecordUnsettled,
     /// LIVE-FILL-01: the daily live paper fill calibration report (plan item
     /// LF-7) could not read its rows, re-price an order, write its files,
     /// copy them to the cold bucket, write its daily marker or its database
@@ -1199,6 +1218,9 @@ impl ErrorCode {
             Self::HotPathStall01 => "HOT-PATH-STALL-01",
             Self::ClockSkew01OffsetOverOneMs => "CLOCK-SKEW-01",
             Self::NetRtt01HandshakeCheckFailed => "NET-RTT-01",
+            Self::DhanFeedTime01TradeTimesWrong => "DHAN-FEED-TIME-01",
+            Self::DhanLtt01CorrectionChanged => "DHAN-LTT-01",
+            Self::DhanLtt02RecordUnsettled => "DHAN-LTT-02",
             Self::LiveFill01ReportFailed => "LIVE-FILL-01",
             Self::LiveFill02FillOutsideWorstCase => "LIVE-FILL-02",
             Self::TickSpill01FileQuarantined => "TICK-SPILL-01",
@@ -1496,6 +1518,9 @@ impl ErrorCode {
             Self::ClockSkew01OffsetOverOneMs => Severity::High,
             // NET-RTT-01: a measurement row is missing or failed; log-only.
             Self::NetRtt01HandshakeCheckFailed => Severity::Low,
+            Self::DhanFeedTime01TradeTimesWrong => Severity::High,
+            Self::DhanLtt01CorrectionChanged => Severity::Low,
+            Self::DhanLtt02RecordUnsettled => Severity::Medium,
             // LIVE-FILL-01: a step of the daily report failed; files kept, log-only.
             Self::LiveFill01ReportFailed => Severity::Medium,
             // LIVE-FILL-02: a paper fill outside the re-priced worst case; log-only.
@@ -1687,6 +1712,9 @@ impl ErrorCode {
             | Self::PrevOi01CacheEmptyAtBoot
             | Self::PrevClose04CacheEmptyAtBoot => "docs/error-runbooks/wave-1-error-codes.md",
             Self::HotPathStall01 => "docs/error-runbooks/hot-path-stall-error-codes.md",
+            Self::DhanFeedTime01TradeTimesWrong
+            | Self::DhanLtt01CorrectionChanged
+            | Self::DhanLtt02RecordUnsettled => "docs/error-runbooks/dhan-feed-time-error-codes.md",
             Self::ClockSkew01OffsetOverOneMs | Self::NetRtt01HandshakeCheckFailed => {
                 "docs/error-runbooks/clock-offset-and-network-rtt-error-codes.md"
             }
@@ -1917,6 +1945,10 @@ impl ErrorCode {
                 // operator judges (restart, apply lag or a real loss); the
                 // TF-VERIFY-01 precedent.
                 | Self::TickConserve01DailyMismatch
+                // DHAN-FEED-TIME-01 (2026-11-20): whether the feed's times are
+                // wrong is an operator verdict (the day is auto-held for the
+                // manual repair); no auto action may rerun or release it.
+                | Self::DhanFeedTime01TradeTimesWrong
                 // EXPIRY-SCOPE-01 (2026-10-28): a scope verdict the operator
                 // judges (selector bug, stale file, vendor relisting).
                 | Self::ExpiryScope01OffExpiry
@@ -2000,6 +2032,9 @@ impl ErrorCode {
             Self::HotPathStall01,
             Self::ClockSkew01OffsetOverOneMs,
             Self::NetRtt01HandshakeCheckFailed,
+            Self::DhanFeedTime01TradeTimesWrong,
+            Self::DhanLtt01CorrectionChanged,
+            Self::DhanLtt02RecordUnsettled,
             Self::LiveFill01ReportFailed,
             Self::LiveFill02FillOutsideWorstCase,
             Self::TickSpill01FileQuarantined,
@@ -2542,6 +2577,8 @@ mod tests {
                 || s.starts_with("CADENCE-")
                 // The revived Dhan feed's live-vs-REST ground-truth check
                 || s.starts_with("DHAN-LIVE-XVERIFY-")
+                || s.starts_with("DHAN-FEED-TIME-")
+                || s.starts_with("DHAN-LTT-")
                 // 2026-08-25: the tick spill tier's replay path — a rescued
                 // file QuestDB will never accept, set aside so the rest of
                 // the backlog can drain.

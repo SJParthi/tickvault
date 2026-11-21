@@ -197,6 +197,11 @@ pub struct ApplicationConfig {
     /// opts in.
     #[serde(default)]
     pub dhan_universe: DhanUniverseConfig,
+    /// `[dhan_feed]` — how the live main feed reads Dhan's Last Trade Time
+    /// (scope lock 2026-11-20, "DHAN TRADE TIME SENT AS UTC"). Absent
+    /// section ⇒ the default `act`.
+    #[serde(default)]
+    pub dhan_feed: DhanFeedConfig,
     /// `[dhan_margin_gate]` — 🔷 DHAN pre-trade margin gate (operator
     /// directive 2026-07-14, relayed via the coordinator session — the
     /// Funds & Margin surface runs as its own dedicated build; umbrella
@@ -1570,6 +1575,44 @@ impl FrameSilenceFastPath {
             Self::Act => "act",
         }
     }
+}
+
+/// What the Dhan trade-time correction does (scope lock 2026-11-20, "DHAN
+/// TRADE TIME SENT AS UTC"). On 2026-11-20 Dhan sent every Last Trade Time as
+/// UTC epoch (19,800 s early under the documented IST rule).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LttUtcAutocorrect {
+    /// No detection and no correction at all, not even from an earlier
+    /// day's armed record (the full rollback).
+    Off,
+    /// The detector runs and logs what it would arm; nothing new is armed.
+    /// Days an earlier `act` run armed are still corrected on replay, so a
+    /// replay matches what the live run wrote.
+    Shadow,
+    /// The detector arms a correction from a saved record. The default.
+    #[default]
+    Act,
+}
+
+impl LttUtcAutocorrect {
+    /// The config spelling, for logs.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Shadow => "shadow",
+            Self::Act => "act",
+        }
+    }
+}
+
+/// `[dhan_feed]` config (scope lock 2026-11-20).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+pub struct DhanFeedConfig {
+    /// `"act"` (default), `"shadow"` or `"off"`.
+    #[serde(default)]
+    pub ltt_utc_autocorrect: LttUtcAutocorrect,
 }
 
 const fn default_main_feed_backup_top_n() -> usize {
@@ -4352,6 +4395,7 @@ mod tests {
             order_update_events: OrderUpdateEventsConfig::default(),
             order_leg_pnl: OrderLegPnlConfig::default(),
             dhan_universe: DhanUniverseConfig::default(),
+            dhan_feed: DhanFeedConfig::default(),
             dhan_margin_gate: DhanMarginGateConfig::default(),
             exit_orders: ExitOrdersConfig::default(),
             raw_frame_archive: RawFrameArchiveConfig::default(),
@@ -5637,6 +5681,57 @@ mod tests {
         assert!(
             section.contains("frame_silence_fast_path = \"shadow\""),
             "base.toml must ship the frame-silence fast paths in shadow mode"
+        );
+    }
+
+    #[test]
+    fn test_ltt_utc_autocorrect_defaults_to_act_and_parses_every_spelling() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            dhan_feed: DhanFeedConfig,
+        }
+        // Absent section and absent key: the scope lock 2026-11-20 default.
+        let absent: Wrapper = Figment::new()
+            .merge(Toml::string("[questdb]\nhost = \"x\"\n"))
+            .extract()
+            .expect("absent [dhan_feed] must default");
+        assert_eq!(absent.dhan_feed.ltt_utc_autocorrect, LttUtcAutocorrect::Act);
+        assert_eq!(LttUtcAutocorrect::default(), LttUtcAutocorrect::Act);
+        for (spelling, want) in [
+            ("off", LttUtcAutocorrect::Off),
+            ("shadow", LttUtcAutocorrect::Shadow),
+            ("act", LttUtcAutocorrect::Act),
+        ] {
+            let parsed: Wrapper = Figment::new()
+                .merge(Toml::string(&format!(
+                    "[dhan_feed]\nltt_utc_autocorrect = \"{spelling}\"\n"
+                )))
+                .extract()
+                .expect("a documented spelling parses");
+            assert_eq!(parsed.dhan_feed.ltt_utc_autocorrect, want);
+            assert_eq!(want.as_str(), spelling);
+        }
+        let typo: Result<Wrapper, _> = Figment::new()
+            .merge(Toml::string("[dhan_feed]\nltt_utc_autocorrect = \"on\"\n"))
+            .extract();
+        assert!(typo.is_err(), "an unknown mode must be refused");
+    }
+
+    #[test]
+    fn test_base_toml_ships_ltt_utc_autocorrect_act() {
+        let base = include_str!("../../../config/base.toml");
+        let section = base
+            .split("\n[dhan_feed]")
+            .nth(1)
+            .expect("base.toml carries [dhan_feed]");
+        let section = section.split("\n[").next().unwrap_or(section);
+        assert!(
+            section.contains("ltt_utc_autocorrect = \"act\""),
+            "base.toml must ship the Dhan trade-time correction in act mode"
         );
     }
 

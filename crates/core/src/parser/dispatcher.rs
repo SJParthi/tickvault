@@ -9,9 +9,10 @@ use metrics::Counter;
 use tickvault_common::constants::{
     DEEP_DEPTH_FEED_CODE_ASK, DEEP_DEPTH_FEED_CODE_BID, DISCONNECT_PACKET_SIZE,
     FULL_QUOTE_PACKET_SIZE, MARKET_STATUS_PACKET_SIZE, OI_PACKET_SIZE, PREVIOUS_CLOSE_PACKET_SIZE,
-    QUOTE_PACKET_SIZE, RESPONSE_CODE_DISCONNECT, RESPONSE_CODE_FULL, RESPONSE_CODE_INDEX_TICKER,
-    RESPONSE_CODE_MARKET_DEPTH, RESPONSE_CODE_MARKET_STATUS, RESPONSE_CODE_OI,
-    RESPONSE_CODE_PREVIOUS_CLOSE, RESPONSE_CODE_QUOTE, RESPONSE_CODE_TICKER, TICKER_PACKET_SIZE,
+    QUOTE_OFFSET_LTT, QUOTE_PACKET_SIZE, RESPONSE_CODE_DISCONNECT, RESPONSE_CODE_FULL,
+    RESPONSE_CODE_INDEX_TICKER, RESPONSE_CODE_MARKET_DEPTH, RESPONSE_CODE_MARKET_STATUS,
+    RESPONSE_CODE_OI, RESPONSE_CODE_PREVIOUS_CLOSE, RESPONSE_CODE_QUOTE, RESPONSE_CODE_TICKER,
+    TICKER_OFFSET_LTT, TICKER_PACKET_SIZE,
 };
 
 // PR #4 (2026-05-19): DEEP_DEPTH_HEADER_SIZE retired alongside the
@@ -164,7 +165,7 @@ pub fn dispatch_frame(raw: &[u8], received_at_nanos: i64) -> Result<ParsedFrame,
     // path zero-allocation (Principle #1) — see `dispatcher_counter`.
     dispatcher_counter(header.response_code).increment(1);
 
-    dispatch_parsed_header(raw, header, received_at_nanos)
+    dispatch_parsed_header(raw, header, received_at_nanos, true)
 }
 
 /// [`dispatch_frame`] without its per-packet response-code counter.
@@ -189,7 +190,64 @@ pub fn dispatch_frame_uncounted(
     received_at_nanos: i64,
 ) -> Result<ParsedFrame, ParseError> {
     let header = parse_header(raw)?;
-    dispatch_parsed_header(raw, header, received_at_nanos)
+    dispatch_parsed_header(raw, header, received_at_nanos, true)
+}
+
+/// [`dispatch_frame_uncounted`] for a frame whose receipt is NOT a WAL stamp
+/// (the live drain's `now - queued` fallback). Identical parse; the Dhan
+/// trade-time correction is never applied (scope lock 2026-11-20: "never
+/// applied to a frame without a WAL receipt stamp"), because a replay of that
+/// record would carry no receipt and could not reproduce the decision.
+///
+/// # Performance
+/// O(1) — header parse + single packet parse. No heap allocation.
+#[inline]
+pub fn dispatch_frame_uncounted_unstamped(
+    raw: &[u8],
+    received_at_nanos: i64,
+) -> Result<ParsedFrame, ParseError> {
+    let header = parse_header(raw)?;
+    dispatch_parsed_header(raw, header, received_at_nanos, false)
+}
+
+/// The Last Trade Time exactly as Dhan sent it in a Ticker, Quote or Full
+/// packet (before any correction), or `None` for any other packet or a short
+/// one. The live drain's trade-time detector votes on this raw value.
+///
+/// # Performance
+/// O(1): one code read and one fixed-offset `u32` read. No allocation.
+#[must_use]
+#[inline]
+pub fn raw_last_trade_time(packet: &[u8]) -> Option<u32> {
+    let offset = match *packet.first()? {
+        RESPONSE_CODE_INDEX_TICKER | RESPONSE_CODE_TICKER => TICKER_OFFSET_LTT,
+        RESPONSE_CODE_QUOTE | RESPONSE_CODE_FULL => QUOTE_OFFSET_LTT,
+        _ => return None,
+    };
+    let bytes: [u8; 4] = packet
+        .get(offset..offset.checked_add(4)?)?
+        .try_into()
+        .ok()?;
+    Some(u32::from_le_bytes(bytes))
+}
+
+/// Applies the Dhan trade-time correction to one parsed tick (scope lock
+/// 2026-11-20). The ONLY place a trade time is corrected: every consumer reads
+/// the tick after this. O(1); one atomic load on a day with nothing armed.
+// DHAN-LTT: correction threaded through the dispatcher (guard pinned).
+#[inline]
+fn apply_ltt_correction(
+    tick: &mut tickvault_common::tick_types::ParsedTick,
+    received_at_nanos: i64,
+    wal_stamped: bool,
+) {
+    if wal_stamped {
+        tick.exchange_timestamp = tickvault_storage::ltt_correction::corrected_ltt(
+            tick.exchange_timestamp,
+            tick.exchange_segment_code,
+            received_at_nanos,
+        );
+    }
 }
 
 /// Adds `packets` to the `tv_packets_by_response_code` series of `code`, the
@@ -211,20 +269,24 @@ fn dispatch_parsed_header(
     raw: &[u8],
     header: PacketHeader,
     received_at_nanos: i64,
+    wal_stamped: bool,
 ) -> Result<ParsedFrame, ParseError> {
     match header.response_code {
         RESPONSE_CODE_INDEX_TICKER | RESPONSE_CODE_TICKER => {
-            let tick = parse_ticker_packet(raw, &header, received_at_nanos)?;
+            let mut tick = parse_ticker_packet(raw, &header, received_at_nanos)?;
+            apply_ltt_correction(&mut tick, received_at_nanos, wal_stamped);
             Ok(ParsedFrame::Tick(tick))
         }
         // PR #4 (2026-05-19): RESPONSE_CODE_MARKET_DEPTH (v1 legacy, code 3)
         // arm retired — v1 is deprecated in v2 (replaced by Full code 8).
         RESPONSE_CODE_QUOTE => {
-            let tick = parse_quote_packet(raw, &header, received_at_nanos)?;
+            let mut tick = parse_quote_packet(raw, &header, received_at_nanos)?;
+            apply_ltt_correction(&mut tick, received_at_nanos, wal_stamped);
             Ok(ParsedFrame::Tick(tick))
         }
         RESPONSE_CODE_FULL => {
-            let (tick, depth) = parse_full_packet(raw, &header, received_at_nanos)?;
+            let (mut tick, depth) = parse_full_packet(raw, &header, received_at_nanos)?;
+            apply_ltt_correction(&mut tick, received_at_nanos, wal_stamped);
             Ok(ParsedFrame::TickWithDepth(tick, depth))
         }
         RESPONSE_CODE_OI => {
@@ -1252,8 +1314,43 @@ mod uncounted_dispatch_tests {
         ) {
             let counted = format!("{:?}", dispatch_frame(&bytes, received_at_nanos));
             let uncounted = format!("{:?}", dispatch_frame_uncounted(&bytes, received_at_nanos));
-            prop_assert_eq!(counted, uncounted);
+            prop_assert_eq!(&counted, &uncounted);
+            // Nothing is armed in this test process, so the unstamped entry
+            // point parses identically too (scope lock 2026-11-20).
+            let unstamped =
+                format!("{:?}", dispatch_frame_uncounted_unstamped(&bytes, received_at_nanos));
+            prop_assert_eq!(counted, unstamped);
         }
+
+        #[test]
+        fn test_raw_last_trade_time_reads_the_parsed_ltt_of_every_tick_packet(
+            bytes in known_packet(),
+        ) {
+            let parsed = dispatch_frame_uncounted_unstamped(&bytes, 0);
+            match (raw_last_trade_time(&bytes), parsed) {
+                (Some(raw), Ok(ParsedFrame::Tick(t) | ParsedFrame::TickWithDepth(t, _))) => {
+                    prop_assert_eq!(raw, t.exchange_timestamp);
+                }
+                (None, Ok(ParsedFrame::Tick(_) | ParsedFrame::TickWithDepth(..))) => {
+                    prop_assert!(false, "a tick packet must have a raw trade time");
+                }
+                (Some(_), _) => prop_assert!(false, "only tick packets have a trade time"),
+                (None, _) => {}
+            }
+        }
+    }
+
+    #[test]
+    fn test_raw_last_trade_time_refuses_short_and_empty_packets() {
+        assert_eq!(raw_last_trade_time(&[]), None);
+        assert_eq!(raw_last_trade_time(&[RESPONSE_CODE_TICKER; 15]), None);
+        assert_eq!(raw_last_trade_time(&[RESPONSE_CODE_QUOTE; 17]), None);
+        assert_eq!(raw_last_trade_time(&[RESPONSE_CODE_OI; 12]), None);
+        let mut ticker = vec![0u8; TICKER_PACKET_SIZE];
+        ticker[0] = RESPONSE_CODE_INDEX_TICKER;
+        ticker[TICKER_OFFSET_LTT..TICKER_OFFSET_LTT + 4]
+            .copy_from_slice(&1_795_152_600u32.to_le_bytes());
+        assert_eq!(raw_last_trade_time(&ticker), Some(1_795_152_600));
     }
 
     /// The drain counts every packet it dispatches, which matches the

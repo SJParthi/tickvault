@@ -153,7 +153,7 @@ pub const GENERIC_SAFE_LINE: &str = "🔔 Alert received — details are in the 
 ///
 /// O(n) scan per lookup — cold path (a handful of alarm renders per SNS
 /// batch), deliberately not a hash map so the table stays a reviewable literal.
-pub const ALARM_PHRASES: [(&str, &str); 86] = [
+pub const ALARM_PHRASES: [(&str, &str); 87] = [
     // ---- capacity + candle building ----
     (
         "aggregator-slots-exhausted",
@@ -469,6 +469,10 @@ pub const ALARM_PHRASES: [(&str, &str); 86] = [
     (
         "errcode-hot-path-stall-01",
         "🔷 DHAN: the live market data path stalled for 2 seconds or more — some prices may have been skipped; check the server",
+    ),
+    (
+        "errcode-dhan-feed-time-01",
+        "🔷 DHAN: live prices still carry the wrong time even after our fix, or no candle formed for 10 minutes — today is held for repair; raw data is kept",
     ),
     (
         "errcode-clock-skew-01",

@@ -113,7 +113,12 @@ mod inline_depth_sample;
 mod silence_tally;
 // Speed fix 4 (2026-11-17): the per-frame counter tally, its own file.
 mod frame_tally;
+// Scope lock 2026-11-20: the drain's side of the Dhan trade-time correction.
+mod ltt_feed;
+// Noise lock §2.24: the DHAN-FEED-TIME-01 page.
+mod feed_time_page;
 use frame_tally::FrameTally;
+pub use ltt_feed::install_ltt_notice;
 use std::time::Instant;
 
 use secrecy::ExposeSecret;
@@ -134,7 +139,7 @@ use tickvault_core::parser::depth::{
     DepthFeedKind, DepthLevelBuffer, DepthPayload, DepthSide, DepthSplitStop, parse_depth_packet,
     split_depth_frame,
 };
-use tickvault_core::parser::dispatcher::{dispatch_frame, dispatch_frame_uncounted};
+use tickvault_core::parser::dispatcher::dispatch_frame;
 use tickvault_core::pipeline::tick_gap_detector::{
     DetectorConfig, LttVerdict, SilenceVerdict, TickAssessment, TickGapDetector, TickObservation,
     VolumeVerdict,
@@ -1770,6 +1775,11 @@ pub struct LiveIngest {
     /// it): its `no_trade_today` rows are never skipped (Quote 61, 2026-11-14
     /// audit fix). Set per frame by the live drain, `false` on replay.
     frame_wal_unbacked: bool,
+    /// Dhan trade-time correction controller (scope lock 2026-11-20); inert
+    /// until `with_ltt_correction`.
+    ltt: tickvault_storage::ltt_correction::LttController,
+    /// §2.24 feed-time page counts (live index ticks, frames).
+    feed_time: feed_time_page::FeedTimeTally,
     /// Late-attach seed batches waiting for the drain's idle arm (plan item
     /// DT-A1, 2026-10-28), seeded [`SEED_STEP_INSTRUMENTS`] at a time.
     seed_queue: SeedQueue,
@@ -2190,6 +2200,8 @@ impl LiveIngest {
             market_data_floor_unix_nanos: None,
             frame_receipt_is_wal_stamp: true,
             frame_wal_unbacked: false,
+            ltt: ltt_feed::inert_controller(),
+            feed_time: feed_time_page::FeedTimeTally::default(),
             seed_queue: SeedQueue::new(),
         }
     }
@@ -7232,6 +7244,7 @@ async fn run_frame_drain(
     // Consecutive alarm-worthy scans, and whether we have already paged for
     // this episode. Edge-triggered per audit Rule 4: the rising edge fires
     // once, the falling edge logs recovery at info and re-arms.
+    let mut feed_time_page = feed_time_page::FeedTimePage::start(); // §2.24
     let mut silent_scans: u32 = 0;
     let mut silence_reported = false;
     // §2.19: an episode below the paging floor is logged once at `warn!`.
@@ -7890,6 +7903,7 @@ async fn run_frame_drain(
             }
             _ = silence_timer.tick() => {
                 let _arm = StageTimer::start(HotPathStage::DrainArmSilence);
+                feed_time_page.scan(&mut ingest); // §2.24: before the session gate below
                 // Daily rollover for the ranking state, checked on the 30s arm
                 // rather than given a timer of its own: it is a cheap integer
                 // compare, and a whole tokio timer to fire once a day would be
@@ -8732,6 +8746,7 @@ pub fn drain_main_feed_frame(
     ingest.frame_receipt_is_wal_stamp =
         crate::tick_quote_route::receipt_is_wal_stamp(frame.received_at_nanos);
     ingest.frame_wal_unbacked = !frame.wal_backed;
+    ingest.ltt_on_live_frame(frame); // DHAN-LTT: before any packet is dispatched
     // A single WebSocket message may carry SEVERAL stacked packets — the
     // frame cap is `MAX_PACKETS_PER_FRAME` (70,000) of them. Walking the frame
     // packet by packet is what stops packets 2..N being silently discarded.
@@ -8840,7 +8855,12 @@ pub fn drain_main_feed_frame(
         if let Some(&code) = frame.bytes.get(offset) {
             tally.count_packet(code);
         }
-        match dispatch_frame_uncounted(&frame.bytes[offset..end], received_at_nanos) {
+        let packet = &frame.bytes[offset..end];
+        match ltt_feed::dispatch_main_feed_packet(
+            packet,
+            received_at_nanos,
+            ingest.frame_receipt_is_wal_stamp,
+        ) {
             // The SECOND copy of a packet for a contract subscribed on two
             // main-feed sockets (scope lock 2026-10-02): the first copy was
             // folded and written; this one is counted and skipped whole — no
@@ -8936,6 +8956,7 @@ pub fn drain_main_feed_frame(
                 // PR DP-6: the frame's tick count, the weight of its per-tick
                 // `drain_main_tick` sample.
                 out.tick_packets = out.tick_packets.saturating_add(1);
+                ingest.ltt_observe(packet, tick, frame); // DHAN-LTT: raw-time vote
                 // Delivery lag is recorded AFTER the fold below (2026-09-23,
                 // FIFTH scope-lock row), because only the fold knows whether
                 // this packet is a REPEATED quote — same trade time, same
@@ -11973,6 +11994,8 @@ pub struct DhanFeedStackParams {
     /// whether the evidence-confirmed frame-silence redials count only
     /// (`shadow`, the default), act, or are off.
     pub frame_silence_fast_path: FrameSilenceFastPath,
+    /// `[dhan_feed] ltt_utc_autocorrect` (scope lock 2026-11-20).
+    pub ltt_utc_autocorrect: tickvault_common::config::LttUtcAutocorrect,
     pub questdb: QuestDbConfig,
     /// The process-wide write-ahead log every captured frame lands in BEFORE
     /// it is visible to the fold. `None` refuses the lane: capture-at-receipt
@@ -17794,7 +17817,11 @@ async fn run_dhan_feed_stack(mut params: DhanFeedStackParams) {
     // frame. Address space only; see `with_fold_capacity` for the bytes.
     .with_fold_capacity(AGGREGATOR_MAX_SLOTS)
     .with_inline_depth(DepthIngest::new(&params.questdb, depth_book_since))
-    .with_subscribe_reconcile(Arc::clone(&subscribe_reconcile));
+    .with_subscribe_reconcile(Arc::clone(&subscribe_reconcile))
+    .with_ltt_correction(
+        params.ltt_utc_autocorrect,
+        ltt_feed::production_writer(params.ltt_utc_autocorrect),
+    );
     // LF-6b: the live paper fill chain's tap, only when the boot built the
     // chain (an approved strategy engine exists); never today.
     if let Some(link) = crate::live_fill::take_tap_sender() {
@@ -18054,6 +18081,8 @@ async fn run_dhan_feed_stack(mut params: DhanFeedStackParams) {
                  the boot WAL refold did not run. The staged write-ahead log frames are \
                  kept and re-offered (deferred, not lost)."
             );
+        } else if ltt_feed::replay_held(&params.wal_replay_live_feed, "boot_refold") {
+            // DHAN-LTT-02: a held day; the staged frames stay unconfirmed.
         } else {
             let unlanded_before =
                 tickvault_storage::wal_applied_watermark::applied_watermark().unlanded_snapshot();
@@ -18636,6 +18665,7 @@ async fn run_dhan_feed_stack(mut params: DhanFeedStackParams) {
             // segments: zero progress from 21 to 26 Oct.
             let mut round_landed = true;
             let mut round_quiesce_held = false;
+            let mut round_ltt_held = false;
             let mut round_frames = 0usize;
             let mut round_ticks = 0u64;
             let mut round_lost = 0u64;
@@ -18675,6 +18705,10 @@ async fn run_dhan_feed_stack(mut params: DhanFeedStackParams) {
                         round_quiesce_held = true;
                         break;
                     };
+                    if ltt_feed::replay_held(chunk, "catchup") {
+                        round_ltt_held = true; // DHAN-LTT-02: before this segment settles
+                        break;
+                    }
                     let unlanded_before = applied_watermark().unlanded_snapshot();
                     let outcome =
                         refold_wal_frames(&mut ingest, chunk, &gaps_in_chunk, round_pace_until);
@@ -18713,6 +18747,10 @@ async fn run_dhan_feed_stack(mut params: DhanFeedStackParams) {
             catchup_ticks = catchup_ticks.saturating_add(round_ticks);
             if !round_landed {
                 catchup_early_stop = catchup_stop::STOP_ACK_TIMEOUT;
+                break;
+            }
+            if round_ltt_held {
+                catchup_early_stop = catchup_stop::STOP_LTT_DAY_HELD;
                 break;
             }
             if round_quiesce_held {
@@ -22158,6 +22196,7 @@ mod tests {
             main_feed_backup_top_n: 0,
             subscribe_reconcile_auto_resubscribe: false,
             frame_silence_fast_path: FrameSilenceFastPath::default(),
+            ltt_utc_autocorrect: tickvault_common::config::LttUtcAutocorrect::Off,
             dhan_enabled: false,
             instance_lock_held: Arc::new(AtomicBool::new(false)),
             // A disabled lane never reaches the re-fold, which is exactly why

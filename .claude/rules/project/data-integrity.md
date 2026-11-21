@@ -194,6 +194,24 @@ Adding +5:30 to WebSocket timestamps corrupts:
 
 **If any test with "CRITICAL" in its name fails on tick timestamps: REVERT IMMEDIATELY.**
 
+> **⚠ CORRECTED 2026-11-21:** neither of the two CRITICAL tests named above
+> exists in the tree (`grep -rn no_ist_offset crates` finds only main.rs comments
+> recording related tests as RETIRED), and the
+> banned-pattern scanner has no IST-offset category. The rule stands; nothing
+> mechanical enforces it today.
+
+### 2026-11-21 — the ONE authorized +19,800 s: Dhan sent trade times as UTC (scope lock 2026-11-20)
+
+On 2026-11-20 Dhan sent every Last Trade Time as plain UTC epoch seconds, so
+`ts = exchange_timestamp × 1e9` put every row 5 h 30 min early. The fix is NOT
+an offset in the `ts` computation: the core dispatcher corrects the trade time
+itself, by exactly +19,800 s, only from a saved, armed per-IST-day record
+(`crates/storage/src/ltt_correction.rs`), before any consumer reads it. So
+`ts = exchange_timestamp × 1e9` stays the rule and stays true; on a corrected
+day `exchange_timestamp` is the corrected IST value. Raw WAL and S3 bytes are
+never changed. On every normal day nothing is armed and the rule above is
+unchanged. Switch: `[dhan_feed] ltt_utc_autocorrect` (`off` = no correction).
+
 ### 2026-10-27 — `tick_quotes` (repeat quotes, owner Quote 41)
 
 A main-feed packet whose exchange trade time is more than 2 s older than its
