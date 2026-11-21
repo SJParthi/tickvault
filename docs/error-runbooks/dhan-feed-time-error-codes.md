@@ -81,7 +81,7 @@ own window and latch (its row below; noise lock §2.24-a):
 |---|---|
 | `prices_outside_session` | In two 30 s scans in a row, at least 20 live index ticks and at least half carried a time (after the correction) outside the session or more than 5 minutes from receipt. |
 | `no_candles` | 20 scans in a row (10 minutes) with main-feed frames arriving and no candle sealed. |
-| `dhan_time_format_reverted` (2026-11-21, noise lock §2.24-a) | `source` of this cause. The reversion guard read 100 fresh index or NSE stock prints (3 distinct instruments, at least 99% agreeing) whose raw trade time is IST epoch again, with a receipt on or after 2026-11-20 inside 09:00–15:40 IST (or the Muhurat window). At most once per segment per IST day per process (the latch is in RAM, so a restart can page again), live drain only. The day is auto-held too (`act` only): the 30 s feed-time scan hands it to the same writer thread within 30 s. |
+| `dhan_time_format_reverted` (2026-11-21, noise lock §2.24-a) | `source` of this cause. The reversion guard read 100 fresh index or NSE stock prints (3 distinct instruments, at least 99% agreeing) whose raw trade time is IST epoch again, with a receipt on or after 2026-11-20 inside 09:00–15:40 IST (or the published Muhurat session, 15 min before to 10 min after; 18:00–19:30 on a Muhurat date with no published times). At most once per segment per IST day per process (the latch is in RAM, so a restart can page again), live drain only. The day is auto-held too (`act` only): the 30 s feed-time scan hands it to the same writer thread within 30 s. |
 
 For every reason the day is written to `data/state/held-days/<date>.hold`
 (daily-universe Quote 63; for `dhan_time_format_reverted` within 30 s of the
@@ -139,7 +139,7 @@ Never pages (§2.24). The once-a-day notice is the operator signal.
 | `ltt_detector_frozen` | 8 changes in one day; the detector stops for the day. | The feed is flapping; check with Dhan. |
 | `ltt_record_day_held` (boot) | A day's record has a change that was started and never confirmed, or cannot be read. That day's frames are held from replay. | Manual repair below. |
 | `ltt_replay_held` | A WAL replay reached such a day and stopped (`stop_reason="ltt_day_held"`). Frames stay in the log. | Manual repair below. |
-| `feed_time_latch_write_failed`, `feed_time_hold_write_failed`, `feed_time_persist_refused` | The page could not save its daily latch or the day's hold marker. | Write `data/state/held-days/<date>.hold` by hand before the evening archive. |
+| `feed_time_latch_write_failed`, `feed_time_hold_write_failed`, `feed_time_persist_refused`, `feed_time_writer_missing` | The page could not save its daily latch or the day's hold marker (`feed_time_writer_missing`: its writer thread never started, logged at the drain's start and again, once per cause per day, when a page cannot hand off; a reversion hold is retried every 30 s scan). | Write `data/state/held-days/<date>.hold` by hand before the evening archive. |
 
 ### Manual repair of a held record day
 
