@@ -746,62 +746,121 @@ pub async fn exec_count(
     Ok(first_count(&exec_dataset(client, exec_url, sql).await?))
 }
 
-/// Streams `SELECT capture_seq ...` through QuestDB's `/exp` (CSV: a header
-/// line, then one number per line) into `out`, chunk by chunk, so tens of
-/// millions of rows never sit in memory as text. O(rows).
+/// Streams one QuestDB `/exp` answer (CSV: a header line, then one row per
+/// line) to `take`, chunk by chunk, so tens of millions of rows never sit in
+/// memory as text. A 429 (QuestDB's export connection limit) is waited out
+/// and the same request sent again from scratch: 1, 2, 4, 8, then 15 s
+/// steps, at most `EXPORT_BUSY_MAX_WAIT` in all; `take` has seen nothing of
+/// a refused answer. Returns the data rows. O(rows).
 ///
 /// # Errors
-/// The request fails, QuestDB answers non-2xx, or a line is not a number.
+/// The request fails, QuestDB answers non-2xx (a 429 past the wait), or
+/// `take` refuses a line.
+pub async fn export_lines(
+    client: &reqwest::Client,
+    exp_url: &str,
+    sql: &str,
+    mut take: impl FnMut(&str) -> anyhow::Result<()>,
+) -> anyhow::Result<u64> {
+    let mut waited = std::time::Duration::ZERO;
+    let mut step = std::time::Duration::from_secs(1);
+    let mut resp = loop {
+        let resp = client
+            .get(exp_url)
+            .query(&[("query", sql)])
+            .send()
+            .await
+            .with_context(|| format!("export {sql}"))?;
+        let status = resp.status();
+        if status.is_success() {
+            break resp;
+        }
+        let body = resp.text().await.unwrap_or_default();
+        if status.as_u16() == 429 && waited < EXPORT_BUSY_MAX_WAIT {
+            tokio::time::sleep(step).await;
+            waited += step;
+            step = (step * 2).min(std::time::Duration::from_secs(15));
+            continue;
+        }
+        bail!("export {sql} returned {status}: {body}");
+    };
+    let mut pending: Vec<u8> = Vec::new();
+    let mut header_seen = false;
+    let mut rows = 0u64;
+    let mut line_of = |line: &[u8]| -> anyhow::Result<()> {
+        let text = std::str::from_utf8(line).context("export line is not UTF-8")?;
+        let text = text.trim_end_matches(['\r', '\n']);
+        if !header_seen {
+            header_seen = true;
+            return Ok(());
+        }
+        if text.trim().is_empty() {
+            return Ok(());
+        }
+        rows += 1;
+        take(text)
+    };
+    while let Some(chunk) = resp.chunk().await.context("read the export")? {
+        pending.extend_from_slice(&chunk);
+        let mut start = 0usize;
+        while let Some(pos) = pending[start..].iter().position(|b| *b == b'\n') {
+            line_of(&pending[start..start + pos])?;
+            start += pos + 1;
+        }
+        pending.drain(..start);
+    }
+    if !pending.is_empty() {
+        line_of(&pending)?;
+    }
+    Ok(rows)
+}
+
+/// How long [`export_lines`] waits out QuestDB's export connection limit.
+const EXPORT_BUSY_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(120); // APPROVED: this IS the named constant the rule asks for
+
+/// `SELECT capture_seq ...` through `/exp` into `out`. O(rows).
+///
+/// # Errors
+/// As [`export_lines`], or a line that is not a number.
 pub async fn export_seqs(
     client: &reqwest::Client,
     exp_url: &str,
     sql: &str,
     out: &mut Vec<u64>,
 ) -> anyhow::Result<u64> {
-    let mut resp = client
-        .get(exp_url)
-        .query(&[("query", sql)])
-        .send()
-        .await
-        .with_context(|| format!("export {sql}"))?;
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        bail!("export {sql} returned {status}: {body}");
-    }
-    let mut pending: Vec<u8> = Vec::new();
-    let mut header_seen = false;
-    let mut rows = 0u64;
-    let mut take = |line: &[u8], header_seen: &mut bool| -> anyhow::Result<()> {
-        let text = std::str::from_utf8(line).context("export line is not UTF-8")?;
-        let text = text.trim().trim_matches('"');
-        if !*header_seen {
-            *header_seen = true;
-            return Ok(());
-        }
-        if text.is_empty() {
-            return Ok(());
-        }
+    export_lines(client, exp_url, sql, |line| {
+        let text = line.trim().trim_matches('"');
         let v: u64 = text
             .parse()
             .with_context(|| format!("export value {text:?} is not a capture_seq"))?;
         out.push(v);
-        rows += 1;
         Ok(())
-    };
-    while let Some(chunk) = resp.chunk().await.context("read the export")? {
-        pending.extend_from_slice(&chunk);
-        let mut start = 0usize;
-        while let Some(pos) = pending[start..].iter().position(|b| *b == b'\n') {
-            take(&pending[start..start + pos], &mut header_seen)?;
-            start += pos + 1;
+    })
+    .await
+}
+
+/// `SELECT DISTINCT security_id, segment ...` through `/exp` into `out` as
+/// `security_id|segment` (the copy reader's contract key). O(rows).
+///
+/// # Errors
+/// As [`export_lines`], or a line with fewer than two fields.
+pub async fn export_contracts(
+    client: &reqwest::Client,
+    exp_url: &str,
+    sql: &str,
+    out: &mut std::collections::BTreeSet<String>,
+) -> anyhow::Result<u64> {
+    export_lines(client, exp_url, sql, |line| {
+        let f = tickvault_storage::day_repair_coverage::csv_fields(line);
+        match (f.first(), f.get(1)) {
+            (Some(sid), Some(seg)) => {
+                out.insert(format!("{}|{}", sid.trim(), seg.trim()));
+                Ok(())
+            }
+            _ => bail!("export line {line:?} has no security_id and segment"),
         }
-        pending.drain(..start);
-    }
-    if !pending.is_empty() {
-        take(&pending, &mut header_seen)?;
-    }
-    Ok(rows)
+    })
+    .await
 }
 
 /// The offset fingerprint of one day: index ticks whose exchange time is
@@ -1423,6 +1482,69 @@ mod stub_exec_tests {
             .await
             .expect_err("500");
         assert!(format!("{e:#}").contains("500"), "{e:#}");
+    }
+
+    #[tokio::test]
+    async fn test_export_lines_waits_out_a_429_and_export_contracts_reads_pairs() {
+        // First answer 429 (QuestDB's export connection limit), then the rows.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let mut n = 0u32;
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut req = Vec::new();
+                let mut part = [0u8; 4096];
+                while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut part).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => req.extend_from_slice(&part[..n]),
+                    }
+                }
+                let (status, body) = if n == 0 {
+                    (429, String::from("busy"))
+                } else {
+                    (
+                        200,
+                        String::from(
+                            "\"security_id\",\"segment\"\r\n13,IDX_I\r\n52411,\"NSE_FNO\"\r\n",
+                        ),
+                    )
+                };
+                n += 1;
+                let reply = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(reply.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        let url = format!("http://{addr}/exp");
+        let mut out = std::collections::BTreeSet::new();
+        let rows = export_contracts(&client(), &url, "SELECT DISTINCT", &mut out)
+            .await
+            .expect("waited out the 429");
+        assert_eq!(rows, 2);
+        let want: std::collections::BTreeSet<String> = ["13|IDX_I", "52411|NSE_FNO"]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        assert_eq!(out, want);
+        // export_lines hands each data line to `take` and stops on its error.
+        let mut seen = Vec::new();
+        let e = export_lines(&client(), &url, "SELECT DISTINCT", |l| {
+            seen.push(l.to_owned());
+            anyhow::bail!("refused")
+        })
+        .await
+        .expect_err("take refused");
+        assert!(format!("{e:#}").contains("refused"), "{e:#}");
+        assert_eq!(seen, vec![String::from("13,IDX_I")]);
     }
 
     #[tokio::test]

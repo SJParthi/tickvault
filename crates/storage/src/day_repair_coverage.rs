@@ -65,6 +65,37 @@ pub struct CopySeqs {
     pub repeat_kind: Vec<u64>,
     /// Data rows read.
     pub rows: u64,
+    /// `security_id|segment` of every contract with a repeat-skip-kind row:
+    /// the rebuild must keep at least one such row per contract (a bound on
+    /// the exemption; 2026-11-21 review).
+    pub repeat_contracts: std::collections::BTreeSet<String>,
+}
+
+/// Where the needed columns sit in one copy's header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Columns {
+    /// `capture_seq`.
+    pub seq: usize,
+    /// `kind` (the aux table only).
+    pub kind: Option<usize>,
+    /// `security_id`.
+    pub sid: Option<usize>,
+    /// `segment`.
+    pub seg: Option<usize>,
+}
+
+impl Columns {
+    /// Reads the indexes from a header line; `None` without `capture_seq`.
+    /// Pure.
+    #[must_use]
+    pub fn from_header(header: &str) -> Option<Self> {
+        Some(Self {
+            seq: column_index(header, "capture_seq")?,
+            kind: column_index(header, "kind"),
+            sid: column_index(header, "security_id"),
+            seg: column_index(header, "segment"),
+        })
+    }
 }
 
 /// Adds one data line to `seqs`. `kind_idx` is the `kind` column (aux table
@@ -73,12 +104,8 @@ pub struct CopySeqs {
 ///
 /// # Errors
 /// A missing or non-numeric `capture_seq`.
-pub fn add_line(
-    seqs: &mut CopySeqs,
-    line: &str,
-    seq_idx: usize,
-    kind_idx: Option<usize>,
-) -> Result<()> {
+pub fn add_line(seqs: &mut CopySeqs, line: &str, cols: Columns) -> Result<()> {
+    let (seq_idx, kind_idx) = (cols.seq, cols.kind);
     if line.trim().is_empty() {
         return Ok(());
     }
@@ -96,6 +123,13 @@ pub fn add_line(
         .is_some_and(|k| REPEAT_SKIP_KINDS.contains(&k.trim()));
     if repeat {
         seqs.repeat_kind.push(seq);
+        let field = |i: Option<usize>| i.and_then(|i| f.get(i)).map(|s| s.trim().to_owned());
+        match (field(cols.sid), field(cols.seg)) {
+            (Some(sid), Some(seg)) if !sid.is_empty() => {
+                seqs.repeat_contracts.insert(format!("{sid}|{seg}"));
+            }
+            _ => bail!("a repeat-kind row has no security_id or segment"),
+        }
     } else {
         seqs.checked.push(seq);
     }
@@ -124,17 +158,16 @@ pub fn read_copy_lines<R: std::io::BufRead>(mut reader: R, seqs: &mut CopySeqs) 
     if reader.read_line(&mut header).context("read the header")? == 0 {
         return Ok(());
     }
-    let Some(seq_idx) = column_index(&header, "capture_seq") else {
+    let Some(cols) = Columns::from_header(&header) else {
         bail!("the header has no capture_seq column: {}", header.trim());
     };
-    let kind_idx = column_index(&header, "kind");
     let mut line = String::new();
     loop {
         line.clear();
         if reader.read_line(&mut line).context("read a row")? == 0 {
             return Ok(());
         }
-        add_line(seqs, &line, seq_idx, kind_idx)?;
+        add_line(seqs, &line, cols)?;
     }
 }
 
@@ -200,27 +233,36 @@ mod tests {
     }
 
     #[test]
-    fn test_add_line_splits_repeat_kinds_and_refuses_a_bad_seq() {
+    fn test_add_line_splits_repeat_kinds_tracks_their_contracts_and_refuses_a_bad_seq() {
+        // ts,kind,capture_seq,security_id,segment
+        let cols = Columns::from_header("ts,kind,capture_seq,security_id,segment").expect("cols");
         let mut s = CopySeqs::default();
-        add_line(&mut s, "t,oi,10\n", 2, Some(1)).expect("oi");
-        add_line(&mut s, "t,no_trade_today,11\n", 2, Some(1)).expect("ntt");
-        add_line(&mut s, "t,connect_snapshot,12\n", 2, Some(1)).expect("cs");
-        add_line(&mut s, "t,out_of_window_tick,13\n", 2, Some(1)).expect("oow");
-        add_line(&mut s, "   \n", 2, Some(1)).expect("blank");
+        add_line(&mut s, "t,oi,10,1,NSE_FNO\n", cols).expect("oi");
+        add_line(&mut s, "t,no_trade_today,11,2,NSE_FNO\n", cols).expect("ntt");
+        add_line(&mut s, "t,connect_snapshot,12,2,NSE_FNO\n", cols).expect("cs");
+        add_line(&mut s, "t,no_trade_today,14,3,NSE_EQ\n", cols).expect("ntt2");
+        add_line(&mut s, "t,out_of_window_tick,13,1,IDX_I\n", cols).expect("oow");
+        add_line(&mut s, "   \n", cols).expect("blank");
         assert_eq!(s.checked, vec![10, 13]);
-        assert_eq!(s.repeat_kind, vec![11, 12]);
-        assert_eq!(s.rows, 4);
-        assert!(add_line(&mut s, "t,oi,\n", 2, Some(1)).is_err());
-        assert!(add_line(&mut s, "t,oi,x\n", 2, Some(1)).is_err());
-        assert!(add_line(&mut s, "t\n", 2, None).is_err());
+        assert_eq!(s.repeat_kind, vec![11, 12, 14]);
+        assert_eq!(s.rows, 5);
+        let contracts: Vec<&str> = s.repeat_contracts.iter().map(String::as_str).collect();
+        assert_eq!(contracts, vec!["2|NSE_FNO", "3|NSE_EQ"]);
+        assert!(add_line(&mut s, "t,oi,,1,NSE_FNO\n", cols).is_err());
+        assert!(add_line(&mut s, "t,oi,x,1,NSE_FNO\n", cols).is_err());
+        assert!(add_line(&mut s, "t\n", cols).is_err());
+        // A repeat-kind row with no contract cannot be bounded: refused.
+        assert!(add_line(&mut s, "t,no_trade_today,15,,NSE_FNO\n", cols).is_err());
         // A table with no kind column checks every row.
+        let q_cols = Columns::from_header("ts,capture_seq").expect("cols");
         let mut q = CopySeqs::default();
-        add_line(&mut q, "t,5\n", 1, None).expect("tick");
+        add_line(&mut q, "t,5\n", q_cols).expect("tick");
         assert_eq!(q.checked, vec![5]);
+        assert_eq!(Columns::from_header("ts,kind"), None);
     }
 
     #[test]
-    fn test_read_copy_gz_and_read_copy_lines_read_a_quarantine_shaped_file() {
+    fn test_read_copy_gz_read_copy_lines_and_from_header_read_a_quarantine_shaped_file() {
         let dir = std::env::temp_dir().join(format!(
             "tv-coverage-{}-{}",
             std::process::id(),
@@ -233,10 +275,10 @@ mod tests {
             flate2::Compression::fast(),
         );
         gz.write_all(
-            b"\"ts\",\"segment\",\"kind\",\"contract\",\"capture_seq\"\n\
-              2026-11-20T09:00:00.000000Z,NSE_FNO,oi,\"A, B\",7\n\
-              2026-11-20T09:00:00.000000Z,NSE_FNO,no_trade_today,X,8\n\
-              2026-11-20T09:00:01.000000Z,IDX_I,out_of_window_tick,,9\n",
+            b"\"ts\",\"segment\",\"kind\",\"contract\",\"capture_seq\",\"security_id\"\n\
+              2026-11-20T09:00:00.000000Z,NSE_FNO,oi,\"A, B\",7,101\n\
+              2026-11-20T09:00:00.000000Z,NSE_FNO,no_trade_today,X,8,102\n\
+              2026-11-20T09:00:01.000000Z,IDX_I,out_of_window_tick,,9,13\n",
         )
         .expect("write");
         gz.finish().expect("finish");
