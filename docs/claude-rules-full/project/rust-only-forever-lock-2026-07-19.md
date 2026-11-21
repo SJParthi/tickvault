@@ -1464,3 +1464,37 @@ Scope is this key-remembering change only. REJECT: putting the key in any link
 or message; remembering it longer than 30 days without a fresh dated quote;
 removing Lock; reading a `tv_token` copy an older build left; any other budget
 increase under this section.
+
+## §0.21. 2026-11-21 — one-off server step for the 2026-11-20 day repair (owner-approved)
+
+The owner, 2026-11-21, on a decision card in the session that built the
+repair. Asked: *"The 20 Nov repair has to run on the server, which needs one
+small one-off server command plus a button in GitHub (deleted after the run,
+as for the October rebuild). Approve that?"*, the owner tapped **"Approve,
+one-off (Recommended)"**, whose text read: *"One short server command that
+only starts the Rust repair program, and a GitHub button that runs: check,
+repair, verify. Both deleted after the run."* The repair itself is authorized
+by daily-universe Quote 63 (2026-11-20); this section covers only the shell it
+needs, in the shape of §0.13 and §0.14.
+
+What it allows, and only this:
+- A Rust runner `tv-day-repair-2026-11-20` sends ONE SSM element per mode
+  (`dry`, `apply`, `verify`), built from one literal in
+  `crates/app/src/day_repair_ssm.rs` of at most 6 lines, which fetches
+  `deploys/<sha>/tickvault` from the cold bucket and `exec`s its Rust
+  `day-repair <mode> <sha>` subcommand. The element's lines and bytes are
+  pinned in `crates/common/tests/shell_budget_guard.rs` when written.
+- A dispatch-only workflow `.github/workflows/day-repair-2026-11-20.yml` with
+  at most 2 `run:` lines (build, then run), no schedule and no push trigger.
+- No new role: the box and workflow use their existing permissions; nothing
+  gains an S3 delete.
+- Refused 08:00–16:30 IST on a trading day, while a deploy run is queued or
+  running, and after 2026-11-30 IST.
+- The runner, the element, the workflow and their guard rows are deleted by
+  the first PR after a passed verify (`RETIRED_ONE_OFF_PATHS`), then §0.21 is
+  ENDED.
+
+REJECT: reusing the element or the workflow for anything else; adding shell
+beyond the one literal; raising its line or byte ceiling; a schedule or push
+trigger; any S3 delete; running before the code has merged with All Green;
+keeping any of it after the run.

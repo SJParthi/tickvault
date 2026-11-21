@@ -129,6 +129,8 @@ pub mod daily_export;
 mod sliced_export;
 // Daily-universe Quote 63 (2026-11-20): held days out of every pass.
 mod held_day_filter;
+// Daily-universe Quote 63: the 20 Nov repair's verified quarantine copy and drop.
+pub mod quarantine_copy;
 
 use hour_path::{
     HOUR_PATH_TABLES, TICK_SPILL_TABLES, hot_hour_floor, hour_window_for,
@@ -6582,6 +6584,8 @@ mod stub_integration_tests {
     mod sliced_export_stub_tests;
     // 2026-11-16: every cold PutObject is unsigned-payload + SHA-256 checksum.
     mod unsigned_payload_stub_tests;
+    // Quote 63: the 20 Nov quarantine copy and drop against the same stubs.
+    mod quarantine_copy_stub_tests;
 
     /// One parsed stub request (method + decoded target + lowercased headers).
     #[derive(Clone, Debug)]

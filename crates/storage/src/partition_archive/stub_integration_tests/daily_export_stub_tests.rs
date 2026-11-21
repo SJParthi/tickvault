@@ -1470,3 +1470,96 @@ async fn test_held_since_pass_start_counts_a_hold_written_mid_pass() {
     assert_eq!(summary.held_day, 1, "{summary:?}");
     let _ = std::fs::remove_dir_all(&scratch);
 }
+
+/// One verified audit row with its `ts` (IST written as Z).
+fn audit_row_at(table: &str, partition: &str, rows: u64, digest: &[u8; 32], ts: &str) -> String {
+    format!(
+        "[\"{table}\",\"{partition}\",\"questdb-partitions/{table}/{partition}.csv.gz\",{rows},9,\"{}\",\"{ts}\"]",
+        crate::s3_cold::hex_encode(digest)
+    )
+}
+
+/// Quote 63 tool, Brutex row (2026-11-21): on a day a verified repair
+/// released, an archiver copy of a held-kind table recorded before 00:00
+/// IST of the `.done` date is left out of the manifest's partitions (it is
+/// listed under `superseded_by_repair` instead); a copy after the cutoff and
+/// a depth copy stay. The same copies on a day never held are all listed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_regression_released_day_leaves_pre_repair_copies_out_of_the_manifest() {
+    use sha2::Digest as _;
+    let digest: [u8; 32] = sha2::Sha256::digest(b"old").into();
+    let audit: &'static str = Box::leak(
+        format!(
+            "{{\"columns\":[],\"dataset\":[{},{},{}]}}",
+            audit_row_at(
+                "ticks",
+                "2026-04-01T10",
+                100,
+                &digest,
+                "2026-04-02T10:00:00.000000Z"
+            ),
+            audit_row_at(
+                "ticks",
+                "2026-04-01T11",
+                7,
+                &digest,
+                "2026-04-06T10:00:00.000000Z"
+            ),
+            audit_row_at(
+                "market_depth",
+                "2026-04-01T10",
+                42,
+                &digest,
+                "2026-04-02T10:00:00.000000Z"
+            ),
+        )
+        .into_boxed_str(),
+    );
+    let seed = |objects: &StubObjects| {
+        seeded_copy(objects, "ticks", "2026-04-01T10", &digest);
+        seeded_copy(objects, "ticks", "2026-04-01T11", &digest);
+        seeded_copy(objects, "market_depth", "2026-04-01T10", &digest);
+    };
+
+    // Control: a day never held lists every verified copy.
+    let objects: StubObjects = Arc::new(Mutex::new(HashMap::new()));
+    seed(&objects);
+    let (archiver, _) = setup(audit, three_rows(), Arc::clone(&objects), true).await;
+    let report = seal(&mut DailyExporter::from_archiver(archiver), vec![]).await;
+    assert_eq!(report.objects, 4, "{report:?}");
+    assert_eq!(report.rows, 3 + 100 + 7 + 42);
+
+    // Released: the `.done` was written on 5 Apr, so the 2 Apr ticks copy is
+    // superseded and the 6 Apr one is kept.
+    let scratch = std::env::temp_dir().join(format!(
+        "tv-released-manifest-{}-{}",
+        std::process::id(),
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+    ));
+    let held = crate::held_days::HeldDays::with_dirs(
+        vec![day()],
+        scratch.join("held-days"),
+        scratch.join("day-repair"),
+    )
+    .with_today(day() + chrono::TimeDelta::days(30));
+    crate::held_days::write_day_marker(
+        held.done_dir(),
+        crate::held_days::MarkerKind::Done,
+        day(),
+        day() + chrono::TimeDelta::days(4),
+        "verified",
+    )
+    .expect("done marker");
+    let objects: StubObjects = Arc::new(Mutex::new(HashMap::new()));
+    seed(&objects);
+    let (archiver, _) = setup(audit, three_rows(), Arc::clone(&objects), true).await;
+    let archiver = archiver.with_test_held_days(held);
+    let report = seal(&mut DailyExporter::from_archiver(archiver), vec![]).await;
+    assert_eq!(
+        report.objects, 3,
+        "the pre-repair ticks copy is out: {report:?}"
+    );
+    assert_eq!(report.rows, 3 + 7 + 42);
+    assert!(report.sealed_by_this_run, "{report:?}");
+    let _ = std::fs::remove_dir_all(&scratch);
+}

@@ -149,3 +149,9 @@ path = "src/bin/tv_guarantees.rs"
 [[bin]]
 name = "tv-live-fill-replay"
 path = "src/bin/tv_live_fill_replay.rs"
+
+# One-off: the 2026-11-20 day repair runner (rust-only lock §0.21). Deleted
+# with its workflow by the first PR after a passed verify.
+[[bin]]
+name = "tv-day-repair-2026-11-20"
+path = "src/bin/tv_day_repair_2026_11_20.rs"

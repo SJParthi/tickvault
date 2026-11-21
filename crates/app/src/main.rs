@@ -774,21 +774,21 @@ async fn async_main() -> Result<()> {
     // -----------------------------------------------------------------------
     // Step 0.5: `tickvault holiday-gate` (audit D6c; was deploy/aws/holiday-gate.sh)
     // -----------------------------------------------------------------------
-    // Run by tickvault-holiday-gate.service before the app. Asks the same
-    // calendar as `--check-trading-day` and, on a definitive holiday, stamps
-    // the stop marker, pages and stops the instance. After the provider
-    // install because its IMDS and AWS clients use TLS.
+    // Run by tickvault-holiday-gate.service before the app: same calendar as `--check-trading-day`;
+    // on a definitive holiday it stamps the stop marker, pages, stops the instance (TLS: IMDS/AWS).
     let cli_args: Vec<String> = std::env::args().collect();
     if tickvault_app::holiday_gate::is_invocation(&cli_args) {
         let code = tickvault_app::holiday_gate::run(holiday_gate_calendar_day).await;
         std::process::exit(code);
     }
-    // `tickvault ensure-questdb` (audit D6d; was scripts/ensure-questdb.sh):
-    // tickvault.service's ExecStartPre and the console's restart actions bring
-    // the QuestDB container up. After the provider install for its SSM client.
+    // `tickvault ensure-questdb` (D6d): ExecStartPre / console restarts bring QuestDB up (SSM, TLS).
+    // `tickvault day-repair`: the one-off repair of 2026-11-20 (Quote 63, rust-only §0.21).
     if tickvault_app::ensure_questdb::is_invocation(&cli_args) {
         let code = tickvault_app::ensure_questdb::run().await;
         std::process::exit(code);
+    }
+    if tickvault_app::day_repair::is_invocation(&cli_args) {
+        std::process::exit(tickvault_app::day_repair::run_cli(&cli_args).await);
     }
 
     // -----------------------------------------------------------------------

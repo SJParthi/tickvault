@@ -389,6 +389,10 @@ pub(crate) const RETENTION_EXEMPT_TABLES: &[&str] = &[
     // row per reset id, never partitioned, never swept: dropping a row would
     // let the one-shot wipe run a SECOND time on the next out-of-session boot.
     "schema_reset_log",
+    // The one-off 20 Nov repair's own record (daily-universe Quote 63,
+    // `day_repair_audit_persistence.rs`): a few hundred rows once, the only
+    // record of a destructive repair, so kept and never swept.
+    "day_repair_audit",
 ];
 
 /// Scratch tables: their owner creates them fresh for every run and drops them after, so

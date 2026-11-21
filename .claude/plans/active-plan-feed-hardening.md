@@ -590,6 +590,11 @@ This plan converts hope into bounded, tested, alarmed guarantees. It does NOT pr
   - Files: docs/claude-rules-full/project/websocket-connection-scope-lock.md and its stub, docs/claude-rules-full/project/dhan-rest-only-noise-lock-2026-07-14.md and its stub, .claude/rules/project/data-integrity.md, docs/dhan-ref/03-live-market-feed-websocket.md, docs/dhan-ref/08-annexure-enums.md, .claude/rules/dhan/live-market-feed.md, .claude/rules/dhan/annexure-enums.md, .claude/rules/project/historical-candles-cross-verify.md, docs/dhan-support/2026-11-20-ltt-sent-as-utc.md, docs/dhan-support/README.md (step 1, rules first); crates/storage/src/ltt_correction.rs (+ ltt_correction_tests.rs; `DHAN_LTT_UTC_FROM_RECEIPT_NANOS`, `corrected_ltt`, `utc_verdict`, refusal counters by reason, `install_at_boot*` a no-op, `LttController::observe` reversion guard), crates/app/src/dhan_feed_stack/ltt_feed.rs (no record writer, no notice), crates/core/src/parser/dispatcher.rs (comment, `tv_dhan_ltt_unstamped_total` on the unstamped path), crates/core/tests/ltt_correction_dispatch.rs, crates/app/tests/ltt_correction_drain.rs, crates/core/tests/dhat_ltt_correction.rs, the `dispatch_frame/ticker_ltt_armed` bench, .github/workflows/ci.yml test lists (step 2 and 3); CLAUDE.md `ltt_correction` / dispatcher / feed_time_page rows and docs/error-runbooks/dhan-feed-time-error-codes.md (step 4). ⚠ CORRECTED 2026-11-21 (review): this list said "Not touched: feed_time_page.rs" and named `crates/storage/tests/dhat_ltt_correction.rs`; both were wrong. Also changed: crates/app/src/dhan_feed_stack/feed_time_page.rs (`Cause::FormatReverted`, `hold_after_reversion_page`, retried hold hand-off, `feed_time_writer_missing`), crates/storage/tests/ltt_reversion_guard_muhurat_window.rs (new), crates/common/src/config.rs (docs), config/base.toml, deploy/aws/terraform/error-code-alarms.tf, crates/aws-lambdas/src/telegram_webhook.rs, .claude/triage/error-rules.yaml, crates/core/src/notification/events.rs (`CustomStatusUrgent` deleted), crates/core/tests/notification_variant_dispatch_guard.rs, crates/core/tests/adversarial_feed_frames_properties.rs, crates/common/tests/loss_counter_visibility_guard.rs, crates/app/tests/dhat_live_ingest_seam.rs. Not touched: trade_safety*.rs, live_fill/*, order_runtime*.rs, daily_task_marker.rs; main.rs and dhan_feed_stack.rs zero added lines
   - Tests: proptest_pre_cutover_is_byte_identical, proptest_post_cutover_exact_or_refused, test_regression_2026_11_20_first_packet_corrected_without_warm_up, test_regression_print_two_days_old_corrected, test_regression_ist_epoch_fresh_print_stays_raw_counted_and_pages_once_per_segment_per_day, test_utc_verdict_never_pages, test_guard_off_never_pages, test_apply_ltt_correction_sits_in_all_three_dispatcher_arms (source scan, bite-tested), dhat_ltt_correction (0 blocks), test_regression_2026_11_21_guard_watches_the_published_muhurat_session, test_regression_reversion_page_follows_the_published_muhurat_session (bite-tested), test_regression_2026_11_21_a_reversion_page_holds_its_day_once, test_regression_2026_11_21_a_full_writer_queue_holds_on_the_next_scan, test_fire_is_never_called_with_the_reversion_cause
   - Rules: scope lock §"2026-11-21", noise lock §2.24-a, data-integrity 2026-11-21 (SECOND); design: Design / Edge Cases / Failure Modes / Test Plan / Rollback / Observability in the UTC-PERMANENT addendum below
+- [ ] ITEM UTC-REPAIR — repair the held day 2026-11-20 once: copy its wrong partitions to the quarantine prefix and verify, drop them in QuestDB only, move its seal/spill/DLQ files aside, rebuild the day from its raw frames through the normal dispatcher (the UTC-PERMANENT rule corrects them, no record file), verify, then write `.done` (daily-universe Quote 63; owner cards 2026-11-21 recorded in the scratch design: "Approve, one-off (Recommended)", "Point Brutex at fixed copy (Recommended)", "Sunday 22 Nov (Recommended)")
+  - Unblocked 2026-11-21: the owner approved the one SSM element and the two-line workflow ("Approve, one-off (Recommended)"), recorded as rust-only lock §0.21. Review fixes the same day: live-mode fold (the 09:15 bars), raw-source pre-checks before any drop, exact per-table verify, paced close seals, app restarted on every exit.
+  - Files: crates/storage/src/partition_archive/quarantine_copy.rs (new; child of `partition_archive` so it reuses the private export, recount and verify functions; `QuarantineIo: ArchiveIo`), crates/storage/src/partition_archive.rs (mod line), crates/storage/src/day_repair_audit_persistence.rs (new; `day_repair_audit` table, DEDUP `(ts, repair_day, step, object, feed)`), crates/storage/src/lib.rs, crates/storage/src/partition_manager.rs (`day_repair_audit` kept, never dropped), crates/storage/src/partition_archive/daily_export.rs (manifest leaves out pre-repair archiver copies of a released day: `superseded_by_repair`, schema version +1), crates/app/src/day_repair/mod.rs (new; `run_cli`, window, app-stopped, WAL-lock and deploy refusals, step driver), crates/app/src/day_repair/state.rs (new; progress file, CRC-32, fsync), crates/app/src/day_repair/rebuild.rs (new; past-day refold through `LiveIngest::ingest_tick_at` / `ingest_non_tick_at`), crates/app/src/day_repair/verify.rs (new; verify gate), crates/app/src/day_repair_ssm.rs (new; the one SSM literal), crates/app/src/bin/tv_day_repair_2026_11_20.rs (new; runner), crates/app/src/lib.rs, crates/app/src/main.rs (dispatch, ZERO net lines), .github/workflows/day-repair-2026-11-20.yml (new), crates/common/tests/shell_budget_guard.rs (rows), deploy/aws/terraform/main.tf (explicit Deny on `s3:DeleteObject`/`s3:DeleteObjectVersion` under `quarantine/*`, the live-fill-logs shape), CLAUDE.md rows, .claude/rules/project/aws-budget.md cost note
+  - Tests: test_allowlist_is_held_kinds_of_2026_11_20_only (never `market_depth*`, never another day), test_window_refuses_0800_to_1630_on_a_trading_day_and_after_2026_11_30, test_placement_absent_identical_different (the `.sha-` arm), test_quarantine_io_never_calls_s3_delete (HTTP stub), test_quarantine_writes_no_canonical_key_manifest_amend_or_archive_audit_row, test_day_repair_ssm_refuses_a_bad_sha_or_mode, test_progress_line_crc_round_trip_and_torn_line_refused, test_past_day_rebuild_matches_a_live_fold_bit_for_bit (fixture frames with a gap and the end-of-day seal), proptest_crash_and_resume_over_every_step, test_released_day_manifest_leaves_out_pre_repair_archiver_copies, test_brutex_done_present_refuses_apply, test_main_rs_dispatch_adds_no_line (size ratchet unchanged)
+  - Rules: daily-universe Quote 63 and its "Quote 63 tool" table (to be written with the §0.21 row); scope lock §"2026-11-21" (the correction); rust-only §0.21 (owner row needed); design: Design / Edge Cases / Failure Modes / Test Plan / Rollback / Observability in the UTC-REPAIR addendum below
 
 ---
 
@@ -723,6 +728,88 @@ Revert the PR. ITEM UTC-FIX in `act` mode then re-arms daily after its votes, a 
 - The reversion page rides the existing `DHAN-FEED-TIME-01` alarm (filter matches the code and `ERROR`; no Terraform change).
 - The daily notice is retired (noise lock §2.24-a).
 - No new alarm, filter or EMF name.
+
+---
+
+## ITEM UTC-REPAIR — DESIGN ADDENDUM (added 2026-11-21, under daily-universe Quote 63)
+
+Status: DRAFT. Blocked until the owner's dated rust-only §0.21 row (the one SSM element and the two-line workflow) is in the rule file; a session may not write that approval itself. The correction itself needs no new record: this branch carries the UTC-PERMANENT rule, so `corrected_ltt` is a pure function of the raw time and the WAL receipt, and 20 Nov frames replayed through the normal dispatcher come out corrected (every segment, old prints included). The design's correction-record step and its options-tally question are dropped.
+
+## Design (Item UTC-REPAIR)
+- Records first: rust-only §0.21 (owner row, full file and stub), the "Quote 63 tool" table under Quote 63, and this item. Code only after all three.
+- Quarantine copy, `partition_archive/quarantine_copy.rs` (child module, so it reuses the private export functions):
+  - Day fixed at 2026-11-20, prefix fixed at `quarantine/2026-11-20-ltt-utc-shift/`.
+  - Allowlist: `held_days::table_is_held_kind(table)` and `partition_day(partition) == 2026-11-20`. Never `market_depth*`, cross-verify, SEBI or audit tables.
+  - Export: `wal_applied_gate`, then `export_ordered_csv` in slices.
+  - Placement: `S3Cold::head`, then `put_if_absent_path`. An identical object is reused; different bytes go to `.sha-<hex>` beside it. Never an overwrite.
+  - Check: `recount_rows`, `verify_archive`, and the stored SHA-256 equals the export's.
+  - Drop: `snapshot_gate::recheck_and_drop` with a `QuarantineIo: ArchiveIo`. `note_drop_intent` does nothing; `delete_own_upload` returns an error and never calls S3; `note_failure` only logs.
+  - Never called: `place_archive`, `note_archived_copy`, `record_failure`, `append_audit`. No canonical key, manifest, amend record or `partition_archive_audit` row. One `day_repair_audit` row per object instead.
+- Box subcommand `tickvault day-repair <dry|apply|verify> <sha>`, dispatched from `main.rs` with zero net lines:
+  - Working directory `/opt/tickvault`.
+  - `systemctl stop` and `mask` the app; refuse unless it then reads inactive or failed.
+  - Take `lock_wal_dir`; refuse on `Ok(None)`.
+  - Refuse 08:00–16:30 IST on a trading day (Muhurat dates included), after 2026-11-30 23:59 IST, and while a deploy workflow is queued or running (checked by the runner).
+  - Write `keep-alive-until` itself, so the curfew does not stop the box mid-run.
+  - `chown` everything it creates to the owner of `data/`.
+- Rebuild, `day_repair/rebuild.rs` (new module; `dhan_feed_stack.rs` is size-pinned and its live path stays unchanged). It reuses `LiveIngest::ingest_tick_at` / `ingest_non_tick_at` and the dispatcher, and fixes the past-day blockers itself:
+  - Fold watermark seeded to 2026-11-20 00:00 IST, never `Utc::now()`, or the candles come out empty.
+  - Hand-over as the replay CLI's `start()`: the 20 Nov boot instant from `ws_event_audit` (else 08:30), `set_replay_mode(true)`, `finish_replay(false)`.
+  - No inline-depth sink (depth rows are correct and kept) and no bound WAL.
+  - `SealWriterRunner` and the global seal sender installed.
+  - Contract names from `publish_contract_labels_at_boot` for 2026-11-20; refuse if another day's names were published.
+  - `load_replay_backup` called; `pace_until` set far ahead.
+  - One pass over the whole day by WAL receipt, so the aux repeat filter skips as it did live.
+  - End of day: `catch_up_seal_all` with a cutoff past 16:05 IST, then `force_seal_all`; never `withhold_open_buckets`.
+  - Frames: S3 `raw-frames/2026-11-20/` with every SHA sidecar checked, one segment at a time into a staging folder the tool created (its own copy is removed after the read); counted against the local WAL archive.
+- Brutex manifest (owner card "Point Brutex at fixed copy (Recommended)"), `daily_export.rs`:
+  - Unchanged: a wrong object already at a canonical key stays; the export's `place()` puts the corrected bytes at `.sha-<hex>` and the manifest names that key.
+  - New: on a day `HeldDays::verdict` reads `Released { done_on }`, an archiver copy of a held-kind table whose audit `ts` is before 00:00 IST of `done_on` is left out of `tables[].partitions` and listed under a new manifest field `superseded_by_repair` (table, partition, key, rows, sha256, copied_at). A copy whose key equals an object this export placed (byte-identical) is not superseded. Schema version +1. O(archived rows), once per export.
+  - If `_daily/2026-11-20/DONE` already exists, `dry` reports it and `apply` refuses: DONE is create-only (Quote 60) and a superseding marker is a Brutex contract change needing its own owner decision.
+- Runner and workflow: runner bin plus `day_repair_ssm.rs` (one element of at most 6 lines: fetch `deploys/<sha>/tickvault`, `exec day-repair <mode> <sha>`). Dispatch-only workflow, two `run:` lines; one dispatch chains `dry`, `apply`, `verify` and stops at the first failure.
+- Steps, each followed by a progress line (CRC-32, fsync) and a `day_repair_audit` row:
+  1. Enumerate partitions and files; offset fingerprint on 19, 20 and 21 Nov; frames per receipt day, locally and in `raw-frames/`; check for canonical 20 Nov objects and a DONE.
+  2. Copy and verify every partition and file.
+  3. Drop the partitions.
+  4. Rename the 20 Nov seal, spill and DLQ files into `data/held/2026-11-20/` (rename only).
+  5. Rebuild.
+  6. Verify.
+  7. Write `.done` (`write_day_marker`), then unmask the app (left stopped; the curfew stops the box).
+
+## Edge Cases (Item UTC-REPAIR)
+- Every `2026-11-20T*` hour of `ticks`, `tick_quotes`, `feed_aux_packets` and the `2026-11-20` partition of every `candles_*` table is dropped and rebuilt: the wrong rows carry different `ts` keys (or, for `tick_quotes`, the wrong membership), so an upsert cannot replace them. Correct OI and previous-close rows come back with identical keys.
+- Restarts on 20 Nov: every gap and restart is a replay gap, so bars across a downtime are withheld, as live did.
+- Prints the rule refuses (band, receipt + 5 s cap, receipt) keep the raw time and are counted in the report.
+- Hours from 21 Nov 00:00–07:00 IST: refused (none expected; the app stopped 20 Nov 16:26 IST).
+- A partition the archiver already copied and dropped on 20 Nov (wrong data at a canonical key): kept in S3, recreated by the rebuild, exported later to `.sha-`, and its old copy listed under `superseded_by_repair`.
+- A 20 Nov WAL segment still waiting for replay: refused (it would replay next to the rebuilt rows).
+- Old binary runs about 10 minutes on Monday 08:30 before the 08:31 deploy: no export (window shut), no archive leg before 15:40.
+
+## Failure Modes (Item UTC-REPAIR)
+- Crash at any step: the next run re-checks the step's result (S3, QuestDB, the disk), never the progress file alone. Copies are reused; a partition already gone counts as dropped only when its verified quarantine row exists; moves are re-checked; the rebuild replays the whole day and upserts onto itself.
+- A writer rescue, a new spill file or an unacked flush during the rebuild: not finished, no `.done`.
+- Accidental app start: refused by the WAL lock and the mask.
+- Disk short for one staged segment plus the after-close floor: stop, nothing dropped past that step.
+- Frames the WAL refused on 20 Nov cannot be rebuilt: counted in the report (owner default).
+
+## Test Plan (Item UTC-REPAIR)
+- Unit: allowlist, date and window guards, the three placement arms, progress line round trip.
+- HTTP stub: `delete_own_upload` never calls S3; the quarantine path writes no canonical key, manifest, amend or `partition_archive_audit` row.
+- SSM element refuses a bad sha or mode.
+- Past-day rebuild over fixture frames compared bit for bit with a live fold, including a gap and the end-of-day seal.
+- Crash-and-resume proptest over every step.
+- Manifest: a released day leaves out pre-repair archiver copies and lists them under `superseded_by_repair`; a DONE-present day refuses `apply`.
+- Guard rows: `SSM_SENDER_FILES`, `WORKFLOW_RUN_LINE_BUDGET`, `DAY_REPAIR_SSM_SHELL_SOURCES`; size ratchet for `main.rs` and `dhan_feed_stack.rs` unchanged.
+- Run `cargo test -p tickvault-storage`, `-p tickvault-app`, `-p tickvault-common`.
+
+## Rollback (Item UTC-REPAIR)
+- Before the drop: abort; nothing changed.
+- After the drop: the quarantine CSVs are the copy of record. A failed rebuild leaves the day held, the app masked, no `.done`; re-run, or re-import from quarantine.
+- The tool, workflow, SSM literal and budget rows are deleted in the next PR (`RETIRED_ONE_OFF_PATHS`, CLAUDE.md cells removed, ENDED notes). The manifest change stays.
+
+## Observability (Item UTC-REPAIR)
+- `day_repair_audit` rows (step, object, rows, bytes, sha256, outcome), coded log lines, a per-step job summary, a dry-run report of every object, and a final report with per-table counts and residue (refused prints, frames the WAL refused).
+- No new page, alarm, filter or EMF name.
 
 ---
 
