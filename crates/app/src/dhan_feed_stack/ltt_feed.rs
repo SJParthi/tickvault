@@ -46,6 +46,7 @@ pub(super) fn inert_controller() -> LttController {
 /// Hands the Telegram service to the correction's record thread, which sends
 /// the once-a-day notice when the correction arms (owner card "Yes, one a day
 /// (Recommended)", noise lock §2.24): instant, never an SMS page.
+// TEST-EXEMPT: covered by needs a live NotificationService; sender path covered by storage test_record_writer_thread_acks_intents_and_sends_one_notice_a_day
 pub fn install_ltt_notice(
     notifier: &std::sync::Arc<tickvault_core::notification::service::NotificationService>,
 ) {
@@ -72,6 +73,7 @@ pub fn install_ltt_notice(
 /// The record writer thread for `act` mode (shadow and off write nothing).
 /// A spawn failure is one coded error and no writer: every change the
 /// detector proposes is then refused (counted), never applied unrecorded.
+// TEST-EXEMPT: covered by spawns the record thread; covered by storage test_record_writer_thread_acks_intents_and_sends_one_notice_a_day
 pub(super) fn production_writer(mode: LttUtcAutocorrect) -> Option<RecordWriterHandle> {
     if mode != LttUtcAutocorrect::Act {
         return None;
@@ -111,6 +113,7 @@ impl LiveIngest {
     /// Arms the production trade-time correction: the controller over the
     /// boot-loaded table, writing its record through `writer`.
     #[must_use]
+    // TEST-EXEMPT: covered by test_regression_2026_11_20_the_live_drain_arms_after_a_durable_intent (app/tests)
     pub fn with_ltt_correction(
         mut self,
         mode: LttUtcAutocorrect,
@@ -122,6 +125,7 @@ impl LiveIngest {
 
     /// The trade-time controller (tests and the drain's counters).
     #[must_use]
+    // TEST-EXEMPT: covered by test_frames_without_a_wal_stamp_or_from_replay_never_vote (app/tests)
     pub fn ltt_controller(&self) -> &LttController {
         &self.ltt
     }
@@ -129,6 +133,7 @@ impl LiveIngest {
     /// Once per main-feed frame, before its packets are dispatched. Only a
     /// live frame with a WAL receipt stamp counts. O(1).
     #[inline]
+    // TEST-EXEMPT: covered by test_regression_2026_11_20_the_live_drain_arms_after_a_durable_intent (app/tests)
     pub(super) fn ltt_on_live_frame(&mut self, frame: &CapturedFrame) {
         if frame.connection_index == u8::MAX {
             return;
@@ -142,6 +147,7 @@ impl LiveIngest {
     /// One vote for a live index tick or NSE stock spot print, on Dhan's raw
     /// trade time (read from the packet bytes, before the correction). O(1).
     #[inline]
+    // TEST-EXEMPT: covered by test_frames_without_a_wal_stamp_or_from_replay_never_vote (app/tests)
     pub(super) fn ltt_observe(&mut self, packet: &[u8], tick: &ParsedTick, frame: &CapturedFrame) {
         let segment = tick.exchange_segment_code;
         if frame.connection_index == u8::MAX

@@ -116,6 +116,7 @@ impl FeedTimeTally {
 
     /// One live index tick with its trade time AFTER the correction. O(1).
     #[inline]
+    // TEST-EXEMPT: covered by test_tally_judges_corrected_times_against_the_window_and_receipt
     pub(super) fn note_index_tick(&mut self, ltt_ist_secs: u32, receipt_nanos: i64) {
         self.index_ticks = self.index_ticks.wrapping_add(1);
         let t = i64::from(ltt_ist_secs);

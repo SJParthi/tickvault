@@ -202,6 +202,7 @@ pub fn dispatch_frame_uncounted(
 /// # Performance
 /// O(1) — header parse + single packet parse. No heap allocation.
 #[inline]
+// TEST-EXEMPT: covered by test_dispatch_frame_uncounted_parses_like_dispatch_frame and core/tests ltt_correction_dispatch
 pub fn dispatch_frame_uncounted_unstamped(
     raw: &[u8],
     received_at_nanos: i64,

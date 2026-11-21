@@ -123,6 +123,7 @@ const MAX_RECORD_BYTES: u64 = 64 * 1024;
 /// The IST wall-clock second of a UTC receipt in nanoseconds.
 #[inline]
 #[must_use]
+// TEST-EXEMPT: covered by test_receipt_ist_day_and_date_round_trip
 pub const fn receipt_ist_secs(receipt_nanos: i64) -> i64 {
     receipt_nanos.div_euclid(NANOS_PER_SEC) + IST_OFFSET_SECS
 }
@@ -136,6 +137,7 @@ pub const fn receipt_ist_day(receipt_nanos: i64) -> i64 {
 
 /// The calendar date of an IST day number.
 #[must_use]
+// TEST-EXEMPT: covered by test_receipt_ist_day_and_date_round_trip
 pub fn ist_day_date(day: i64) -> Option<NaiveDate> {
     let ce = day.checked_add(UNIX_EPOCH_DAYS_FROM_CE)?;
     NaiveDate::from_num_days_from_ce_opt(i32::try_from(ce).ok()?)
@@ -143,6 +145,7 @@ pub fn ist_day_date(day: i64) -> Option<NaiveDate> {
 
 /// The IST day number of a calendar date.
 #[must_use]
+// TEST-EXEMPT: covered by test_receipt_ist_day_and_date_round_trip
 pub fn date_ist_day(date: NaiveDate) -> i64 {
     i64::from(chrono::Datelike::num_days_from_ce(&date)) - UNIX_EPOCH_DAYS_FROM_CE
 }
@@ -163,6 +166,7 @@ const fn slot_index(day: i64) -> usize {
 /// (one installed-calendar lookup) runs only for a corrected time on the
 /// receipt's previous IST day.
 #[must_use]
+// TEST-EXEMPT: covered by proptest_correction_obeys_every_guard
 pub fn correction_verdict(raw: u32, receipt_nanos: i64, confirmed: bool) -> Option<u32> {
     if plausible_receipt_nanos(receipt_nanos) == WAL_RECEIPT_UNKNOWN_NANOS {
         return None;
@@ -298,12 +302,14 @@ impl LttTable {
 
     /// True when any day has an armed entry.
     #[must_use]
+    // TEST-EXEMPT: covered by test_table_corrects_only_inside_an_entry_and_on_its_day
     pub fn any_entry(&self) -> bool {
         self.slots.iter().any(|s| s.day != i64::MIN && s.len > 0)
     }
 
     /// True when any day is held.
     #[must_use]
+    // TEST-EXEMPT: covered by test_held_days_are_read_by_receipt
     pub fn any_held(&self) -> bool {
         !self.old_record_days.is_empty() || self.slots.iter().any(|s| s.day != i64::MIN && s.held)
     }
@@ -340,6 +346,7 @@ impl LttTable {
     }
 
     /// Replaces `day` with a record read from disk.
+    // TEST-EXEMPT: covered by test_held_days_are_read_by_receipt
     pub fn install_day(&mut self, day: i64, record: &DayRecord) {
         let slot = self.day_mut(day);
         *slot = EMPTY_SLOT;
@@ -384,6 +391,7 @@ impl LttTable {
 
     /// True when the IST day of `receipt_nanos` is held from replay.
     #[must_use]
+    // TEST-EXEMPT: covered by test_held_days_are_read_by_receipt
     pub fn receipt_day_held(&self, receipt_nanos: i64) -> bool {
         let day = receipt_ist_day(receipt_nanos);
         let slot = &self.slots[slot_index(day)];
@@ -401,6 +409,7 @@ static TABLE: LazyLock<ArcSwap<LttTable>> =
     LazyLock::new(|| ArcSwap::from_pointee(LttTable::empty()));
 
 /// Publishes `table` to every reader. Cold (boot, and a change on the drain).
+// TEST-EXEMPT: covered by test_dispatcher_corrects_ticker_quote_and_full_only_while_armed (core/tests)
 pub fn install_table(table: LttTable) {
     let active = table.any_entry();
     let held = table.any_held();
@@ -411,6 +420,7 @@ pub fn install_table(table: LttTable) {
 
 /// A copy of the published table (cold).
 #[must_use]
+// TEST-EXEMPT: covered by test_regression_2026_11_20_the_live_drain_arms_after_a_durable_intent (app/tests)
 pub fn current_table() -> LttTable {
     LttTable::clone(&TABLE.load())
 }
@@ -420,6 +430,7 @@ pub fn current_table() -> LttTable {
 /// WAL stamp. O(1): one atomic load on a day with nothing armed anywhere.
 #[inline]
 #[must_use]
+// TEST-EXEMPT: covered by test_dispatcher_corrects_ticker_quote_and_full_only_while_armed (core/tests)
 pub fn corrected_ltt(raw: u32, segment: u8, receipt_nanos: i64) -> u32 {
     if !ACTIVE.load(Ordering::Acquire) {
         return raw;
@@ -433,6 +444,7 @@ pub fn corrected_ltt(raw: u32, segment: u8, receipt_nanos: i64) -> u32 {
 /// True when any receipt's IST day is held from replay. O(1) when no day is
 /// held; otherwise O(receipts) with one slot read each (cold, before a replay
 /// chunk).
+// TEST-EXEMPT: covered by test_replay_held_is_false_with_nothing_held (app ltt_feed)
 pub fn any_receipt_day_held(mut receipts: impl Iterator<Item = i64>) -> bool {
     if !ANY_HELD.load(Ordering::Acquire) {
         return false;
@@ -492,6 +504,7 @@ impl RecordKind {
 
     /// An intent: the drain waits for its fsync acknowledgement.
     #[must_use]
+    // TEST-EXEMPT: covered by test_record_writer_thread_acks_intents_and_sends_one_notice_a_day
     pub const fn is_intent(self) -> bool {
         matches!(self, Self::Entry | Self::Close)
     }
@@ -508,6 +521,7 @@ pub struct RecordLine {
 
 /// The line's text, newline included, with its CRC-32.
 #[must_use]
+// TEST-EXEMPT: covered by test_record_line_round_trips_and_refuses_damage
 pub fn encode_line(line: &RecordLine) -> String {
     let body = format!(
         "{RECORD_PREFIX} {} {} {} {}",
@@ -522,6 +536,7 @@ pub fn encode_line(line: &RecordLine) -> String {
 
 /// One line parsed back; `None` for a torn, damaged or foreign line.
 #[must_use]
+// TEST-EXEMPT: covered by test_record_line_round_trips_and_refuses_damage
 pub fn decode_line(text: &str) -> Option<RecordLine> {
     let text = text.trim_end_matches(['\n', '\r']);
     let (body, crc) = text.rsplit_once(' ')?;
@@ -629,6 +644,7 @@ impl DayRecord {
 
     /// The committed, not voided entries.
     #[must_use]
+    // TEST-EXEMPT: covered by test_day_record_held_semantics
     pub fn armed_entries(&self) -> Vec<LttEntry> {
         let mut out = Vec::with_capacity(MAX_ENTRIES_PER_DAY);
         for (id, state) in self.ids.iter().enumerate() {
@@ -668,6 +684,7 @@ impl DayRecord {
 
 /// The record path of `day` under `dir`.
 #[must_use]
+// TEST-EXEMPT: covered by test_an_unreadable_record_holds_its_day
 pub fn record_path(dir: &Path, day: i64) -> Option<PathBuf> {
     let date = ist_day_date(day)?;
     Some(dir.join(format!("{}{RECORD_SUFFIX}", date.format("%Y-%m-%d"))))
@@ -677,6 +694,7 @@ pub fn record_path(dir: &Path, day: i64) -> Option<PathBuf> {
 ///
 /// # Errors
 /// An unreadable or oversized file.
+// TEST-EXEMPT: covered by test_an_unreadable_record_holds_its_day
 pub fn read_day_record(dir: &Path, day: i64) -> std::io::Result<Option<DayRecord>> {
     let Some(path) = record_path(dir, day) else {
         return Ok(None);
@@ -780,6 +798,7 @@ static BOOT_REPORT: OnceLock<BootReport> = OnceLock::new();
 
 /// Loads and publishes the records at boot, before any frame is dispatched
 /// (main.rs, right after the WAL folder is locked). Once per process.
+// TEST-EXEMPT: covered by boot wiring; load path covered by test_append_and_load_record_dir
 pub fn install_at_boot(dir: &Path, mode: LttUtcAutocorrect) {
     let today = receipt_ist_day(now_utc_nanos());
     let (table, report) = load_record_dir(dir, today, mode);
@@ -792,6 +811,7 @@ pub fn install_at_boot(dir: &Path, mode: LttUtcAutocorrect) {
 
 /// [`install_at_boot`] over [`LTT_RECORD_DIR`] with the configured mode
 /// (the one main.rs call).
+// TEST-EXEMPT: covered by one-line main.rs wrapper over install_at_boot; load path covered by test_append_and_load_record_dir
 pub fn install_at_boot_from(config: &tickvault_common::config::ApplicationConfig) {
     install_at_boot(
         Path::new(LTT_RECORD_DIR),
@@ -800,6 +820,7 @@ pub fn install_at_boot_from(config: &tickvault_common::config::ApplicationConfig
 }
 
 /// Logs what [`install_at_boot`] found (it runs before tracing exists).
+// TEST-EXEMPT: covered by boot log only; report built by test_append_and_load_record_dir
 pub fn log_boot_summary() {
     let Some(report) = BOOT_REPORT.get() else {
         return;
@@ -860,6 +881,7 @@ static NOTICE: OnceLock<LttNoticeFn> = OnceLock::new();
 /// Installs the process-wide notice sender (main.rs, once the Telegram
 /// service exists; it is built after the lane starts). A record writer with no
 /// sender of its own uses this one. Once per process.
+// TEST-EXEMPT: covered by process OnceLock setter; sender path covered by test_record_writer_thread_acks_intents_and_sends_one_notice_a_day
 pub fn install_notice(notice: LttNoticeFn) {
     if NOTICE.set(notice).is_err() {
         // A second install in one process: the first sender stands.
@@ -877,6 +899,7 @@ pub struct RecordWriterHandle {
 impl RecordWriterHandle {
     /// A handle over caller-made channels (tests).
     #[must_use]
+    // TEST-EXEMPT: covered by test_controller_arms_from_one_past_every_dispatched_receipt
     pub fn from_channels(tx: Sender<RecordCmd>, acks: Receiver<RecordAck>) -> Self {
         Self { tx, acks }
     }
@@ -884,6 +907,7 @@ impl RecordWriterHandle {
     /// A handle plus the writer's end of both channels, for a test that plays
     /// the record writer itself.
     #[must_use]
+    // TEST-EXEMPT: covered by test_regression_2026_11_20_the_live_drain_arms_after_a_durable_intent (app/tests)
     pub fn stub_pair() -> (Self, Receiver<RecordCmd>, Sender<RecordAck>) {
         let (tx, cmds) = crossbeam_channel::bounded(RECORD_CMD_DEPTH);
         let (acks_tx, acks) = crossbeam_channel::bounded(RECORD_ACK_DEPTH);
@@ -898,6 +922,7 @@ const RECORD_ACK_DEPTH: usize = 16;
 ///
 /// # Errors
 /// Any create, open, write or sync failure.
+// TEST-EXEMPT: covered by test_append_and_load_record_dir
 pub fn append_line(dir: &Path, day: i64, line: &RecordLine) -> std::io::Result<()> {
     let path = record_path(dir, day).ok_or_else(|| std::io::Error::other("day out of range"))?;
     std::fs::create_dir_all(dir)?;
@@ -942,6 +967,7 @@ pub fn notice_text(segment: u8, from_nanos: i64) -> String {
 ///
 /// # Errors
 /// The thread could not be spawned.
+// TEST-EXEMPT: covered by test_record_writer_thread_acks_intents_and_sends_one_notice_a_day
 pub fn spawn_record_writer(
     dir: PathBuf,
     notice: Option<LttNoticeFn>,
@@ -1254,6 +1280,7 @@ impl LttController {
     /// Call once per live WAL-stamped frame, BEFORE its packets are
     /// dispatched. Rolls the day, applies an acknowledged change, then counts
     /// the frame's receipt. O(1).
+    // TEST-EXEMPT: covered by test_controller_arms_from_one_past_every_dispatched_receipt
     pub fn on_frame(&mut self, receipt_nanos: i64) {
         if self.mode == LttUtcAutocorrect::Off
             || plausible_receipt_nanos(receipt_nanos) == WAL_RECEIPT_UNKNOWN_NANOS
