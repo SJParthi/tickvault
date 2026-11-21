@@ -32,6 +32,10 @@ pub(super) const STOP_ACK_TIMEOUT: &str = "ack_timeout";
 /// The partition archiver held the old-hour writers out for longer than the
 /// bounded wait (PR AA, owner Quote 51): the segments wait for the next drain.
 pub(super) const STOP_ARCHIVE_QUIESCE: &str = "archive_quiesce";
+/// A frame's IST day has a Dhan trade-time correction change that was started
+/// and never confirmed (scope lock 2026-11-20): the replay stops before that
+/// segment settles and the frames stay in the log (`DHAN-LTT-02`).
+pub(super) const STOP_LTT_DAY_HELD: &str = "ltt_day_held";
 
 /// The reason for an early stop when the final replay pass returned no
 /// frames: `frame_cap`, `memory`, `disk` or `deferred`, in that order of

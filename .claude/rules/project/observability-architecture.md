@@ -180,7 +180,12 @@ authority `dhan-rest-only-noise-lock-2026-07-14.md` §2.22, Quote 57: chrony's
 clock offset over 1 ms for 5 consecutive minute samples inside 09:00–15:40 IST;
 written by the clock-skew poller, once per episode; a failed sample is a `warn!`
 with this code and does not match the filter. `ok_recovery = false`: the rule
-forbids a recovery page**)**.
+forbids a recovery page**)**, and **DHAN-FEED-TIME-01 (added 2026-11-21** —
+owner cards 2026-11-20, authority `dhan-rest-only-noise-lock-2026-07-14.md`
+§2.24: the live feed's trade times still look wrong after the Dhan trade-time
+correction, or no candle for 10 minutes while prices arrive, inside the
+session; at most once per cause per IST day, latch saved off the drain, the day
+auto-held. `ok_recovery = false`: the rule forbids a recovery page**)**.
 **Everything else
 is log-sink-only** unless it has its own metric alarm (app-alarms.tf) or a
 typed `NotificationEvent`. Counter-side (non-errcode) pager added

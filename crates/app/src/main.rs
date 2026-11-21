@@ -1294,6 +1294,7 @@ async fn async_main() -> Result<()> {
         }
     };
     // §2.20 + K4: backlog vs the last start, then the last receipt, before any append.
+    tickvault_storage::ltt_correction::install_at_boot_from(&config); // scope lock 2026-11-20
     let _backlog_trend = tickvault_storage::wal_backlog_trend::judge_at_boot(&ws_wal_path);
     let previous_process_last_receipt =
         tickvault_storage::wal_last_receipt::newest_receipt_nanos_on_disk(&ws_wal_path);
@@ -2297,6 +2298,7 @@ async fn async_main() -> Result<()> {
     // PR W review round 6: the WAL boot fold ran before this subscriber
     // existed; write what it recorded (and any failed fold persist) now.
     let _boot_fold_logged = tickvault_storage::wal_unapplied_ranges::log_boot_fold_summary();
+    tickvault_storage::ltt_correction::log_boot_summary(); // scope lock 2026-11-20
 
     // Start telemetry after metrics and tracing, before the watched live tasks.
     // 2026-10-30: the per-minute latency proof tables, writer before publisher.
@@ -3854,15 +3856,14 @@ async fn async_main() -> Result<()> {
             // Plan item 49e step 3: absent section = off (market_depth rows).
             depth_storage: config.depth_storage,
             tick_storage: config.tick_storage, // ITEM DT: absent section = library encoder
-            // A second copy of the top contracts on another main-feed socket
-            // (scope lock 2026-10-02). 0 turns it off.
+            // Backup copy on another main-feed socket (scope lock 2026-10-02); 0 = off.
             main_feed_backup_top_n: config.dhan_universe.backup_top_n,
             subscribe_reconcile_auto_resubscribe: config
                 .dhan_universe
                 .subscribe_reconcile_auto_resubscribe,
-            // Frame-silence fast paths (scope lock 2026-10-10): shadow by
-            // default, so they count would-redials before anything acts.
+            // Frame-silence fast paths (scope lock 2026-10-10): shadow by default.
             frame_silence_fast_path: config.dhan_universe.frame_silence_fast_path,
+            ltt_utc_autocorrect: config.dhan_feed.ltt_utc_autocorrect, // scope lock 2026-11-20
             dhan_enabled: config.feeds.dhan_enabled,
             instance_lock_held: std::sync::Arc::clone(&dhan_instance_lock_held),
             // Frames a previous session captured but died before folding. The
@@ -3885,8 +3886,7 @@ async fn async_main() -> Result<()> {
             depth_20_instruments: Vec::new(),
             depth_200_instruments: Vec::new(),
             questdb: config.questdb.clone(),
-            // So the lane can report whether it is ACTUALLY running, instead of
-            // the console reading a flag nothing ever set (2026-08-14).
+            // So the lane reports whether it is ACTUALLY running (2026-08-14).
             feed_runtime: std::sync::Arc::clone(&feed_runtime),
             // And so a DEAD lane can report dead (2026-08-18). The drain
             // records rows flushed to QuestDB, which is what lets the Dhan
@@ -4753,9 +4753,8 @@ async fn build_shared_infra(
             return Err(anyhow::anyhow!(reason));
         }
     };
-    // Wave 3-B Item 11: opt-in Telegram bucket-coalescer (defaults to `true`).
-    // 2026-07-07 UX overhaul: digest window from config; the drain loop
-    // also owns the episode stability ticker (green-close promotion).
+    // Wave 3-B Item 11: Telegram bucket-coalescer (default true); 2026-07-07: digest window
+    // from config, and the drain loop owns the episode stability ticker (green-close).
     let notifier = if config.features.telegram_bucket_coalescer {
         NotificationService::enable_coalescer(
             notifier,
@@ -4772,6 +4771,7 @@ async fn build_shared_infra(
         NotificationService::spawn_episode_ticker(&notifier);
         notifier
     };
+    tickvault_app::dhan_feed_stack::install_ltt_notice(&notifier); // §2.24: one notice a day
     // Boot bubble (2026-07-09): declare which feed lines the checklist
     // shows as pending from its first page.
     notifier.set_boot_expectations(config.feeds.dhan_enabled);

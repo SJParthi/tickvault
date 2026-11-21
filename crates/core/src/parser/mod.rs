@@ -106,7 +106,8 @@ pub use depth::{
 };
 pub use dispatcher::{
     count_packets_by_response_code, dispatch_depth_packet, dispatch_frame,
-    dispatch_frame_uncounted, prewarm_dispatcher_counters,
+    dispatch_frame_uncounted, dispatch_frame_uncounted_unstamped, prewarm_dispatcher_counters,
+    raw_last_trade_time,
 };
 pub use order_update::{
     OrderUpdateParseError, build_order_update_login, is_hollow_order_update, parse_order_update,

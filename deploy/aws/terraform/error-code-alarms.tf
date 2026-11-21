@@ -113,7 +113,7 @@
 #   what each dated change added or retired, and it is kept for that. It is NOT
 #   the current shape, and has not been since 2026-09-16. Counted in the file
 #   rather than carried forward: 4 standalone `aws_cloudwatch_log_metric_filter`
-#   resources, 3 standalone `aws_cloudwatch_metric_alarm` resources, and 19 live
+#   resources, 3 standalone `aws_cloudwatch_metric_alarm` resources, and 20 live
 #   `error_code_alerts` map entries (5 filters, 4 alarms and 22 entries until
 #   2026-11-11, when the operator Quote 53 alarm review,
 #   docs/audits/2026-11-alarm-review.md, removed the preopen-ready pair and
@@ -125,7 +125,9 @@
 #   `aggregator-stall-01`, audit PR40d — noise-lock §2.7; +1 on 2026-10-02,
 #   `hot-path-stall-01`, noise-lock §2.8; -1 on 2026-10-22, the depth
 #   swap-emptied entry, Quote 37 alarm review — noise-lock §2.14; +1 on
-#   2026-11-12, `clock-skew-01`, Quote 57 — noise-lock §2.22). Re-count with:
+#   2026-11-12, `clock-skew-01`, Quote 57 — noise-lock §2.22; +1 on
+#   2026-11-21, `dhan-feed-time-01`, owner cards 2026-11-20 — noise-lock
+#   §2.24). Re-count with:
 #     grep -c '^resource "aws_cloudwatch_log_metric_filter"' <this file>
 #     grep -c '^resource "aws_cloudwatch_metric_alarm"'      <this file>
 #   A count in a comment is a claim, and a claim carries a date — this repo has
@@ -409,6 +411,22 @@ locals {
       dta         = 1
       ok_recovery = false # 2026-11-12: §2.22 forbids a recovery page; the episode ends silently
       desc        = "CLOCK-SKEW-01 = chrony's clock offset was over 1 ms for 5 consecutive minute samples inside 09:00-15:40 IST. Signal, order and fill times read from this clock are off by about offset_ns (positive = clock ahead). Fields: offset_ns, consecutive_minutes, threshold_ns. Check chronyc tracking and chronyc sources on the box; host_capacity_minute.clock_offset_ns has the minute series. Once per episode. NO recovered/OK page. Runbook: docs/error-runbooks/clock-offset-and-network-rtt-error-codes.md"
+    }
+    # DHAN-FEED-TIME-01 (added 2026-11-21, owner cards 2026-11-20 "Yes, page
+    # me (Recommended)" / "After correction (Recommended)", noise-lock §2.24):
+    # the live main feed's trade times still look wrong after the Dhan
+    # trade-time correction, or no candle formed for 10 minutes while prices
+    # arrive, inside the session. At most once per cause per IST day (the
+    # latch is saved off the drain); the day is auto-held from the archive and
+    # the export. ok_recovery = false: §2.24 forbids a recovery page.
+    "dhan-feed-time-01" = {
+      pattern     = "{ $.code = \"DHAN-FEED-TIME-01\" && $.level = \"ERROR\" }"
+      period      = 300
+      threshold   = 1
+      eval        = 1
+      dta         = 1
+      ok_recovery = false # 2026-11-21: §2.24 forbids a recovery page
+      desc        = "DHAN-FEED-TIME-01 = Dhan's live trade times look wrong during the session even after the 5 h 30 min correction (cause=prices_outside_session), or no candle formed for 10 minutes while prices arrive (cause=no_candles). Today is auto-held out of the archive and the export; raw frames are kept. Once per cause per day, no recovery page. Runbook: docs/error-runbooks/dhan-feed-time-error-codes.md"
     }
     # WAL-SUSPEND-01 (added 2026-07-10, W2 PR#6 — audit follow-up row 10):
     # a QuestDB table's WAL apply is SUSPENDED (post disk-full / apply

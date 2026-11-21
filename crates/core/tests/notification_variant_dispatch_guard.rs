@@ -55,7 +55,6 @@ const NO_PRODUCTION_DISPATCHER: &[&str] = &[
     "BootDeadlineMissed",
     "CrossVerify1mAborted",
     "CrossVerify1mSummary",
-    "CustomStatusUrgent",
     "EndOfDayDigest",
     "InstrumentBuildFailed",
     "IpVerificationFailed",

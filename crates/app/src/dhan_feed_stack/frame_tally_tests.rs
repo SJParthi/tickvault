@@ -14,6 +14,7 @@ use proptest::prelude::*;
 use super::frame_tally::CodeRun;
 use super::*;
 use tickvault_common::feed::Feed;
+use tickvault_core::parser::dispatcher::dispatch_frame_uncounted;
 use tickvault_core::websocket::pool_budget::DhanEndpointType;
 use tickvault_storage::tick_persistence::TickWriter;
 

@@ -196,6 +196,13 @@ instrument_csv_fallback_url = "https://images.dhan.co/api-data/api-scrip-master.
 max_instruments_per_connection = 5000
 max_websocket_connections = 5
 
+# Scope lock 2026-11-20 ("DHAN TRADE TIME SENT AS UTC"): on 20 Nov Dhan sent
+# every trade time 5 h 30 min early. "act" corrects it by exactly +19,800 s
+# from a saved, armed per-day record; "shadow" only logs; "off" is the full
+# rollback (no correction at all).
+[dhan_feed]
+ltt_utc_autocorrect = "act"
+
 [questdb]
 host = "tv-questdb"
 http_port = 9000

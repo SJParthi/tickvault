@@ -62,6 +62,11 @@ const LOG_ONLY_CODES: &[&str] = &[
     "DH-909",
     "DH-910",
     "DHAN-LIVE-XVERIFY-01",
+    // 2026-11-21 (scope lock 2026-11-20): the Dhan trade-time correction's own
+    // lines. Never paged: noise lock §2.24 REJECT "paging the correction's own
+    // coded warnings"; DHAN-FEED-TIME-01 is the page.
+    "DHAN-LTT-01",
+    "DHAN-LTT-02",
     // DISK-WATCHER-01: its alarm left 2026-11-11 (operator Quote 53 alarm review).
     "DISK-WATCHER-01",
     "DRAIN-HOLD-01",
