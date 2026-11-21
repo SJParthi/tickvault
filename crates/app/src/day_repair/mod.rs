@@ -1794,7 +1794,7 @@ mod dropped_rows_tests {
     }
 
     #[test]
-    fn test_dropped_rows_count_first_copy_of_tick_path_tables_only() {
+    fn test_dropped_tick_path_rows_count_first_copy_of_tick_path_tables_only() {
         let lines = vec![
             copy("ticks/2026-11-20T09", 100),
             copy("tick_quotes/2026-11-20T09", 40),
@@ -2050,7 +2050,7 @@ mod tests {
     /// `settling/` or `archive/` must still be found, so a segment missing from
     /// `raw-frames/` refuses the apply before any drop.
     #[test]
-    fn test_local_day_segments_cover_every_wal_folder_and_flag_missing_copies() {
+    fn test_local_day_segment_names_and_segments_missing_from_listing_cover_every_wal_folder() {
         let root = scratch("walall");
         let wal = root.join("ws_wal");
         for d in ["replaying", "settling", "archive"] {
