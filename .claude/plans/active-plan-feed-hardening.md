@@ -586,6 +586,10 @@ This plan converts hope into bounded, tested, alarmed guarantees. It does NOT pr
   - Files: crates/app/src/trade_safety.rs (new), crates/app/src/lib.rs, crates/app/src/daily_task_marker.rs (`marker_state`), crates/app/src/dhan_feed_stack/feed_time_page.rs, crates/app/src/live_fill/chain.rs, crates/app/src/live_fill/mod.rs, crates/app/src/order_runtime_live_fill.rs, crates/app/src/order_runtime.rs, crates/app/src/live_fill_report/build.rs, crates/app/tests/trade_safety_wiring_guard.rs (new), crates/app/tests/dhat_live_fill.rs, CLAUDE.md
   - Tests: trade_safety unit tests (same/next/earlier day, causes reset on a new day, chain day equals ist_day_number_now), chain entry refused with Decision+Reject rows and exit sent, held entry refused at fill, runtime backstop `refused:feed_time_alarm`, self-test skipped not failed, fire engages before the hand-off, marker Present/Unreadable/Absent at chain start, proptest against an oracle, dhat_live_fill with the switch set, trade_safety_wiring_guard (bite-tested)
   - Rules: daily-universe §28.7; noise lock §2.24 (no second DHAN-FEED-TIME-01 error); design: Design / Edge Cases / Failure Modes / Test Plan / Rollback / Observability in the UTC-SAFETY addendum below
+- [ ] ITEM UTC-PERMANENT — Dhan Live LTT is UTC epoch from WAL receipt 2026-11-20 00:00 IST: always add exactly +19,800 s as a pure function of (raw, receipt), no armed record; the detector stays only as a reversion guard that pages (scope lock §"2026-11-21", noise lock §2.24-a; Dhan ticket #6684672; owner cards "Yes, always UTC (Recommended)" and "Before Monday if checks pass (Recommended)", 2026-11-21)
+  - Files: docs/claude-rules-full/project/websocket-connection-scope-lock.md and its stub, docs/claude-rules-full/project/dhan-rest-only-noise-lock-2026-07-14.md and its stub, .claude/rules/project/data-integrity.md, docs/dhan-ref/03-live-market-feed-websocket.md, docs/dhan-ref/08-annexure-enums.md, .claude/rules/dhan/live-market-feed.md, .claude/rules/dhan/annexure-enums.md, .claude/rules/project/historical-candles-cross-verify.md, docs/dhan-support/2026-11-20-ltt-sent-as-utc.md, docs/dhan-support/README.md (step 1, rules first); crates/storage/src/ltt_correction.rs (+ ltt_correction_tests.rs; `DHAN_LTT_UTC_FROM_RECEIPT_NANOS`, `corrected_ltt`, `utc_verdict`, refusal counters by reason, `install_at_boot*` a no-op, `LttController::observe` reversion guard), crates/app/src/dhan_feed_stack/ltt_feed.rs (no record writer, no notice), crates/core/src/parser/dispatcher.rs (comment, `tv_dhan_ltt_unstamped_total` on the unstamped path), crates/core/tests/ltt_correction_dispatch.rs, crates/app/tests/ltt_correction_drain.rs, crates/storage/tests/dhat_ltt_correction.rs, the `dispatch_frame/ticker_ltt_armed` bench, .github/workflows/ci.yml test lists (step 2 and 3); CLAUDE.md `ltt_correction` / dispatcher rows and docs/error-runbooks/dhan-feed-time-error-codes.md (step 4). Not touched: feed_time_page.rs, trade_safety*.rs, live_fill/*, order_runtime*.rs, daily_task_marker.rs; main.rs and dhan_feed_stack.rs zero added lines
+  - Tests: proptest_pre_cutover_is_byte_identical, proptest_post_cutover_exact_or_refused, test_regression_2026_11_20_first_packet_corrected_without_warm_up, test_regression_print_two_days_old_corrected, test_regression_ist_epoch_fresh_print_stays_raw_counted_and_pages_once_per_segment_per_day, test_utc_verdict_never_pages, test_guard_off_never_pages, test_apply_ltt_correction_sits_in_all_three_dispatcher_arms (source scan, bite-tested), dhat_ltt_correction (0 blocks)
+  - Rules: scope lock §"2026-11-21", noise lock §2.24-a, data-integrity 2026-11-21 (SECOND); design: Design / Edge Cases / Failure Modes / Test Plan / Rollback / Observability in the UTC-PERMANENT addendum below
 
 ---
 
@@ -669,6 +673,55 @@ Revert the PR. There is no table, config, Terraform or data change. The `live_or
 - crates/app/src/live_fill_report/build.rs (`entries_blocked` field)
 - crates/app/tests/trade_safety_wiring_guard.rs (new), crates/app/tests/dhat_live_fill.rs
 - CLAUDE.md
+
+---
+
+## ITEM UTC-PERMANENT — DESIGN ADDENDUM (added 2026-11-21, owner cards "Yes, always UTC (Recommended)" and "Before Monday if checks pass (Recommended)")
+
+Dhan support, ticket #6684672, 21 Nov 2026: the Live LTT changed from IST-based to UTC-based epoch effective 20 Nov 2026, before the market opened, as part of an API restructuring, and "UTC-based epoch is now the permanent format for all Live Market Feed timestamps". So the per-day armed record of ITEM UTC-FIX is no longer needed: the correction becomes a fixed rule by WAL receipt. Ships only on All Green before Mon 23 Nov 08:30 IST; otherwise ITEM UTC-FIX stays in place. The dormant record, arming and notice code (about 1,255 lines) is deleted in a follow-up PR.
+
+## Design (Item UTC-PERMANENT)
+- `crates/storage/src/ltt_correction.rs`: `pub const DHAN_LTT_UTC_FROM_RECEIPT_NANOS: i64 = 1_795_113_000_000_000_000;` (receipt 2026-11-19T18:30Z = 2026-11-20 00:00 IST). `corrected_ltt(raw, segment, receipt)` returns `raw` when `receipt` is before it (pre-cutover, `0` and negatives); otherwise `utc_verdict(raw, receipt)`, which returns the corrected value or `raw` and counts the refusal.
+- Kept guards: plausible receipt, the raw band (so `0` and out-of-band values stay raw), `checked_add(19_800)`, and the receipt + 5 s cap (the reversion firewall). Refusals are counted on relaxed `AtomicU64`s by reason (band, cap, receipt).
+- Removed guards: the previous-day-session limit and the unconfirmed-fresh-print limit. Dhan says every Live LTT is UTC, so a print two or more days old also needs +19,800 s.
+- Cost per packet: one `i64` compare before the cutover; after it about five compares, plus one relaxed add on the refused branch only. No `ArcSwap`, no allocation, no new dependency.
+- Boot: `install_at_boot*` becomes a no-op with one log line; `ACTIVE` stays false, so `any_receipt_day_held` returns false and replay is never held. A leftover `.rec` file is ignored, never deleted.
+- `crates/app/src/dhan_feed_stack/ltt_feed.rs`: the record writer and the daily notice are not started.
+- `crates/core/src/parser/dispatcher.rs`: `dispatch_frame_uncounted_unstamped` stays raw and also counts on `tv_dhan_ltt_unstamped_total` (local only).
+- Reversion guard: `LttController::observe` keeps `classify_vote` and `LttDetector`, on raw, live, WAL-stamped `IDX_I` / `NSE_EQ` prints only. A `Utc` verdict does nothing. The first `Normal` verdict per segment per IST day, with receipt at or after the cutover and inside 09:00–15:40 IST (Muhurat-aware), logs one coded `error!` with `code = DHAN-FEED-TIME-01`, `source = "dhan_time_format_reverted"`, broker named. The latch is two bools, cleared at the day roll. The guard never writes a record and never changes the correction.
+- `[dhan_feed] ltt_utc_autocorrect`: parsing unchanged (no `common` code edit); it governs only the guard (`off` = no detector, `shadow` = coded `warn!`, `act` = page). Rolling the correction back is a code change behind a fresh dated quote.
+
+## Edge Cases (Item UTC-PERMANENT)
+- Pre-cutover receipts (old WAL replay, receipt `0`, v1/v2 records) are byte-identical to before.
+- 20 Nov first NIFTY packet at 08:31:22 IST: corrected, with no warm-up and no record.
+- A pre-open snapshot carrying yesterday's 15:29 trade, a Monday print of a Friday trade, an illiquid option two days old: all corrected.
+- Assumed: a trade from 19 Nov delivered after the cutover is also UTC-encoded. Verify on a 20 Nov raw frame for a contract whose last trade was 19 Nov before deploy.
+- Our clock more than 5 s behind: a fresh print is refused, stays raw (5.5 h early), routes to `tick_quotes`, and is counted.
+- A frame with no WAL receipt stamp: never corrected (as before).
+
+## Failure Modes (Item UTC-PERMANENT)
+- Dhan reverts to IST epoch: fresh prints exceed the cap and stay raw (correct IST) and are counted; the guard pages once per segment per day; same-day prints about 5.5 to 6.6 h old are shifted wrongly. Remedy: a manual `.hold`; auto-hold of a reversion day is a follow-up after the trade-safety PR lands.
+- A restart can page a second time that day (the latch is in RAM; Limitation).
+- 20 Nov WAL segments still waiting would replay corrected `ts` next to the wrong stored rows; DEDUP starts with `ts`, so both copies would survive. Order: copy, drop the 20 Nov partitions (Quote 63), then replay or rebuild.
+- Unknown: main-feed frames received between 19 Nov 15:40 and 20 Nov 08:31 IST would straddle the cutover. Check the WAL receipts read-only before deploy.
+- Not ready by Mon 23 Nov 08:30 IST: do not deploy; ITEM UTC-FIX re-arms each day after its votes (known, bounded).
+
+## Test Plan (Item UTC-PERMANENT)
+- `proptest_pre_cutover_is_byte_identical`: for every raw `u32`, every segment and every receipt in `[i64::MIN, cutover)`, output equals raw; `dispatch_frame` gives the same bytes as the unstamped path for generated Ticker/Quote/Full frames.
+- `proptest_post_cutover_exact_or_refused`: for receipt at or after the cutover, either output = raw + 19,800 and at most receipt + 5 s, or output = raw and exactly one refusal counter grew by 1.
+- Regressions: the 20 Nov first packet; a print two days old; an IST-epoch fresh print stays raw, is counted, and pages once per segment per day; a `Utc` verdict never pages; `off` never pages.
+- New source-scan guard: `apply_ltt_correction` sits in all three dispatcher arms (bite-tested).
+- Rewrite `crates/core/tests/ltt_correction_dispatch.rs`, `crates/app/tests/ltt_correction_drain.rs`, the `ltt_feed.rs` tests, `dhat_ltt_correction.rs` (0 blocks), the `dispatch_frame/ticker_ltt_armed` bench (same key, no `install_table`) and the `ci.yml` test lists. Arm, record and notice tests are marked dormant and deleted in the follow-up.
+- Run `cargo test -p tickvault-storage`, `-p tickvault-core`, `-p tickvault-app`, and `-p tickvault-common` for the rule-file guards.
+
+## Rollback (Item UTC-PERMANENT)
+Revert the PR. ITEM UTC-FIX in `act` mode then re-arms daily after its votes, a known, bounded failure. A day run under a wrong mode gets a `.hold`. No table, config schema, Terraform or data change.
+
+## Observability (Item UTC-PERMANENT)
+- Local refusal counters by reason (band, cap, receipt), and `tv_dhan_ltt_unstamped_total`; local `/metrics` only, registered at 0.
+- The reversion page rides the existing `DHAN-FEED-TIME-01` alarm (filter matches the code and `ERROR`; no Terraform change).
+- The daily notice is retired (noise lock §2.24-a).
+- No new alarm, filter or EMF name.
 
 ---
 

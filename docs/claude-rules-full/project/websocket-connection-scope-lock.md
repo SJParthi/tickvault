@@ -9639,3 +9639,37 @@ REJECT (adds to the section above): any per-contract, per-socket or order-depend
 - A switch `[dhan_feed] ltt_utc_autocorrect = "act" | "shadow" | "off"`, default `act`.
 
 **REJECT:** any offset other than +19,800 s; correcting without an armed record, before an entry's `from`, or deciding in replay; a result after receipt + 5 s or outside the receipt's day or the previous day's session; correcting a stale print on an unconfirmed segment; shifting `0` or out-of-band values; an entry carried across IST midnight; a time-based segment veto; changing raw WAL or S3 bytes; removing the switch or the dispatcher threading guard.
+
+> **⚠ SUPERSEDED IN PART 2026-11-21:** Dhan confirmed the change is permanent (next section). The armed-record, deciding-in-replay, other-day, unconfirmed-segment, midnight and removing-the-switch rows of the section above are replaced by the section below. The section above is kept as history.
+
+### 2026-11-21 — DHAN LIVE LTT IS UTC EPOCH FROM RECEIPT 2026-11-20 00:00 IST (permanent; supersedes the armed-record rows of 2026-11-20)
+
+**Dhan's answer (Verified, Dhan support, ticket #6684672, 21 Nov 2026 10:35 UTC, verbatim):** "Yes, the Live LTT timestamp format has been changed from IST-based epoch to UTC-based epoch effective 20th November 2026. ... The change was implemented on 20th November. However, an exact implementation timestamp is not available. ... Yes, this change is part of an API restructuring exercise. ... The restructuring was carried out to standardise the timestamp format across all API endpoints. Please note that UTC-based epoch is now the permanent format for all Live Market Feed timestamps. ... As of now, there are no further changes planned regarding the timestamp format. Please note that these changes were implemented before the market opened on 20th November." Full record: `docs/dhan-support/2026-11-20-ltt-sent-as-utc.md`.
+
+**Owner decisions (cards, 2026-11-21):** **"Yes, always UTC (Recommended)"** — from 2026-11-20 always treat the Dhan Live Market Feed Last Trade Time as UTC epoch and add exactly 19,800 s from the very first packet; days before stay IST epoch; the detector stays only as a reversion guard that pages. **"Before Monday if checks pass (Recommended)"** — ship before Mon 23 Nov 08:30 IST only on All Green; otherwise keep the 2026-11-20 armed-record code.
+
+**The rule.**
+- Every Ticker, Quote and Full Last Trade Time whose frame's WAL receipt is at or after **2026-11-20 00:00 IST** (receipt `1_795_113_000` s = 2026-11-19T18:30Z) gets exactly **+19,800 s**, in the core dispatcher, before any consumer reads it.
+- The correction is a pure function of (raw trade time, WAL receipt) only, so it is the same live and in replay, with no record, no arming, no warm-up and no per-day state.
+- It is applied only inside the existing guards: a plausible receipt, the raw band (so `0` and out-of-band values stay raw), `checked_add`, and the receipt + 5 s cap. A value the cap or the band refuses stays raw and is counted on a local refusal counter by reason.
+- Receipts before the cutover, and frames with no WAL receipt stamp, are never changed (byte-identical to before).
+- The previous-day-session and unconfirmed-fresh-print guards of 2026-11-20 are removed: Dhan says every Live LTT is UTC, so a print two or more days old also needs +19,800 s.
+- The detector only guards against reversion: it votes on raw, live, WAL-stamped prints and never writes a record or changes a correction. The first `Normal` (IST-epoch) verdict per segment per IST day inside the session window pages (noise lock §2.24-a).
+- `[dhan_feed] ltt_utc_autocorrect` now governs only the guard (`off` = no detector, `shadow` = coded warning, `act` = page). It never switches the correction; rolling the correction back is a code change behind a fresh dated quote.
+- Raw WAL and S3 bytes are never changed.
+
+This supersedes the 2026-11-20 rows on: the armed record, deciding in replay, the other-day limit, the unconfirmed segment, the midnight carry and removing the switch. The +19,800 s offset, the receipt + 5 s cap, the dispatcher threading guard and raw bytes unchanged stand.
+
+**Honest limits.** Assumed: a trade from 19 Nov delivered after the cutover is also UTC-encoded (to verify on a 20 Nov raw frame before deploy). If Dhan reverts, fresh prints exceed the cap and stay raw (correct), but same-day prints about 5.5 to 6.6 h old are shifted wrongly until the day is held. Unknown: whether any frame received between 19 Nov 15:40 and 20 Nov 08:31 IST straddles the cutover (check the WAL receipts read-only).
+
+**REJECT:**
+- any offset other than +19,800 s;
+- a cutover other than WAL receipt 2026-11-20 00:00 IST;
+- correcting a pre-cutover receipt or a frame with no WAL receipt stamp;
+- an input to the correction beyond (raw trade time, receipt);
+- a config that switches the correction off or on;
+- a cap above receipt + 5 s, or dropping the refusal counters;
+- the reversion guard changing a correction or writing a record;
+- changing raw WAL or S3 bytes.
+
+"Any such PR MUST be rejected in review even if the operator approves verbally — the operator must update this section FIRST with a dated quote."

@@ -5597,3 +5597,15 @@ Why: on 20 Nov 2026 Dhan sent trade times as UTC (see `websocket-connection-scop
 Code `DHAN-FEED-TIME-01` for both page causes (one `error_code_alerts` entry, period 300 s, threshold 1, no `ok_actions`). The latch is per cause per IST day and is persisted off the drain. When a cause fires, that day is auto-held (daily-universe Quote 63).
 
 **REJECT (§2.24):** firing outside the session gate or from replay; judging cause A on Dhan's raw time; more than once per cause per IST day; `ok_actions` or a recovery page; fewer than 20 ticks or 2 scans for A, or under 10 minutes for B; a per-instrument or per-connection dimension; persisting the latch on the drain; more than one notice a day; paging the correction's own coded warnings.
+
+### §2.24-a — 2026-11-21: the daily notice is retired; a third reason pages if Dhan goes back to IST epoch
+
+Dhan confirmed the Live Market Feed trade time is UTC epoch permanently from 20 Nov 2026 (ticket #6684672; `websocket-connection-scope-lock.md` §"2026-11-21"). Owner card (2026-11-21), verbatim: **"Yes, always UTC (Recommended)"** — the correction is always on from 20 Nov and "the detector only as a reversion guard that pages".
+
+- The daily "time correction switched on" notice of §2.24 is retired: the correction no longer arms, so there is nothing to announce.
+- A third reason on `DHAN-FEED-TIME-01`, `source = "dhan_time_format_reverted"`: the reversion guard sees an IST-epoch (`Normal`) verdict on raw, live, WAL-stamped prints. At most once per segment per IST day, live drain only, 09:00–15:40 IST (or the published Muhurat window), broker named. Same `error_code_alerts` entry and filter (`$.code = "DHAN-FEED-TIME-01" && $.level = "ERROR"`), no `ok_actions`, no new alarm, filter or EMF name. With `[dhan_feed] ltt_utc_autocorrect = "shadow"` it is a coded `warn!` only; with `off` there is no guard.
+- Causes A and B of §2.24 are unchanged.
+
+Limitation: the per-segment latch is in RAM, so a restart can page a second time that day. A reversion day is not auto-held by this change (a manual `.hold`; auto-hold is a follow-up).
+
+**REJECT (§2.24-a):** more than once per segment per IST day; firing outside the window or from replay; a page on a `Utc` verdict; a new alarm, filter, `ok_actions` or EMF name for it; bringing back the daily notice without a fresh dated quote.
