@@ -255,63 +255,124 @@ pub async fn list_copy_keys(s3: &crate::s3_cold::S3Cold, prefix: &str) -> Result
         .collect())
 }
 
-/// What two copies of one vendor packet share in any of the three tables
-/// (`ticks`, `tick_quotes`, `feed_aux_packets`): the instrument, the price,
-/// the cumulative volume, the open interest and the exchange time. Two copies
-/// of one packet (the backup socket's copy, which the live drain and the
-/// replay may pick differently) carry different `capture_seq` and
-/// `received_at` and the same `ContentKey`.
+/// The stored value columns of a `ticks` / `tick_quotes` row, in key order
+/// (the two tables share them). The exchange time is apart.
+pub const TICK_VALUE_COLS: [&str; 13] = [
+    "ltp",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "oi",
+    "oi_day_high",
+    "oi_day_low",
+    "avg_price",
+    "last_trade_qty",
+    "total_buy_qty",
+    "total_sell_qty",
+];
+
+/// The stored value columns of a `feed_aux_packets` row, in key order. The
+/// exchange time is apart.
+pub const AUX_VALUE_COLS: [&str; 13] = [
+    "kind",
+    "oi",
+    "prev_close",
+    "prev_oi",
+    "ltp",
+    "volume",
+    "day_open",
+    "day_high",
+    "day_low",
+    "day_close",
+    "oi_day_high",
+    "oi_day_low",
+    "reason_code",
+];
+
+/// Which family of table a row comes from: the two tick tables share one
+/// row shape, the aux table has its own. A packet is matched only within its
+/// family (a cross-family pair is left unmatched, so the check refuses).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RowClass {
+    /// `ticks` or `tick_quotes`.
+    Tick,
+    /// `feed_aux_packets`.
+    Aux,
+}
+
+/// Everything two copies of one vendor packet share as stored: the table
+/// family, the instrument, every value column, and the exchange time. Two
+/// copies of one packet (the backup socket's copy, which the live drain and
+/// the replay may keep differently) differ only in `capture_seq`,
+/// `received_at` and, in `tick_quotes`, the arrival-time `ts`; those are the
+/// only columns left out, with `feed`, `contract` and the never-written
+/// `payload_hash` (2026-11-21 second review: a six-column key let a different
+/// packet with the same price and volume stand in for a lost one).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ContentKey {
+    /// The table family.
+    pub class: RowClass,
     /// `security_id`.
     pub sid: i64,
     /// `segment`.
     pub seg: String,
-    /// `ltp` as `f64` bits (`None` = NULL).
-    pub ltp: Option<u64>,
-    /// `volume`.
-    pub volume: Option<i64>,
-    /// `oi`.
-    pub oi: Option<i64>,
-    /// The exchange time in µs since the epoch (`exchange_timestamp` in the
-    /// tick tables, `exchange_ts` in the aux table).
+    /// The value columns in key order, each normalized: a number as its
+    /// `f64` bits in hex (so `5.5` and `5.50` agree), NULL as empty, other
+    /// text as written.
+    pub values: Vec<String>,
+    /// The exchange time in µs (`ts` in `ticks`, `exchange_timestamp` in
+    /// `tick_quotes`, `exchange_ts` in the aux table).
     pub exch_micros: Option<i64>,
 }
 
 /// Where the [`ContentKey`] columns sit in one CSV header.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContentCols {
+    /// The table family.
+    pub class: RowClass,
     /// `capture_seq`.
     pub seq: usize,
     /// `security_id`.
     pub sid: usize,
     /// `segment`.
     pub seg: usize,
-    /// `ltp`.
-    pub ltp: Option<usize>,
-    /// `volume`.
-    pub volume: Option<usize>,
-    /// `oi`.
-    pub oi: Option<usize>,
-    /// `exchange_timestamp` or `exchange_ts`.
-    pub exch: Option<usize>,
+    /// The value columns, in key order (`None` = not in this header; a
+    /// header must hold every one, see [`ContentCols::from_header`]).
+    pub values: Vec<usize>,
+    /// The exchange time column.
+    pub exch: usize,
 }
 
 impl ContentCols {
-    /// Reads the indexes from a header line; `None` without `capture_seq`,
-    /// `security_id` or `segment`. Pure.
+    /// Reads the indexes from a header line. The family is the aux table
+    /// when the header has `kind`. `None` when any key column is absent (a
+    /// row whose value columns cannot all be compared is never matched).
+    /// The exchange time is `exchange_ts` (aux), else `exchange_timestamp`
+    /// (`tick_quotes`), else `ts` (`ticks`, whose `ts` is the exchange time).
+    /// Pure.
     #[must_use]
     pub fn from_header(header: &str) -> Option<Self> {
         let names = csv_fields(header);
         let at = |n: &str| names.iter().position(|c| c == n);
+        let (class, cols): (RowClass, &[&str]) = if at("kind").is_some() {
+            (RowClass::Aux, &AUX_VALUE_COLS)
+        } else {
+            (RowClass::Tick, &TICK_VALUE_COLS)
+        };
+        let values = cols.iter().map(|c| at(c)).collect::<Option<Vec<_>>>()?;
+        let exch = match class {
+            RowClass::Aux => at("exchange_ts")?,
+            RowClass::Tick => at("exchange_timestamp").or_else(|| at("ts"))?,
+        };
         Some(Self {
+            class,
             seq: at("capture_seq")?,
             sid: at("security_id")?,
             seg: at("segment")?,
-            ltp: at("ltp"),
-            volume: at("volume"),
-            oi: at("oi"),
-            exch: at("exchange_timestamp").or_else(|| at("exchange_ts")),
+            values,
+            exch,
         })
     }
 }
@@ -331,55 +392,56 @@ pub fn parse_ts_micros(text: &str) -> Result<Option<i64>> {
     Ok(Some(dt.timestamp_micros()))
 }
 
+/// One value normalized for comparison: a number as its `f64` bits in hex,
+/// NULL as empty, other text as written. Pure.
+#[must_use]
+pub fn normalize_value(text: &str) -> String {
+    let t = text.trim();
+    if t.is_empty() {
+        return String::new();
+    }
+    match t.parse::<f64>() {
+        Ok(v) => format!("{:016x}", v.to_bits()),
+        Err(_) => t.to_owned(),
+    }
+}
+
 /// One row's `capture_seq` and [`ContentKey`], its exchange time moved by
 /// `shift_micros` (a zero or absent time is never moved). Pure.
 ///
 /// # Errors
-/// A field that does not parse.
-pub fn content_of(f: &[String], cols: ContentCols, shift_micros: i64) -> Result<(u64, ContentKey)> {
+/// A `capture_seq`, `security_id` or exchange time that does not parse.
+pub fn content_of(
+    f: &[String],
+    cols: &ContentCols,
+    shift_micros: i64,
+) -> Result<(u64, ContentKey)> {
     let get = |i: usize| f.get(i).map_or("", |s| s.trim());
-    let opt = |i: Option<usize>| i.map(get).filter(|s| !s.is_empty());
     let seq: u64 = get(cols.seq)
         .parse()
         .with_context(|| format!("capture_seq {:?} is not a number", get(cols.seq)))?;
     let sid: i64 = get(cols.sid)
         .parse()
         .with_context(|| format!("security_id {:?} is not a number", get(cols.sid)))?;
-    let int = |i: Option<usize>, name: &str| -> Result<Option<i64>> {
-        opt(i)
-            .map(|s| {
-                s.parse::<i64>()
-                    .with_context(|| format!("{name} {s:?} is not a number"))
-            })
-            .transpose()
-    };
-    let ltp = opt(cols.ltp)
-        .map(|s| {
-            s.parse::<f64>()
-                .with_context(|| format!("ltp {s:?} is not a number"))
-        })
-        .transpose()?
-        .map(f64::to_bits);
     // A zero (epoch) time is a packet with no trade time: never shifted.
-    let exch = opt(cols.exch)
-        .map(parse_ts_micros)
-        .transpose()?
-        .flatten()
-        .map(|t| {
-            if t == 0 {
-                0
-            } else {
-                t.saturating_add(shift_micros)
-            }
-        });
+    let exch = parse_ts_micros(get(cols.exch))?.map(|t| {
+        if t == 0 {
+            0
+        } else {
+            t.saturating_add(shift_micros)
+        }
+    });
     Ok((
         seq,
         ContentKey {
+            class: cols.class,
             sid,
             seg: get(cols.seg).to_owned(),
-            ltp,
-            volume: int(cols.volume, "volume")?,
-            oi: int(cols.oi, "oi")?,
+            values: cols
+                .values
+                .iter()
+                .map(|i| normalize_value(get(*i)))
+                .collect(),
             exch_micros: exch,
         },
     ))
@@ -397,12 +459,11 @@ pub struct MissingContent {
 }
 
 /// Reads the rows of one copy whose `capture_seq` is in sorted `missing`
-/// into `out` (one entry per packet, however many copies hold it). Lines
-/// before the header-bearing first line are not expected. O(bytes ×
+/// into `out` (one entry per packet, however many copies hold it). O(bytes ×
 /// log missing).
 ///
 /// # Errors
-/// The header lacks a needed column, or a missing row does not parse.
+/// The header lacks a key column, or a missing row does not parse.
 pub fn read_missing_contents<R: std::io::BufRead>(
     mut reader: R,
     missing: &[u64],
@@ -414,10 +475,7 @@ pub fn read_missing_contents<R: std::io::BufRead>(
         return Ok(());
     }
     let Some(cols) = ContentCols::from_header(&header) else {
-        bail!(
-            "the header lacks capture_seq, security_id or segment: {}",
-            header.trim()
-        );
+        bail!("the header lacks a content column: {}", header.trim());
     };
     let mut line = String::new();
     loop {
@@ -435,8 +493,8 @@ pub fn read_missing_contents<R: std::io::BufRead>(
         if missing.binary_search(&seq).is_err() || out.contains_key(&seq) {
             continue;
         }
-        let (_, shifted) = content_of(&f, cols, shift_micros)?;
-        let (_, as_stored) = content_of(&f, cols, 0)?;
+        let (_, shifted) = content_of(&f, &cols, shift_micros)?;
+        let (_, as_stored) = content_of(&f, &cols, 0)?;
         out.insert(seq, MissingContent { shifted, as_stored });
     }
 }
@@ -471,7 +529,7 @@ pub fn read_missing_contents_gz(
 /// A field that does not parse.
 pub fn add_spare(
     f: &[String],
-    cols: ContentCols,
+    cols: &ContentCols,
     dropped: &[u64],
     spare: &mut std::collections::BTreeMap<ContentKey, u64>,
 ) -> Result<()> {
@@ -647,82 +705,189 @@ mod tests {
         assert!(copies_under_prefix(&hour, &day).is_empty());
     }
 
+    const TICK_HDR: &str = "\"ts\",\"security_id\",\"segment\",\"ltp\",\"open\",\"high\",\"low\",\"close\",\"volume\",\"oi\",\"oi_day_high\",\"oi_day_low\",\"avg_price\",\"last_trade_qty\",\"total_buy_qty\",\"total_sell_qty\",\"received_at\",\"capture_seq\"\n";
+    const QUOTE_HDR: &str = "\"ts\",\"security_id\",\"segment\",\"ltp\",\"open\",\"high\",\"low\",\"close\",\"volume\",\"oi\",\"oi_day_high\",\"oi_day_low\",\"avg_price\",\"last_trade_qty\",\"total_buy_qty\",\"total_sell_qty\",\"received_at\",\"capture_seq\",\"exchange_timestamp\"\n";
+    const AUX_HDR: &str = "ts,received_at,feed,segment,kind,contract,security_id,oi,prev_close,prev_oi,ltp,exchange_ts,volume,day_open,day_high,day_low,day_close,oi_day_high,oi_day_low,reason_code,capture_seq\n";
+
+    /// One tick-family row: exchange time `t`, received `r`, `buy` total buy
+    /// quantity.
+    fn tick_row(t: &str, sid: i64, ltp: &str, vol: i64, buy: i64, r: &str, seq: u64) -> String {
+        format!("{t},{sid},NSE_FNO,{ltp},1,2,0.5,1.5,{vol},,,,1.25,75,{buy},9,{r},{seq}\n")
+    }
+
     #[test]
-    fn test_content_cols_from_header_parse_ts_micros_and_content_of_shift_only_real_times() {
-        let tick = ContentCols::from_header(
-            "\"security_id\",\"segment\",\"ltp\",\"volume\",\"oi\",\"capture_seq\",\"exchange_timestamp\"\r\n",
-        )
-        .expect("cols");
-        let aux = ContentCols::from_header("capture_seq,security_id,segment,kind,ltp,exchange_ts")
-            .expect("cols");
-        assert_eq!(aux.exch, Some(5));
-        assert_eq!(aux.volume, None);
-        assert!(ContentCols::from_header("capture_seq,segment").is_none());
+    fn test_content_cols_from_header_parse_ts_micros_normalize_value_and_content_of() {
+        let tick = ContentCols::from_header(TICK_HDR).expect("ticks");
+        assert_eq!(tick.class, RowClass::Tick);
+        assert_eq!(tick.exch, 0, "ticks: ts is the exchange time");
+        let quote = ContentCols::from_header(QUOTE_HDR).expect("quotes");
+        assert_eq!(quote.exch, 18, "tick_quotes: exchange_timestamp");
+        let aux = ContentCols::from_header(AUX_HDR).expect("aux");
+        assert_eq!((aux.class, aux.exch), (RowClass::Aux, 11));
+        // A header missing a value column cannot be compared.
+        assert!(ContentCols::from_header("capture_seq,security_id,segment,ts").is_none());
         assert_eq!(parse_ts_micros("").expect("empty"), None);
         assert_eq!(
             parse_ts_micros("1970-01-01T00:00:01.000002Z").expect("ts"),
             Some(1_000_002)
         );
         assert!(parse_ts_micros("nope").is_err());
-        let row = csv_fields("52411,NSE_FNO,101.5,9000,,77,2026-11-20T04:00:00.000000Z");
-        let (seq, k) = content_of(&row, tick, 19_800_000_000).expect("row");
-        assert_eq!(seq, 77);
-        assert_eq!(k.sid, 52_411);
-        assert_eq!(k.seg, "NSE_FNO");
-        assert_eq!(k.ltp, Some(101.5f64.to_bits()));
-        assert_eq!(k.volume, Some(9_000));
-        assert_eq!(k.oi, None);
-        let corrected = parse_ts_micros("2026-11-20T09:30:00.000000Z")
-            .expect("ts")
-            .expect("some");
-        assert_eq!(k.exch_micros, Some(corrected));
-        // A zero time is never shifted; an empty one stays NULL.
-        let zero = csv_fields("1,IDX_I,10,,,2,1970-01-01T00:00:00.000000Z");
+        assert_eq!(normalize_value("5.5"), normalize_value("5.50"));
+        assert_eq!(normalize_value("7"), normalize_value("7.0"));
+        assert_eq!(normalize_value(" "), "");
+        assert_eq!(normalize_value("oi"), "oi");
+        let row = csv_fields(&tick_row(
+            "2026-11-20T04:00:00.000000Z",
+            52_411,
+            "101.5",
+            9_000,
+            40,
+            "2026-11-20T09:30:01.000000Z",
+            77,
+        ));
+        let (seq, k) = content_of(&row, &tick, 19_800_000_000).expect("row");
+        assert_eq!((seq, k.sid, k.seg.as_str()), (77, 52_411, "NSE_FNO"));
+        assert_eq!(k.values.len(), TICK_VALUE_COLS.len());
+        assert_eq!(k.values[0], normalize_value("101.5"));
         assert_eq!(
-            content_of(&zero, tick, 5).expect("row").1.exch_micros,
+            k.exch_micros,
+            parse_ts_micros("2026-11-20T09:30:00.000000Z").expect("ts")
+        );
+        // A zero time is never shifted; an empty one stays NULL.
+        let zero = csv_fields(&tick_row(
+            "1970-01-01T00:00:00.000000Z",
+            1,
+            "1",
+            1,
+            1,
+            "",
+            2,
+        ));
+        assert_eq!(
+            content_of(&zero, &tick, 5).expect("row").1.exch_micros,
             Some(0)
         );
-        let none = csv_fields("1,IDX_I,10,,,2,");
-        assert_eq!(content_of(&none, tick, 5).expect("row").1.exch_micros, None);
-        assert!(content_of(&csv_fields("x,IDX_I,10,,,2,"), tick, 0).is_err());
+        let none = csv_fields(&tick_row("", 1, "1", 1, 1, "", 2));
+        assert_eq!(
+            content_of(&none, &tick, 5).expect("row").1.exch_micros,
+            None
+        );
+        let bad =
+            csv_fields(&tick_row("", 1, "1", 1, 1, "", 2).replace(",1,NSE_FNO", ",x,NSE_FNO"));
+        assert!(content_of(&bad, &tick, 0).is_err());
     }
 
     #[test]
-    fn test_read_missing_contents_add_spare_and_match_spares_count_one_spare_per_packet() {
-        let copy = "capture_seq,security_id,segment,ltp,volume,oi,exchange_timestamp\n\
-                    10,7,NSE_FNO,5.5,100,,2026-11-20T04:00:00.000000Z\n\
-                    11,7,NSE_FNO,5.5,100,,2026-11-20T04:00:00.000000Z\n\
-                    12,7,NSE_FNO,6.0,101,,2026-11-20T04:00:01.000000Z\n\
-                    13,8,NSE_FNO,1.0,1,,2026-11-20T04:00:02.000000Z\n\
-                    \n";
-        let missing = vec![10u64, 11, 13];
+    fn test_read_missing_contents_add_spare_and_match_spares_need_every_value_column_equal() {
         let shift = 19_800_000_000i64;
+        // Dropped: 10 and 11 two packets with equal price and volume but a
+        // different total buy quantity; 12 kept; 13 lost.
+        let copy = format!(
+            "{QUOTE_HDR}{}{}{}{}\n",
+            tick_row(
+                "2026-11-20T09:31:00.0Z",
+                7,
+                "5.5",
+                100,
+                40,
+                "2026-11-20T04:00:00.000000Z",
+                10
+            )
+            .trim_end()
+            .to_owned()
+                + "\n",
+            tick_row(
+                "2026-11-20T09:31:01.0Z",
+                7,
+                "5.5",
+                100,
+                41,
+                "2026-11-20T04:00:00.000000Z",
+                11
+            )
+            .trim_end()
+            .to_owned()
+                + "\n",
+            tick_row(
+                "2026-11-20T09:31:02.0Z",
+                7,
+                "6.0",
+                101,
+                42,
+                "2026-11-20T04:00:01.000000Z",
+                12
+            )
+            .trim_end()
+            .to_owned()
+                + "\n",
+            tick_row(
+                "2026-11-20T09:31:03.0Z",
+                8,
+                "1.0",
+                1,
+                1,
+                "2026-11-20T04:00:02.000000Z",
+                13
+            ),
+        );
+        // A quotes copy: append the exchange time column (UTC-shifted).
+        let copy: String = copy
+            .lines()
+            .enumerate()
+            .map(|(i, l)| {
+                if i == 0 {
+                    format!("{l}\n")
+                } else if l.trim().is_empty() {
+                    String::new()
+                } else {
+                    let r = csv_fields(l);
+                    format!("{l},{}\n", r[16])
+                }
+            })
+            .collect();
+        let missing = vec![10u64, 11, 13];
         let mut out = std::collections::BTreeMap::new();
         read_missing_contents(copy.as_bytes(), &missing, shift, &mut out).expect("read");
-        // A second copy of the same partition adds nothing new.
-        read_missing_contents(copy.as_bytes(), &missing, shift, &mut out).expect("read");
+        read_missing_contents(copy.as_bytes(), &missing, shift, &mut out).expect("again");
         assert_eq!(out.keys().copied().collect::<Vec<_>>(), vec![10, 11, 13]);
-        // Rebuilt day: packet 12 kept, one spare copy of the 10/11 content
-        // (the backup socket's copy), and packet 13's content as stored.
-        let rebuilt = "capture_seq,security_id,segment,ltp,volume,oi,exchange_timestamp\n\
-                       12,7,NSE_FNO,6.0,101,,2026-11-20T09:30:01.000000Z\n\
-                       90,7,NSE_FNO,5.5,100,,2026-11-20T09:30:00.000000Z\n\
-                       91,8,NSE_FNO,1.0,1,,2026-11-20T04:00:02.000000Z";
+        // Rebuilt `ticks` (ts = corrected exchange time): 12 kept; 90 the
+        // backup copy of packet 10 (same buy quantity 40); 91 a packet with
+        // packet 11's price and volume but another buy quantity; 92 packet
+        // 13 with its time as stored.
+        let rebuilt = format!(
+            "{TICK_HDR}{}{}{}{}",
+            tick_row("2026-11-20T09:30:01.000000Z", 7, "6.0", 101, 42, "x", 12),
+            tick_row("2026-11-20T09:30:00.000000Z", 7, "5.5", 100, 40, "x", 90),
+            tick_row("2026-11-20T09:30:00.000000Z", 7, "5.5", 100, 99, "x", 91),
+            tick_row("2026-11-20T04:00:02.000000Z", 8, "1.0", 1, 1, "x", 92),
+        );
         let mut lines = rebuilt.lines();
         let cols = ContentCols::from_header(lines.next().expect("header")).expect("cols");
         let dropped = vec![10u64, 11, 12, 13];
         let mut spare = std::collections::BTreeMap::new();
         for l in lines {
-            add_spare(&csv_fields(l), cols, &dropped, &mut spare).expect("spare");
+            add_spare(&csv_fields(l), &cols, &dropped, &mut spare).expect("spare");
         }
         let (matched, unmatched) = match_spares(&out, &mut spare.clone());
-        // 10 takes the one spare; 11 has none left; 13 matches as stored.
+        // 10 takes 90; 11 has no exact copy (91 differs in buy quantity);
+        // 13 matches as stored.
         assert_eq!(matched, 2);
         assert_eq!(unmatched, vec![11]);
-        // With no spare rows nothing matches.
         let (m, u) = match_spares(&out, &mut std::collections::BTreeMap::new());
         assert_eq!((m, u.len()), (0, 3));
-        // A header without the identity columns is refused.
+        // An aux row never matches a tick row with the same numbers.
+        let aux_cols = ContentCols::from_header(AUX_HDR).expect("aux");
+        let aux = csv_fields(
+            "2026-11-20T09:00:00.0Z,x,dhan,NSE_FNO,out_of_window_tick,c,8,,,,1.0,2026-11-20T04:00:02.000000Z,1,,,,,,,,93\n",
+        );
+        let mut aux_spare = std::collections::BTreeMap::new();
+        add_spare(&aux, &aux_cols, &dropped, &mut aux_spare).expect("aux spare");
+        let only13: std::collections::BTreeMap<u64, MissingContent> = out
+            .iter()
+            .filter(|(k, _)| **k == 13)
+            .map(|(k, v)| (*k, v.clone()))
+            .collect();
+        assert_eq!(match_spares(&only13, &mut aux_spare), (0, vec![13]));
         let mut o = std::collections::BTreeMap::new();
         assert!(read_missing_contents("capture_seq\n1\n".as_bytes(), &[1], 0, &mut o).is_err());
     }
@@ -736,8 +901,12 @@ mod tests {
             std::fs::File::create(&path).expect("file"),
             flate2::Compression::fast(),
         );
-        gz.write_all(b"capture_seq,security_id,segment\n5,1,IDX_I\n6,2,IDX_I\n")
-            .expect("write");
+        let body = format!(
+            "{TICK_HDR}{}{}",
+            tick_row("2026-11-20T04:00:00.000000Z", 1, "1", 1, 1, "x", 5),
+            tick_row("2026-11-20T04:00:00.000000Z", 2, "1", 1, 1, "x", 6)
+        );
+        gz.write_all(body.as_bytes()).expect("write");
         gz.finish().expect("finish");
         let mut out = std::collections::BTreeMap::new();
         read_missing_contents_gz(&path, &[6], 0, &mut out).expect("read");

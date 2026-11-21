@@ -760,6 +760,21 @@ pub async fn export_lines(
     client: &reqwest::Client,
     exp_url: &str,
     sql: &str,
+    take: impl FnMut(&str) -> anyhow::Result<()>,
+) -> anyhow::Result<u64> {
+    export_csv(client, exp_url, sql, |_| Ok(()), take).await
+}
+
+/// [`export_lines`] that also hands the header line to `on_header` before
+/// any row. O(rows).
+///
+/// # Errors
+/// As [`export_lines`], or `on_header` refuses the header.
+pub async fn export_csv(
+    client: &reqwest::Client,
+    exp_url: &str,
+    sql: &str,
+    mut on_header: impl FnMut(&str) -> anyhow::Result<()>,
     mut take: impl FnMut(&str) -> anyhow::Result<()>,
 ) -> anyhow::Result<u64> {
     let mut waited = std::time::Duration::ZERO;
@@ -792,7 +807,7 @@ pub async fn export_lines(
         let text = text.trim_end_matches(['\r', '\n']);
         if !header_seen {
             header_seen = true;
-            return Ok(());
+            return on_header(text);
         }
         if text.trim().is_empty() {
             return Ok(());
@@ -867,24 +882,15 @@ pub async fn export_contracts(
     .await
 }
 
-/// The column order [`export_spares`] selects: `capture_seq, security_id,
-/// segment, ltp, volume, oi, <exchange time>`.
-pub const SPARE_COLS: tickvault_storage::day_repair_coverage::ContentCols =
-    tickvault_storage::day_repair_coverage::ContentCols {
-        seq: 0,
-        sid: 1,
-        seg: 2,
-        ltp: Some(3),
-        volume: Some(4),
-        oi: Some(5),
-        exch: Some(6),
-    };
-
-/// Streams a [`SPARE_COLS`]-shaped `/exp` answer into `spare`: every rebuilt
-/// row whose `capture_seq` is not in sorted `dropped`. O(rows log dropped).
+/// Streams a `SELECT * FROM <tick-path table> ...` `/exp` answer into
+/// `spare`: every rebuilt row whose `capture_seq` is not in sorted `dropped`,
+/// keyed by every stored value column. The columns are read from the answer's
+/// own header, so each table's real column set is used (`ticks` has no
+/// `exchange_timestamp`; its `ts` is the exchange time). O(rows log dropped).
 ///
 /// # Errors
-/// As [`export_lines`], or a row that does not parse.
+/// As [`export_csv`], a header without a content column, or a row that does
+/// not parse.
 pub async fn export_spares(
     client: &reqwest::Client,
     exp_url: &str,
@@ -893,9 +899,23 @@ pub async fn export_spares(
     spare: &mut std::collections::BTreeMap<tickvault_storage::day_repair_coverage::ContentKey, u64>,
 ) -> anyhow::Result<u64> {
     use tickvault_storage::day_repair_coverage as cov;
-    export_lines(client, exp_url, sql, |line| {
-        cov::add_spare(&cov::csv_fields(line), SPARE_COLS, dropped, spare)
-    })
+    let cols: std::cell::RefCell<Option<cov::ContentCols>> = std::cell::RefCell::new(None);
+    export_csv(
+        client,
+        exp_url,
+        sql,
+        |header| {
+            let c = cov::ContentCols::from_header(header)
+                .with_context(|| format!("the export header lacks a content column: {header}"))?;
+            *cols.borrow_mut() = Some(c);
+            Ok(())
+        },
+        |line| {
+            let guard = cols.borrow();
+            let c = guard.as_ref().context("a row before the header")?;
+            cov::add_spare(&cov::csv_fields(line), c, dropped, spare)
+        },
+    )
     .await
 }
 
@@ -1584,13 +1604,13 @@ mod stub_exec_tests {
     }
 
     #[tokio::test]
-    async fn test_export_spares_counts_rebuilt_rows_whose_number_is_no_dropped_packet() {
-        let body = String::from(
-            "capture_seq,security_id,segment,ltp,volume,oi,exchange_timestamp\r\n\
-             10,7,NSE_FNO,5.5,100,,2026-11-20T09:30:00.000000Z\r\n\
-             90,7,NSE_FNO,5.5,100,,2026-11-20T09:30:00.000000Z\r\n\
-             91,7,NSE_FNO,5.5,100,,2026-11-20T09:30:00.000000Z\r\n",
-        );
+    async fn test_export_spares_and_export_csv_count_rebuilt_rows_whose_number_is_no_dropped_packet()
+     {
+        let hdr = "ts,security_id,segment,ltp,open,high,low,close,volume,oi,oi_day_high,oi_day_low,avg_price,last_trade_qty,total_buy_qty,total_sell_qty,received_at,capture_seq\r\n";
+        let row = |seq: u64| {
+            format!("2026-11-20T09:30:00.000000Z,7,NSE_FNO,5.5,,,,,100,,,,,,,,,{seq}\r\n")
+        };
+        let body = format!("{hdr}{}{}{}", row(10), row(90), row(91));
         let (url, seen) = stub(vec![
             ("FROM ticks", 200, body),
             ("", 500, String::from("x")),
