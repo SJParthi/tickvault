@@ -10,12 +10,14 @@
 //!    first copy and any drop-time re-export at a `.sha-` key), the recorded
 //!    one at exactly its recorded row count;
 //! 2. each dropped `capture_seq` is looked up in the rebuilt day;
-//! 3. a packet missing by number counts as kept only when a rebuilt row whose
-//!    number is no dropped packet's is identical in the instrument, every
-//!    stored value column and the exchange time (the backup socket's copy of
-//!    the same vendor packet), one such row per packet;
-//! 4. rows of the Quote 61 repeat-skip kinds may be absent, but every
-//!    contract that had one keeps at least one.
+//! 3. STRICT: every dropped packet must be there under its own number, the
+//!    Quote 61 repeat-skip kinds included, and every contract that had a
+//!    repeat-kind row keeps one. Nothing is excused: three hostile reviews
+//!    each found a way an accepted look-alike could hide a lost packet;
+//! 4. for the report only, a packet missing by number is looked up as an
+//!    exact copy under another number (the backup socket's copy of the same
+//!    vendor packet), and live out-of-window aux rows are counted, so a
+//!    refusal says why.
 //!
 //! Cold, offline, once per verify: O(bytes) per copy read (twice when any
 //! packet is missing), O(n log n) to sort the numbers. Deleted with the rest
@@ -202,11 +204,16 @@ pub(crate) async fn run_coverage<S: CopyStore>(
         .await
         .context("the coverage compare stopped")?;
     let (checked, repeat_n, missing) = (need.len(), repeat.len(), missing_list.len());
+    let missing_sample: Vec<u64> = missing_list.iter().take(10).copied().collect();
     // 3. A packet missing by number may be in the rebuilt day under the other
     //    number of the same vendor packet: a contract on the backup socket
     //    arrives twice, and the live drain and the replay can keep different
     //    copies.
     let (mut matched, mut unmatched) = (0u64, Vec::new());
+    // How many unmatched packets were live `out_of_window_tick` aux rows (a
+    // tick live filed in the aux table because of the wrong time, which the
+    // rebuild files in a tick table; the copy match never crosses families).
+    let mut unmatched_out_of_window = 0u64;
     if !missing_list.is_empty() {
         let missing_sorted = std::sync::Arc::new(missing_list);
         let mut contents = std::collections::BTreeMap::new();
@@ -250,6 +257,14 @@ pub(crate) async fn run_coverage<S: CopyStore>(
             }
         }
         (matched, unmatched) = cov::match_spares(&contents, &mut spare);
+        unmatched_out_of_window = unmatched
+            .iter()
+            .filter_map(|s| contents.get(s))
+            .filter(|m| {
+                m.shifted.class == cov::RowClass::Aux
+                    && m.shifted.values.first().map(String::as_str) == Some("out_of_window_tick")
+            })
+            .count() as u64;
         // A packet not found again in its copies stays unmatched.
         for seq in missing_sorted.iter() {
             if !contents.contains_key(seq) {
@@ -273,18 +288,33 @@ pub(crate) async fn run_coverage<S: CopyStore>(
     );
     super::say(&format!(
         "coverage: {} copies read ({} recorded), {rows} dropped rows, {checked} distinct packets \
-         checked, {missing} missing by number, {matched} of them kept as another copy of the same \
-         packet, {unmatched_n} not in the rebuild; {repeat_n} repeat-kind packets, \
-         {repeat_missing} of them skipped by the Quote 61 repeat rule; {repeat_contracts} \
+         checked, {missing} missing by number ({matched} with an exact copy under another number, \
+         {unmatched_n} without, {unmatched_out_of_window} of those live out-of-window aux rows); \
+         {repeat_n} repeat-kind packets, {repeat_missing} of them not rebuilt; {repeat_contracts} \
          repeat-kind contracts, {} without a rebuilt row; {have} distinct packets rebuilt",
         objects.len(),
         copies.len(),
         lost_contracts.len()
     ));
-    if unmatched_n > 0 {
+    // STRICT (2026-11-21, after three hostile reviews): every dropped packet
+    // must be in the rebuilt day under its own number, repeat kinds
+    // included. The copy match and the repeat-skip counts above are
+    // REPORTED, never accepted: each round of review found another way an
+    // accepted look-alike could hide a lost packet, so nothing is excused.
+    if missing > 0 {
+        let mut first = missing_sample;
+        first.truncate(10);
         findings.push(format!(
-            "{unmatched_n} dropped packets are not in the rebuilt day (first capture_seq: {:?})",
-            unmatched.iter().take(10).collect::<Vec<_>>()
+            "{missing} dropped packets are not in the rebuilt day under their own number \
+             ({matched} of them have an exact copy under another number, \
+             {unmatched_n} have none, {unmatched_out_of_window} of those were live \
+             out-of-window aux rows; first capture_seq: {first:?})"
+        ));
+    }
+    if repeat_missing > 0 {
+        findings.push(format!(
+            "{repeat_missing} dropped no-trade-today / connect-snapshot packets are not in the \
+             rebuilt day (the repeat skip is not accepted)"
         ));
     }
     Ok(findings)
@@ -530,7 +560,7 @@ mod tests {
                 ),
                 ("SELECT capture_seq FROM ticks", seqs(&[1, 2])),
                 ("SELECT capture_seq FROM tick_quotes", seqs(&[3])),
-                ("SELECT capture_seq FROM feed_aux_packets", seqs(&[5])),
+                ("SELECT capture_seq FROM feed_aux_packets", seqs(&[4, 5])),
             ],
             "clean",
         )
@@ -543,7 +573,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_run_coverage_keeps_a_packet_the_rebuild_holds_as_the_backup_copy() {
+    async fn test_run_coverage_refuses_a_backup_copy_under_another_number_and_reports_it() {
         let (store, copies) = dropped_store();
         // Packet 3 rebuilt as 99 (the other socket's copy), time corrected.
         let spare = format!(
@@ -560,12 +590,20 @@ mod tests {
                 ),
                 ("SELECT * FROM ticks", spare),
                 ("SELECT capture_seq FROM ticks", seqs(&[1, 2, 99])),
-                ("SELECT capture_seq FROM feed_aux_packets", seqs(&[5])),
+                ("SELECT capture_seq FROM feed_aux_packets", seqs(&[4, 5])),
             ],
             "spare",
         )
         .await;
-        assert_eq!(got.expect("ran"), Vec::<String>::new());
+        // Strict: the exact copy under number 99 is reported, not accepted.
+        let findings = got.expect("ran");
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(findings[0].contains("1 dropped packets"), "{findings:?}");
+        assert!(
+            findings[0].contains("1 of them have an exact copy"),
+            "{findings:?}"
+        );
+        assert!(findings[0].contains("0 have none"), "{findings:?}");
         assert!(
             queries.iter().any(|q| q.contains("security_id IN (8)")),
             "{queries:?}"
@@ -589,11 +627,17 @@ mod tests {
         )
         .await;
         let findings = got.expect("ran");
-        assert_eq!(findings.len(), 3, "{findings:?}");
+        assert_eq!(findings.len(), 4, "{findings:?}");
         assert!(findings[0].contains("read 3 rows, its record says 4"));
-        assert!(findings[1].contains("no-trade-today"));
+        assert!(findings[1].contains("no-trade-today row before and none"));
         assert!(findings[2].contains("1 dropped packets are not in the rebuilt day"));
+        assert!(findings[2].contains("0 of them have an exact copy"));
         assert!(findings[2].contains("[3]"));
+        // The repeat-kind packet 4 is not rebuilt: not excused.
+        assert!(
+            findings[3].contains("1 dropped no-trade-today"),
+            "{findings:?}"
+        );
     }
 
     #[tokio::test]
@@ -622,7 +666,7 @@ mod tests {
                     String::from("security_id,segment\r\n9,NSE_EQ\r\n"),
                 ),
                 ("SELECT capture_seq FROM ticks", seqs(&[1, 2, 3])),
-                ("SELECT capture_seq FROM feed_aux_packets", seqs(&[5])),
+                ("SELECT capture_seq FROM feed_aux_packets", seqs(&[4, 5])),
             ],
             "second",
         )
