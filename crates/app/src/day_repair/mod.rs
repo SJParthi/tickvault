@@ -597,6 +597,10 @@ pub(crate) trait RepairIo {
     async fn rebuild(&mut self) -> anyhow::Result<RebuildReport>;
     /// The verify gate; returns the findings (empty = repaired).
     async fn verify(&mut self, rep: &RebuildReport) -> anyhow::Result<Vec<String>>;
+    /// The packet coverage check: every dropped packet (by `capture_seq`) of
+    /// the given quarantine copies must be in the rebuilt day; rows of the
+    /// Quote 61 repeat-skip kinds are counted apart. Returns the findings.
+    async fn coverage(&mut self, copies: &[(String, CopyRecord)]) -> anyhow::Result<Vec<String>>;
     /// `Ok` while the run window is open; an error carrying [`WINDOW_STOP`]
     /// once 08:00 IST on a session day (or the tool's expiry) is reached.
     async fn window_open(&mut self) -> anyhow::Result<()>;
@@ -861,7 +865,10 @@ pub(crate) async fn run_verify<I: RepairIo>(
         );
     }
     let mut findings = io.verify(&rep).await?;
-    findings.extend(rebuilt_covers_dropped(log.lines(), &rep));
+    // Every dropped packet must be in the rebuilt day (2026-11-21: a row
+    // count could not tell a missing packet from a re-routed replay row or a
+    // Quote 61 repeat skip).
+    findings.extend(io.coverage(&dropped_tick_path_copies(log.lines())).await?);
     if !findings.is_empty() {
         io.audit(
             Step::Verify,
@@ -895,41 +902,23 @@ pub(crate) async fn run_verify<I: RepairIo>(
 /// before and after, only the table may change with the corrected time.
 const TICK_PATH_TABLES: [&str; 3] = ["ticks", "tick_quotes", "feed_aux_packets"];
 
-/// Rows the repair dropped from the tick-path tables: the FIRST recorded copy
-/// of each partition (a re-run copies its own rebuilt rows again under a
+/// The dropped tick-path partitions' quarantine copies: the FIRST recorded
+/// copy of each partition (a re-run copies its own rebuilt rows again under a
 /// later line; those are not the original day). O(lines).
 #[must_use]
-pub fn dropped_tick_path_rows(lines: &[ProgressLine]) -> u64 {
+pub fn dropped_tick_path_copies(lines: &[ProgressLine]) -> Vec<(String, CopyRecord)> {
     let mut seen = std::collections::BTreeSet::new();
-    let mut total = 0_u64;
+    let mut out = Vec::new();
     for l in lines.iter().filter(|l| l.step == Step::Copy) {
         let table = l.object.split('/').next().unwrap_or_default();
         if !TICK_PATH_TABLES.contains(&table) || !seen.insert(l.object.as_str()) {
             continue;
         }
         if let Some(rec) = CopyRecord::decode(&l.detail) {
-            total = total.saturating_add(rec.rows);
+            out.push((l.object.clone(), rec));
         }
     }
-    total
-}
-
-/// A finding when the rebuild wrote fewer tick-path rows than the repair
-/// dropped (2026-11-21 review): rows the raw frames did not reproduce would
-/// be gone from the database and every later export. Pure.
-#[must_use]
-pub fn rebuilt_covers_dropped(lines: &[ProgressLine], rep: &RebuildReport) -> Option<String> {
-    let dropped = dropped_tick_path_rows(lines);
-    let rebuilt = rep
-        .tick_rows
-        .saturating_add(rep.quote_rows)
-        .saturating_add(rep.aux_rows);
-    (rebuilt < dropped).then(|| {
-        format!(
-            "the rebuild wrote {rebuilt} ticks + tick_quotes + feed_aux_packets rows, fewer than \
-             the {dropped} the repair dropped"
-        )
-    })
+    out
 }
 
 /// One `KEY=value` from the output of `systemctl show <unit> -p Environment
@@ -1767,6 +1756,95 @@ mod prod_io {
             Ok(findings)
         }
 
+        async fn coverage(
+            &mut self,
+            copies: &[(String, CopyRecord)],
+        ) -> anyhow::Result<Vec<String>> {
+            use tickvault_storage::day_repair_coverage as cov;
+            let s3 = tickvault_storage::s3_cold::S3Cold::load(
+                &self.config.partition_retention.archive_bucket,
+            )
+            .await
+            .context("no cold bucket resolves")?;
+            std::fs::create_dir_all(&self.staging)
+                .with_context(|| format!("create {}", self.staging.display()))?;
+            let mut dropped = cov::CopySeqs::default();
+            for (i, (object, rec)) in copies.iter().enumerate() {
+                // The staging folder holds only this run's files.
+                let path = self.staging.join(format!("coverage-{i}.csv.gz"));
+                let _stale = std::fs::remove_file(&path);
+                cov::download_copy(&s3, &rec.key, &path)
+                    .await
+                    .with_context(|| format!("download the copy of {object}"))?;
+                let read_path = path.clone();
+                let mut acc = std::mem::take(&mut dropped);
+                acc = tokio::task::spawn_blocking(move || {
+                    cov::read_copy_gz(&read_path, &mut acc).map(|()| acc)
+                })
+                .await
+                .context("the copy reader stopped")??;
+                dropped = acc;
+                std::fs::remove_file(&path)
+                    .with_context(|| format!("remove {}", path.display()))?;
+            }
+            let rows = dropped.rows;
+            let exp_url = self.exec_url.replacen("/exec", "/exp", 1);
+            // An export of tens of millions of rows outlives the probe client.
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(1_800))
+                .build()
+                .context("build the export client")?;
+            let d = self.day.format("%Y-%m-%d").to_string();
+            let mut rebuilt = Vec::new();
+            for table in super::TICK_PATH_TABLES {
+                let sql = format!("SELECT capture_seq FROM {table} WHERE ts IN '{d}'");
+                super::rebuild::export_seqs(&client, &exp_url, &sql, &mut rebuilt).await?;
+            }
+            let (checked, repeat, have, missing, sample, repeat_missing) =
+                tokio::task::spawn_blocking(move || {
+                    let mut need = dropped.checked;
+                    let mut repeat = dropped.repeat_kind;
+                    cov::sort_dedup(&mut need);
+                    cov::sort_dedup(&mut repeat);
+                    cov::sort_dedup(&mut rebuilt);
+                    let (missing, sample) = cov::missing_from(&need, &rebuilt, 10);
+                    let (repeat_missing, _) = cov::missing_from(&repeat, &rebuilt, 0);
+                    (
+                        need.len(),
+                        repeat.len(),
+                        rebuilt.len(),
+                        missing,
+                        sample,
+                        repeat_missing,
+                    )
+                })
+                .await
+                .context("the coverage compare stopped")?;
+            tracing::info!(
+                copies = copies.len(),
+                dropped_rows = rows,
+                dropped_packets_checked = checked,
+                repeat_kind_packets = repeat,
+                repeat_kind_not_rebuilt = repeat_missing,
+                rebuilt_packets = have,
+                missing,
+                "day repair: packet coverage of the dropped copies"
+            );
+            super::say(&format!(
+                "coverage: {rows} dropped rows, {checked} distinct packets checked, {missing} \
+                 missing from the rebuild; {repeat} repeat-kind packets, {repeat_missing} of them \
+                 skipped by the Quote 61 repeat rule; {have} distinct packets rebuilt"
+            ));
+            Ok(if missing == 0 {
+                Vec::new()
+            } else {
+                vec![format!(
+                    "{missing} dropped packets are not in the rebuilt day (first capture_seq: \
+                     {sample:?})"
+                )]
+            })
+        }
+
         async fn audit(
             &mut self,
             step: Step,
@@ -1972,7 +2050,7 @@ mod dropped_rows_tests {
     }
 
     #[test]
-    fn test_dropped_tick_path_rows_count_first_copy_of_tick_path_tables_only() {
+    fn test_dropped_tick_path_copies_take_the_first_copy_of_tick_path_tables_only() {
         let lines = vec![
             copy("ticks/2026-11-20T09", 100),
             copy("tick_quotes/2026-11-20T09", 40),
@@ -1981,26 +2059,18 @@ mod dropped_rows_tests {
             // A re-run's copy of its own rebuilt rows: not the original day.
             copy("ticks/2026-11-20T09", 500),
         ];
-        assert_eq!(dropped_tick_path_rows(&lines), 147);
-    }
-
-    #[test]
-    fn test_rebuilt_covers_dropped_flags_only_a_shortfall() {
-        let lines = vec![
-            copy("ticks/2026-11-20T09", 100),
-            copy("tick_quotes/2026-11-20T10", 50),
-        ];
-        let mut rep = RebuildReport {
-            tick_rows: 60,
-            quote_rows: 60,
-            aux_rows: 30,
-            ..RebuildReport::default()
-        };
-        assert_eq!(rebuilt_covers_dropped(&lines, &rep), None);
-        rep.aux_rows = 29;
-        let f = rebuilt_covers_dropped(&lines, &rep).expect("shortfall");
-        assert!(f.contains("149") && f.contains("150"), "{f}");
-        assert_eq!(rebuilt_covers_dropped(&[], &RebuildReport::default()), None);
+        let got = dropped_tick_path_copies(&lines);
+        let objects: Vec<&str> = got.iter().map(|(o, _)| o.as_str()).collect();
+        assert_eq!(
+            objects,
+            vec![
+                "ticks/2026-11-20T09",
+                "tick_quotes/2026-11-20T09",
+                "feed_aux_packets/2026-11-20"
+            ]
+        );
+        assert_eq!(got[0].1.rows, 100, "the first copy, not the re-run's");
+        assert!(dropped_tick_path_copies(&[]).is_empty());
     }
 }
 
@@ -2419,6 +2489,13 @@ mod tests {
         async fn verify(&mut self, _rep: &RebuildReport) -> anyhow::Result<Vec<String>> {
             self.tick()?;
             self.remote.borrow_mut().verifies += 1;
+            Ok(Vec::new())
+        }
+        async fn coverage(
+            &mut self,
+            _copies: &[(String, CopyRecord)],
+        ) -> anyhow::Result<Vec<String>> {
+            self.tick()?;
             Ok(Vec::new())
         }
         async fn audit(

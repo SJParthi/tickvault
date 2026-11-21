@@ -746,6 +746,64 @@ pub async fn exec_count(
     Ok(first_count(&exec_dataset(client, exec_url, sql).await?))
 }
 
+/// Streams `SELECT capture_seq ...` through QuestDB's `/exp` (CSV: a header
+/// line, then one number per line) into `out`, chunk by chunk, so tens of
+/// millions of rows never sit in memory as text. O(rows).
+///
+/// # Errors
+/// The request fails, QuestDB answers non-2xx, or a line is not a number.
+pub async fn export_seqs(
+    client: &reqwest::Client,
+    exp_url: &str,
+    sql: &str,
+    out: &mut Vec<u64>,
+) -> anyhow::Result<u64> {
+    let mut resp = client
+        .get(exp_url)
+        .query(&[("query", sql)])
+        .send()
+        .await
+        .with_context(|| format!("export {sql}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        bail!("export {sql} returned {status}: {body}");
+    }
+    let mut pending: Vec<u8> = Vec::new();
+    let mut header_seen = false;
+    let mut rows = 0u64;
+    let mut take = |line: &[u8], header_seen: &mut bool| -> anyhow::Result<()> {
+        let text = std::str::from_utf8(line).context("export line is not UTF-8")?;
+        let text = text.trim().trim_matches('"');
+        if !*header_seen {
+            *header_seen = true;
+            return Ok(());
+        }
+        if text.is_empty() {
+            return Ok(());
+        }
+        let v: u64 = text
+            .parse()
+            .with_context(|| format!("export value {text:?} is not a capture_seq"))?;
+        out.push(v);
+        rows += 1;
+        Ok(())
+    };
+    while let Some(chunk) = resp.chunk().await.context("read the export")? {
+        pending.extend_from_slice(&chunk);
+        let mut start = 0usize;
+        while let Some(pos) = pending[start..].iter().position(|b| *b == b'\n') {
+            take(&pending[start..start + pos], &mut header_seen)?;
+            start += pos + 1;
+        }
+        pending.drain(..start);
+    }
+    if !pending.is_empty() {
+        take(&pending, &mut header_seen)?;
+    }
+    Ok(rows)
+}
+
 /// The offset fingerprint of one day: index ticks whose exchange time is
 /// before 09:00 IST. The `ticks` writer refuses such a tick to
 /// `feed_aux_packets` as `out_of_window_tick` (it never holds a `ticks` row
@@ -1335,6 +1393,36 @@ mod stub_exec_tests {
         // does not hold it.
         assert!(seen[0].contains("wal_tables"), "{seen:?}");
         assert_eq!(seen.len(), 7, "{seen:?}");
+    }
+
+    #[tokio::test]
+    async fn test_export_seqs_streams_numbers_after_the_header() {
+        let mut body = String::from("\"capture_seq\"\r\n");
+        for i in 0..5_000u64 {
+            body.push_str(&format!("{}\r\n", 1_000_000 + i));
+        }
+        body.push_str("42");
+        let (url, _) = stub(vec![
+            ("FROM ticks", 200, body),
+            ("FROM bad", 200, String::from("capture_seq\n1\nx\n")),
+            ("", 500, String::from("boom")),
+        ])
+        .await;
+        let mut out = Vec::new();
+        let n = export_seqs(&client(), &url, "SELECT capture_seq FROM ticks", &mut out)
+            .await
+            .expect("export");
+        assert_eq!(n, 5_001);
+        assert_eq!(out.first(), Some(&1_000_000));
+        assert_eq!(out.last(), Some(&42));
+        let e = export_seqs(&client(), &url, "SELECT capture_seq FROM bad", &mut out)
+            .await
+            .expect_err("not a number");
+        assert!(format!("{e:#}").contains("\"x\""), "{e:#}");
+        let e = export_seqs(&client(), &url, "other", &mut out)
+            .await
+            .expect_err("500");
+        assert!(format!("{e:#}").contains("500"), "{e:#}");
     }
 
     #[tokio::test]
