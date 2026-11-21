@@ -3896,3 +3896,31 @@ Owner, 2026-11-16, after the Quote 60 card "One decision waiting for you: extra 
 - Writing canonical keys, manifests, amend records or `partition_archive_audit` rows from the repair.
 - A manual or SSM delete of market data (Quote 51 binds).
 - Reusing Quote 63 for another day or another delete.
+
+##### The Quote 63 tool (plan item UTC-REPAIR, written 2026-11-21, before any copy or drop)
+
+This table records how the Quote 63 repair is built. It authorizes nothing beyond Quote 63, and nothing runs until the owner's dated row for the one SSM element and the two-line workflow is in `rust-only-forever-lock-2026-07-19.md` (§0.21, not yet written: a session may not record that approval itself). The owner's answers of 2026-11-21 as relayed to this session (card labels, to be confirmed in the §0.21 row): "Approve, one-off (Recommended)" for the server step, "Point Brutex at fixed copy (Recommended)" for a wrong canonical copy, "Sunday 22 Nov (Recommended)" for the run.
+
+| Item | Locked value |
+|---|---|
+| Tool | Runner `tv-day-repair-2026-11-20` (`crates/app/src/bin/tv_day_repair_2026_11_20.rs`) and `tickvault day-repair <dry\|apply\|verify> <sha>` on the box (`crates/app/src/day_repair/`), run by the dispatch-only `.github/workflows/day-repair-2026-11-20.yml`; one dispatch chains dry, apply, verify and stops at the first failure. Every copy, drop and keep decision is a pure, tested function; nothing comes from config. |
+| Correction | No record file: the permanent rule (scope lock §"2026-11-21", `ltt_correction::corrected_ltt`, a pure function of raw time and WAL receipt from 2026-11-20 00:00 IST) corrects every 20 Nov frame replayed through the normal dispatcher. This is the "+19,800 s correction recorded for that day" of the Rebuild row above. Prints the rule refuses keep their raw time and are counted. |
+| Allowlist | Day 2026-11-20 only, and only `held_days::table_is_held_kind` tables: the `2026-11-20` partition of every `candles_*` table and every `2026-11-20T*` hour of `ticks`, `tick_quotes`, `feed_aux_packets`. Never `market_depth*`, cross-verify, SEBI or audit tables. Hours of 21 Nov 00:00–07:00 IST are refused. |
+| Copy | Each allowed partition: WAL applied, exported in DEDUP-key order, copied create-only to `s3://tv-prod-cold/quarantine/2026-11-20-ltt-utc-shift/` (identical bytes reused; different bytes to a `.sha-<hex>` key beside it, never an overwrite), recounted, size and SHA-256 checked against the export, one `day_repair_audit` row. Never a canonical key, manifest, amend record or `partition_archive_audit` row. The 20 Nov seal, spill and DLQ files are copied the same way. |
+| Drop | Only a partition with a verified quarantine row, only in QuestDB, through the snapshot gate's re-check (WAL applied, recount). The drop path's S3 hook returns an error and never calls S3. |
+| Files | 20 Nov seal, spill and DLQ files are RENAMED into `data/held/2026-11-20/` after their verified copy; never deleted. |
+| Rebuild | From `s3://tv-prod-cold/raw-frames/2026-11-20/` with every SHA sidecar checked (counted against the local WAL archive), one segment at a time, through the normal dispatcher and `LiveIngest` fold, in a new module (the live drain is unchanged); fold watermark seeded at 2026-11-20 00:00 IST; restarts and gaps of that day withheld as live did; end-of-day seal as live. Refused while any 20 Nov WAL segment still waits for replay. |
+| Verify | `candles_1m` covers 09:15–15:29; no ~19,800 s offset outside the counted refusals; rows written equal the replay's own counts; no new spill or DLQ file; every flush acked. Only a passed verify writes `data/state/day-repair/2026-11-20.done`. |
+| Brutex | A wrong object already at a canonical 20 Nov key stays. After release, the normal export (not the repair) places the corrected bytes at the `.sha-<hex>` key and its manifest names that key; archiver copies of held-kind tables made before 00:00 IST of the `.done` date are left out of the manifest's partitions and listed under `superseded_by_repair` (a byte-identical copy is not superseded). If `_daily/2026-11-20/DONE` already exists, `dry` reports it and `apply` refuses (DONE is create-only under Quote 60; a superseding marker needs its own owner decision). |
+| Box | Stops and masks `tickvault`; refuses unless it then reads inactive or failed; holds the WAL owner lock; keeps the curfew off while it runs; leaves the app stopped and unmasked after `.done`. |
+| Identity | The existing deploy keys over SSM and the box's own instance role (whole-bucket Put/Get/List on `tv-prod-cold`, no delete). No new role. An explicit Deny on `s3:DeleteObject` and `s3:DeleteObjectVersion` under `quarantine/*` on the box role (the live-fill-logs shape). |
+| When | Never 08:00–16:30 IST on a trading day (Muhurat dates included), never while a deploy workflow is queued or running, never after 2026-11-30 23:59 IST. Planned: Sunday 2026-11-22, finished before Monday 08:30 IST. |
+| Afterwards | The first PR after a passed verify deletes the runner, the workflow, the SSM literal, the subcommand, `day_repair/` and their budget rows, records the run here and marks Quote 63 SPENT for the repair. `day_repair_audit`, the quarantine objects and `data/held/2026-11-20/` are kept; the manifest rule stays. |
+
+##### What violates the Quote 63 tool (REJECT)
+- Running any step before the owner's §0.21 row is recorded.
+- Any day but 2026-11-20, any table outside the allowlist, or any hour of 21 Nov.
+- A drop without a verified quarantine row; deleting or overwriting any S3 object, or deleting a seal, spill or DLQ file.
+- A correction record file or any correction other than the permanent rule.
+- Writing a canonical key, manifest, amend record, DONE or `partition_archive_audit` row from the repair tool.
+- Writing `.done` without a passed verify, or applying while `_daily/2026-11-20/DONE` exists.
