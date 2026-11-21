@@ -867,6 +867,38 @@ pub async fn export_contracts(
     .await
 }
 
+/// The column order [`export_spares`] selects: `capture_seq, security_id,
+/// segment, ltp, volume, oi, <exchange time>`.
+pub const SPARE_COLS: tickvault_storage::day_repair_coverage::ContentCols =
+    tickvault_storage::day_repair_coverage::ContentCols {
+        seq: 0,
+        sid: 1,
+        seg: 2,
+        ltp: Some(3),
+        volume: Some(4),
+        oi: Some(5),
+        exch: Some(6),
+    };
+
+/// Streams a [`SPARE_COLS`]-shaped `/exp` answer into `spare`: every rebuilt
+/// row whose `capture_seq` is not in sorted `dropped`. O(rows log dropped).
+///
+/// # Errors
+/// As [`export_lines`], or a row that does not parse.
+pub async fn export_spares(
+    client: &reqwest::Client,
+    exp_url: &str,
+    sql: &str,
+    dropped: &[u64],
+    spare: &mut std::collections::BTreeMap<tickvault_storage::day_repair_coverage::ContentKey, u64>,
+) -> anyhow::Result<u64> {
+    use tickvault_storage::day_repair_coverage as cov;
+    export_lines(client, exp_url, sql, |line| {
+        cov::add_spare(&cov::csv_fields(line), SPARE_COLS, dropped, spare)
+    })
+    .await
+}
+
 /// The offset fingerprint of one day: index ticks whose exchange time is
 /// before 09:00 IST. The `ticks` writer refuses such a tick to
 /// `feed_aux_packets` as `out_of_window_tick` (it never holds a `ticks` row
@@ -1549,6 +1581,45 @@ mod stub_exec_tests {
         .expect_err("take refused");
         assert!(format!("{e:#}").contains("refused"), "{e:#}");
         assert_eq!(seen, vec![String::from("13,IDX_I")]);
+    }
+
+    #[tokio::test]
+    async fn test_export_spares_counts_rebuilt_rows_whose_number_is_no_dropped_packet() {
+        let body = String::from(
+            "capture_seq,security_id,segment,ltp,volume,oi,exchange_timestamp\r\n\
+             10,7,NSE_FNO,5.5,100,,2026-11-20T09:30:00.000000Z\r\n\
+             90,7,NSE_FNO,5.5,100,,2026-11-20T09:30:00.000000Z\r\n\
+             91,7,NSE_FNO,5.5,100,,2026-11-20T09:30:00.000000Z\r\n",
+        );
+        let (url, seen) = stub(vec![
+            ("FROM ticks", 200, body),
+            ("", 500, String::from("x")),
+        ])
+        .await;
+        let mut spare = std::collections::BTreeMap::new();
+        let rows = export_spares(
+            &client(),
+            &url,
+            "SELECT capture_seq FROM ticks",
+            &[10, 11],
+            &mut spare,
+        )
+        .await
+        .expect("export");
+        assert_eq!(rows, 3);
+        assert_eq!(spare.len(), 1);
+        assert_eq!(spare.values().copied().sum::<u64>(), 2, "90 and 91 only");
+        assert!(
+            seen.lock()
+                .expect("lock")
+                .iter()
+                .any(|q| q.contains("FROM ticks"))
+        );
+        assert!(
+            export_spares(&client(), &url, "other", &[], &mut spare)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

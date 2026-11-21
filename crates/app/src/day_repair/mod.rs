@@ -864,6 +864,9 @@ pub(crate) async fn run_verify<I: RepairIo>(
             unfinished.join("; ")
         );
     }
+    // The verify reads and exports for a long while; it runs only inside
+    // the window like every other step (2026-11-21 review).
+    io.window_open().await?;
     let mut findings = io.verify(&rep).await?;
     // Every dropped packet must be in the rebuilt day (2026-11-21: a row
     // count could not tell a missing packet from a re-routed replay row or a
@@ -1801,20 +1804,53 @@ mod prod_io {
             std::fs::create_dir_all(&self.staging)
                 .with_context(|| format!("create {}", self.staging.display()))?;
             let mut findings = Vec::new();
+            // Every copy in the bucket of each dropped partition: the first
+            // recorded copy AND any drop-time re-export that landed other
+            // bytes at a `.sha-` key. The drop re-exports and drops against
+            // that newer copy, which the progress file does not record, so
+            // the rows actually dropped can be more than the first copy held
+            // (2026-11-21 review). Expected rows only for the recorded copy.
+            let mut objects: Vec<(String, String, Option<u64>)> = Vec::new();
+            for (object, rec) in copies {
+                self.window_open().await?;
+                let (table, partition) = object
+                    .split_once('/')
+                    .with_context(|| format!("{object} is not table/partition"))?;
+                let prefix = cov::partition_copy_prefix(table, partition);
+                let listed = cov::copies_under_prefix(
+                    &cov::list_copy_keys(&s3, &prefix)
+                        .await
+                        .with_context(|| format!("list the copies of {object}"))?,
+                    &prefix,
+                );
+                if !listed.contains(&rec.key) {
+                    findings.push(format!(
+                        "the recorded copy {} of {object} is not in the bucket",
+                        rec.key
+                    ));
+                    continue;
+                }
+                objects.push((object.clone(), rec.key.clone(), Some(rec.rows)));
+                for key in listed.into_iter().filter(|k| *k != rec.key) {
+                    tracing::info!(object = %object, key = %key, "day repair: a second copy of a dropped partition is read too");
+                    objects.push((object.clone(), key, None));
+                }
+            }
             let expected_rows: u64 = copies.iter().map(|(_, r)| r.rows).sum();
             let mut dropped = cov::CopySeqs {
                 // Sized once: no doubling past ~0.5 GB on the box.
                 checked: Vec::with_capacity(usize::try_from(expected_rows).unwrap_or(0)),
                 ..cov::CopySeqs::default()
             };
-            for (i, (object, rec)) in copies.iter().enumerate() {
+            for (i, (object, key, want_rows)) in objects.iter().enumerate() {
+                self.window_open().await?;
                 let rows_before = dropped.rows;
                 // The staging folder holds only this run's files.
                 let path = self.staging.join(format!("coverage-{i}.csv.gz"));
                 let _stale = std::fs::remove_file(&path);
-                cov::download_copy(&s3, &rec.key, &path)
+                cov::download_copy(&s3, key, &path)
                     .await
-                    .with_context(|| format!("download the copy of {object}"))?;
+                    .with_context(|| format!("download {key} ({object})"))?;
                 let read_path = path.clone();
                 let mut acc = std::mem::take(&mut dropped);
                 acc = tokio::task::spawn_blocking(move || {
@@ -1825,13 +1861,14 @@ mod prod_io {
                 dropped = acc;
                 std::fs::remove_file(&path)
                     .with_context(|| format!("remove {}", path.display()))?;
-                // The object read must be the copy the repair verified and
-                // dropped against: the same number of rows (2026-11-21 review).
+                // The recorded copy must read the rows its record says: the
+                // object read is then the copy the repair verified.
                 let read = dropped.rows.saturating_sub(rows_before);
-                if read != rec.rows {
+                if let Some(want) = want_rows
+                    && read != *want
+                {
                     findings.push(format!(
-                        "the copy of {object} read {read} rows, its record says {}",
-                        rec.rows
+                        "the copy {key} of {object} read {read} rows, its record says {want}"
                     ));
                 }
             }
@@ -1845,6 +1882,7 @@ mod prod_io {
             let d = self.day.format("%Y-%m-%d").to_string();
             let mut rebuilt = Vec::with_capacity(usize::try_from(expected_rows).unwrap_or(0));
             for table in super::TICK_PATH_TABLES {
+                self.window_open().await?;
                 let sql = format!("SELECT capture_seq FROM {table} WHERE ts IN '{d}'");
                 super::rebuild::export_seqs(&client, &exp_url, &sql, &mut rebuilt).await?;
             }
@@ -1876,47 +1914,132 @@ mod prod_io {
                     lost_contracts.iter().take(10).collect::<Vec<_>>()
                 ));
             }
-            let (checked, repeat, have, missing, sample, repeat_missing) =
+            let (need, repeat, have, missing_list, repeat_missing) =
                 tokio::task::spawn_blocking(move || {
                     let mut need = dropped.checked;
                     let mut repeat = dropped.repeat_kind;
                     cov::sort_dedup(&mut need);
                     cov::sort_dedup(&mut repeat);
                     cov::sort_dedup(&mut rebuilt);
-                    let (missing, sample) = cov::missing_from(&need, &rebuilt, 10);
+                    let (_, missing_list) = cov::missing_from(&need, &rebuilt, usize::MAX);
                     let (repeat_missing, _) = cov::missing_from(&repeat, &rebuilt, 0);
-                    (
-                        need.len(),
-                        repeat.len(),
-                        rebuilt.len(),
-                        missing,
-                        sample,
-                        repeat_missing,
-                    )
+                    (need, repeat, rebuilt.len(), missing_list, repeat_missing)
                 })
                 .await
                 .context("the coverage compare stopped")?;
+            let (checked, repeat_n, missing) = (need.len(), repeat.len(), missing_list.len());
+            // A packet missing by number may be in the rebuilt day under the
+            // other number of the same vendor packet: a contract on the
+            // backup socket arrives twice, and the live drain and the replay
+            // can keep different copies (2026-11-21 review). Such a packet
+            // counts as kept only when a rebuilt row whose number is no
+            // dropped packet's carries the same instrument, price, volume,
+            // open interest and exchange time, one spare row per packet.
+            let (mut matched, mut unmatched) = (0u64, Vec::new());
+            if !missing_list.is_empty() {
+                let shift = i64::from(tickvault_common::constants::IST_UTC_OFFSET_SECONDS)
+                    .saturating_mul(1_000_000);
+                let missing_sorted = std::sync::Arc::new(missing_list);
+                let mut contents = std::collections::BTreeMap::new();
+                for (i, (object, key, _)) in objects.iter().enumerate() {
+                    self.window_open().await?;
+                    let path = self.staging.join(format!("coverage-missing-{i}.csv.gz"));
+                    let _stale = std::fs::remove_file(&path);
+                    cov::download_copy(&s3, key, &path)
+                        .await
+                        .with_context(|| format!("download {key} ({object}) again"))?;
+                    let read_path = path.clone();
+                    let wanted = std::sync::Arc::clone(&missing_sorted);
+                    let mut acc = std::mem::take(&mut contents);
+                    acc = tokio::task::spawn_blocking(move || {
+                        cov::read_missing_contents_gz(&read_path, &wanted, shift, &mut acc)
+                            .map(|()| acc)
+                    })
+                    .await
+                    .context("the missing-row reader stopped")??;
+                    contents = acc;
+                    std::fs::remove_file(&path)
+                        .with_context(|| format!("remove {}", path.display()))?;
+                }
+                if contents.len() != missing_sorted.len() {
+                    findings.push(format!(
+                        "{} of {} missing packets were not found again in their copies",
+                        missing_sorted.len().saturating_sub(contents.len()),
+                        missing_sorted.len()
+                    ));
+                }
+                let mut dropped_all: Vec<u64> = need;
+                dropped_all.extend_from_slice(&repeat);
+                cov::sort_dedup(&mut dropped_all);
+                let sids: std::collections::BTreeSet<i64> =
+                    contents.values().map(|m| m.shifted.sid).collect();
+                let sids: Vec<i64> = sids.into_iter().collect();
+                let mut spare = std::collections::BTreeMap::new();
+                for table in super::TICK_PATH_TABLES {
+                    let exch = if table == "feed_aux_packets" {
+                        "exchange_ts"
+                    } else {
+                        "exchange_timestamp"
+                    };
+                    for chunk in sids.chunks(500) {
+                        self.window_open().await?;
+                        let list = chunk
+                            .iter()
+                            .map(i64::to_string)
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        let sql = format!(
+                            "SELECT capture_seq, security_id, segment, ltp, volume, oi, {exch} \
+                             FROM {table} WHERE ts IN '{d}' AND security_id IN ({list})"
+                        );
+                        super::rebuild::export_spares(
+                            &client,
+                            &exp_url,
+                            &sql,
+                            &dropped_all,
+                            &mut spare,
+                        )
+                        .await?;
+                    }
+                }
+                (matched, unmatched) = cov::match_spares(&contents, &mut spare);
+                // A packet not found again in its copies stays unmatched.
+                for seq in missing_sorted.iter() {
+                    if !contents.contains_key(seq) {
+                        unmatched.push(*seq);
+                    }
+                }
+            }
+            let unmatched_n = unmatched.len();
             tracing::info!(
                 copies = copies.len(),
+                objects_read = objects.len(),
                 dropped_rows = rows,
                 dropped_packets_checked = checked,
-                repeat_kind_packets = repeat,
+                repeat_kind_packets = repeat_n,
                 repeat_kind_not_rebuilt = repeat_missing,
                 rebuilt_packets = have,
                 missing,
+                matched_by_content = matched,
+                unmatched = unmatched_n,
                 "day repair: packet coverage of the dropped copies"
             );
             super::say(&format!(
-                "coverage: {rows} dropped rows, {checked} distinct packets checked, {missing} \
-                 missing from the rebuild; {repeat} repeat-kind packets, {repeat_missing} of them \
-                 skipped by the Quote 61 repeat rule; {repeat_contracts} repeat-kind contracts, \
-                 {} without a rebuilt row; {have} distinct packets rebuilt",
+                "coverage: {} copies read ({} recorded), {rows} dropped rows, {checked} distinct \
+                 packets checked, {missing} missing by number, {matched} of them kept as another \
+                 copy of the same packet, {unmatched_n} not in the rebuild; {repeat_n} repeat-kind \
+                 packets, {repeat_missing} of them skipped by the Quote 61 repeat rule; \
+                 {repeat_contracts} repeat-kind contracts, {} without a rebuilt row; {have} \
+                 distinct packets rebuilt",
+                objects.len(),
+                copies.len(),
                 lost_contracts.len()
             ));
-            if missing > 0 {
+            if unmatched_n > 0 {
                 findings.push(format!(
-                    "{missing} dropped packets are not in the rebuilt day (first capture_seq: \
-                     {sample:?})"
+                    "{unmatched_n} dropped packets are not in the rebuilt day (first capture_seq: \
+                     {:?})",
+                    unmatched.iter().take(10).collect::<Vec<_>>()
                 ));
             }
             Ok(findings)
