@@ -5174,6 +5174,8 @@ reached nobody.
 - Opens earlier than session start + 20 minutes, or types the session times in
   terraform without the same change in `config/base.toml`.
 
+**Note (2026-11-11, operator Quote 53 alarm review, §2.21):** two of the three did-it-run alarms named above (`deploy-watchdog-not-invoked`, `market-open-readiness-not-invoked`) were removed, so they are no longer in `ALARM_NAMES` and the Muhurat open skips only `boot-heartbeat-gate-not-invoked`, which the review KEPT (it watches the gate that arms the kept `boot-heartbeat-missing`). The rows above still bind: every did-it-run alarm in `ALARM_NAMES` must be in the open's `skip_alarms`, and a skip list naming a removed alarm is a terraform error, not a fix.
+
 ## §2.16 — 2026-11-06: two pages made quieter (`questdb-disconnected`, `RISK-GAP-03`; no new page)
 
 **The owner's decision (2026-11-06 decision card, option label verbatim):**
@@ -5292,3 +5294,329 @@ readable segments before the unreadable neighbour's share is released.
 - Drops the `tv_wal_replay_frame_cap_stops_total` increment on the planned path.
 - Adds a page, alarm, `ok_actions`, metric filter or EMF name under cover of
   this section, or edits the `ws-spill-01` alarm to exclude these sources.
+
+**§2.17 note — 2026-11-11: the two replay DEFERRAL lines are quiet on the
+same planned boot (no new page; same owner card).** Recorded BEFORE the code,
+per the rule-file-first law, under the owner's 2026-11-08 card
+**"Quiet on planned restarts (Recommended)"** quoted above ("Only the planned
+evening restart logs it quietly (still counted and visible in logs). Any other
+start that hits the limit still pages you, and a real data problem always
+pages.").
+
+**Why (Verified on the production box, 2026-11-09):** every PLANNED
+evening-drain restart (3:54, 4:34 and 5:14 PM IST) sent two false pages,
+because the catch-up replay reports the segments it leaves for the next boot
+at ERROR: the once-per-boot `WS-SPILL-01` `source = "replay_deferred"` line
+("WAL replay DEFERRED segments past its RAM budget", `dhan_feed_stack`) and
+the `WS-SPILL-02` line "WAL replay DEFERRED the remaining segments to the next
+boot" (`ws_frame_spill::replay_all_with_report_at`). The `ws-spill-01` and
+`ws-spill-02` filters match `level = "ERROR"` only. Nothing is lost on these
+lines: a deferred segment stays a `*.wal` file and is replayed by a later boot.
+On a planned restart the per-boot slice ending with segments left is the
+expected end of that boot, the same case as `replay_frame_cap_planned`.
+
+| Line | Before | After (2026-11-11) |
+|---|---|---|
+| `WS-SPILL-01` `source = "replay_deferred"` on a planned evening-drain boot | `error!`, pages | coded `warn!`, `source = "replay_deferred_planned"`, same code, every counter kept |
+| `WS-SPILL-02` replay budget deferral on a planned evening-drain boot, BYTE-budget stop | `error!`, pages | coded `warn!`, `source = "replay_budget_deferred_planned"`, same code, every counter kept |
+| `WS-SPILL-02` replay deferral on ANY boot, MEMORY-guard stop (`stopped_for_memory = true`) | `error!`, pages | unchanged (review 2, 2026-11-11: a different remedy, the host cannot hold the frames; it keeps paging on the planned boot too) |
+| Either line on any other boot | `error!`, pages | same fields and text; only the log `target` moved to `tickvault_storage::wal_replay_frame_cap` (no alarm filter keys on it) |
+
+"Planned" is exactly the §2.17 test, read by
+`wal_replay_frame_cap::planned_evening_drain_boot`: the boot's replay frame cap
+is the evening-drain allowance (`cap_is_planned_evening_drain(
+replay_frame_cap_this_boot())`), or `claim_planned_boot` recorded this
+process's claim as planned (`note_planned_evening_drain_claim`). The second arm
+exists because the boot's STAGE-C replay runs before the catch-up drain raises
+the cap; both arms come from the same one read-and-clear of the planned mark,
+so a deploy, crash, manual, Muhurat or unreadable-state boot is never
+planned. Cost: zero (no alarm, filter, EMF name, `ok_actions` or Telegram
+family).
+
+**Honest limit (Rule 11):** a planned boot that defers because the backlog is
+large is silent on the phone; it stays on the counters, in the app log, and in
+the evening drain's progress check, which stops the restarts when the backlog
+does not shrink. A memory-guard stop is NOT quieted (row above).
+
+**Authority, CONFIRMED by the owner 2026-11-11:** review 2 flagged that the
+card text above names the frame-cap line only. Asked directly on the card
+"Should these two lines also be quiet on planned evening restarts only?", the
+owner chose **"Yes, quiet them too (Recommended)"** ("On the planned evening
+restart only, they become quiet log lines (still counted). Any other start
+still pages, a memory-limit stop always pages, and real data loss always
+pages."). This note covers exactly these two deferral lines; it is not a
+precedent for quieting any other line.
+
+**REJECT (2026-11-11 note):** quieting either deferral line on a boot that is
+not the planned evening-drain boot; quieting `replay_rows_lost`; dropping any
+counter on the planned path; any new page, alarm, metric filter or EMF name, or
+editing `ws-spill-01` / `ws-spill-02` to exclude these sources.
+
+## §2.18 — 2026-11-11: one daily AWS WASTE page (a new page family, owner-approved)
+
+**Owner, 2026-11-11 (verbatim, typos preserved):** "see ypou never told me whu this fuckign billing issue arised dude why?" and "is this always already fully 24/7 monitored automated dude thats my main question". On the card "Should I add a daily automatic \"waste check\" that sends one Telegram message naming what is wasting money and what to delete?" the owner chose **"Yes, daily waste check (Recommended)"** ("Once a day, read-only: lists disks attached to nothing for over 2 days, snapshots older than 30 days, unused IPs, and the top 5 costs this month. One message per new finding, never repeated. Results also saved to S3 as an audit file. ... It can only look, never delete.").
+
+**Why (Verified 2026-11-11):** the hourly guard reads month-to-date spend only while the box runs; the native budget pages only at 80% forecast and acts at 100% actual; the 17:30 IST cost card shows totals. Nothing in the repository listed unattached volumes, snapshots or idle addresses (`grep DescribeVolumes` hits only `downsize-instance.yml`), so a 600 GB and a 30 GB volume attached to nothing billed about $21 (1–11 Nov) with no message naming them.
+
+| Item | What §2.18 authorizes |
+|---|---|
+| Family | ONE new Telegram page family, "AWS waste", from a Rust Lambda run once a day (all days, outside 09:00–15:40 IST) |
+| Inputs | Read-only: `ec2:DescribeVolumes`, `ec2:DescribeSnapshots` (owner self), `ec2:DescribeAddresses`, and ONE Cost Explorer `GetCostAndUsage` grouped by service per run ($0.01 each, ~$0.30 a month; the owner's card said "top 5 costs"; corrected cost told to the owner the same day) |
+| Findings | A volume `available` for over 48 h; an owned snapshot older than 30 days; an Elastic IP with no association; the top 5 services by month-to-date cost (context, not a finding) |
+| Delivery | Edge-triggered: a message only when the set of findings gains an item not in the previous run's set (kept in one SSM parameter or S3 object); a resolved finding sends nothing; at most one message a day; plain English, names each item, its size and its estimated monthly cost, and the console action to delete it |
+| Audit | Each run writes one JSON file to `s3://tv-<env>-cold/cost-audit/<date>.json` (kept, never expired) |
+| Power | Read-only: no Delete, Release, Modify or Stop action in its role; no `ok_actions`, no CloudWatch alarm beyond its own not-invoked check |
+
+**What a PR that violates §2.18 looks like (REJECT):**
+- Gives the waste Lambda (or any role) a delete, release, modify or stop permission, or makes it act on a finding.
+- Sends more than one waste message a day, or repeats an unchanged finding set, or pages on a resolved finding.
+- Runs more than one Cost Explorer query per run, or runs it more than once a day.
+- Adds per-resource CloudWatch metrics or alarms for the findings.
+- Uses any language but Rust for the Lambda.
+
+**Built 2026-11-11 (implementation note, no new decision):** `tv-<env>-aws-waste-check` (`crates/aws-lambdas/src/waste_check.rs`, `deploy/aws/terraform/waste-check-lambda.tf`), cron `37 12 * * ? *` (18:07 IST, every day), automatic retries 0, and the not-invoked alarm only (§2.18 Power row: no other CloudWatch alarm, so a failed run shows only in its log group and as a missing audit file). The one Cost Explorer call needs the Cost Explorer client crate back (`aws-sdk-costexplorer` =1.138.0, removed 2026-10-22 by plan item 63); this note reads the owner card above as covering that call. **Owner approved the crate itself 2026-11-11** on the card "Yes, add it (Recommended)" ("Add Amazon's Cost Explorer library at one exact pinned version, used only by the waste-check Lambda for its one daily lookup."). A role with any delete, release, modify, stop, bare `*` or `NotAction` action, a `*` resource beyond the Describe reads and the cost query, or a second policy on the role fails `crates/aws-lambdas/tests/waste_check_wiring_guard.rs`.
+
+**Corrected 2026-11-11, same day (review of the first build, no new decision; each change brings the build in line with the table above):** (1) the state moved from one SSM parameter to one S3 object `waste-check/state.json` in the cold bucket (the table allows either); the SSM value's 4,096-byte cap had forced a digest past about 150 ids, after which one resolved or one new item re-sent every item, which the REJECT rows forbid. The role may list only that one key (an `s3:prefix` condition) and read only that key. (2) "A volume `available` for over 48 h" is now measured by this check: the state keeps the IST date each volume was first seen unattached, and a volume is reported once seen unattached in runs 2 IST days apart (it was the volume's creation time, so an old root detached minutes earlier was paged the same evening). (3) At most one message a day and at most one Cost Explorer query a day are held by create-only S3 claim objects (`waste-check/claims/<date>-message` and `-cost-query`, PutObject with If-None-Match), so a duplicate EventBridge delivery, a re-run or a test invoke cannot send twice or query twice; the Cost Explorer client has SDK retries off, so one call is one billed request. (4) The state is written as "sent today" BEFORE the message, and put back if the send fails, so a failure can miss a message but never repeat one. (5) A Cost Explorer failure no longer stops the run: the message carries "Top costs this month: not available today." (6) The errors alarm built first is REMOVED: §2.18 allows no alarm beyond the not-invoked check. (7) Names in the message keep only ASCII letters, digits, spaces and a few punctuation marks, so a `Name` tag cannot reorder the line with bidirectional characters. (8) A message stays under the relay's 3,500-character cap: item lines stop early and the remaining count, the totals and the closing line are always kept. **Honest limit added:** the not-invoked alarm fires once by itself right after it is first created (no run yet; Assumed from CloudWatch's missing-data rules), and needs no action.
+
+**Corrected 2026-11-11, second review (no new decision; each change brings the build in line with the REJECT rows "repeating an unchanged set" and "more than one message a day"):** (9) note (4) above was not true as built: the SNS client kept the SDK's standard retry (3 attempts), so a publish SNS accepted but whose reply was lost could be sent twice in one run, and any failed publish put the old state back, so a send SNS had in fact delivered was repeated the next day. The SNS client and the day-claim client now make ONE attempt (SDK retries off), and the old state is put back only when SNS certainly refused the send (a 4xx answer, or a request that was never sent); on a timeout, a network error, a 5xx or an unreadable reply the "sent" state is kept, so the worst case is a missed message, never a repeat. A claim whose reply is lost is now a failed run (a missed message or top-5 line, visible in the log and as a missing audit file), never a retry that reads its own claim back as "already taken". (10) Names also lose `:` `/` `.` `@` and `#`, so a `Name` tag cannot put a link Telegram makes clickable (a URL, a bare domain, an email, a mention or a hashtag) inside the message. (11) The role may write logs only to its own log group (no `logs:CreateLogGroup`; was every log group in the region, which would have let it write coded ERROR lines into the app log groups). (12) `crates/common/tests/cloudwatch_app_alarms_wiring.rs` lists `aws_waste_check` in `LAMBDA_ERRORS_ALARM_EXEMPT` with this section as its reason (note (6): no Errors alarm by decision); that guard otherwise fails on a Lambda with no routed Errors alarm.
+
+## §2.19 — 2026-11-11: the silent-instrument page (`RISK-GAP-03`) pages only real feed trouble (no new page)
+
+**Owner, 2026-11-11 (screenshot of seven SOS pages "DHAN: some instruments have gone quiet or never sent a price today", 09:42 to 12:16 IST, one every 30 minutes):** on the card "When should it page you instead?" the owner chose **"Only real feed trouble (Recommended)"** ("Page when at least 1% of subscribed instruments (about 200) go quiet together, or any instrument never sent a single price since subscribing. A few slow stocks are only logged and counted, never paged.").
+
+**Why (Verified 2026-11-11 from the live app log):** every page that day named 1 to 3 of 19,868 tracked instruments, all `NSE_EQ` stocks, quiet 31 to 68 s against a learned cadence of 30 to 66 s, with `never_ticked = 0` throughout; slow stocks between trades, not a feed fault. The 30-minute cooldown (§2.16) only spaced them out.
+
+| Item | What §2.19 changes |
+|---|---|
+| Page (coded `error!`, the `errcode-risk-gap-03` filter) | Only when the instruments that TICKED and then went quiet (`silent - never`; the never-ticked set is judged on its own) reach 1% of the tracked instruments (`ceil(tracked / 100)`, at least 1), or an instrument that never ticked is new this session (`never > 0` and not yet reported) |
+| Below that | One coded `warn!` per episode with the same fields plus the floor, and the named instruments at `warn!`; the alarm filter matches `level = ERROR` only, so it never pages |
+| Unchanged | The scan, both gauges (`tv_dhan_feed_instruments_silent`, `..._never_ticked`), the 2-scan confirmation, the 30-minute page cooldown, the session gate, the dead-class and detector-blind reports, the alarm itself |
+
+**REJECT (§2.19):** a page for fewer quiet instruments than the 1% floor; dropping the never-ticked page; removing or narrowing the gauges or the `warn!` record; a new page, alarm, filter or EMF name; changing the floor without a fresh dated owner quote.
+
+**Note (2026-11-15, 15 Nov audit finding live-1, a fix that only narrows a false page; no new page):** the session gate for this page (and the dead-class report beside it) ended at the 15:40 IST capture end, not the 15:30 continuous close. Every trading day at about 15:31 the option contracts stop together, about 525 instruments read quiet with `never_ticked = 0`, they clear the 1% floor, and the page fired for a market that closed normally. The gate now ends at 15:30:00 IST (`CONTINUOUS_SESSION_END_SECS_OF_DAY_IST`, checked at compile time to be no later than the capture end); capture, both gauges, the floor, the cooldown and the alarm are unchanged. Honest limit: an instrument that goes quiet in the last 60 to 90 s before 15:30 is not paged that day (it is still on the gauges). The Muhurat evening gate still ends at its capture end (unchanged). REJECT: ending the gate after 15:30 on a regular day, or using this note to narrow any other page.
+
+## §2.21 — 2026-11-11: the Quote 53 alarm review removes pages from these families (no new page)
+
+**Owner, 2026-11-11 (operator Quote 53, recorded in `daily-universe-scope-expansion-2026-05-27.md`):** on the card "which of these may I do from December?" the owner ticked "Cut alarms 93 → ~30 (Recommended)", "Trim CloudWatch metrics (Recommended)", "Cheaper S3 class for old raw frames (Recommended)" and "Delete the CloudWatch dashboard". Quote 53 requires a removed alarm in a family recorded here to have this file's dated edit in the same change; this section is that edit. Every removal has its row (what it watched, what still covers it) in `docs/audits/2026-11-alarm-review.md`.
+
+| Family (this file) | Alarms removed | Still covered by |
+|---|---|---|
+| §2.3 live-lane integrity | `dhan-ring-dwell-high`, `tick-spill-replay-failing`, `ticks-spilling`, `seal-writer-rescued`, `wal-catchup-budget-exhausted`, `wal-replay-restore-failed`, `aggregator-refusal-rate-high`, `preopen-ready-late` | The lane-down, socket-parked, ticks-dropped, ring-full and other data-loss pages, all kept |
+| §2.3f / §2.3g / §2.3h watchers and QuestDB | `deploy-watchdog-errors`, `deploy-watchdog-not-invoked`, `market-open-readiness-errors`, `market-open-readiness-not-invoked`, `questdb-wal-apply-lag`, `questdb-wal-probe-failed`, `disk-fill-rate-high`, `disk-watcher-respawn` | `boot-heartbeat-missing` (its gate keeps both its alarms: `boot-heartbeat-gate-errors` and `boot-heartbeat-gate-not-invoked`, not removed), `market-hours-liveness-missing` (its gate keeps both its alarms), `questdb-disconnected`, `questdb-wal-suspended` with its blind detector `wal-suspension-probe-blind` (kept), `disk-used-high`, `spill-dir-free-low` |
+| §2.3p / §2.3q | `errcode-resource-02`, `errcode-scoreboard-01` | `errcode-proc-01` (the kill itself); `audit-rows-lost` for the raw audit rows |
+| §2.6 | `dhan-feed-delay-high`, `dhan-main-reconnect-slow` | Delay is not loss; a socket that does not come back is paged by `dhan-socket-parked` and `ws-no-alive-connections` |
+| §2.9 | `disk-kept-not-backed-up`, `feed-thread-wrote-to-disk` | `cold-backup-failing` and the disk-full pages; `errcode-hot-path-stall-01` |
+| §2.13 | `dhan-worst-socket-deaf` | `errcode-risk-gap-03` (1% floor, §2.19) |
+
+**Not removed (2026-11-11, review of the first draft):** the first draft also removed five alarms that are the only page for a failure on the Quote 53 KEPT list; they stay: `errcode-stream-silent` with its two schema filters (§2.3s: `app-log-ingestion-silent` cannot see errors.jsonl alone stop, so every KEPT `$.code` page would go dark), `live-universe-fallback` (it also counts `truncated_to_capacity`, `artifact_unreadable`, `artifact_unparseable` and `no_usable_widening`, which the universe-collapse filter does not match), `tick-spill-quarantined` (a whole quarantined tick file is missing from QuestDB), `wal-suspension-probe-blind` (the only blind detector left for `questdb-wal-suspended`) and `deploy-provenance-blind` (without it `binary-sha-stale` reads OK when it does not know, §2.3q). Each has its KEEP row in the review. A second review the same day put back two more: `boot-heartbeat-gate-errors` and `boot-heartbeat-gate-not-invoked` (the kept `boot-heartbeat-missing` ships disarmed and only that gate arms it, so without them a failing or dropped gate leaves it off unseen until the liveness page after 09:20 IST), and corrected one cover: `wal-replay-restore-failed` stays removed, but its failure is a data-loss path (the segment is archived unread) whose page is the coded `WS-SPILL-02` ERROR at the same site and the kept `errcode-ws-spill-02`, so that filter must not be narrowed by `source`.
+
+The coded log lines, counters and local `/metrics` of every removed alarm are unchanged; only the CloudWatch filter and alarm go. The §2.6, §2.9 and §2.13 rows that constrain these alarms stay in force for any future alarm of the same name.
+
+**REJECT (§2.21):** re-adding any alarm named above without a fresh dated owner quote recorded here first; removing any page this table names as the remaining cover; removing any of the seven alarms listed under "Not removed"; narrowing the `errcode-ws-spill-02` filter (for example by `source`) while `wal-replay-restore-failed` stays removed; using §2.20 to remove any other alarm.
+
+## §2.20 — 2026-11-11: the WAL replay limit and deferral lines page only when the backlog is stuck (no new page)
+
+**The owner's decision (2026-11-11 decision card, after the 8:33 AM IST SOS "safety capture hit a limit"; option label verbatim):**
+
+> **"Page only if stuck (Recommended)"**
+
+The card read: the replay-limit line is quiet on EVERY boot (not only the
+planned evening restart); it pages only if the waiting backlog of WAL segments
+does not shrink between two starts; real data loss (`replay_rows_lost`,
+memory-guard stops) always pages. Recorded here BEFORE the code, per the
+rule-file-first law. Plan: `active-plan-audit-2026-10-20.md`, item PR RS.
+
+**Why:** the per-boot frame cap and the byte budget end almost every boot's
+replay with segments left while a large backlog drains a slice per start
+(§2.17). Nothing is lost on these lines (a deferred segment stays a `*.wal`
+file and is replayed by a later start). §2.17 quieted them on the planned
+evening restart only, so the 8:33 AM morning start paged although the backlog
+had shrunk overnight. The question the owner wants paged is "is the backlog
+stuck", not "did this start leave some for the next one".
+
+| Line | Before (§2.17) | After (2026-11-11, §2.20) |
+|---|---|---|
+| `WS-SPILL-01` `replay_frame_cap`, `WS-SPILL-01` `replay_deferred`, `WS-SPILL-02` byte-budget deferral, on a start whose waiting backlog is STRICTLY lower than the previous start's | `error!`, pages (unless the planned evening restart) | coded `warn!`, same code, `source` with the suffix `_shrinking` (`replay_frame_cap_shrinking`, `replay_deferred_shrinking`, `replay_budget_deferred_shrinking`); every counter kept; not paged (the filters match `ERROR` only) |
+| The same lines on the planned evening restart | coded `warn!` `*_planned` | unchanged (planned wins over shrinking) |
+| The same lines on a start with no previous record, an unreadable record, a record dated after today, an unknown count now or then, or an equal or higher count | `error!`, pages | unchanged: `error!`, pages |
+| `WS-SPILL-02` MEMORY-guard stop (`stopped_for_memory = true`) | `error!`, pages | unchanged on every start |
+| `replay_rows_lost`, `replay_ack_wait_timeout` | `error!`, pages | unchanged |
+
+**How "shrinking" is measured:** once per start, after the WAL folder is
+claimed and before the boot replay reads anything, the app counts the waiting
+segments the replay would still read (every segment in the live folder,
+`replaying/` and `settling/` that the applied watermark saved on disk does not
+cover; every waiting segment when no watermark loads) and compares it with the
+count the previous start saved in `data/state/wal-backlog-trend.state` (one
+line: version, IST date, count or `unknown`; written with a temp file, sync,
+rename and a folder sync). Every start overwrites the record with its own
+count (or `unknown`), so the next start compares against the start just
+before it. A record that cannot be written is removed, so the next start
+pages. The verdict is decided once per process and never changes inside it.
+
+**⚠ CHANGED 2026-11-11 (same-day review fix, within the owner's card: it only
+narrows when a line is quiet).** Three points of the paragraph above were
+wrong:
+- *"Every start overwrites the record ... the start just before it."* The
+  planned evening-drain restart no longer saves its count. It is quiet anyway
+  (§2.17 wins), and its count is taken after the trading day's growth and
+  before its own replay; saving it let the next morning compare only against
+  the evening's progress, so a backlog growing a few segments every day read
+  "shrinking" every morning and never paged. Every other start now compares
+  with the previous start that was NOT a planned evening restart (normally the
+  previous morning, so the comparison covers one whole day: the session's
+  growth and the evening's drain together).
+- *"A record that cannot be written is removed, so the next start pages."*
+  When `data/state` itself cannot be written (permissions, a read-only
+  remount), the old record cannot be removed either, and every later start
+  compared against that frozen count. Now a start that cannot save its record
+  pages its own lines (verdict `state_not_saved`) whatever it compared, so a
+  folder that stays unwritable pages on every start. The old record is still
+  removed when it can be.
+- The record now carries a CRC-32 (version `v2`); a line whose checksum does
+  not match is unreadable and pages, so a corrupted digit cannot read as a
+  higher previous count.
+Honest limit kept: when the folder becomes writable again, the first start
+after it can still compare once against a record left by an earlier failed
+start (one quiet start at most, then it saves its own count).
+
+*Second review note (2026-11-11, same owner card, a narrowing toward MORE
+paging, no new page).* A start whose applied watermark (`applied.tvaw`) was
+absent, rejected, or loaded as an overflow of unknown height counted every
+waiting segment, applied ones waiting only for the S3 copy included, and
+saved that inflated number as a known count; the next start with a clean
+watermark then read `Shrinking` and stayed quiet on a stuck backlog. Such a
+start now counts `unknown` while segments wait (it pages, `current_unknown`,
+and saves `unknown`, so the next start pages, `previous_unknown`). A failed
+save now logs which record it removed (`removed_record`: the previous
+start's, or this start's when only the folder sync after the rename failed)
+and whether that removal was synced (`removal_synced`), replacing
+`old_record_removed`.
+
+**Cost:** zero. No alarm, metric filter, EMF name, `ok_actions` or Telegram
+family added; `ws-spill-01` and `ws-spill-02` are unchanged.
+
+**Honest limits (Rule 11):** a backlog that shrinks by one segment per start
+is quiet on the phone even if it would take weeks to drain; it stays on the
+counters (`tv_wal_replay_frame_cap_stops_total`, `tv_wal_replay_deferred_segments_total`),
+in the app log, on `tv_wal_unapplied_pinned_segments` and in the evening
+drain's progress check. The count is the replay's view from the saved
+watermark (an approximation of what the replay reads, the same each start, so
+a trend is fair); it excludes segments this start's own boot fold will pin.
+
+**REJECT (§2.20):**
+- Quieting `replay_rows_lost`, `replay_ack_wait_timeout` or a MEMORY-guard stop on any start.
+- Quieting a line on a start whose count is equal to or higher than the previous start's, or when either count is unknown, the record is missing, unreadable or dated after today.
+- (2026-11-11 review fix) Saving the planned evening restart's count as the comparison point; quieting a start whose own record save failed; reading a record without checking its checksum.
+- (2026-11-11 second review fix) Saving a known count taken while segments wait without a trusted, bounded applied watermark.
+- Dropping any counter on the quiet path.
+- Any new page, alarm, metric filter or EMF name, or editing `ws-spill-01` / `ws-spill-02` to exclude these sources.
+
+## §2.22 — 2026-11-12: clock offset page, five minutes in a row over 1 ms (ONE new page)
+
+**Owner, 2026-11-12 (Quote 57, daily-universe file):** on the card "Your task asks to alert if the clock is off by more than 1 ms. A Telegram page for that needs your OK under the alert-noise rule. What should happen?" the owner tapped **"Page if 5 min in a row (Recommended)"**: "Log the offset every minute (database + dashboard). Page you once only if it stays over 1 ms for 5 minutes in a row during market hours, and once when it recovers is NOT sent. Avoids pages for a single blip."
+
+| Item | Contract |
+|---|---|
+| Sample | chrony's offset from the Amazon Time Sync Service, once a minute, written to the database |
+| Page | one coded ERROR when the absolute offset is over 1 ms for 5 consecutive minute samples inside 09:00–15:40 IST; edge-triggered once per episode, no recovery page, no `ok_actions` |
+| Not a page | a single reading over 1 ms, a failed sample (coded warn only), anything outside 09:00–15:40 IST |
+
+**REJECT (§2.22):** paging on fewer than 5 consecutive readings or outside 09:00–15:40 IST; a recovery page or `ok_actions`; paging more than once per episode; a per-instrument or per-connection dimension; using §2.22 for any other page.
+
+### §2.22-a — 2026-11-12: the paper-order log rides the existing audit-rows-lost and order-audit-chain-loss pages (NO new page)
+
+**Owner, 2026-11-12**, asked "If rows ever get stuck on disk or have to be set aside [in the new paper-order log table `live_order_events`], should that page you on Telegram, using the existing 'audit rows lost' page (no new alarm)?" (Recommended: "Yes, use existing page"), answered: "Monitor log track capture db save audit log visualised dashboard alrm ring do everything sud eokay?".
+
+`live_order_events` joins the audit disk tier as `AuditSpillTable::LiveOrderEvents`. What pages, as the code does it (checked against `crates/storage/src/audit_spill.rs` and `deploy/aws/terraform/{loss-group-alarms,order-side-alarms}.tf`, 2026-11-12):
+
+- a batch the disk tier refuses, a file QuestDB permanently refuses (quarantined) and a failed replay move the generic `tv_audit_spill_refused_rows_total`, `tv_audit_spill_quarantined_rows_total` and `tv_audit_spill_replay_failed_total` (label `table=live_order_events`), which are legs of the §2.10 `audit-rows-lost` group;
+- rows lost from the chain (a quarantined file's rows, or a crashed half-written spill file) move `tv_order_audit_chain_lost_total{source="live_order_events_spill_lost"}`, and a backlog whose oldest file has waited 30 minutes counts `tv_order_audit_persist_errors_total{stage="spill_backlog"}` once per episode; both are legs of the existing `order-audit-chain-loss` alarm (`order-side-alarms.tf`, m6 and m2).
+
+No new alarm, page, metric filter, EMF name or `ok_actions`. The writer's own counters (`tv_live_order_events_*`) stay on the box's local `/metrics`.
+
+**REJECT (§2.22-a):** a separate page, alarm, filter or EMF name for this table; paging a refused (validated-out) row; moving this table out of the audit spill tier without a fresh dated quote.
+
+## §2.23 — 2026-11-15: below 90% the disk-pressure stall page (`STORAGE-GAP-05`) needs a pass that freed nothing, and a stall pages only at or above high water (no new page)
+
+**Why (audit 2026-11-15, finding live-2).** The disk-pressure episode paged the
+Critical `STORAGE-GAP-05` after five limited in-session passes that did not move
+the whole-number used%. Each of those passes freed one partition. On 12 Nov the
+episode started at 15:34 at 75% and paged at 15:40:58; it ended by itself at
+16:01 at 57%. On 13 Nov it paged at 14:18:52 at 72%, below the 75% high water;
+at 16:06 the post-close pass freed 18 partitions. The page says "nothing further
+will be deleted" and "grow the gp3 volume". Both were false here, and Quote 51
+forbids growing the volume. This only narrows a false page.
+
+| Case | Before | After (2026-11-15) |
+|---|---|---|
+| A limited pass that freed at least one partition, used below 90% | counted toward the five-pass stall | progress: resets the stall |
+| A limited pass that freed at least one partition, used 90% or more | counted | counted (unchanged, PR DP review M1) |
+| A stand-aside at 90%+ in session | counted | counted (unchanged) |
+| Stall set, used below high water (75%) | page | no page; the episode keeps passing |
+| Stall set, used at or above high water | page | page (unchanged) |
+| A pass that freed nothing outside the session, or passes used up | page | page (unchanged) |
+
+Unchanged: the page text, `apply_action`, the one-page-per-episode latch, the
+re-arm, and every other `STORAGE-GAP-05` path. No alarm, filter, EMF name or
+`ok_actions` added. Code: `disk_pressure::decide_pressure_action` and
+`disk_pressure_boot::gated_stall_after_pass`; tests
+`test_regression_live2_gated_stall_below_high_water_does_not_escalate` and
+`test_regression_live2_gated_stall_after_pass_counts_progress_only_at_emergency`.
+
+**Honest limit.** Between high water (75%) and 90%, in session, a limited pass
+that frees one partition a minute while the disk fills faster does not page
+through the stall. What still covers it: the stall page itself once used reaches
+90% (gated passes count again there, as PR DP review M1 set), the CloudWatch
+`disk-used-high` alarm (over 90%), `spill-dir-free-low` (20 GiB or less), and
+the after-close unlimited pass at 15:40. This narrows only the false page seen on
+12 and 13 Nov (75% and 72%).
+
+*Corrected 2026-11-15 (review of this section, same day):* the first draft of
+§2.23 reset the stall on every pass that freed a partition, at any used%. That
+removed the 90%+ page PR DP review M1 added, not only the false one, so the
+90% floor above was restored before merge.
+
+**REJECT (§2.23):** counting a pass that freed a partition toward the stall
+below 90% used; not counting it at 90% or more; paging a stall below high water; removing the page for a pass that freed
+nothing; changing the page text under §2.23.
+
+### §2.24 — 2026-11-20: Dhan feed-time page (prices outside the session, or no candles for 10 minutes), and one notice a day when the time correction switches on
+
+Owner cards (2026-11-20), verbatim: **"Yes, page me (Recommended)"** — "One Telegram page per day per cause during 9:15 AM–3:30 PM. Today it would have fired at about 9:25 AM." **"After correction (Recommended)"** — "Pages only if prices are still wrong after our fix, i.e. a real problem remains. A corrected day does not page." **"Yes, one a day (Recommended)"** — "You know the same morning that Dhan changed format and that it was handled. At most one message a day."
+
+Why: on 20 Nov 2026 Dhan sent trade times as UTC (see `websocket-connection-scope-lock.md`, 2026-11-20). No candle was sealed from 08:32 to 14:52 and nothing paged until the 15:50 cross-check.
+
+| Cause | Fires when | At most |
+|---|---|---|
+| A: prices outside the session | During 09:15–15:30 IST (or the published Muhurat window), in two 30 s scans in a row, at least 20 live index ticks and at least half of them carry a trade time (after the correction) outside 09:00–15:40 or more than 5 minutes from receipt | once per IST day |
+| B: no candles | 20 scans in a row (10 minutes) in the same window with main-feed frames arriving in each and no candle sealed by the live drain (replay not counted) | once per IST day |
+| Notice | The time correction arms on a day ("Dhan sent trade times 5 h 30 min early; correcting from <time>, raw data kept") | once per IST day |
+
+Code `DHAN-FEED-TIME-01` for both page causes (one `error_code_alerts` entry, period 300 s, threshold 1, no `ok_actions`). The latch is per cause per IST day and is persisted off the drain. When a cause fires, that day is auto-held (daily-universe Quote 63).
+
+**REJECT (§2.24):** firing outside the session gate or from replay; judging cause A on Dhan's raw time; more than once per cause per IST day; `ok_actions` or a recovery page; fewer than 20 ticks or 2 scans for A, or under 10 minutes for B; a per-instrument or per-connection dimension; persisting the latch on the drain; more than one notice a day; paging the correction's own coded warnings.
+
+### §2.24-a — 2026-11-21: the daily notice is retired; a third reason pages if Dhan goes back to IST epoch
+
+Dhan confirmed the Live Market Feed trade time is UTC epoch permanently from 20 Nov 2026 (ticket #6684672; `websocket-connection-scope-lock.md` §"2026-11-21"). Owner card (2026-11-21), verbatim: **"Yes, always UTC (Recommended)"** — the correction is always on from 20 Nov and "the detector only as a reversion guard that pages".
+
+- The daily "time correction switched on" notice of §2.24 is retired: the correction no longer arms, so there is nothing to announce.
+- A third reason on `DHAN-FEED-TIME-01`, `source = "dhan_time_format_reverted"`: the reversion guard sees an IST-epoch (`Normal`) verdict on raw, live, WAL-stamped prints. At most once per segment per IST day, live drain only, 09:00–15:40 IST (or the published Muhurat window), broker named. Same `error_code_alerts` entry and filter (`$.code = "DHAN-FEED-TIME-01" && $.level = "ERROR"`), no `ok_actions`, no new alarm, filter or EMF name. With `[dhan_feed] ltt_utc_autocorrect = "shadow"` it is a coded `warn!` only; with `off` there is no guard.
+- Causes A and B of §2.24 are unchanged.
+- **The day is auto-held**, as §2.24 and daily-universe Quote 63 ("A future day on which the feed-time page fires is auto-held", owner card "Yes, hold that day (Recommended)") require: in `act` mode the drain's 30 s feed-time scan reads the guard's page count and hands that day to the same `tv-feed-time-latch` writer thread, which writes `data/state/held-days/<date>.hold` off the drain (one `try_send` on the scan, no allocation). The guard's own `error!` is the only page; the hand-off logs nothing unless the hold cannot be handed off or written (`DHAN-LTT-02`, log only). `shadow` and `off` never hold.
+
+**§2.24 rows that do NOT apply to `dhan_time_format_reverted`** (corrected 2026-11-21, review; basis: the owner card "Yes, always UTC (Recommended)" of 2026-11-21, which approved "the detector only as a reversion guard that pages" with this design, and Quote 63 for the hold). Every other §2.24 row binds it:
+
+| §2.24 row | For this reason instead |
+|---|---|
+| The session gate 09:15–15:30 IST (REJECT "firing outside the session gate") | 09:00–15:40 IST, or the Muhurat window (a reversion is visible from the first packet, and the capture window is where wrong rows are stored) |
+| "The latch is per cause per IST day and is persisted off the drain"; REJECT "more than once per cause per IST day" | One latch per SEGMENT (index, NSE stock) per IST day, held in RAM: at most once per segment per IST day **per process**; a restart can page again that day (the second hold is a no-op) |
+| REJECT "judging cause A on Dhan's raw time" | This reason judges Dhan's RAW trade time by design (it must see the format Dhan sent); causes A and B still judge the corrected time |
+
+Limitation: the per-segment latch is in RAM, so a restart can page a second time that day. The hold is written up to 30 s after the page (one scan); a process that dies inside those 30 s writes no hold, and the next start pages and holds again only if the reversion is still visible.
+
+**Note (2026-11-21, review fix, no rule change):** "the Muhurat window" in this section is the PUBLISHED session of a calendar Muhurat date, from 15 minutes before its start to 10 minutes after its end (the same widening the feed-time page uses for causes A and B); only a Muhurat date with no published times falls back to 18:00–19:30 IST. The first code judged a fixed 18:00–19:30, which missed an afternoon or late session. A hold the scan cannot hand off (writer thread missing, queue full) logs one `DHAN-LTT-02` line per cause per day, is not counted as held, and is tried again at every 30 s scan; a writer thread that never started logs `DHAN-LTT-02` (`feed_time_writer_missing`) at the drain's start.
+
+**REJECT (§2.24-a):** more than once per segment per IST day per process; firing outside the 09:00–15:40 IST window (or the Muhurat window) or from replay; a page on a `Utc` verdict; a reversion page in `act` mode that does not hand its day to the hold writer; a second `DHAN-FEED-TIME-01` line from the hold hand-off (its failures log `DHAN-LTT-02` only); writing the hold on the drain's per-frame or per-tick path; a new alarm, filter, `ok_actions` or EMF name for it; bringing back the daily notice without a fresh dated quote.

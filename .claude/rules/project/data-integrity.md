@@ -53,6 +53,22 @@ paths:
   idempotency — it is seeded from wall-clock nanos.
 - Regression-pinned by `chaos_index_same_value_burst_preserved.rs` (the
   `45→75→45` test + replay-twice idempotency) + `test_dedup_key_is_capture_seq_after_flip`.
+- **⚠ CORRECTED 2026-11-15 (audit repo-5)** — six names above match nothing
+  in the tree: `ensure_tick_table_dedup_keys`, `ticks_table_is_populated`,
+  `tv_ticks_dedup_drop_blocked_total`, `chaos_index_same_value_burst_preserved.rs`,
+  `test_dedup_key_is_capture_seq_after_flip`, and the DROP-recovery path itself.
+  What is real: the key flip is the in-place
+  `ALTER TABLE ticks DEDUP ENABLE UPSERT KEYS({DEDUP_KEY_TICKS})` run by
+  `tick_persistence::ensure_ticks_table` / `ensure_ticks_tables_verdict`.
+  `tick_persistence.rs` has no DROP path, so the honest protection is that no
+  code there drops `ticks`; the boot reset (`fresh_start_reset::ResetAction`)
+  drops a table only when QuestDB reports it empty and otherwise RENAMES it to
+  `<name>_pre_reset_<yyyymmdd>`. The key is pinned by the `tick_persistence.rs`
+  unit tests `tick_dedup_key_matches_questdb_init_script`,
+  `tick_dedup_key_has_ts_first_segment_capture_seq_and_feed`,
+  `n_ticks_in_one_second_with_distinct_capture_seq_produce_distinct_rows` and
+  `constant_capture_seq_collapses_a_whole_second_into_one_row`. The old text is
+  kept as history.
 - Bounded ring buffer for O(1) lookup; log duplicates at WARN.
 
 ## Per-Feed Identity in DEDUP keys (operator 2026-06-23)
@@ -177,6 +193,36 @@ Adding +5:30 to WebSocket timestamps corrupts:
 - Pre-commit hook: `banned-pattern-scanner.sh` blocks IST offset patterns in ts computation
 
 **If any test with "CRITICAL" in its name fails on tick timestamps: REVERT IMMEDIATELY.**
+
+> **⚠ CORRECTED 2026-11-21:** neither of the two CRITICAL tests named above
+> exists in the tree (`grep -rn no_ist_offset crates` finds only main.rs comments
+> recording related tests as RETIRED), and the
+> banned-pattern scanner has no IST-offset category. The rule stands; nothing
+> mechanical enforces it today.
+
+### 2026-11-21 — the ONE authorized +19,800 s: Dhan sent trade times as UTC (scope lock 2026-11-20)
+
+On 2026-11-20 Dhan sent every Last Trade Time as plain UTC epoch seconds, so
+`ts = exchange_timestamp × 1e9` put every row 5 h 30 min early. The fix is NOT
+an offset in the `ts` computation: the core dispatcher corrects the trade time
+itself, by exactly +19,800 s, only from a saved, armed per-IST-day record
+(`crates/storage/src/ltt_correction.rs`), before any consumer reads it. So
+`ts = exchange_timestamp × 1e9` stays the rule and stays true; on a corrected
+day `exchange_timestamp` is the corrected IST value. Raw WAL and S3 bytes are
+never changed. On every normal day nothing is armed and the rule above is
+unchanged. Switch: `[dhan_feed] ltt_utc_autocorrect` (`off` = no correction).
+
+### 2026-11-21 (SECOND) — Dhan Live LTT is UTC epoch from WAL receipt 2026-11-20 00:00 IST (permanent)
+
+From WAL receipt 2026-11-20 00:00 IST, Dhan LTT is UTC epoch, so IST = raw +
+19,800 (ticket #6684672: "UTC-based epoch is now the permanent format for all
+Live Market Feed timestamps"). Earlier receipts stay IST epoch, unchanged. The
+correction is still made to the trade time in the core dispatcher, never in the
+`ts` computation, so `ts = exchange_timestamp × 1e9` stays true; it is now a
+pure function of (raw, receipt) with no armed record, and the config switch no
+longer turns it off (scope lock §"2026-11-21"). This supersedes the "only from
+a saved, armed per-IST-day record", "on every normal day nothing is armed" and
+"`off` = no correction" wording above.
 
 ### 2026-10-27 — `tick_quotes` (repeat quotes, owner Quote 41)
 

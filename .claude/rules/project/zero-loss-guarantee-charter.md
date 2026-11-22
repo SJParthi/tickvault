@@ -28,6 +28,13 @@ This is a **checklist contract**, not an aspiration. The mechanical reality:
 | Every commit | banned-pattern + secret + pub-fn + fmt + the 12 pre-push gates | git hooks (see `operator-charter-forever.md` enforcement chain) |
 | GitHub (CI) | full 22-test battery + Build & Verify + Security & Audit + Commit Lint + Secret Scan | `.github/workflows/*.yml` |
 
+> **⚠ CORRECTED 2026-11-15 (audit repo-3) — the first row is not what
+> runs.** The two SessionStart hooks in `.claude/settings.json` are
+> `session-sanity.sh` and `session-auto-health.sh`; they run shell scripts
+> (`scripts/doctor.sh` among them), not `run_doctor` or `summary_snapshot`.
+> A command hook cannot call an MCP tool, so the session must call those two
+> itself. The row is kept as history.
+
 **Rule:** no box may be silently skipped. A box that genuinely does not apply
 is written `N/A — <one-line reason>`. A box with no evidence and no N/A reason
 **blocks the PR in review.**
@@ -65,7 +72,7 @@ allowed where genuinely inapplicable.
 
 | Dimension | Proof artefact (real, no hallucination) |
 |---|---|
-| Code coverage | `quality/crate-coverage-thresholds.toml` (ratcheted per-crate floors (72.6–99.4, target 100%), floors only move up), `scripts/coverage-gate.sh` ~~post-merge~~ **⚠ CORRECTED 2026-10-11:** on every PR inside All Green, and again after merge |
+| Code coverage | `quality/crate-coverage-thresholds.toml` (ratcheted per-crate floors (86.4–99.4 on the test-inclusive gate figure since 2026-11-13, plus production-only `[production]` floors; target 100%), floors only move up), `scripts/coverage-gate.sh` ~~post-merge~~ **⚠ CORRECTED 2026-10-11:** on every PR inside All Green, and again after merge |
 | Audit coverage | `<event>_audit` QuestDB table with DEDUP UPSERT KEYS |
 | Testing coverage | the 22 test categories in `testing.md`, scoped to changed crate(s) |
 | Security coverage | banned-pattern + secret-scan + `Secret<T>` + security-reviewer agent |

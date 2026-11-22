@@ -45,9 +45,12 @@
 //! restarts each day.
 //!
 //! **Replay.** Each publication is also persisted ([`record_backup_set`]) into
-//! a bounded HISTORY of publications (the two most recent IST days that have
-//! one, at most [`BACKUP_HISTORY_MAX`] entries), so a later publication never
-//! erases the set an earlier, still-unreplayed frame was deduplicated with.
+//! a bounded HISTORY of publications (the [`BACKUP_HISTORY_DAYS`] most recent
+//! IST days that have one, at most [`BACKUP_HISTORY_MAX`] entries; two days
+//! until B1, 2026-11-13), so a later publication never erases the set an
+//! earlier, still-unreplayed frame was deduplicated with. A frame from a day
+//! the history trimmed is folded whole (both socket copies may land) and
+//! counted on [`BACKUP_REPLAY_UNJUDGED_COUNTER`], never silently.
 //! The WAL replay ([`ReplayBackup`]) applies to each frame the publication
 //! with the greatest instant at or before the frame's receipt on the same IST
 //! day, switching state exactly as the live drain does. A replayed frame
@@ -548,6 +551,15 @@ impl BackupDedup {
         self.slots.is_empty()
     }
 
+    /// Whether the contract `(security_id, segment)` is in the set in force
+    /// (carried on two main-feed sockets). One bool, one filter bit and at
+    /// most one hash probe: O(1), zero allocation.
+    #[inline]
+    #[must_use]
+    pub fn holds(&self, security_id: u64, segment: u8) -> bool {
+        self.slot_of(security_id, segment).is_some()
+    }
+
     /// Replaces the set in place. Cold: allocates for the new set. The drain
     /// never calls this; it adopts a publication in [`Self::on_frame`].
     pub fn install(&mut self, set: &[(u64, u8)]) {
@@ -801,7 +813,25 @@ const BACKUP_SET_FILE: &str = "main-feed-backup-set.json";
 /// Most publications kept in the persisted history. A day normally has one
 /// or two (the publication and its narrowing share an instant, so they are
 /// one entry); a restart adds one. Bounds the file and the replay's table.
-pub const BACKUP_HISTORY_MAX: usize = 16;
+/// B1 (2026-11-13): 16 → 64, with [`BACKUP_HISTORY_DAYS`] 2 → 15, because
+/// the pinned WAL backlog replays frames older than two days as the normal
+/// case. File size at the default 1,000 contracts: about 20 bytes a contract,
+/// so about 1.3 MB at 64 entries (6.4 MB at the 5,000 ceiling), rewritten a
+/// few times a day and read once per lane start. Cold.
+pub const BACKUP_HISTORY_MAX: usize = 64;
+
+/// IST days with a publication the persisted history keeps (B1, 2026-11-13;
+/// was 2). A frame from an older day replays with no publication to judge it,
+/// and is counted on [`BACKUP_REPLAY_UNJUDGED_COUNTER`].
+pub const BACKUP_HISTORY_DAYS: usize = 15;
+
+/// Counter: replayed main-feed frames from a day whose backup publication
+/// the history no longer holds (B1, 2026-11-13). Such a frame is folded
+/// whole: both socket copies of a backed-up packet can land, where the live
+/// drain wrote one. Counted, never dropped (dropping could lose the only
+/// copy). Local `/metrics` only (no alarm, no filter, no EMF name),
+/// registered at 0 at lane start.
+pub const BACKUP_REPLAY_UNJUDGED_COUNTER: &str = "tv_dhan_feed_backup_replay_unjudged_frames_total";
 
 /// Counter: the WAL replay's backup set, by `outcome` (`loaded`, `missing`,
 /// `unreadable`). Once per lane start.
@@ -844,9 +874,16 @@ impl PersistedBackupSet {
 /// unreplayed earlier frame was deduplicated with).
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PersistedBackupHistory {
-    /// Ascending by instant, one entry per instant, only the two most recent
-    /// IST days that have one, at most [`BACKUP_HISTORY_MAX`].
+    /// Ascending by instant, one entry per instant, only the
+    /// [`BACKUP_HISTORY_DAYS`] most recent IST days that have one, at most
+    /// [`BACKUP_HISTORY_MAX`].
     pub publications: Vec<PersistedBackupSet>,
+    /// The newest IST day number whose publication was trimmed away (B1,
+    /// 2026-11-13). A replayed frame from that day or earlier cannot be
+    /// judged, and is counted. `None` when nothing was ever trimmed (a file an
+    /// earlier build wrote reads as `None`: what it trimmed is unknown).
+    #[serde(default)]
+    pub trimmed_through_day: Option<i64>,
 }
 
 impl PersistedBackupHistory {
@@ -866,32 +903,76 @@ impl PersistedBackupHistory {
 
     /// Restores the invariants: drops instant-less entries, orders by
     /// instant (stable, so of two entries with one instant the later
-    /// recorded wins), keeps the two most recent IST days that have a
-    /// publication — two days, not "today and yesterday", so Friday's set
-    /// still covers Friday's frames replayed on Monday — and at most
-    /// [`BACKUP_HISTORY_MAX`], the newest. Cold.
+    /// recorded wins), keeps the [`BACKUP_HISTORY_DAYS`] most recent IST days
+    /// that have a publication (days with one, not calendar days, so
+    /// Friday's set still covers Friday's frames replayed on Monday), and at
+    /// most [`BACKUP_HISTORY_MAX`], the newest. Every trimmed entry raises
+    /// [`Self::trimmed_through_day`] to its day. Cold: O(history).
     fn normalise(&mut self) {
         self.publications.retain(|p| p.published_at_nanos > 0);
         self.publications.sort_by_key(|p| p.published_at_nanos);
         self.publications.reverse();
         self.publications.dedup_by_key(|p| p.published_at_nanos);
         self.publications.reverse();
-        if let Some(latest_day) = self
-            .latest()
+        let mut days_seen = 0_usize;
+        let mut last_day = None;
+        // Newest first: the day at which the BACKUP_HISTORY_DAYS-th distinct
+        // day ends is the oldest kept.
+        let mut oldest_kept_day = None;
+        for day in self
+            .publications
+            .iter()
+            .rev()
             .map(|p| ist_day_of_nanos(p.published_at_nanos))
         {
-            let oldest_kept_day = self
-                .publications
-                .iter()
-                .rev()
-                .map(|p| ist_day_of_nanos(p.published_at_nanos))
-                .find(|&d| d < latest_day)
-                .unwrap_or(latest_day);
-            self.publications
-                .retain(|p| ist_day_of_nanos(p.published_at_nanos) >= oldest_kept_day);
+            if last_day != Some(day) {
+                days_seen += 1;
+                last_day = Some(day);
+                if days_seen > BACKUP_HISTORY_DAYS {
+                    break;
+                }
+                oldest_kept_day = Some(day);
+            }
         }
-        let excess = self.publications.len().saturating_sub(BACKUP_HISTORY_MAX);
-        self.publications.drain(..excess);
+        if let Some(oldest) = oldest_kept_day {
+            self.trim_while(|p| ist_day_of_nanos(p.published_at_nanos) < oldest);
+        }
+        // B1 review 4: the entry cap drops WHOLE oldest days. Trimming single
+        // entries could cut a day in two, and the replay then started that
+        // day's first surviving publication with an empty dedup ring where
+        // the live drain had carried the earlier publication's state over
+        // (same process and day), so the lagging second copies the live
+        // drain dropped were folded again, judged and uncounted. A day is
+        // now either kept whole or trimmed whole (and its frames counted).
+        // Honest limit: one day alone above the cap still trims its own
+        // oldest entries (about 64 publications in a day, never measured).
+        // Cold: O(days x history).
+        while self.publications.len() > BACKUP_HISTORY_MAX {
+            let day_of =
+                |p: Option<&PersistedBackupSet>| p.map(|p| ist_day_of_nanos(p.published_at_nanos));
+            let oldest = day_of(self.publications.first());
+            if oldest.is_none() || oldest == day_of(self.publications.last()) {
+                let excess = self.publications.len().saturating_sub(BACKUP_HISTORY_MAX);
+                let mut index = 0_usize;
+                self.trim_while(|_| {
+                    index += 1;
+                    index <= excess
+                });
+                break;
+            }
+            self.trim_while(|p| Some(ist_day_of_nanos(p.published_at_nanos)) == oldest);
+        }
+    }
+
+    /// Drops the OLDEST entries while `drop_it` holds, raising
+    /// [`Self::trimmed_through_day`] to each dropped entry's day. The list is
+    /// ascending, so the dropped entries are a prefix. Cold.
+    fn trim_while(&mut self, mut drop_it: impl FnMut(&PersistedBackupSet) -> bool) {
+        let cut = self.publications.iter().take_while(|p| drop_it(p)).count();
+        for gone in self.publications.drain(..cut) {
+            let day = ist_day_of_nanos(gone.published_at_nanos);
+            self.trimmed_through_day = Some(self.trimmed_through_day.map_or(day, |d| d.max(day)));
+        }
     }
 }
 
@@ -980,6 +1061,7 @@ pub fn read_backup_history(
                 Ok(OnDisk::History(history)) => history,
                 Ok(OnDisk::Single(set)) => PersistedBackupHistory {
                     publications: vec![set],
+                    trimmed_through_day: None,
                 },
                 Err(err) => return Err(err.to_string()),
             };
@@ -1012,6 +1094,22 @@ fn ist_day_of_nanos(nanos: i64) -> i64 {
     secs.div_euclid(86_400)
 }
 
+/// The past-day repair's backup contracts: the union of every publication
+/// in `history` made on the IST day `ist_day` (days since 1970-01-01 IST).
+/// Sorted, deduped. Cold, O(publications x contracts).
+#[must_use]
+pub fn contracts_published_on(history: &PersistedBackupHistory, ist_day: i64) -> Vec<(u64, u8)> {
+    let mut out: Vec<(u64, u8)> = history
+        .publications
+        .iter()
+        .filter(|p| ist_day_of_nanos(p.published_at_nanos) == ist_day)
+        .flat_map(|p| p.contracts.iter().copied())
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
 /// The WAL replay's dedup: each frame is judged with the publication the
 /// live drain was using when it received it — the one with the greatest
 /// instant at or before the frame's receipt, on the same IST day (the
@@ -1040,6 +1138,210 @@ pub struct ReplayBackup {
     /// When a later process started: frames from then on are not this
     /// publication's (`i64::MAX` when none, or unknown).
     until_nanos: i64,
+    /// The history's [`PersistedBackupHistory::trimmed_through_day`] (B1).
+    trimmed_through_day: Option<i64>,
+    /// [`BACKUP_REPLAY_UNJUDGED_COUNTER`], resolved once (no per-frame label).
+    unjudged: metrics::Counter,
+    /// The one-off past-day repair only: which copies the live run WROTE
+    /// ([`LiveKept`]); `None` in every live replay.
+    live_kept: Option<LiveKept>,
+}
+
+/// The past-day repair's record of which backup-socket copies the LIVE run
+/// wrote (2026-11-22, the 2026-11-20 repair's second verify).
+///
+/// The replay's dedup cannot reproduce the live drain's choice: the WAL
+/// holds the two sockets' copies in write order, not drain order, so the
+/// first-arrival winner can differ, and a replayed frame has no socket, so a
+/// late packet the live drain accepted from the other socket
+/// (`AcceptLate`) and a same-socket identical repeat it kept are both
+/// dropped. The quarantine copies of the dropped day hold the numbers live
+/// wrote, so for a contract in the day's backup publications:
+///
+/// - a packet whose `capture_seq` live wrote is kept;
+/// - a packet live did NOT write is dropped only when a byte-identical twin
+///   of it IS one live wrote (live kept the other copy); the twins are the
+///   fingerprints [`Self::note_packet`] recorded for this segment and the
+///   one before (the two copies are milliseconds apart in the WAL);
+/// - otherwise the replay dedup decides, as before (a packet live captured
+///   but never landed, e.g. a row still in a spill file, is not lost).
+///
+/// Honest limits: a twin in a segment beyond the one before is not seen, so
+/// both copies can be written; each such duplicate is counted
+/// (`duplicates_written`). O(1) average per judged packet (`ahash` probes),
+/// fingerprint sets sized by the segment's backup packets.
+#[derive(Debug, Default)]
+pub struct LiveKept {
+    contracts: std::collections::HashSet<(u64, u8), ahash::RandomState>,
+    seqs: std::collections::HashSet<u64, ahash::RandomState>,
+    /// The numbers of every Quote 61 repeat-kind row live wrote (any
+    /// contract): the rebuild writes exactly those (2026-11-22 review).
+    repeat_seqs: std::collections::HashSet<u64, ahash::RandomState>,
+    /// Fingerprints of packets live wrote: this segment and the one before.
+    twins: [std::collections::HashSet<u64, ahash::RandomState>; 2],
+    /// Fingerprints of packets written by the dedup fallback, same two
+    /// generations (to count a duplicate when the live copy follows).
+    fallback_kept: [std::collections::HashSet<u64, ahash::RandomState>; 2],
+    counts: LiveKeptCounts,
+}
+
+/// What [`LiveKept::judge`] decided, by packet.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct LiveKeptCounts {
+    /// Packets of a backup contract judged.
+    pub judged: u64,
+    /// Kept: live wrote the number.
+    pub kept: u64,
+    /// Kept although the replay's dedup would have dropped it.
+    pub kept_against_dedup: u64,
+    /// Dropped: live wrote a byte-identical twin instead.
+    pub dropped_for_twin: u64,
+    /// Of those, ones the replay's dedup would have kept.
+    pub dropped_against_dedup: u64,
+    /// Neither the number nor a twin was written by live: the replay's dedup
+    /// decided (`fallback_kept` of them kept).
+    pub fallback: u64,
+    pub fallback_kept: u64,
+    /// A live-written packet kept after the fallback had already kept its
+    /// twin: both copies are written (a twin across a segment boundary).
+    pub duplicates_written: u64,
+}
+
+impl LiveKept {
+    /// Builds the record. `contracts` are the day's backup contracts,
+    /// `seqs` the numbers live wrote for them. Cold, once.
+    #[must_use]
+    pub fn new(contracts: &[(u64, u8)], seqs: &[u64]) -> Self {
+        let mut c = std::collections::HashSet::with_capacity_and_hasher(
+            contracts.len(),
+            ahash::RandomState::new(),
+        );
+        c.extend(contracts.iter().copied());
+        let mut s = std::collections::HashSet::with_capacity_and_hasher(
+            seqs.len(),
+            ahash::RandomState::new(),
+        );
+        s.extend(seqs.iter().copied());
+        Self {
+            contracts: c,
+            seqs: s,
+            repeat_seqs: std::collections::HashSet::with_hasher(ahash::RandomState::new()),
+            twins: Default::default(),
+            fallback_kept: Default::default(),
+            counts: LiveKeptCounts::default(),
+        }
+    }
+
+    /// `(contracts, numbers)` held. O(1).
+    #[must_use]
+    pub fn sizes(&self) -> (usize, usize) {
+        (self.contracts.len(), self.seqs.len())
+    }
+
+    /// Records one row the live run wrote, read from an original copy:
+    /// its number joins the backup numbers and/or the repeat numbers.
+    /// Inserted straight into the sets while reading (no intermediate list).
+    /// O(1) average.
+    pub fn note_live_row(&mut self, row: tickvault_storage::day_repair_coverage::LiveRow) {
+        if row.backup {
+            self.seqs.insert(row.seq);
+        }
+        if row.repeat {
+            self.repeat_seqs.insert(row.seq);
+        }
+    }
+
+    /// Repeat-kind numbers held. O(1).
+    #[must_use]
+    pub fn repeat_numbers(&self) -> usize {
+        self.repeat_seqs.len()
+    }
+
+    /// Whether live wrote a repeat-kind row with number `seq`. O(1).
+    #[must_use]
+    pub fn wrote_repeat(&self, seq: u64) -> bool {
+        self.repeat_seqs.contains(&seq)
+    }
+
+    /// Whether `(security_id, segment)` is a backup contract of the day.
+    #[must_use]
+    pub fn covers(&self, security_id: u64, segment: u8) -> bool {
+        self.contracts.contains(&(security_id, segment))
+    }
+
+    /// The fingerprint of one packet's bytes. Deterministic (fixed keys),
+    /// O(packet bytes), a fixed 162 at most.
+    #[must_use]
+    pub fn fingerprint(packet: &[u8]) -> u64 {
+        ahash::RandomState::with_seeds(0x5452_4155, 0x4e44_4159, 0x2026_1120, 0x0000_0d17)
+            .hash_one(packet)
+    }
+
+    /// Starts a new segment: the fingerprints two segments old are dropped.
+    /// O(1) apart from freeing that generation.
+    pub fn begin_segment(&mut self) {
+        self.twins.swap(0, 1);
+        self.twins[0].clear();
+        self.fallback_kept.swap(0, 1);
+        self.fallback_kept[0].clear();
+    }
+
+    /// Records, ahead of the fold, one packet of the segment: its fingerprint
+    /// is a live-written twin when it is a backup contract's packet whose
+    /// number live wrote. O(1) average.
+    pub fn note_packet(&mut self, security_id: u64, segment: u8, seq: Option<u64>, packet: &[u8]) {
+        if self.covers(security_id, segment) && seq.is_some_and(|s| self.seqs.contains(&s)) {
+            self.twins[0].insert(Self::fingerprint(packet));
+        }
+    }
+
+    /// Whether the packet of `(security_id, segment)` with number `seq` and
+    /// bytes `packet` is dropped. A contract outside the day's backup set
+    /// keeps the replay dedup's verdict `dedup_drops`. O(1) average.
+    pub fn judge(
+        &mut self,
+        security_id: u64,
+        segment: u8,
+        seq: Option<u64>,
+        packet: &[u8],
+        dedup_drops: bool,
+    ) -> bool {
+        if !self.covers(security_id, segment) {
+            return dedup_drops;
+        }
+        self.counts.judged = self.counts.judged.saturating_add(1);
+        let print = Self::fingerprint(packet);
+        if seq.is_some_and(|s| self.seqs.contains(&s)) {
+            self.counts.kept = self.counts.kept.saturating_add(1);
+            if dedup_drops {
+                self.counts.kept_against_dedup = self.counts.kept_against_dedup.saturating_add(1);
+            }
+            if self.fallback_kept.iter().any(|g| g.contains(&print)) {
+                self.counts.duplicates_written = self.counts.duplicates_written.saturating_add(1);
+            }
+            return false;
+        }
+        if self.twins.iter().any(|g| g.contains(&print)) {
+            self.counts.dropped_for_twin = self.counts.dropped_for_twin.saturating_add(1);
+            if !dedup_drops {
+                self.counts.dropped_against_dedup =
+                    self.counts.dropped_against_dedup.saturating_add(1);
+            }
+            return true;
+        }
+        self.counts.fallback = self.counts.fallback.saturating_add(1);
+        if !dedup_drops {
+            self.counts.fallback_kept = self.counts.fallback_kept.saturating_add(1);
+            self.fallback_kept[0].insert(print);
+        }
+        dedup_drops
+    }
+
+    /// The counts so far. O(1).
+    #[must_use]
+    pub const fn counts(&self) -> LiveKeptCounts {
+        self.counts
+    }
 }
 
 impl ReplayBackup {
@@ -1049,7 +1351,24 @@ impl ReplayBackup {
     pub fn new(history: &PersistedBackupHistory) -> Option<Self> {
         let mut history = history.clone();
         history.normalise();
-        if history.publications.iter().all(|p| p.contracts.is_empty()) {
+        // B1 review (2026-11-13): a history with no trim record (every file
+        // an earlier build wrote, which kept only two days) treats every day
+        // before its oldest kept publication as trimmed. Conservative: no
+        // publication is left to judge such a frame either way, so it is
+        // counted rather than folded whole in silence.
+        let trimmed_through_day = history.trimmed_through_day.or_else(|| {
+            history
+                .publications
+                .first()
+                .map(|p| ist_day_of_nanos(p.published_at_nanos).saturating_sub(1))
+        });
+        // B1: a history that RECORDED a trim is kept even with no contract, so
+        // frames from those days are still counted as unjudged. (The
+        // conservative reading above does not keep an all-empty history: it
+        // deduplicates nothing, as before.)
+        if history.publications.iter().all(|p| p.contracts.is_empty())
+            && history.trimmed_through_day.is_none()
+        {
             return None;
         }
         Some(Self {
@@ -1060,7 +1379,21 @@ impl ReplayBackup {
             day: NO_DAY,
             process: 0,
             until_nanos: i64::MAX,
+            trimmed_through_day,
+            unjudged: metrics::counter!(BACKUP_REPLAY_UNJUDGED_COUNTER),
+            live_kept: None,
         })
+    }
+
+    /// Installs the past-day repair's [`LiveKept`] record. Cold, once.
+    pub fn set_live_kept(&mut self, kept: LiveKept) {
+        self.live_kept = Some(kept);
+    }
+
+    /// The past-day repair's record, when installed.
+    #[inline]
+    pub fn live_kept_mut(&mut self) -> Option<&mut LiveKept> {
+        self.live_kept.as_mut()
     }
 
     /// Selects the publication for a frame received at `received_at_nanos`
@@ -1097,11 +1430,27 @@ impl ReplayBackup {
             self.next += 1;
             let _retired = self.dedup.swap_in(table, slots, day, carry);
         }
-        self.next > 0
+        let frame_day = ist_day_of_nanos(received_at_nanos);
+        let judged = self.next > 0
             && !self.dedup.is_empty()
             && received_at_nanos >= self.from_nanos
             && received_at_nanos < self.until_nanos
-            && ist_day_of_nanos(received_at_nanos) == self.day
+            && frame_day == self.day;
+        // B1 (2026-11-13): a frame from a day whose publication the history
+        // trimmed away is folded whole (both socket copies may land): counted,
+        // never silent. One compare per frame.
+        if !judged && self.trimmed_through_day.is_some_and(|d| frame_day <= d) {
+            self.unjudged.increment(1);
+        }
+        judged
+    }
+
+    /// Test-only: whether a frame received at `received_at_nanos` falls on a
+    /// day the history trimmed (B1).
+    #[cfg(test)]
+    fn day_was_trimmed(&self, received_at_nanos: i64) -> bool {
+        self.trimmed_through_day
+            .is_some_and(|d| ist_day_of_nanos(received_at_nanos) <= d)
     }
 
     /// The table, for the replayed packets [`Self::select`] said it covers.
@@ -1355,6 +1704,18 @@ mod tests {
     }
 
     #[test]
+    fn test_holds_answers_on_the_composite_key_of_the_set_in_force() {
+        let mut d = BackupDedup::new();
+        assert!(!d.holds(42, SEG), "an inactive table holds nothing");
+        d.install(&[(42, SEG)]);
+        assert!(d.holds(42, SEG));
+        assert!(!d.holds(42, SEG + 1), "same id, other segment (I-P1-11)");
+        assert!(!d.holds(43, SEG));
+        d.install(&[]);
+        assert!(!d.holds(42, SEG), "an emptied set holds nothing");
+    }
+
+    #[test]
     fn test_packet_fingerprint_is_never_zero_and_separates_bytes() {
         assert_ne!(packet_fingerprint(&[]), 0);
         assert_ne!(
@@ -1521,6 +1882,7 @@ mod tests {
 
     fn history_of(pubs: &[(i64, &[u64])]) -> PersistedBackupHistory {
         PersistedBackupHistory {
+            trimmed_through_day: None,
             publications: pubs
                 .iter()
                 .map(|(at, sids)| PersistedBackupSet {
@@ -1630,31 +1992,30 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
 
-        // Only the two most recent IST days that have a publication: a
-        // Friday set still covers Friday's frames replayed on Monday.
+        // Only the BACKUP_HISTORY_DAYS most recent IST days that have a
+        // publication (days with one, so a Friday set still covers Friday's
+        // frames replayed on Monday). B1 (2026-11-13): was two days.
         let mut h = PersistedBackupHistory::default();
-        let friday = TEN_AM - 3 * DAY;
-        h.record(PersistedBackupSet {
-            published_at_nanos: friday - DAY,
-            process_started_at_nanos: 0,
-            contracts: vec![(1, SEG)],
-        });
-        h.record(PersistedBackupSet {
-            published_at_nanos: friday,
-            process_started_at_nanos: 0,
-            contracts: vec![(2, SEG)],
-        });
-        h.record(PersistedBackupSet {
-            published_at_nanos: TEN_AM,
-            process_started_at_nanos: 0,
-            contracts: vec![(3, SEG)],
-        });
+        let days = BACKUP_HISTORY_DAYS as i64;
+        for back in (0..=days).rev() {
+            h.record(PersistedBackupSet {
+                published_at_nanos: TEN_AM - back * DAY,
+                process_started_at_nanos: 0,
+                contracts: vec![(1, SEG)],
+            });
+        }
         let kept: Vec<i64> = h
             .publications
             .iter()
             .map(|p| p.published_at_nanos)
             .collect();
-        assert_eq!(kept, vec![friday, TEN_AM], "Thursday is dropped");
+        let expect: Vec<i64> = (0..days).rev().map(|back| TEN_AM - back * DAY).collect();
+        assert_eq!(kept, expect, "the oldest of the 16 days is dropped");
+        assert_eq!(
+            h.trimmed_through_day,
+            Some(ist_day_of_nanos(TEN_AM - days * DAY)),
+            "the trim is recorded"
+        );
         // At most BACKUP_HISTORY_MAX, the newest; instant-less entries never.
         for i in 0..(BACKUP_HISTORY_MAX as i64 + 5) {
             h.record(PersistedBackupSet {
@@ -1850,6 +2211,152 @@ mod tests {
         assert!(!r.select(TEN_AM + 30 * MIN));
     }
 
+    /// Regression, B1 review 4: when the entry cap binds it drops the oldest
+    /// day WHOLE, never part of it. Before, it dropped the single oldest
+    /// entry, so a day with two publications of one process (09:20, then a
+    /// widen at 11:05) kept only the 11:05 one; the replay then started it
+    /// with an empty ring (no carry-over), folded the lagging second copies
+    /// the live drain had dropped, and counted nothing.
+    #[test]
+    fn test_regression_entry_cap_trims_whole_days_never_part_of_one() {
+        let mut h = PersistedBackupHistory::default();
+        let process = TEN_AM - 14 * DAY - 60 * MIN;
+        let oldest_day = TEN_AM - 14 * DAY;
+        for at in [oldest_day - 40 * MIN, oldest_day + 65 * MIN] {
+            h.record(PersistedBackupSet {
+                published_at_nanos: at,
+                process_started_at_nanos: process,
+                contracts: vec![(42, SEG)],
+            });
+        }
+        // Fill the 14 later days so the history is one entry over the cap.
+        let mut n = 2_usize;
+        let mut back = 13_i64;
+        while n <= BACKUP_HISTORY_MAX {
+            let per_day = 5_i64;
+            for k in 0..per_day {
+                if n > BACKUP_HISTORY_MAX {
+                    break;
+                }
+                h.record(PersistedBackupSet {
+                    published_at_nanos: TEN_AM - back * DAY + k * MIN,
+                    process_started_at_nanos: 0,
+                    contracts: vec![(42, SEG)],
+                });
+                n += 1;
+            }
+            back = (back - 1).max(0);
+        }
+        assert!(h.publications.len() <= BACKUP_HISTORY_MAX);
+        let oldest = ist_day_of_nanos(oldest_day);
+        assert!(
+            h.publications
+                .iter()
+                .all(|p| ist_day_of_nanos(p.published_at_nanos) != oldest),
+            "the cut day is gone whole, not split"
+        );
+        assert_eq!(h.trimmed_through_day, Some(oldest));
+        // So a frame after that day's surviving widen is counted, not judged
+        // by a fresh ring.
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let mut replay =
+            metrics::with_local_recorder(&recorder, || ReplayBackup::new(&h).expect("contracts"));
+        assert!(
+            !replay.select(oldest_day + 66 * MIN),
+            "not judged by a fresh ring"
+        );
+        assert!(
+            handle
+                .render()
+                .lines()
+                .any(|l| l == format!("{BACKUP_REPLAY_UNJUDGED_COUNTER} 1")),
+            "counted"
+        );
+    }
+
+    /// Regression, B1 (2026-11-13): the history kept only two publication
+    /// days, so a frame from three days back (the pinned WAL backlog replays
+    /// such frames as the normal case) had no publication: both socket copies
+    /// were folded with nothing counted. The history now keeps 15 days, and a
+    /// frame from a day the history trimmed is counted as unjudged.
+    #[test]
+    fn test_regression_old_frames_are_judged_or_counted_never_silent() {
+        let mut h = PersistedBackupHistory::default();
+        for back in (0..=3_i64).rev() {
+            h.record(PersistedBackupSet {
+                published_at_nanos: TEN_AM - back * DAY,
+                process_started_at_nanos: 0,
+                contracts: vec![(42, SEG)],
+            });
+        }
+        assert_eq!(h.publications.len(), 4, "three days back is still held");
+        let mut replay = ReplayBackup::new(&h).expect("contracts");
+        assert!(
+            replay.select(TEN_AM - 3 * DAY + MIN),
+            "a frame from three days back is judged by its own day's set"
+        );
+        // A history that has trimmed a day counts that day's frames.
+        let mut trimmed = PersistedBackupHistory::default();
+        for back in (0..=(BACKUP_HISTORY_DAYS as i64)).rev() {
+            trimmed.record(PersistedBackupSet {
+                published_at_nanos: TEN_AM - back * DAY,
+                process_started_at_nanos: 0,
+                contracts: vec![(42, SEG)],
+            });
+        }
+        let old = TEN_AM - (BACKUP_HISTORY_DAYS as i64) * DAY + MIN;
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let mut replay = metrics::with_local_recorder(&recorder, || {
+            ReplayBackup::new(&trimmed).expect("contracts")
+        });
+        assert!(replay.day_was_trimmed(old));
+        assert!(!replay.select(old), "no publication left to judge it");
+        assert!(!replay.day_was_trimmed(TEN_AM + MIN));
+        assert!(replay.select(TEN_AM + MIN), "today's frame is judged");
+        assert!(
+            handle
+                .render()
+                .lines()
+                .any(|l| l == format!("{BACKUP_REPLAY_UNJUDGED_COUNTER} 1")),
+            "the unjudged frame is counted once, the judged one not at all"
+        );
+    }
+
+    /// Regression, B1 review (2026-11-13): a history file an earlier build
+    /// wrote has no `trimmed_through_day` (it reads `None`), although that
+    /// build kept only two days. A frame from before its oldest publication
+    /// is counted as unjudged; before, the counter stayed at 0 for exactly
+    /// the backlog the counter was added for.
+    #[test]
+    fn test_regression_legacy_history_counts_frames_older_than_its_oldest_day() {
+        let legacy = history_of(&[(TEN_AM - DAY, &[42]), (TEN_AM, &[42])]);
+        let mut json = serde_json::to_value(&legacy).expect("to json");
+        let removed = json
+            .as_object_mut()
+            .and_then(|o| o.remove("trimmed_through_day"));
+        assert!(removed.is_some(), "the field existed and is now gone");
+        let read: PersistedBackupHistory = serde_json::from_value(json).expect("from json");
+        assert_eq!(read.trimmed_through_day, None, "a pre-B1 file reads None");
+        let old = TEN_AM - 5 * DAY + MIN;
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let mut replay = metrics::with_local_recorder(&recorder, || {
+            ReplayBackup::new(&read).expect("contracts")
+        });
+        assert!(replay.day_was_trimmed(old));
+        assert!(!replay.select(old));
+        assert!(!replay.day_was_trimmed(TEN_AM - DAY + MIN), "a kept day");
+        assert!(
+            handle
+                .render()
+                .lines()
+                .any(|l| l == format!("{BACKUP_REPLAY_UNJUDGED_COUNTER} 1")),
+            "the frame five days back is counted"
+        );
+    }
+
     /// Review 2026-10-02, F1: process 2 started at 11:00 and published at
     /// 11:05. Its frames from 11:00 to 11:05 were folded live with NO set (a
     /// fresh drain), so the replay must not judge them with process 1's 09:20
@@ -1862,6 +2369,7 @@ mod tests {
         let p2_start = TEN_AM + 60 * MIN;
         let at_1105 = TEN_AM + 65 * MIN;
         let history = PersistedBackupHistory {
+            trimmed_through_day: None,
             publications: vec![
                 PersistedBackupSet {
                     published_at_nanos: at_0920,
@@ -2120,6 +2628,221 @@ mod tests {
                 prop_assert!(*n <= 1, "packet {} folded {} times", i, n);
                 if carried_by[i] == 0 && lag <= 4 {
                     prop_assert_eq!(*n, 1, "packet {} on both sockets was not folded", i);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_live_kept_keeps_live_numbers_drops_only_twins_and_falls_back_otherwise() {
+        let mut k = LiveKept::new(&[(42, SEG)], &[100, 102]);
+        assert_eq!(k.sizes(), (1, 2));
+        k.begin_segment();
+        k.note_packet(42, SEG, Some(100), b"copy-a");
+        k.note_packet(42, SEG, Some(999), b"never-written");
+        k.note_packet(7, SEG, Some(100), b"not-a-backup-contract");
+        // Live's number is kept even when the dedup drops it.
+        assert!(!k.judge(42, SEG, Some(100), b"copy-a", true));
+        // Not live's number, but its twin is: dropped, even if the dedup keeps it.
+        assert!(k.judge(42, SEG, Some(101), b"copy-a", false));
+        // Neither the number nor a twin: the dedup decides.
+        assert!(!k.judge(42, SEG, Some(103), b"lost-by-live", false));
+        assert!(k.judge(42, SEG, Some(104), b"never-written", true));
+        assert!(!k.judge(42, SEG, None, b"x", false));
+        // Outside the set (another segment of the same id too): the dedup.
+        assert!(!k.judge(42, 1, Some(999), b"copy-a", false));
+        assert!(k.judge(7, SEG, Some(100), b"copy-a", true));
+        assert_eq!(
+            k.counts(),
+            LiveKeptCounts {
+                judged: 5,
+                kept: 1,
+                kept_against_dedup: 1,
+                dropped_for_twin: 1,
+                dropped_against_dedup: 1,
+                fallback: 3,
+                fallback_kept: 2,
+                duplicates_written: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn test_live_kept_twins_last_two_segments_and_counts_a_duplicate() {
+        let mut k = LiveKept::new(&[(42, SEG)], &[200]);
+        k.begin_segment();
+        k.note_packet(42, SEG, Some(200), b"twin");
+        k.begin_segment();
+        // The twin noted one segment earlier still counts...
+        assert!(k.judge(42, SEG, Some(201), b"twin", false));
+        k.begin_segment();
+        // ...two segments earlier it no longer does: the dedup decides.
+        assert!(!k.judge(42, SEG, Some(202), b"twin", false));
+        // The live copy arriving after the fallback kept its twin: counted.
+        assert!(!k.judge(42, SEG, Some(200), b"twin", true));
+        assert_eq!(k.counts().duplicates_written, 1);
+        assert_eq!(
+            LiveKept::fingerprint(b"twin"),
+            LiveKept::fingerprint(b"twin")
+        );
+        assert_ne!(
+            LiveKept::fingerprint(b"twin"),
+            LiveKept::fingerprint(b"twim")
+        );
+    }
+
+    #[test]
+    fn test_begin_segment_retires_the_fingerprints_two_segments_old() {
+        let mut k = LiveKept::new(&[(1, SEG)], &[10]);
+        k.begin_segment();
+        k.note_packet(1, SEG, Some(10), b"p");
+        k.begin_segment();
+        assert!(
+            k.judge(1, SEG, Some(11), b"p", false),
+            "one segment old: a twin"
+        );
+        k.begin_segment();
+        assert!(
+            !k.judge(1, SEG, Some(12), b"p", false),
+            "two segments old: forgotten"
+        );
+    }
+
+    #[test]
+    fn test_note_packet_records_only_live_numbers_of_backup_contracts() {
+        let mut k = LiveKept::new(&[(1, SEG)], &[10]);
+        k.begin_segment();
+        k.note_packet(1, SEG, Some(11), b"not-live");
+        k.note_packet(2, SEG, Some(10), b"not-backup");
+        k.note_packet(1, SEG, None, b"no-number");
+        for p in [&b"not-live"[..], b"not-backup", b"no-number"] {
+            assert!(!k.judge(1, SEG, Some(99), p, false), "{p:?} is no twin");
+        }
+        assert!(k.covers(1, SEG) && !k.covers(2, SEG) && !k.covers(1, 1));
+    }
+
+    #[test]
+    fn test_set_live_kept_and_live_kept_mut_install_the_record() {
+        let mut r = ReplayBackup::new(&PersistedBackupHistory {
+            publications: vec![PersistedBackupSet {
+                published_at_nanos: 1,
+                contracts: vec![(1, SEG)],
+                process_started_at_nanos: 0,
+            }],
+            ..PersistedBackupHistory::default()
+        })
+        .expect("a history with a contract");
+        assert!(r.live_kept_mut().is_none());
+        r.set_live_kept(LiveKept::new(&[(1, SEG)], &[5]));
+        assert_eq!(r.live_kept_mut().map(|k| k.sizes()), Some((1, 1)));
+    }
+
+    #[test]
+    fn test_note_live_row_fills_backup_and_repeat_numbers_wrote_repeat_and_repeat_numbers() {
+        use tickvault_storage::day_repair_coverage::LiveRow;
+        let mut k = LiveKept::new(&[(1, SEG)], &[]);
+        k.note_live_row(LiveRow {
+            seq: 10,
+            backup: true,
+            repeat: false,
+        });
+        k.note_live_row(LiveRow {
+            seq: 11,
+            backup: false,
+            repeat: true,
+        });
+        k.note_live_row(LiveRow {
+            seq: 12,
+            backup: true,
+            repeat: true,
+        });
+        k.note_live_row(LiveRow {
+            seq: 12,
+            backup: true,
+            repeat: true,
+        });
+        assert_eq!(k.sizes(), (1, 2));
+        assert_eq!(k.repeat_numbers(), 2);
+        assert!(k.wrote_repeat(11) && k.wrote_repeat(12) && !k.wrote_repeat(10));
+        k.begin_segment();
+        k.note_packet(1, SEG, Some(10), b"x");
+        assert!(!k.judge(1, SEG, Some(10), b"x", true));
+        assert!(
+            !k.judge(1, SEG, Some(11), b"y", false),
+            "a repeat number alone is not a backup number"
+        );
+    }
+
+    #[test]
+    fn test_contracts_published_on_unions_only_that_ist_day() {
+        // 2026-11-20 00:00 IST = 2026-11-19T18:30Z.
+        let day_start_utc_nanos = 1_795_113_000_i64 * 1_000_000_000;
+        let ist_day = ist_day_of_nanos(day_start_utc_nanos);
+        let hist = PersistedBackupHistory {
+            publications: vec![
+                PersistedBackupSet {
+                    published_at_nanos: day_start_utc_nanos - 1,
+                    contracts: vec![(1, SEG)],
+                    process_started_at_nanos: 0,
+                },
+                PersistedBackupSet {
+                    published_at_nanos: day_start_utc_nanos,
+                    contracts: vec![(5, SEG), (4, SEG)],
+                    process_started_at_nanos: 0,
+                },
+                PersistedBackupSet {
+                    published_at_nanos: day_start_utc_nanos + 3_600 * 1_000_000_000,
+                    contracts: vec![(4, SEG), (6, 1)],
+                    process_started_at_nanos: 0,
+                },
+                PersistedBackupSet {
+                    published_at_nanos: day_start_utc_nanos + 86_400 * 1_000_000_000,
+                    contracts: vec![(9, SEG)],
+                    process_started_at_nanos: 0,
+                },
+            ],
+            ..PersistedBackupHistory::default()
+        };
+        assert_eq!(
+            contracts_published_on(&hist, ist_day),
+            vec![(4, SEG), (5, SEG), (6, 1)]
+        );
+        assert!(contracts_published_on(&hist, ist_day + 10).is_empty());
+    }
+
+    proptest! {
+        /// Over random backup sets, numbers, twins and dedup verdicts, within
+        /// one segment: a backup contract's packet is kept when live wrote
+        /// its number, dropped when live wrote a twin instead, and otherwise
+        /// (and for every other contract) the dedup decides.
+        #[test]
+        fn proptest_live_kept_matches_live_for_backup_and_dedup_elsewhere(
+            set in proptest::collection::btree_set(0u64..20, 0..8),
+            kept in proptest::collection::btree_set(0u64..200, 0..60),
+            packets in proptest::collection::vec((0u64..20, 0u64..200, 0u8..30, any::<bool>()), 0..200),
+        ) {
+            let contracts: Vec<(u64, u8)> = set.iter().map(|&s| (s, SEG)).collect();
+            let seqs: Vec<u64> = kept.iter().copied().collect();
+            let mut k = LiveKept::new(&contracts, &seqs);
+            k.begin_segment();
+            let mut twins = std::collections::BTreeSet::new();
+            for (sid, seq, body, _) in &packets {
+                k.note_packet(*sid, SEG, Some(*seq), &[*body, *sid as u8]);
+                if set.contains(sid) && kept.contains(seq) {
+                    twins.insert([*body, *sid as u8]);
+                }
+            }
+            for (sid, seq, body, dedup) in packets {
+                let bytes = [body, sid as u8];
+                let dropped = k.judge(sid, SEG, Some(seq), &bytes, dedup);
+                if !set.contains(&sid) {
+                    prop_assert_eq!(dropped, dedup);
+                } else if kept.contains(&seq) {
+                    prop_assert!(!dropped);
+                } else if twins.contains(&bytes) {
+                    prop_assert!(dropped);
+                } else {
+                    prop_assert_eq!(dropped, dedup);
                 }
             }
         }

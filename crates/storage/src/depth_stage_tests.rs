@@ -318,6 +318,9 @@ fn test_pf4b_drain_book_append_never_writes_ilp_text() {
         "pub fn append_book_row(",
         "fn append_book_row_inner(",
         "fn stage_pin_after_cut(",
+        "pub fn append_book_pair(",
+        "fn resolve_book_label(",
+        "fn stage_book_side(",
     ] {
         let body = body_of(&src, sig);
         for writer in [
@@ -334,7 +337,10 @@ fn test_pf4b_drain_book_append_never_writes_ilp_text() {
             );
         }
     }
-    assert!(body_of(&src, "fn append_book_row_inner(").contains("self.staged.push("));
+    assert!(body_of(&src, "fn stage_book_side(").contains("self.staged.push("));
+    // Speed fix 5: both appends stage through the one staging step.
+    assert!(body_of(&src, "fn append_book_row_inner(").contains("self.stage_book_side("));
+    assert!(body_of(&src, "pub fn append_book_pair(").contains("self.stage_book_side("));
     let write = body_of(&src, "pub fn write(&mut self, batch: &mut DepthFlushBatch)");
     let encode = write.find("self.encode_staged(batch)").expect("encodes");
     let post = write.find("self.write_inner(batch)").expect("posts");
@@ -626,4 +632,234 @@ fn test_escaped_symbol_len_adds_one_byte_per_escaped_character() {
             "{value:?}"
         );
     }
+}
+
+// ---- Speed fix 5 (2026-11-17): the generation-checked pin ----
+
+/// A table whose one name marks it as the `n`th publish.
+fn publish_numbered(n: u64) {
+    let mut labels = CandleContractLabels::default();
+    labels.insert((1, "NSE_FNO"), Arc::from(format!("T{n}").as_str()));
+    publish_candle_contract_labels(labels);
+}
+
+#[test]
+fn test_try_pin_at_generation_records_the_generation_only_on_success() {
+    let _g = TEST_PUBLISH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    publish_numbered(0);
+    let mut batch = DepthStagedBatch::new();
+    let g = crate::candle_contract_labels::candle_contract_labels_generation();
+    let pin = batch
+        .try_pin_at_generation(crate::candle_contract_labels::candle_contract_labels(), g)
+        .expect("pin");
+    assert_eq!(pin, 0);
+    assert_eq!(batch.current_pin_at_generation(g), Some(0));
+    // Fill every other slot with tables of unknown generation.
+    for i in 1..DEPTH_STAGE_LABEL_PINS {
+        batch
+            .pin_table(labels_with(i as i64, "X"))
+            .expect("free slot");
+    }
+    publish_numbered(1);
+    let g1 = crate::candle_contract_labels::candle_contract_labels_generation();
+    assert!(
+        batch
+            .try_pin_at_generation(crate::candle_contract_labels::candle_contract_labels(), g1)
+            .is_err(),
+        "a ninth table is handed back"
+    );
+    assert_eq!(
+        batch.current_pin_at_generation(g1),
+        None,
+        "a refused pin records nothing"
+    );
+    publish_candle_contract_labels(CandleContractLabels::default());
+}
+
+#[test]
+fn test_current_pin_at_generation_answers_only_the_last_pin_of_that_generation() {
+    let _g = TEST_PUBLISH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    publish_numbered(0);
+    let mut batch = DepthStagedBatch::new();
+    let g = crate::candle_contract_labels::candle_contract_labels_generation();
+    assert_eq!(batch.current_pin_at_generation(g), None, "an empty batch");
+    batch
+        .try_pin_at_generation(crate::candle_contract_labels::candle_contract_labels(), g)
+        .expect("pin");
+    assert_eq!(batch.current_pin_at_generation(g), Some(0));
+    assert_eq!(
+        batch.current_pin_at_generation(g + 1),
+        None,
+        "another generation"
+    );
+    batch.clear_rows();
+    assert_eq!(
+        batch.current_pin_at_generation(g),
+        Some(0),
+        "clear_rows keeps the pins, so it keeps the generation"
+    );
+    // A pin of unknown generation (the carried run table) forgets it.
+    batch.pin_table(labels_with(9, "C")).expect("pin");
+    assert_eq!(batch.current_pin_at_generation(g), None);
+    // A plain `try_pin` of a NEW table forgets it too.
+    batch
+        .try_pin_at_generation(crate::candle_contract_labels::candle_contract_labels(), g)
+        .expect("pin");
+    assert_eq!(batch.current_pin_at_generation(g), Some(2));
+    publish_numbered(1);
+    batch
+        .try_pin(crate::candle_contract_labels::candle_contract_labels())
+        .expect("pin");
+    assert_eq!(batch.current_pin_at_generation(g), None);
+    assert_eq!(
+        batch.current_pin_at_generation(g + 1),
+        None,
+        "try_pin never records a generation"
+    );
+    batch.clear();
+    assert_eq!(
+        batch.current_pin_at_generation(g + 1),
+        None,
+        "clear forgets"
+    );
+    publish_candle_contract_labels(CandleContractLabels::default());
+}
+
+#[test]
+fn test_labels_reads_the_pinned_table_and_an_unused_slot_reads_empty() {
+    let mut batch = DepthStagedBatch::new();
+    let table = labels_with(1, "A");
+    let pin = batch.pin_table(Arc::clone(&table)).expect("pin");
+    assert!(std::ptr::eq(batch.labels(pin), &*table));
+    assert_eq!(
+        batch.labels(pin).get(&(1, "NSE_FNO")).map(|n| &**n),
+        Some("A")
+    );
+    assert!(batch.labels(7).is_empty(), "an unused slot reads no names");
+}
+
+/// One step of the pin proptest.
+#[derive(Debug, Clone)]
+enum PinOp {
+    Publish,
+    Pin,
+    ClearRows,
+    Clear,
+    Carry,
+}
+
+fn pin_op() -> impl Strategy<Value = PinOp> {
+    prop_oneof![
+        4 => Just(PinOp::Publish),
+        8 => Just(PinOp::Pin),
+        1 => Just(PinOp::ClearRows),
+        1 => Just(PinOp::Clear),
+        1 => Just(PinOp::Carry),
+    ]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 512, ..ProptestConfig::default() })]
+
+    /// Speed fix 5: across random publishes (a ninth distinct table
+    /// included), clears and carried pins, the generation-checked pin gives
+    /// the SAME pin index and the SAME table as a fresh load plus
+    /// `try_pin` on every step.
+    #[test]
+    fn proptest_fix5_generation_pin_equals_a_fresh_load_across_publishes(
+        ops in proptest::collection::vec(pin_op(), 1..120)
+    ) {
+        let _g = TEST_PUBLISH_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut published = 0_u64;
+        publish_numbered(published);
+        let mut fast = DepthStagedBatch::new();
+        let mut reference = DepthStagedBatch::new();
+        for op in &ops {
+            match op {
+                PinOp::Publish => {
+                    published += 1;
+                    publish_numbered(published);
+                }
+                PinOp::Pin => {
+                    let g = crate::candle_contract_labels::candle_contract_labels_generation();
+                    let got = match fast.current_pin_at_generation(g) {
+                        Some(pin) => Some(pin),
+                        None => fast
+                            .try_pin_at_generation(
+                                crate::candle_contract_labels::candle_contract_labels(),
+                                g,
+                            )
+                            .ok(),
+                    };
+                    let want = reference
+                        .try_pin(crate::candle_contract_labels::candle_contract_labels())
+                        .ok();
+                    prop_assert_eq!(got, want);
+                    match want {
+                        Some(pin) => {
+                            let a = fast.pinned_table(pin).expect("pinned");
+                            let b = reference.pinned_table(pin).expect("pinned");
+                            prop_assert!(Arc::ptr_eq(&a, &b), "a different table");
+                            prop_assert!(std::ptr::eq(fast.labels(pin), &*b));
+                        }
+                        None => {
+                            // The writer's cut: a fresh batch.
+                            fast.clear();
+                            reference.clear();
+                        }
+                    }
+                }
+                PinOp::ClearRows => {
+                    fast.clear_rows();
+                    reference.clear_rows();
+                }
+                PinOp::Clear => {
+                    fast.clear();
+                    reference.clear();
+                }
+                PinOp::Carry => {
+                    // A carried table: an older pin moved to the end.
+                    let held = reference.pinned_table(0);
+                    if let Some(table) = held {
+                        let a = fast.pin_table(Arc::clone(&table)).ok();
+                        let b = reference.pin_table(table).ok();
+                        prop_assert_eq!(a, b);
+                    }
+                }
+            }
+            prop_assert_eq!(fast.pin_count(), reference.pin_count());
+        }
+        publish_candle_contract_labels(CandleContractLabels::default());
+    }
+}
+
+/// The pin proptest's generator reaches a ninth table (so the cut arm is
+/// exercised, not only described).
+#[test]
+fn test_fix5_pin_steps_reach_a_ninth_table() {
+    let _g = TEST_PUBLISH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut batch = DepthStagedBatch::new();
+    let mut refused = false;
+    for n in 0..10_u64 {
+        publish_numbered(n);
+        let g = crate::candle_contract_labels::candle_contract_labels_generation();
+        let pinned = match batch.current_pin_at_generation(g) {
+            Some(pin) => Some(pin),
+            None => batch
+                .try_pin_at_generation(crate::candle_contract_labels::candle_contract_labels(), g)
+                .ok(),
+        };
+        refused |= pinned.is_none();
+    }
+    assert!(refused, "nine tables in one batch must be refused");
+    assert_eq!(batch.pin_count(), DEPTH_STAGE_LABEL_PINS);
+    publish_candle_contract_labels(CandleContractLabels::default());
 }

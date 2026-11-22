@@ -8,10 +8,16 @@
 //! than the share of PRODUCTION lines the tests reach.
 //!
 //! This tool reads the same `cargo llvm-cov --json` export the gate reads and
-//! prints, per crate, the line coverage of production code only. It is a
-//! REPORT: it gates nothing and the floors in
-//! `quality/crate-coverage-thresholds.toml` are unchanged. It is printed next
-//! to them so the gap is visible.
+//! prints, per crate, the line coverage of production code only, next to the
+//! gate's floors (which it does not change) so the gap is visible.
+//!
+//! B3 (2026-11-13): it is also a GATE when the thresholds file has a
+//! `[production]` table. Each crate listed there must reach its floor on the
+//! production-only per-line figure, or the tool exits 1 (a crate missing
+//! from the report, a crate with no production lines and a floor that does
+//! not parse fail too). With no `[production]` table it gates nothing, as
+//! before. A thresholds path that cannot be read now fails instead of
+//! silently turning the check off.
 //!
 //! Usage: `coverage_prod_report <coverage.json> [crate-coverage-thresholds.toml]`
 //!
@@ -1013,9 +1019,99 @@ fn parse_floors(toml: &str) -> (Option<String>, BTreeMap<String, String>) {
     (default, floors)
 }
 
+/// The `[production]` table of the thresholds file (B3, 2026-11-13): per-crate
+/// floors on PRODUCTION-only line coverage (the per-line production column),
+/// as text. Empty when the table is absent, and then nothing is gated.
+///
+/// A crate written twice (quotes trimmed, so `app` and `"app"` are one key)
+/// is refused: a map keeps the LAST line, so a second, lower `app = 1.0`
+/// under the pinned line would lower the gate while a check reading the
+/// first line still saw the pin (B3 review, 2026-11-13).
+fn parse_production_floors(toml: &str) -> Result<BTreeMap<String, String>, String> {
+    let mut floors = BTreeMap::new();
+    let mut in_production = false;
+    for raw in toml.lines() {
+        let line = raw.split('#').next().unwrap_or_default().trim();
+        if line.starts_with('[') {
+            in_production = line == "[production]";
+            continue;
+        }
+        if !in_production {
+            continue;
+        }
+        if let Some((key, value)) = line.split_once('=') {
+            let key = key.trim().trim_matches('"').to_string();
+            if floors.contains_key(&key) {
+                return Err(format!(
+                    "FAIL: crate `{key}` is written twice in the [production] table; \
+                     write one floor per crate\n"
+                ));
+            }
+            floors.insert(key, value.trim().to_string());
+        }
+    }
+    Ok(floors)
+}
+
+/// A floor written with at most two decimals, in hundredths of a percent
+/// (`71.4` is 7_140). `None` for anything else, which the gate refuses.
+fn floor_hundredths(text: &str) -> Option<u128> {
+    let (whole, frac) = text.split_once('.').unwrap_or((text, ""));
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let has_point = text.contains('.');
+    if !digits(whole) || frac.len() > 2 || (has_point && !digits(frac)) {
+        return None;
+    }
+    let whole: u128 = whole.parse().ok()?;
+    let frac: u128 = format!("{frac:0<2}").parse().ok()?;
+    let value = whole.checked_mul(100)?.checked_add(frac)?;
+    (value <= 10_000).then_some(value)
+}
+
+/// Checks each crate in `floors` against its production-only coverage. The
+/// comparison is exact integer arithmetic (`covered / lines >= floor`), so a
+/// crate at its floor passes. Returns the printed lines and whether every
+/// listed crate passed. A listed crate missing from the report, with no
+/// production lines, or with a floor that does not parse, fails (fail-closed:
+/// a gate that cannot measure must not read as a pass).
+fn check_production_floors(report: &Report, floors: &BTreeMap<String, String>) -> (String, bool) {
+    let mut out = String::new();
+    let mut ok = true;
+    out.push_str(
+        "## Production floors (`[production]` in quality/crate-coverage-thresholds.toml)\n\n",
+    );
+    for (krate, floor) in floors {
+        let Some(hundredths) = floor_hundredths(floor) else {
+            out.push_str(&format!(
+                "  FAIL: {krate} production floor `{floor}` does not parse\n"
+            ));
+            ok = false;
+            continue;
+        };
+        let Some(entry) = report.crates.get(krate) else {
+            out.push_str(&format!(
+                "  MISSING: {krate} is not in the coverage report\n"
+            ));
+            ok = false;
+            continue;
+        };
+        let prod = entry.production;
+        let passes = prod.lines > 0
+            && u128::from(prod.covered) * 10_000 >= hundredths * u128::from(prod.lines);
+        let verdict = if passes { "PASS" } else { "FAIL" };
+        out.push_str(&format!(
+            "  {verdict}: {krate} {}% production (floor: {floor}%)\n",
+            prod.percent()
+        ));
+        ok &= passes;
+    }
+    out.push('\n');
+    (out, ok)
+}
+
 fn render(report: &Report, floors: &(Option<String>, BTreeMap<String, String>)) -> String {
     let mut out = String::new();
-    out.push_str("## Production-only line coverage (report only; floors unchanged)\n\n");
+    out.push_str("## Production-only line coverage (gate floors unchanged; any `[production]` floors are checked below)\n\n");
     out.push_str("| Crate | Gate % (summary) | All lines % (per line) | Production % (per line) | Production lines covered | Test lines in src | Floor (unchanged) |\n");
     out.push_str("|---|---|---|---|---|---|---|\n");
     let mut total = CrateReport::default();
@@ -1097,20 +1193,38 @@ fn outcome(args: &[String]) -> (String, i32) {
     if files.is_empty() {
         return (format!("{json_path} lists no files\n"), 1);
     }
-    let floors = args
-        .get(2)
-        .and_then(|path| std::fs::read_to_string(path).ok())
-        .map(|text| parse_floors(&text))
-        .unwrap_or_default();
+    // A thresholds path that cannot be read fails: it would otherwise turn
+    // the production gate off without a word (B3).
+    let thresholds = match args.get(2) {
+        Some(path) => match std::fs::read_to_string(path) {
+            Ok(text) => Some(text),
+            Err(err) => return (format!("cannot read {path}: {err}\n"), 1),
+        },
+        None => None,
+    };
+    let floors = thresholds.as_deref().map(parse_floors).unwrap_or_default();
+    let production_floors = match thresholds.as_deref().map(parse_production_floors) {
+        Some(Ok(floors)) => floors,
+        Some(Err(refusal)) => return (refusal, 1),
+        None => BTreeMap::new(),
+    };
     let report = build_report(&files, |path| std::fs::read_to_string(path).ok());
-    (render(&report, &floors), 0)
+    let mut text = render(&report, &floors);
+    if production_floors.is_empty() {
+        return (text, 0);
+    }
+    let (checked, ok) = check_production_floors(&report, &production_floors);
+    text.push_str(&checked);
+    (text, if ok { 0 } else { 1 })
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let (text, code) = outcome(&args);
     let _ = std::io::stdout().write_all(text.as_bytes());
-    if code == 0
+    // The table is written to the step summary whenever it was built, a
+    // production-floor failure included (B3); an input error writes nothing.
+    if text.starts_with("## Production-only")
         && let Ok(summary_path) = std::env::var("GITHUB_STEP_SUMMARY")
         && let Ok(mut summary) = std::fs::OpenOptions::new()
             .append(true)
@@ -1495,6 +1609,121 @@ mod tests {
         assert!(text.contains("| app |"), "{text}");
         assert!(text.contains("72.6"), "{text}");
         assert!(text.contains("floors unchanged"), "{text}");
+    }
+
+    // B3 (2026-11-13): the `[production]` table gates production-only
+    // coverage. Only that table is read; a crate at its floor passes, one
+    // hundredth below fails, and anything unmeasurable fails closed.
+    #[test]
+    fn test_production_floors_parse_and_gate_exactly() {
+        let toml = "default = 63.0\n[crates]\napp = 86.4\n[production]\n# x = 1\napp = 71.4 # note\n\"core\" = 88\n[files]\n\"app\" = 1.0\n";
+        let floors = parse_production_floors(toml).expect("no duplicate");
+        assert_eq!(floors.len(), 2);
+        assert_eq!(floors.get("app").map(String::as_str), Some("71.4"));
+        assert_eq!(floors.get("core").map(String::as_str), Some("88"));
+        assert_eq!(
+            parse_floors(toml).1.get("app").map(String::as_str),
+            Some("86.4")
+        );
+        assert!(parse_production_floors("[crates]\napp = 1.0\n").is_ok_and(|f| f.is_empty()));
+
+        assert_eq!(floor_hundredths("71.4"), Some(7_140));
+        assert_eq!(floor_hundredths("88"), Some(8_800));
+        assert_eq!(floor_hundredths("99.58"), Some(9_958));
+        assert_eq!(floor_hundredths("100"), Some(10_000));
+        for bad in ["", "71.", "71.456", "-1", "1e2", "abc", "100.01", " 7"] {
+            assert_eq!(floor_hundredths(bad), None, "{bad:?}");
+        }
+
+        // The fixture's app crate: production 5 of 13 = 38.46%.
+        let files = parse_export(FIXTURE.as_bytes()).expect("fixture parses");
+        let report = build_report(&files, |_| Some(FIXTURE_LIB.to_string()));
+        let gate = |floor: &str| {
+            let mut f = BTreeMap::new();
+            f.insert("app".to_string(), floor.to_string());
+            check_production_floors(&report, &f)
+        };
+        // 5 / 13 = 0.384615..., so 38.46 passes and 38.47 fails.
+        let (text, ok) = gate("38.46");
+        assert!(ok, "{text}");
+        assert!(
+            text.contains("PASS: app 38.46% production (floor: 38.46%)"),
+            "{text}"
+        );
+        let (text, ok) = gate("38.47");
+        assert!(!ok, "{text}");
+        assert!(text.contains("FAIL: app"), "{text}");
+        let (text, ok) = gate("seventy");
+        assert!(!ok && text.contains("does not parse"), "{text}");
+        let mut missing = BTreeMap::new();
+        missing.insert("ghost".to_string(), "1.0".to_string());
+        let (text, ok) = check_production_floors(&report, &missing);
+        assert!(!ok && text.contains("MISSING: ghost"), "{text}");
+    }
+
+    #[test]
+    fn test_outcome_exits_one_below_a_production_floor_and_on_an_unreadable_thresholds_file() {
+        let source = temp_file("crates/app/src/lib.rs", FIXTURE_LIB);
+        let json = FIXTURE.replace("/w/crates/app/src/lib.rs", &source.to_string_lossy());
+        let good = temp_file("good_prod.json", &json);
+        let run = |floors: &str| {
+            let path = temp_file("prod_floors.toml", floors);
+            outcome(&[
+                "x".into(),
+                good.to_string_lossy().into_owned(),
+                path.to_string_lossy().into_owned(),
+            ])
+        };
+        let (text, code) = run("default = 63.0\n[crates]\napp = 1.0\n[production]\napp = 38.46\n");
+        assert_eq!(code, 0, "{text}");
+        assert!(text.contains("## Production floors"), "{text}");
+        let (text, code) = run("default = 63.0\n[crates]\napp = 1.0\n[production]\napp = 38.47\n");
+        assert_eq!(code, 1, "{text}");
+        assert!(text.starts_with("## Production-only"), "{text}");
+        assert!(text.contains("FAIL: app"), "{text}");
+        let (text, code) = outcome(&[
+            "x".into(),
+            good.to_string_lossy().into_owned(),
+            "/nonexistent/thresholds.toml".into(),
+        ]);
+        assert_eq!(code, 1, "{text}");
+        assert!(
+            text.starts_with("cannot read /nonexistent/thresholds.toml"),
+            "{text}"
+        );
+    }
+
+    // B3 review (2026-11-13): a second, lower line for the same crate used to
+    // win (the map kept the last one), so the gate passed at 1% while the
+    // lockdown test still read the first, pinned line. Both spellings of the
+    // key count as one crate, and the run fails.
+    #[test]
+    fn test_regression_a_duplicate_production_floor_fails_the_run() {
+        let source = temp_file("crates/app/src/lib.rs", FIXTURE_LIB);
+        let json = FIXTURE.replace("/w/crates/app/src/lib.rs", &source.to_string_lossy());
+        let good = temp_file("dup_prod.json", &json);
+        let run = |floors: &str| {
+            let path = temp_file("dup_prod_floors.toml", floors);
+            outcome(&[
+                "x".into(),
+                good.to_string_lossy().into_owned(),
+                path.to_string_lossy().into_owned(),
+            ])
+        };
+        // The fixture's app crate is 38.46% production: 99.0 alone fails.
+        let (text, code) = run("[production]\napp = 99.0\n");
+        assert_eq!(code, 1, "{text}");
+        for dup in [
+            "[production]\napp = 99.0\napp = 1.0\n",
+            "[production]\napp = 99.0\n\"app\" = 1.0\n",
+            "[production]\napp = 99.0\n[files]\nx = 1\n[production]\napp = 1.0\n",
+        ] {
+            let (text, code) = run(dup);
+            assert_eq!(code, 1, "{dup:?} -> {text}");
+            assert!(text.contains("written twice"), "{dup:?} -> {text}");
+            assert!(!text.contains("PASS: app"), "{dup:?} -> {text}");
+        }
+        assert!(parse_production_floors("[production]\napp = 1\n\"app\" = 2\n").is_err());
     }
 
     #[test]

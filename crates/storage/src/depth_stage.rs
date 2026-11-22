@@ -152,6 +152,12 @@ pub struct DepthStagedBatch {
     values: Vec<f64>,
     pins: [Option<Arc<CandleContractLabels>>; DEPTH_STAGE_LABEL_PINS],
     pin_count: u8,
+    /// Speed fix 5 (2026-11-17): the name-table publish generation read
+    /// just before the table at the LAST pin was loaded, when known. While
+    /// the generation has not moved, that table is the one a fresh load
+    /// would return, so a name lookup can skip the load. `None` after a pin
+    /// of unknown generation and after [`Self::clear`].
+    last_pin_generation: Option<u64>,
     /// Exact ILP text bytes of every staged row (see [`book_line_len`]).
     text_bytes: usize,
     /// Levels staged, counted as the writer's `pending` counts them (a side
@@ -181,6 +187,7 @@ impl DepthStagedBatch {
             values: Vec::new(),
             pins: [const { None }; DEPTH_STAGE_LABEL_PINS],
             pin_count: 0,
+            last_pin_generation: None,
             text_bytes: 0,
             levels_total: 0,
             refused_levels: 0,
@@ -192,7 +199,7 @@ impl DepthStagedBatch {
     #[must_use]
     pub(crate) fn presized() -> Self {
         let mut batch = Self::new();
-        batch.reserve_presize();
+        let _fresh = batch.reserve_presize();
         batch
     }
 
@@ -207,19 +214,26 @@ impl DepthStagedBatch {
     }
 
     /// Reserves to the pre-size and touches the new pages, when smaller.
-    pub(crate) fn reserve_presize(&mut self) {
+    /// Returns `true` when either part reserved (2026-11-16: the writer
+    /// counts a fresh reserve on the drain's hand-off,
+    /// `tv_depth_stage_presize_fresh_total`).
+    pub(crate) fn reserve_presize(&mut self) -> bool {
+        let mut fresh = false;
         if self.rows.capacity() < DEPTH_STAGED_ROWS_PRESIZE {
             let have = self.rows.len();
             self.rows
                 .reserve_exact(DEPTH_STAGED_ROWS_PRESIZE.saturating_sub(have));
             prefault(&mut self.rows, StagedBookRow::FILLER);
+            fresh = true;
         }
         if self.values.capacity() < DEPTH_STAGED_VALUES_PRESIZE {
             let have = self.values.len();
             self.values
                 .reserve_exact(DEPTH_STAGED_VALUES_PRESIZE.saturating_sub(have));
             prefault(&mut self.values, 0.0);
+            fresh = true;
         }
+        fresh
     }
 
     /// Rows staged (refused ones included).
@@ -295,6 +309,8 @@ impl DepthStagedBatch {
             return Err(table);
         };
         *slot = Some(table);
+        // A carried table of unknown generation is now the last pin.
+        self.last_pin_generation = None;
         self.pin_count += 1;
         Ok(self.pin_count - 1)
     }
@@ -319,8 +335,42 @@ impl DepthStagedBatch {
             return Err(labels);
         };
         *slot = Some(Guard::into_inner(labels));
+        // Pinned with no generation: the next lookup loads the table again.
+        self.last_pin_generation = None;
         self.pin_count += 1;
         Ok(self.pin_count - 1)
+    }
+
+    /// [`Self::try_pin`] for a table loaded right AFTER `generation` was
+    /// read (speed fix 5, 2026-11-17): on success under a settled (even)
+    /// generation, the generation is kept with the last pin, so [`Self::current_pin_at_generation`] can answer
+    /// the next lookup without a table load. O(1).
+    pub(crate) fn try_pin_at_generation(
+        &mut self,
+        labels: Guard<Arc<CandleContractLabels>>,
+        generation: u64,
+    ) -> std::result::Result<u8, Guard<Arc<CandleContractLabels>>> {
+        let pinned = self.try_pin(labels);
+        // Kept only under a settled (even) generation: an odd one means a
+        // publish may be storing right now, so the next lookup loads again.
+        if pinned.is_ok() && crate::candle_contract_labels::generation_is_settled(generation) {
+            self.last_pin_generation = Some(generation);
+        }
+        pinned
+    }
+
+    /// The last pin, when it was loaded under `generation` (speed fix 5):
+    /// no table was published since, so a fresh table load would return
+    /// the table already pinned there and [`Self::try_pin`] would answer
+    /// this same index. `None` sends the caller to the load. O(1), one
+    /// compare.
+    #[inline]
+    pub(crate) fn current_pin_at_generation(&self, generation: u64) -> Option<u8> {
+        if self.last_pin_generation == Some(generation) {
+            self.pin_count.checked_sub(1)
+        } else {
+            None
+        }
     }
 
     /// Stages one side whose three slices the caller has already checked
@@ -360,6 +410,7 @@ impl DepthStagedBatch {
         self.clear_rows();
         self.pins = [const { None }; DEPTH_STAGE_LABEL_PINS];
         self.pin_count = 0;
+        self.last_pin_generation = None;
     }
 
     /// Empties the rows but KEEPS the name pins and the capacity: the clear
@@ -407,8 +458,9 @@ impl DepthStagedBatch {
         (self.rows.capacity(), self.values.capacity())
     }
 
-    /// The name table pinned at `pin`.
-    fn labels(&self, pin: u8) -> &CandleContractLabels {
+    /// The name table pinned at `pin` (the writer reads it on a name lookup
+    /// the generation check answered; speed fix 5). O(1).
+    pub(crate) fn labels(&self, pin: u8) -> &CandleContractLabels {
         self.pins
             .get(usize::from(pin))
             .and_then(Option::as_deref)

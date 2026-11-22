@@ -129,6 +129,7 @@ paths:
 13. **Timestamps — two conventions depending on data source.**
     - **Historical REST API** (`/v2/charts/historical`, `/v2/charts/intraday`): standard UNIX epoch (seconds since 1970-01-01 00:00 UTC). Add +5:30 (19800 seconds) for IST display.
     - **WebSocket Live Market Feed** (LTT fields in binary packets): IST epoch seconds. Do NOT add +5:30 — the raw value already represents IST wall-clock time. To convert to UTC, subtract 19800 seconds.
+    - ⚠ 2026-11-20: Dhan changed WebSocket LTT to UTC epoch, permanently, effective 20 Nov 2026 (ticket #6684672). From a frame receipt of 2026-11-20 00:00 IST, LTT is standard UNIX epoch like REST (IST = raw + 19,800 s, added once in the core dispatcher by WAL receipt; scope lock §"2026-11-21"). The IST-epoch line above holds for earlier receipts only.
     - NOT milliseconds, NOT microseconds, NOT custom epoch.
 
 14. **Error response structure — exactly 3 string fields.**

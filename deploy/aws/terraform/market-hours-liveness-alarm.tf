@@ -480,8 +480,6 @@ resource "aws_lambda_function" "tv_market_hours_liveness_gate" {
         #
         # Authorization and the binding constraints are the dated §2.3c row in
         # dhan-rest-only-noise-lock-2026-07-14.md. Count: read ALARM_NAMES above (it is authoritative).
-        aws_cloudwatch_metric_alarm.tick_spill_replay_failing.alarm_name,
-        aws_cloudwatch_metric_alarm.ticks_spilling.alarm_name,
         # 2026-10-22: depth_steering_stalled LEFT the gate with its alarm
         # (deleted by the alarm review under operator Quote 37, noise-lock
         # §2.14; depth is switched off). Restore both together if depth
@@ -519,7 +517,6 @@ resource "aws_lambda_function" "tv_market_hours_liveness_gate" {
         # threshold, so a genuine timestamp regression and a quiet market are
         # still not distinguishable by this alarm alone. The per-reason split
         # lives only in the 30-second AGGREGATOR-DROP-01 log line.
-        aws_cloudwatch_metric_alarm.aggregator_refusal_rate_high.alarm_name,
         # 2026-08-26: dhan_worst_socket_deaf JOINS the gate — OPERATOR-APPROVED
         # ("Yes, phone me", 2026-08-26).
         #
@@ -537,7 +534,6 @@ resource "aws_lambda_function" "tv_market_hours_liveness_gate" {
         # Authorization and the binding constraints are the dated §2.3i row in
         # dhan-rest-only-noise-lock-2026-07-14.md. Count: read ALARM_NAMES
         # alarms — this one and the depth-steering sibling added the same day.
-        aws_cloudwatch_metric_alarm.dhan_worst_socket_deaf.alarm_name,
         # 2026-09-01: the THREE "did it run?" alarms JOIN the gate.
         #
         # These are a different shape from everything above and the reason is
@@ -575,8 +571,10 @@ resource "aws_lambda_function" "tv_market_hours_liveness_gate" {
         # checks, not the primary signal.
         #
         # Count: read ALARM_NAMES above (it is authoritative).
-        aws_cloudwatch_metric_alarm.deploy_watchdog_not_invoked.alarm_name,
-        aws_cloudwatch_metric_alarm.market_open_readiness_not_invoked.alarm_name,
+        # 2026-11-11 (operator Quote 53 alarm review): the deploy-watchdog and
+        # market-open-readiness did-it-run alarms were removed; the
+        # boot-heartbeat-gate one is KEPT, because that gate arms the kept
+        # boot-heartbeat-missing page. The Muhurat open below still skips it.
         aws_cloudwatch_metric_alarm.boot_heartbeat_gate_not_invoked.alarm_name,
         # Joined 2026-09-23 (dhan-rest-only-noise-lock-2026-07-14.md §2.3x).
         # The process publishes 0 for this gauge from its 08:30 boot until the
@@ -807,15 +805,15 @@ resource "aws_cloudwatch_event_target" "tv_market_hours_liveness_muhurat_open" {
   rule      = aws_cloudwatch_event_rule.tv_market_hours_liveness_muhurat_open[each.key].name
   target_id = "tv-market-hours-liveness-muhurat-open"
   arn       = aws_lambda_function.tv_market_hours_liveness_gate.arn
-  # The three did-it-run alarms watch MON-FRI Lambdas (Invocations < 1 over a
+  # The did-it-run alarms watch MON-FRI Lambdas (Invocations < 1 over a
   # day, breaching): armed on a weekend Muhurat date they would page for a
   # check that correctly did not run, so the gate leaves them disarmed
-  # (market_hours_gate::alarms_to_open, a subset only).
+  # (market_hours_gate::alarms_to_open, a subset only). 2026-11-11 (operator
+  # Quote 53, docs/audits/2026-11-alarm-review.md): the deploy-watchdog and
+  # market-open-readiness ones were removed, so one is left to skip.
   input = jsonencode({
     mode = "open"
     skip_alarms = [
-      aws_cloudwatch_metric_alarm.deploy_watchdog_not_invoked.alarm_name,
-      aws_cloudwatch_metric_alarm.market_open_readiness_not_invoked.alarm_name,
       aws_cloudwatch_metric_alarm.boot_heartbeat_gate_not_invoked.alarm_name,
     ]
   })

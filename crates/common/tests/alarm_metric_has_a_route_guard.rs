@@ -324,8 +324,10 @@ fn every_alarm_metric_can_actually_arrive() {
     );
 
     let selector = emf_selected(&root);
+    // Floor 50 -> 30 on 2026-11-11: operator Quote 53 trimmed the selector to
+    // the 43 names a kept alarm reads (docs/audits/2026-11-alarm-review.md).
     assert!(
-        selector.len() > 50,
+        selector.len() > 30,
         "EMF selector parsed to only {} names — parser drift, not a real \
          shrink; refusing to judge alarms against a broken read",
         selector.len()

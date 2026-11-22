@@ -690,6 +690,9 @@ where
         Ok(result) => result,
         Err(join_error) => Err(format!("chronyc probe task failed: {join_error}")),
     };
+    // Plan item LF-6a: the reading (or its absence) also feeds the per-minute
+    // `host_capacity_minute.clock_offset_ns` column. Two atomic stores.
+    let now_unix_secs = chrono::Utc::now().timestamp();
     match chronyc {
         Ok(sample) => {
             // Emit a Prometheus gauge so dashboards can plot drift over
@@ -697,9 +700,14 @@ where
             metrics::gauge!("tv_clock_skew_seconds", "source" => sample.source)
                 .set(sample.skew_secs);
             metrics::gauge!("tv_clock_skew_probe_available").set(1.0);
+            tickvault_storage::host_capacity_minute::publish_clock_offset(
+                Some(sample.skew_secs),
+                now_unix_secs,
+            );
             Ok(sample)
         }
         Err(primary_err) => {
+            tickvault_storage::host_capacity_minute::publish_clock_offset(None, now_unix_secs);
             debug!(
                 error = %primary_err,
                 "chronyc clock-skew probe failed; skew is unknown (no fallback source)"
@@ -747,9 +755,48 @@ async fn run_clock_skew_loop(interval: Duration) {
     // has just sampled, so skip it rather than probe twice in a second.
     ticker.tick().await;
     let mut failures: u64 = 0;
+    // Plan item LF-6a (noise lock §2.22): the first probe of each minute is
+    // that minute's sample for the 1 ms / 5-minute page. The latch is saved
+    // under data/state so a restart inside one unbroken episode does not page
+    // it again (once per episode).
+    let latch_dir = std::path::Path::new(crate::clock_offset_page::CLOCK_OFFSET_LATCH_DIR);
+    let restored = tickvault_storage::off_worker::off_worker(|| {
+        crate::clock_offset_page::restore_clock_offset_latch_in(
+            latch_dir,
+            crate::clock_offset_page::ist_date_of_unix_secs(chrono::Utc::now().timestamp()),
+        )
+    });
+    let mut episode = crate::clock_offset_page::ClockOffsetEpisode::with_latch(restored);
     loop {
         ticker.tick().await;
-        match probe_clock_skew().await {
+        let probed = probe_clock_skew().await;
+        // The RAW reading: the stored column's one-hour bound is not applied
+        // to the page, so the largest skews page too.
+        let minute_sample = match &probed {
+            Ok(s) => crate::clock_offset_page::clock_offset_sample_from_secs(s.skew_secs),
+            Err(_) => crate::clock_offset_page::ClockOffsetSample::Failed,
+        };
+        let now_unix_secs = chrono::Utc::now().timestamp();
+        let was_latched = episode.is_latched();
+        crate::clock_offset_page::report_clock_offset_verdict(
+            crate::clock_offset_page::feed_clock_offset_episode(
+                &mut episode,
+                now_unix_secs,
+                minute_sample,
+            ),
+        );
+        let is_latched = episode.is_latched();
+        if was_latched != is_latched {
+            tickvault_storage::off_worker::off_worker(|| {
+                crate::clock_offset_page::persist_clock_offset_latch_change_in(
+                    latch_dir,
+                    crate::clock_offset_page::ist_date_of_unix_secs(now_unix_secs),
+                    was_latched,
+                    is_latched,
+                )
+            });
+        }
+        match probed {
             Ok(sample) => {
                 failures = 0;
                 debug!(

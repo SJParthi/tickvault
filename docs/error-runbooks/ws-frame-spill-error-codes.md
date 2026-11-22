@@ -203,6 +203,58 @@ These `WS-SPILL-01` lines are not a writer or disk fault; the alarm text's
 | `replay_rows_lost` | ERROR | yes | A replayed row landed in neither QuestDB nor a spill. With `confirmed = false` (a tick row, or depth the table could not mark) the batch is held for the next boot. With `confirmed = true` (PR RD review, 2026-11-08) only order-book rows were lost: their range is marked for the after-close pass, the segments are archived, and the marks keep them on disk until that pass writes the rows back (below the 5% disk floor a marked segment with a verified S3 copy can still be deleted, `deferred_depth_deleted_under_disk_floor_copy_in_s3`). Check the depth and tick spill folders' size and the QuestDB logs. |
 | `replay_ack_wait_timeout` | ERROR | yes | The replay ack really waited its full time; the batch is held for the next boot. Check QuestDB health. |
 
+### 2026-11-11 — the replay DEFERRAL lines on the planned evening restart (noise lock §2.17 note)
+
+On the evening drain's own planned restart (the boot's frame cap is the
+evening allowance, or the boot's claim recorded it, since the STAGE-C replay
+runs before the cap is raised) the replay's two DEFERRAL lines are quiet.
+Nothing is lost on either: a deferred segment stays a `*.wal` file for a
+later boot. Owner confirmed 2026-11-11 ("Yes, quiet them too (Recommended)"; see the §2.17 note).
+
+| Code | `source` | Level | Pages | Meaning, and what to do |
+|---|---|---|---|---|
+| `WS-SPILL-01` | `replay_deferred` | ERROR | yes | The catch-up replay left segments past its RAM budget on a boot that is NOT the planned evening restart. A deferral on every boot means the WAL grows faster than replay drains it; read `tv_wal_unapplied_pinned_bytes` over several boots. |
+| `WS-SPILL-01` | `replay_deferred_planned` | WARN | no | The same line on the planned evening restart: the boot's slice ended with segments left, which is expected. The evening drain's progress check stops the restarts if the backlog does not shrink. |
+| `WS-SPILL-02` | *(no `source`)* | ERROR | yes | A replay pass deferred the remaining segments. `stopped_for_memory = true`: the host cannot hold the frames (raising the byte budget makes it worse); this one pages on EVERY boot, the planned one included. `false`: the byte budget; raise it or drain more often. |
+| `WS-SPILL-02` | `replay_budget_deferred_planned` | WARN | no | A BYTE-budget deferral (`stopped_for_memory = false`) on the planned evening restart. Expected; counted as before. |
+
+The ERROR lines keep their fields and text; only their log `target` moved to
+`tickvault_storage::wal_replay_frame_cap` (no alarm filter keys on it).
+
+### 2026-11-11 — the replay limit lines page only when the backlog is stuck (noise lock §2.20)
+
+Owner card "Page only if stuck (Recommended)", answered after the 8:33 AM IST
+SOS "safety capture hit a limit". Once per start, after the WAL folder is
+claimed and before the boot replay, the app counts the waiting segments the
+replay would still read and compares the count with the one saved by the
+previous start that was NOT a planned evening restart (the planned evening
+restart saves no count) in `data/state/wal-backlog-trend.state`. The record
+is one line, `v2 <IST date> <count|unknown> <crc32 hex>`, the CRC-32 (IEEE,
+eight lower-case hex digits) of the text before the space that precedes it,
+then a newline. A
+`v1` line, or one whose checksum does not match, reads as unreadable and
+pages; do not write the file by hand (delete it instead: the next start then
+reads `first_start` and pages once). A count taken while segments wait but
+the applied watermark (`applied.tvaw`) is absent, rejected or overflowed
+with no known height is saved as `unknown`, so the start after it pages too.
+The boot log carries one `info!` line with `verdict`,
+`previous_backlog_segments` and `backlog_segments`.
+
+| Code | `source` | Level | Pages? | Meaning / action |
+|---|---|---|---|---|
+| `WS-SPILL-01` | `replay_frame_cap_shrinking` | WARN | no | The frame cap stopped this start's replay, and the waiting backlog is strictly lower than at the previous start: it is draining. Counted on `tv_wal_replay_frame_cap_stops_total` as before. |
+| `WS-SPILL-01` | `replay_deferred_shrinking` | WARN | no | The catch-up replay left segments for the next start on a shrinking backlog. |
+| `WS-SPILL-02` | `replay_budget_deferred_shrinking` | WARN | no | A BYTE-budget deferral on a shrinking backlog. A MEMORY-guard stop (`stopped_for_memory = true`) still pages on every start. |
+| `WS-SPILL-01` | `wal_backlog_trend_state` | WARN | no | The record could not be saved. This start's replay-limit lines page (verdict `state_not_saved`) whatever it compared, and so does every later start that cannot save it, so a folder that stays unwritable pages on every start. Whatever record is at the path is removed when it can be (`record_removed = true`; `removed_record` says whether it was the previous start's or this start's, the latter when only the folder sync after the rename failed; `removal_synced = false` means a power cut can bring a record back); when it cannot (the folder itself is not writable, so unlink fails too), it stays until a save succeeds, and the first start after the folder recovers can compare against it once. Check the `data/state` folder is writable. The planned evening restart never saves a count (by design, not a failure). |
+
+The plain `replay_frame_cap`, `replay_deferred` and byte-budget ERROR lines
+still page on a first start, an unreadable or future-dated record, an
+unknown count now or before, or an equal or higher count: that is a stuck
+backlog. Read `tv_wal_unapplied_pinned_bytes` over several starts.
+`replay_rows_lost` and `replay_ack_wait_timeout` are unchanged and always
+page. Honest limit: a backlog that falls by one segment per start stays
+quiet on the phone; it is on the counters and the boot `info!` line.
+
 ---
 
 ## §3. Trigger / auto-load

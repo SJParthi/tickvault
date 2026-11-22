@@ -36,6 +36,23 @@
 /// Shrink-only in spirit: adding a row is a decision that must be justified
 /// in writing, not a way to make the build green.
 const DELIBERATELY_LOCAL_ONLY: &[(&str, &str)] = &[
+    // 2026-11-11, operator Quote 53: four writer metrics left CloudWatch.
+    (
+        "tv_tick_optional_price_dropped_total",
+        "ADDED 2026-11-11 (operator Quote 53, card \"Trim CloudWatch metrics\": CloudWatch receives only the metrics an alarm reads). It was EMF-shipped and read by no alarm (docs/audits/2026-11-alarm-review.md), so it left the selector; it stays on the box's local /metrics. The tick row itself is written; only an optional price column is dropped.",
+    ),
+    (
+        "tv_tick_spill_over_soft_ceiling_total",
+        "ADDED 2026-11-11 (operator Quote 53, card \"Trim CloudWatch metrics\": CloudWatch receives only the metrics an alarm reads). It was EMF-shipped and read by no alarm (docs/audits/2026-11-alarm-review.md), so it left the selector; it stays on the box's local /metrics. A soft rail: nothing is lost at the soft ceiling; a real tick loss is paged by ticks-dropped and ticks-lost-spill.",
+    ),
+    (
+        "tv_depth_spill_over_soft_cap_total",
+        "ADDED 2026-11-11 (operator Quote 53, card \"Trim CloudWatch metrics\": CloudWatch receives only the metrics an alarm reads). It was EMF-shipped and read by no alarm (docs/audits/2026-11-alarm-review.md), so it left the selector; it stays on the box's local /metrics. A soft rail: nothing is lost at the soft cap; lost depth rows are paged by market-data-persistence-loss.",
+    ),
+    (
+        "tv_depth_spill_write_errors_total",
+        "ADDED 2026-11-11 (operator Quote 53, card \"Trim CloudWatch metrics\": CloudWatch receives only the metrics an alarm reads). It was EMF-shipped and read by no alarm (docs/audits/2026-11-alarm-review.md), so it left the selector; it stays on the box's local /metrics. The same arm counts the rows on tv_depth_rows_dropped_total, which the kept market-data-persistence-loss page reads, and logs a coded error!.",
+    ),
     (
         "tv_tick_rescue_deferred_to_wal_total",
         "ADDED 2026-09-26 (audit fix PR3). A CAUSE counter, not the loss \

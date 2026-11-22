@@ -8,7 +8,10 @@
 //! (the two CPU-affinity syscalls, each block bounds-checked with a SAFETY
 //! note) and, since 2026-10-12 (deep audit DA-12), the `statvfs_probe` module
 //! in `crates/storage/src/disk_health_watcher.rs` (one `statvfs` call that
-//! replaced a forked `df` process on the rescue free-space probe). Test code (Rust 2024 `env::set_var` in `#[cfg(test)]` modules) is
+//! replaced a forked `df` process on the rescue free-space probe). Since 2026-11-13 also the `ioctl_call`
+//! module in `crates/core/src/network/nic_coalesce.rs` (the one ethtool
+//! coalescing ioctl of the owner-approved one-day NIC trial, run only by
+//! `tickvault host-tuning apply`, never by the trading app). Test code (Rust 2024 `env::set_var` in `#[cfg(test)]` modules) is
 //! outside the lint by the `cfg_attr(not(test), ...)` form.
 //!
 //! These two tests stop the lint being removed quietly, and stop a second
@@ -133,6 +136,10 @@ fn allow_unsafe_code_appears_only_on_the_listed_modules() {
         sites,
         vec![
             (
+                "crates/core/src/network/nic_coalesce.rs".to_string(),
+                "mod ioctl_call {".to_string()
+            ),
+            (
                 "crates/core/src/websocket/reader_runtime.rs".to_string(),
                 "mod affinity {".to_string()
             ),
@@ -145,7 +152,7 @@ fn allow_unsafe_code_appears_only_on_the_listed_modules() {
                 "mod trim_call {".to_string()
             ),
         ],
-        "the only production opt-outs from deny(unsafe_code) are the affinity, \
+        "the only production opt-outs from deny(unsafe_code) are the ioctl_call, affinity, \
          statvfs_probe and trim_call modules; a new one needs its own SAFETY notes and this test \
          updated in the same change"
     );

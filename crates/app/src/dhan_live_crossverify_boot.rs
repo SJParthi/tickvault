@@ -149,6 +149,12 @@ pub const XVERIFY_PERSIST_ERRORS_COUNTER: &str = "tv_dhan_feed_xverify_persist_e
 /// `xverify_failed` (`reason = "not_persisted"`).
 pub const XVERIFY_PERSIST_DEADLINE_STOPS_COUNTER: &str =
     "tv_dhan_xverify_persist_deadline_stops_total";
+/// B1 review 4: audit persists skipped because the cross-verify tables were
+/// not keyed yet, by `pass` (`spot`, `options`). A deferral, not a loss: the
+/// attempt is retried and writes no marker. Local `/metrics` only: no EMF
+/// name, filter or alarm reads it.
+pub const XVERIFY_PERSIST_UNKEYED_SKIPS_COUNTER: &str =
+    "tv_dhan_xverify_persist_unkeyed_skips_total";
 /// Subscribed instruments the comparator cannot target (F&O etc.).
 pub const XVERIFY_UNVERIFIABLE_COUNTER: &str = "tv_dhan_xverify_targets_unverifiable_total";
 
@@ -764,6 +770,14 @@ pub struct PersistOutcome {
     /// Rows already buffered when the persist stopped at the deadline,
     /// abandoned on purpose (`abandon_pending`), never counted as discarded.
     pub rows_abandoned_at_deadline: usize,
+    /// B1 review 4: the cross-verify tables were not keyed, so the persist
+    /// appended and flushed nothing. A deferral, never a lost row: the
+    /// attempt reads `NotPersisted` (no marker, retried) and no §2.10
+    /// `audit_rows` counter moves. `final_flush_ok` is then `false`.
+    pub tables_not_keyed: bool,
+    /// Rows the persist did not write because the tables were not keyed (the
+    /// daily row included).
+    pub rows_not_written_unkeyed: usize,
 }
 
 /// The persist half of an attempt's verdict. `NotPersisted` when the final
@@ -1131,6 +1145,16 @@ pub trait ReadinessSource {
 struct ProductionReadiness<'a> {
     client: reqwest::Client,
     exec_url: &'a str,
+    /// UTC unix seconds. [`wall_clock_unix_secs`] in production; the daily
+    /// expiry-scope check passes its own injected clock (B3 review,
+    /// 2026-11-13), so the readiness wait's sleep to the live-final instant
+    /// follows the same clock as the rest of that task.
+    now_unix_secs: &'a (dyn Fn() -> i64 + Sync),
+}
+
+/// The wall clock, UTC unix seconds. O(1).
+fn wall_clock_unix_secs() -> i64 {
+    chrono::Utc::now().timestamp()
 }
 
 impl ReadinessSource for ProductionReadiness<'_> {
@@ -1160,7 +1184,7 @@ impl ReadinessSource for ProductionReadiness<'_> {
     }
 
     fn now_unix_secs(&self) -> i64 {
-        chrono::Utc::now().timestamp()
+        (self.now_unix_secs)()
     }
 }
 
@@ -1395,6 +1419,7 @@ async fn attempt_readiness(
     let src = ProductionReadiness {
         client,
         exec_url: &deps.questdb_exec_url,
+        now_unix_secs: &wall_clock_unix_secs,
     };
     let day_key = day_start_ist_nanos.div_euclid(1_000_000_000);
     let prior = FIRST_AFTER_LIVE_FINAL
@@ -1423,6 +1448,29 @@ pub async fn live_side_readiness(
     day_start_ist_nanos: i64,
     deadline: tokio::time::Instant,
 ) -> LiveReadiness {
+    live_side_readiness_with_clock(
+        exec_url,
+        today,
+        day_start_ist_nanos,
+        deadline,
+        &wall_clock_unix_secs,
+    )
+    .await
+}
+
+/// [`live_side_readiness`] with the clock passed in: `now_unix_secs` returns
+/// UTC unix seconds and is what the wait reads to decide how long to sleep
+/// before the live-final instant. The daily expiry-scope check passes its
+/// injected clock here (B3 review, 2026-11-13), so a test that fixes that
+/// task's date also fixes this wait. The sleeps are tokio sleeps either way.
+/// Same cost as [`live_side_readiness`].
+pub async fn live_side_readiness_with_clock(
+    exec_url: &str,
+    today: chrono::NaiveDate,
+    day_start_ist_nanos: i64,
+    deadline: tokio::time::Instant,
+    now_unix_secs: &(dyn Fn() -> i64 + Sync),
+) -> LiveReadiness {
     let Ok(client) = reqwest::Client::builder()
         .timeout(Duration::from_secs(READINESS_PROBE_TIMEOUT_SECS))
         .build()
@@ -1432,7 +1480,11 @@ pub async fn live_side_readiness(
             completeness: Completeness::Unknown,
         };
     };
-    let src = ProductionReadiness { client, exec_url };
+    let src = ProductionReadiness {
+        client,
+        exec_url,
+        now_unix_secs,
+    };
     wait_live_final(&src, today, day_start_ist_nanos, deadline, None)
         .await
         .0
@@ -1479,19 +1531,22 @@ fn day_start_ist_nanos_of(day: chrono::NaiveDate) -> i64 {
 /// `MAX_CROSSVERIFY_HOLD_DAYS` days before `today` with no day marker and no
 /// refused marker, oldest first, because the oldest is the next the S3 archive
 /// releases unverified. Whatever today's own marker says. Older days are not
-/// checked: the archive no longer waits for them. Pure, O(hold days).
+/// checked: the archive no longer waits for them. A day `is_held` (daily-universe
+/// Quote 63: `held_days` or a `.hold` file, until its repair `.done`) is
+/// skipped. Pure, O(hold days).
 #[must_use]
 pub fn past_days_to_check(
     today: chrono::NaiveDate,
     is_trading_day: impl Fn(chrono::NaiveDate) -> bool,
     is_recorded: impl Fn(chrono::NaiveDate) -> bool,
     is_refused: impl Fn(chrono::NaiveDate) -> bool,
+    is_held: impl Fn(chrono::NaiveDate) -> bool,
 ) -> Vec<chrono::NaiveDate> {
     let max = tickvault_storage::partition_archive::MAX_CROSSVERIFY_HOLD_DAYS;
     (1..=max)
         .rev()
         .filter_map(|age| today.checked_sub_signed(chrono::TimeDelta::try_days(age)?))
-        .filter(|d| is_trading_day(*d) && !is_recorded(*d) && !is_refused(*d))
+        .filter(|d| is_trading_day(*d) && !is_recorded(*d) && !is_refused(*d) && !is_held(*d))
         .collect()
 }
 
@@ -1624,11 +1679,27 @@ async fn run_past_days(
     tried: &mut Vec<chrono::NaiveDate>,
 ) -> bool {
     let calendar = Arc::clone(&deps.calendar);
+    // Quote 63: a held day is not checked until its repair `.done`. At most
+    // two small file reads per past day.
+    let held_days = tickvault_storage::held_days::process_held_days();
     let days = past_days_to_check(
         pass_day,
         |d| calendar.is_trading_day(d),
         |d| daily_marker_exists(CROSSVERIFY_MARKER_TASK, d),
         |d| daily_marker_exists(CROSSVERIFY_REFUSED_MARKER_TASK, d),
+        |d| {
+            let held = tickvault_storage::off_worker::off_worker(|| held_days.is_held(d));
+            if held {
+                info!(
+                    day = %d,
+                    "Dhan 1-minute cross-verification: a HELD past day (Quote 63) is skipped. \
+                     The catch-up looks back only 3 days, so a day released later is never \
+                     checked; once that window passes the archive copies it without a check \
+                     (logged as STORAGE-GAP-04)"
+                );
+            }
+            held
+        },
     );
     for day in days {
         // O(1) EXEMPT: at most MAX_CROSSVERIFY_HOLD_DAYS (3) entries.
@@ -2790,6 +2861,15 @@ async fn run_once(
                 extremes_live_outside = c.divergence_profile.extremes_live_outside,
                 missing_live_zero_volume = c.missing_live_zero_volume,
                 missing_live_index = c.divergence_profile.missing_live_index,
+                // §12.15.17 shadow split (never read by the verdict).
+                cells_boundary_consistent = c.divergence_profile.boundary_consistent,
+                cells_close_within_bar = c.divergence_profile.close_within_bar,
+                cells_unexplained = c.divergence_profile.unexplained,
+                cells_unexplained_open = c.divergence_profile.unexplained_open,
+                cells_unexplained_high = c.divergence_profile.unexplained_high,
+                cells_unexplained_low = c.divergence_profile.unexplained_low,
+                cells_unexplained_close = c.divergence_profile.unexplained_close,
+                index_missing_rest_closing = c.divergence_profile.index_missing_rest_closing,
                 findings = c.findings.len(),
                 rest_failures = report.rest_failures,
                 rest_failure_reasons = %report.rest_failure_breakdown.summary(),
@@ -2802,6 +2882,7 @@ async fn run_once(
                 vacuous = c.is_vacuous(),
                 "Dhan 1-minute cross-verification finished"
             );
+            ensure_xverify_tables_before(&deps.questdb, deadline).await;
             let complete = run_is_complete(
                 report.budget_elapsed,
                 report.live_truncated,
@@ -3098,6 +3179,30 @@ enum PersistScope {
     TapeOnly,
 }
 
+/// B1 (2026-11-13): when the boot's ensure of the three cross-verify tables
+/// was refused, re-runs it before this attempt persists, bounded by
+/// `deadline`. The writer refuses to post until the tables are keyed (a row
+/// reaching a missing table would make QuestDB create it in a shape no ensure
+/// can repair), so a refusal here leaves the attempt unpersisted and retried.
+/// One Acquire load when keyed (the normal case).
+async fn ensure_xverify_tables_before(questdb: &QuestDbConfig, deadline: tokio::time::Instant) {
+    use tickvault_storage::dhan_live_crossverify_persistence as xp;
+    if xp::xverify_tables_keyed() {
+        return;
+    }
+    let keyed = tokio::time::timeout_at(deadline, xp::ensure_dhan_live_crossverify_tables(questdb))
+        .await
+        .unwrap_or(false);
+    if !keyed {
+        warn!(
+            code = ErrorCode::DhanLiveXverify01RunDegraded.code_str(),
+            source = "xverify_tables_not_keyed",
+            "Dhan 1-minute cross-verification tables are still not created with their \
+             keys; this attempt's rows are not written and the attempt is retried"
+        );
+    }
+}
+
 /// Persists the run through the production writer, in batches of
 /// [`PERSIST_BATCH_ROWS`], stopping at `deadline`. See [`persist_report_into`].
 fn persist_report(
@@ -3148,6 +3253,20 @@ fn persist_report_into(
 ) -> PersistOutcome {
     let c = &report.comparison;
     let mut out = PersistOutcome::default();
+    // B1 review 4: with the tables not keyed every flush posts nothing and
+    // returns `Err`, which the code below would count as discarded rows and a
+    // failed final flush (a §2.10 `audit_rows` page per attempt). It is a
+    // deferral: append nothing, flush nothing, count the rows locally only.
+    if !writer.tables_keyed() {
+        let full = rows.scope == PersistScope::Full;
+        let findings = if full { c.findings.len() } else { 0 };
+        out.tables_not_keyed = true;
+        out.final_flush_ok = false;
+        out.rows_not_written_unkeyed = findings
+            .saturating_add(report.rest_tape.len())
+            .saturating_add(usize::from(full));
+        return finish_persist(report, out, 0, None, rows.scope);
+    }
     let mut batch_errors = 0_usize;
     // Counts the rows a flush took with it: on `Err` they were discarded; on
     // `Ok` with an empty buffer they were ACKed. An `Ok` that left rows
@@ -3287,6 +3406,18 @@ fn finish_persist(
 ) -> PersistOutcome {
     let c = &report.comparison;
     metrics::counter!(XVERIFY_PERSIST_ROWS_COUNTER).increment(out.rows_flushed as u64);
+    if out.tables_not_keyed {
+        // B1 review 4: local counters only. Never `XVERIFY_PERSIST_ERRORS_COUNTER`
+        // nor the writer's discard counter (both §2.10 `audit_rows` members):
+        // nothing was sent, the rows are recomputed by the next attempt, and
+        // the coded warn in `ensure_xverify_tables_before` is the signal.
+        metrics::counter!(
+            tickvault_storage::dhan_live_crossverify_persistence::DHAN_LIVE_XVERIFY_AUDIT_ROWS_ABANDONED_COUNTER
+        )
+        .increment(out.rows_not_written_unkeyed as u64);
+        metrics::counter!(XVERIFY_PERSIST_UNKEYED_SKIPS_COUNTER, "pass" => "spot").increment(1);
+        return out;
+    }
     if out.deadline_reached {
         // §12.15.8 (51b review): a deliberate stop counts only locally. It
         // never touches `XVERIFY_PERSIST_ERRORS_COUNTER` or the writer's
@@ -3607,6 +3738,7 @@ async fn run_option_pass(
     match result {
         Ok(report) => {
             let c = &report.comparison;
+            ensure_xverify_tables_before(&deps.questdb, deadline).await;
             let persisted_ok = persist_option_findings(&deps.questdb, &report, deadline);
             let label =
                 option_pass_outcome(c.is_vacuous(), report.budget_elapsed, report.rest_failures);
@@ -3698,6 +3830,9 @@ enum OptionPersist {
     Failed,
     /// The persist stopped before a flush it could not end by the deadline.
     StoppedAtDeadline,
+    /// B1 review 4: the tables were not keyed, so nothing was appended or
+    /// flushed (a deferral, counted locally only).
+    TablesNotKeyed,
 }
 
 /// The body of [`persist_option_findings`], with the writer and the clock
@@ -3710,6 +3845,17 @@ fn persist_option_findings_into(
     mut now: impl FnMut() -> tokio::time::Instant,
 ) -> OptionPersist {
     let c = &report.comparison;
+    // B1 review 4: as in `persist_report_into`, an un-keyed writer flushes
+    // nothing; skip before any append so no refused flush reaches
+    // `XVERIFY_PERSIST_ERRORS_COUNTER` (a §2.10 `audit_rows` member).
+    if !writer.tables_keyed() {
+        metrics::counter!(
+            tickvault_storage::dhan_live_crossverify_persistence::DHAN_LIVE_XVERIFY_AUDIT_ROWS_ABANDONED_COUNTER
+        )
+        .increment((c.findings.len() as u64).saturating_add(report.rest_tape.len() as u64));
+        metrics::counter!(XVERIFY_PERSIST_UNKEYED_SKIPS_COUNTER, "pass" => "options").increment(1);
+        return OptionPersist::TablesNotKeyed;
+    }
     let mut row_errors = 0_usize;
     let mut batch_errors = 0_usize;
     let mut flush_if_full = |w: &mut DhanLiveXverifyAuditWriter| {
@@ -3846,6 +3992,34 @@ mod tests {
     /// before its persist, and stamps that reading on its daily row and on
     /// every cell; `run_complete` on the row is the same `run_is_complete`
     /// value the marker decision uses. The option pass stamps its cells too.
+    /// Regression, B1 (2026-11-13): every attempt re-runs the cross-verify
+    /// DDL (when the boot's ensure was refused) BEFORE it persists, on both
+    /// the spot and the option pass, and the helper asks the keyed verdict.
+    #[test]
+    fn test_regression_each_attempt_ensures_the_tables_before_persisting() {
+        let prod = prod_src();
+        for (pass, persist) in [
+            (
+                "async fn run_once(",
+                "persist_report(&deps.questdb, &report, rows, deadline)",
+            ),
+            (
+                "async fn run_option_pass(",
+                "persist_option_findings(&deps.questdb",
+            ),
+        ] {
+            let body = fn_body(prod, pass);
+            let ensure = body
+                .find("ensure_xverify_tables_before(&deps.questdb, deadline).await")
+                .unwrap_or_else(|| panic!("{pass} must ensure the tables"));
+            let write = body.find(persist).expect("the persist call");
+            assert!(ensure < write, "{pass}: ensure, then persist");
+        }
+        let helper = fn_body(prod, "async fn ensure_xverify_tables_before(");
+        assert!(helper.contains("xverify_tables_keyed()"));
+        assert!(helper.contains("ensure_dhan_live_crossverify_tables(questdb)"));
+    }
+
     #[test]
     fn test_every_persisted_row_carries_one_attempt_stamp_and_the_run_complete_flag() {
         let prod = prod_src();
@@ -4305,6 +4479,8 @@ mod tests {
                 deadline_reached: false,
                 rows_not_written_at_deadline: 0,
                 rows_abandoned_at_deadline: 0,
+                tables_not_keyed: false,
+                rows_not_written_unkeyed: 0,
             };
             let lost = rows_discarded > 0 || cell_append_errors > 0 || tape_append_errors > 0;
             let expected = if !final_flush_ok || !daily_appended {
@@ -4406,6 +4582,50 @@ mod tests {
             live_truncated: false,
             rest_tape: (0..tape).map(|i| tape_row(to_i64(i))).collect(),
         }
+    }
+
+    /// Regression, B1 review 4: with the cross-verify tables not keyed, both
+    /// passes append and flush nothing, the spot attempt reads
+    /// `NotPersisted` (no marker, retried), and the §2.10 `audit_rows`
+    /// counters (`XVERIFY_PERSIST_ERRORS_COUNTER` and the writer's discard
+    /// counter) are never registered. Before the fix, the final flush's
+    /// refusal took `finish_persist`'s error arm and paged per attempt.
+    #[test]
+    fn test_regression_unkeyed_tables_skip_the_persist_and_never_page() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let report = report_with(5, 3);
+        let t0 = tokio::time::Instant::now();
+        let far = t0 + Duration::from_secs(86_400);
+        let (spot, options) = metrics::with_local_recorder(&recorder, || {
+            let mut writer = DhanLiveXverifyAuditWriter::for_test_unkeyed();
+            let spot = persist_report_into(&mut writer, &report, test_rows(), 2, far, || t0);
+            assert_eq!(writer.pending(), 0, "nothing appended");
+            let mut writer = DhanLiveXverifyAuditWriter::for_test_unkeyed();
+            let options =
+                persist_option_findings_into(&mut writer, &report, TEST_ATTEMPT_AT, far, || t0);
+            assert_eq!(writer.pending(), 0, "nothing appended");
+            (spot, options)
+        });
+        assert!(spot.tables_not_keyed, "{spot:?}");
+        assert_eq!(spot.rows_not_written_unkeyed, 5 + 3 + 1, "{spot:?}");
+        assert_eq!(spot.rows_discarded, 0, "{spot:?}");
+        assert!(!spot.deadline_reached);
+        assert_eq!(persist_verdict(&spot), Err(AttemptFailure::NotPersisted));
+        assert_eq!(options, OptionPersist::TablesNotKeyed);
+        let rendered = handle.render();
+        assert!(
+            !rendered.contains(XVERIFY_PERSIST_ERRORS_COUNTER),
+            "the paging persist-errors counter must not move:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("tv_dhan_live_xverify_audit_rows_discarded_total"),
+            "the paging discard counter must not move:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(XVERIFY_PERSIST_UNKEYED_SKIPS_COUNTER),
+            "{rendered}"
+        );
     }
 
     /// §12.15.8: with the deadline already passed, no row is appended and no
@@ -6969,7 +7189,7 @@ mod tests {
     #[test]
     fn test_past_days_to_check_last_chance_first() {
         let today = chrono::NaiveDate::from_ymd_opt(2026, 10, 30).unwrap_or_default();
-        let all = past_days_to_check(today, |_| true, |_| false, |_| false);
+        let all = past_days_to_check(today, |_| true, |_| false, |_| false, |_| false);
         let max = tickvault_storage::partition_archive::MAX_CROSSVERIFY_HOLD_DAYS;
         assert_eq!(all.len(), usize::try_from(max).unwrap_or(0));
         assert!(all.windows(2).all(|w| w[0] < w[1]), "oldest first: {all:?}");
@@ -6981,11 +7201,21 @@ mod tests {
         assert!(!all.contains(&today));
         let yesterday = today.pred_opt().unwrap_or_default();
         let two_back = yesterday.pred_opt().unwrap_or_default();
-        let skip = past_days_to_check(today, |d| d != two_back, |d| d == yesterday, |_| false);
+        let skip = past_days_to_check(
+            today,
+            |d| d != two_back,
+            |d| d == yesterday,
+            |_| false,
+            |_| false,
+        );
         assert!(!skip.contains(&two_back), "not a trading day");
         assert!(!skip.contains(&yesterday), "already recorded");
-        let refused = past_days_to_check(today, |_| true, |_| false, |d| d == yesterday);
+        let refused = past_days_to_check(today, |_| true, |_| false, |d| d == yesterday, |_| false);
         assert!(!refused.contains(&yesterday), "refused days are not re-run");
+        // Quote 63: a held day is skipped; the others still run.
+        let held = past_days_to_check(today, |_| true, |_| false, |_| false, |d| d == yesterday);
+        assert!(!held.contains(&yesterday), "held days are not checked");
+        assert_eq!(held.len() + 1, all.len());
     }
 
     /// 51g: a past day's worst case is every attempt at its worst plus the
@@ -8085,7 +8315,20 @@ mod tests {
                 ));
             }
         }
+        /// Keeps a second, inert `tracing` dispatcher registered for the whole test
+        /// process. While a scoped subscriber is the only registered dispatcher,
+        /// tracing-core caches a callsite as `never` when a thread with no
+        /// subscriber reaches it first, and the scoped subscriber then misses the
+        /// line. Call before installing the scoped subscriber.
+        fn keep_callsite_interest_shared() {
+            static ANCHOR: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+            ANCHOR.get_or_init(|| {
+                tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default())
+            });
+        }
+
         let page_events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        keep_callsite_interest_shared();
         let page_dispatch = tracing::Dispatch::new(
             tracing_subscriber::registry().with(PageEvents(Arc::clone(&page_events))),
         );
@@ -8335,5 +8578,95 @@ mod tests {
             ],
             "actual alarm events occur once per date, with only a warning on same-day replay"
         );
+    }
+
+    /// B3 review (2026-11-13): the production readiness source used to read
+    /// the wall clock whatever its caller's clock said, so the daily
+    /// expiry-scope check's injected clock did not reach the readiness
+    /// wait's sleep to the live-final instant. The source now reads the
+    /// clock it is given; the cross-check passes the wall clock.
+    #[test]
+    fn production_readiness_reads_the_clock_it_was_given() {
+        let fixed = || 1_762_857_000_i64;
+        let src = ProductionReadiness {
+            client: reqwest::Client::new(),
+            exec_url: "http://tv-test-unreachable.invalid:9000/exec",
+            now_unix_secs: &fixed,
+        };
+        assert_eq!(src.now_unix_secs(), 1_762_857_000);
+        let wall = ProductionReadiness {
+            client: reqwest::Client::new(),
+            exec_url: "http://tv-test-unreachable.invalid:9000/exec",
+            now_unix_secs: &wall_clock_unix_secs,
+        };
+        let before = chrono::Utc::now().timestamp();
+        let read = wall.now_unix_secs();
+        let after = chrono::Utc::now().timestamp();
+        assert!(before <= read && read <= after, "{before} {read} {after}");
+    }
+
+    #[tokio::test]
+    async fn live_side_readiness_with_clock_is_not_ready_without_a_drained_seal_writer() {
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 11, 11).expect("date");
+        let day_start = day
+            .and_hms_opt(0, 0, 0)
+            .and_then(|dt| dt.and_utc().timestamp_nanos_opt())
+            .expect("nanos");
+        let clock = || 1_762_857_000_i64;
+        let readiness = live_side_readiness_with_clock(
+            "http://tv-test-unreachable.invalid:9000/exec",
+            day,
+            day_start,
+            tokio::time::Instant::now(),
+            &clock,
+        )
+        .await;
+        assert_ne!(readiness.durability, Durability::Applied, "{readiness:?}");
+    }
+
+    /// B3 review round 3 (2026-11-13): the test above passes with any clock
+    /// (its deadline cuts the early sleep off at once, and no seal writer
+    /// means not ready whatever the time), so nothing at run time proved
+    /// that `live_side_readiness_with_clock` hands the readiness wait the
+    /// clock it was given. Here the clock reads 600 s before the day's
+    /// live-final instant and counts its reads: the wait must read it (a
+    /// wall clock passed inside would leave the count at 0), and with a 300 s
+    /// deadline it must sleep to that deadline before its first sample, so
+    /// the call returns no earlier than 300 s of virtual time.
+    #[tokio::test(start_paused = true)]
+    async fn live_side_readiness_with_clock_sleeps_on_the_clock_it_was_given() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 11, 11).expect("date");
+        let day_start = day
+            .and_hms_opt(0, 0, 0)
+            .and_then(|dt| dt.and_utc().timestamp_nanos_opt())
+            .expect("nanos");
+        let early_reading = ReadinessDay::new(day_start)
+            .live_final_unix_secs
+            .saturating_sub(600);
+        let reads = AtomicUsize::new(0);
+        let clock = || {
+            reads.fetch_add(1, Ordering::Relaxed);
+            early_reading
+        };
+        let start = tokio::time::Instant::now();
+        let deadline = start + Duration::from_secs(300);
+        let readiness = live_side_readiness_with_clock(
+            "http://tv-test-unreachable.invalid:9000/exec",
+            day,
+            day_start,
+            deadline,
+            &clock,
+        )
+        .await;
+        assert!(
+            reads.load(Ordering::Relaxed) >= 1,
+            "the readiness wait must read the injected clock"
+        );
+        assert!(
+            tokio::time::Instant::now() >= deadline,
+            "the wait sleeps toward the live-final instant on the injected clock"
+        );
+        assert_ne!(readiness.durability, Durability::Applied, "{readiness:?}");
     }
 }

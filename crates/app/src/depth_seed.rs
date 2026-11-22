@@ -223,6 +223,7 @@ pub fn leg_code(leg: &str) -> u8 {
 /// from today's artifact so the seed WRITER can stamp each held contract.
 /// O(rows) once per write, at the 15:40 close, cold.
 #[must_use]
+// APPROVED: bare id, not single-segment — a reused id across exchanges stamps a wrong identity, and judge refuses it (fails closed).
 pub fn identity_index(rows: &[ContractRow]) -> HashMap<u64, (u32, i64, u8)> {
     let mut index = HashMap::with_capacity(rows.len());
     for r in rows {
@@ -420,6 +421,7 @@ enum Verdict {
 struct TodayIndex {
     /// `security_id` → (is a stock-option CE/PE leg, expiry `YYYYMMDD`,
     /// strike paise, leg code).
+    // APPROVED: bare id, not single-segment — the artifact spans exchanges; a reused id fails closed (is_leg false, or Segment / IdentityChanged in judge).
     rows: HashMap<u64, (bool, u32, i64, u8)>,
 }
 

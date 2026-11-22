@@ -140,6 +140,28 @@ pub fn mark_table_ensured(table: GatedTable) {
     ENSURED.fetch_or(table.bit(), Ordering::Release);
 }
 
+/// Whether `ddl` is one of the statements that key a table: its CREATE or its
+/// `DEDUP ENABLE`. The `ADD COLUMN IF NOT EXISTS` self-heals are best-effort
+/// (ILP adds a missing column itself; a refused one is a gap, not a table that
+/// dedups wrongly forever), the same split as the cross-verify tables'
+/// `xverify_ddl_is_key_bearing`. Pure.
+#[must_use]
+pub fn ddl_is_key_bearing(ddl: &str) -> bool {
+    ddl.starts_with("CREATE") || ddl.contains("DEDUP ENABLE")
+}
+
+/// Records that every KEY-BEARING statement of `table`'s ensure (see
+/// [`ddl_is_key_bearing`]) was accepted, even if a column self-heal was
+/// refused. Sets the same bit as [`mark_table_ensured`]: the gates (live
+/// writers and spill replay) only need the table to exist with its key.
+///
+/// B1 review (2026-11-13): before this, the bit needed EVERY statement, so one
+/// refused `ADD COLUMN` on an already-keyed table shut the live tick writer
+/// and the spill replay for the whole session. O(1).
+pub fn mark_table_keyed(table: GatedTable) {
+    ENSURED.fetch_or(table.bit(), Ordering::Release);
+}
+
 /// A snapshot of which gated tables are ensured. `Copy`, so a replay round
 /// judges every file against one reading.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,6 +230,193 @@ pub fn first_unensured_in_record(
         return first_unensured_in_lines(payload, ensured);
     }
     GatedTable::from_measurement(measurement_name(payload)).filter(|t| !ensured.contains(*t))
+}
+
+// ---------------------------------------------------------------------------
+// The LIVE writers' gate (B1, 2026-11-13).
+//
+// The spill replay above was gated; the live `ticks` / `tick_quotes` /
+// `feed_aux_packets` writer and the `market_depth` level writer were not.
+// When the boot's bounded live-table DDL gave up (QuestDB still replaying its
+// WAL), the first live flush made QuestDB create the table itself, with the
+// `timestamp` shape that can never take the DEDUP key, and the background
+// re-run could never repair it. Once the gate is ARMED (by the boot's
+// live-table DDL step, `candle_ddl_boot::run_live_table_ddl_at_boot`, before
+// its first ensure), a live writer posts only into tables this process has
+// ensured; until then each batch takes the writer's existing rescue (the
+// spill file, which the replay above posts once the table is ensured, or the
+// WAL deferral). Nothing is dropped. One Acquire load per FLUSH, never per
+// row. A process that never runs the boot DDL step (a unit test driving a
+// writer against a mock server) never arms it and posts as before.
+// ---------------------------------------------------------------------------
+
+/// Set once the boot's live-table DDL step starts. Never cleared.
+static LIVE_WRITE_GATE_ARMED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Arms the live writers' gate. Called by the boot's live-table DDL step
+/// before its first ensure. O(1).
+pub fn arm_live_write_gate() {
+    LIVE_WRITE_GATE_ARMED.store(true, Ordering::Release);
+}
+
+/// The tables one live `ticks` writer batch can hold rows for.
+pub const LIVE_TICK_TABLES: [GatedTable; 3] = [
+    GatedTable::Ticks,
+    GatedTable::TickQuotes,
+    GatedTable::FeedAuxPackets,
+];
+
+/// The tables a live tick batch's TICK rows go to (B1 review 2): `ticks` and
+/// `tick_quotes`. Its `feed_aux_packets` rows are judged on their own
+/// ([`LIVE_TICK_AUX_TABLES`]), so an auxiliary table that cannot be keyed
+/// never holds the ticks back: the writer thread sets only the aux rows aside
+/// to the spill and posts the rest. B1 review 3: the writer thread now judges
+/// each of the three tables on its own (`tick_quotes` rows are set aside the
+/// same way), and the replay check reads this set through
+/// `catchup_stop::replay_ready`, which drops an un-keyable `tick_quotes`.
+pub const LIVE_TICK_MAIN_TABLES: [GatedTable; 2] = [GatedTable::Ticks, GatedTable::TickQuotes];
+
+/// The table a live tick batch's auxiliary rows go to (B1 review 2).
+pub const LIVE_TICK_AUX_TABLES: [GatedTable; 1] = [GatedTable::FeedAuxPackets];
+
+/// Bit per [`GatedTable`]: set once this process found the table EXISTING in
+/// a shape that can never take its DEDUP key (designated timestamp not `ts`:
+/// QuestDB created it itself from an ILP row before our CREATE ran). No DDL
+/// re-run can repair that, so the live gate stays shut for that table until
+/// someone repairs it by hand (B1 review 2). Never cleared.
+static UNKEYABLE: AtomicU8 = AtomicU8::new(0);
+
+/// Whether `table` was found un-keyable in this process (see [`UNKEYABLE`]).
+/// One Acquire load.
+#[must_use]
+pub fn table_unkeyable(table: GatedTable) -> bool {
+    UNKEYABLE.load(Ordering::Acquire) & table.bit() != 0
+}
+
+/// The designated timestamp column of a table's `table_columns()` answer, or
+/// `None` when it has none. O(columns), cold.
+fn designated_timestamp(columns: &[crate::depth_persistence::TableColumn]) -> Option<&str> {
+    // O(1) EXEMPT: boot-only, once per refused ensure, over the table's few columns.
+    columns
+        .iter()
+        .find(|c| c.designated)
+        .map(|c| c.name.as_str())
+}
+
+/// Whether an EXISTING table (non-empty `columns`) cannot take a DEDUP key on
+/// `ts` because its designated timestamp is something else (or missing).
+/// Pure, O(columns).
+#[must_use]
+pub(crate) fn columns_are_unkeyable(columns: &[crate::depth_persistence::TableColumn]) -> bool {
+    !columns.is_empty() && designated_timestamp(columns) != Some("ts")
+}
+
+/// Request timeout, in seconds, of the one shape probe
+/// [`diagnose_refused_key`] makes (the DDL client's own bound).
+const DIAGNOSE_TIMEOUT_SECS: u64 = 10;
+
+/// Called by an ensure whose KEY-BEARING statement was refused (B1 review 2):
+/// reads `table`'s columns once and, when the table exists with a designated
+/// timestamp other than `ts`, records it un-keyable and logs ONE coded error
+/// per table per process saying the live feed for it is HELD and how to
+/// repair it. A table that is merely missing, or an answer it cannot read, is
+/// left alone (the re-run may still key it). Returns whether it is
+/// un-keyable. One HTTP query, cold (only after a refusal).
+pub async fn diagnose_refused_key(
+    questdb_config: &tickvault_common::config::QuestDbConfig,
+    table: GatedTable,
+) -> bool {
+    // APPROVED: QuestDB base URL, once per refused ensure
+    let url = format!(
+        "http://{}:{}/exec",
+        questdb_config.host, questdb_config.http_port
+    );
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(DIAGNOSE_TIMEOUT_SECS))
+        .build()
+    else {
+        return false;
+    };
+    // APPROVED: boot-only probe query
+    let query = format!("SELECT * FROM table_columns('{}')", table.name());
+    let Ok(resp) = client
+        .get(&url)
+        .query(&[("query", query.as_str())])
+        .send()
+        .await
+    else {
+        return false;
+    };
+    if !resp.status().is_success() {
+        return false;
+    }
+    let Ok(body) = resp.text().await else {
+        return false;
+    };
+    let Some(columns) = crate::depth_persistence::parse_table_columns_answer(&body) else {
+        return false;
+    };
+    if !columns_are_unkeyable(&columns) {
+        return false;
+    }
+    let before = UNKEYABLE.fetch_or(table.bit(), Ordering::AcqRel);
+    if before & table.bit() == 0 {
+        tracing::error!(
+            code = tickvault_common::error_code::ErrorCode::HotPath02WriterQueueDrop.code_str(),
+            source = "live_table_unkeyable",
+            table = table.name(),
+            designated = designated_timestamp(&columns).unwrap_or("none"),
+            "a live table exists in a shape that can never take its DEDUP key (its designated \
+             timestamp is not ts: QuestDB created it itself from a row written before our \
+             CREATE). No automatic re-run can repair it, so the live feed for this table is \
+             HELD: its rows stay in the spill files and the frame log and are not in QuestDB \
+             until the table is repaired by hand (rename it aside, then restart so the boot \
+             creates it with ts and the key)."
+        );
+    }
+    true
+}
+
+/// Pure: whether a live batch with rows for `tables` may be posted, given
+/// whether the gate is `armed` and the `ensured` snapshot. O(tables).
+#[must_use]
+pub fn live_batch_writable(armed: bool, ensured: EnsuredTables, tables: &[GatedTable]) -> bool {
+    !armed || tables.iter().all(|t| ensured.contains(*t))
+}
+
+/// Whether a live batch with rows for `tables` may be posted now. Two Acquire
+/// loads; called once per flush, never per row.
+#[must_use]
+// WIRING-EXEMPT: called through the `table_gate` fn pointer TickWriter and DepthWriter hold (set in their constructors), never by name with parentheses.
+pub fn live_tables_writable(tables: &[GatedTable]) -> bool {
+    live_batch_writable(
+        LIVE_WRITE_GATE_ARMED.load(Ordering::Acquire),
+        EnsuredTables::current(),
+        tables,
+    )
+}
+
+/// Edge latch for [`note_live_batch_held`]: one line per process.
+static LIVE_HOLD_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Logs, once per process, that a live writer rescued a batch because its
+/// table is not yet keyed. The per-batch rescue line names each batch. Cold.
+pub fn note_live_batch_held(writer: &'static str) {
+    if !LIVE_HOLD_LOGGED.swap(true, Ordering::AcqRel) {
+        tracing::warn!(
+            code = tickvault_common::error_code::ErrorCode::HotPath02WriterQueueDrop.code_str(),
+            source = "live_write_held_table_not_keyed",
+            writer,
+            "a live writer is not posting: its table has not been created with its DEDUP key \
+             in this process yet (the boot DDL was refused). Posting now would let QuestDB \
+             create the table itself in a shape that can never take the key. Its batches go \
+             to the spill file (or stay in the frame log) and are written once the DDL \
+             re-run keys the table. Until then those rows are on disk, NOT in QuestDB; if the \
+             table already exists in the wrong shape (see source live_table_unkeyable) no \
+             re-run can key it and the rows wait for a repair by hand."
+        );
+    }
 }
 
 /// Edge latch for [`note_replay_held_table_not_ensured`]'s log line: one bit
@@ -293,6 +502,143 @@ pub fn note_replay_held_table_not_ensured(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A QuestDB stand-in for the un-keyable case: it refuses every
+    /// `DEDUP ENABLE` the way QuestDB does for a table it created itself, and
+    /// answers `table_columns` with a designated timestamp named `timestamp`.
+    fn auto_created_table_server() -> u16 {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut request = Vec::new();
+                let mut buf = [0u8; 8_192];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => request.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let head = String::from_utf8_lossy(&request);
+                let body = if head.contains("table_columns") {
+                    r#"{"columns":[{"name":"column","type":"STRING"},{"name":"type","type":"STRING"},{"name":"designated","type":"BOOLEAN"}],"dataset":[["timestamp","TIMESTAMP",true],["kind","SYMBOL",false]]}"#
+                } else if head.contains("DEDUP") {
+                    ""
+                } else {
+                    "{}"
+                };
+                let status = if body.is_empty() {
+                    "400 Bad Request"
+                } else {
+                    "200 OK"
+                };
+                let reply = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(reply.as_bytes());
+            }
+        });
+        port
+    }
+
+    /// Regression, B1 review 2 (2026-11-13): a live table QuestDB created
+    /// itself (designated timestamp `timestamp`, so `DEDUP ENABLE ... (ts, ..)`
+    /// is refused with "column not found [ts]") was held silently all
+    /// session: the gate stayed shut, the re-run retried every 30 s, and the
+    /// only line said "nothing is lost". The ensure now probes the table's
+    /// shape after QuestDB refuses a key statement and records it
+    /// un-keyable (one coded error per table per process).
+    #[tokio::test]
+    async fn test_regression_diagnose_refused_key_marks_an_auto_created_table_unkeyable() {
+        let cfg = tickvault_common::config::QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: auto_created_table_server(),
+            pg_port: 1,
+            ilp_port: 1,
+        };
+        assert!(!table_unkeyable(GatedTable::FeedAuxPackets));
+        assert!(!crate::feed_aux_persistence::ensure_feed_aux_table(&cfg).await);
+        assert!(
+            table_unkeyable(GatedTable::FeedAuxPackets),
+            "the refused key on an auto-created table is recorded"
+        );
+    }
+
+    /// The shape check itself: only an EXISTING table whose designated
+    /// timestamp is not `ts` is un-keyable; a missing table is not.
+    #[test]
+    fn test_columns_are_unkeyable_only_for_an_existing_wrong_shape() {
+        use crate::depth_persistence::TableColumn;
+        let col = |name: &str, designated: bool| TableColumn {
+            name: name.to_string(),
+            ty: "TIMESTAMP".to_string(),
+            designated,
+        };
+        assert!(
+            !columns_are_unkeyable(&[]),
+            "no table yet: CREATE can make it"
+        );
+        assert!(!columns_are_unkeyable(&[col("ts", true), col("x", false)]));
+        assert!(columns_are_unkeyable(&[
+            col("timestamp", true),
+            col("ts", false)
+        ]));
+        assert!(
+            columns_are_unkeyable(&[col("ts", false)]),
+            "no designated timestamp"
+        );
+    }
+
+    /// Regression, B1 (2026-11-13): once armed, a live batch posts only when
+    /// EVERY table it can hold rows for is ensured; unarmed (no boot DDL step
+    /// in this process) it posts as before.
+    #[test]
+    fn test_live_batch_writable_regression_armed_gate_refuses_an_unkeyed_table() {
+        let none = EnsuredTables::NONE;
+        assert!(!live_batch_writable(true, none, &LIVE_TICK_TABLES));
+        let ticks_only = none.with(GatedTable::Ticks).with(GatedTable::TickQuotes);
+        assert!(
+            !live_batch_writable(true, ticks_only, &LIVE_TICK_TABLES),
+            "feed_aux_packets rides the same batch, so it must be keyed too"
+        );
+        let all = ticks_only.with(GatedTable::FeedAuxPackets);
+        assert!(live_batch_writable(true, all, &LIVE_TICK_TABLES));
+        assert!(!live_batch_writable(true, all, &[GatedTable::MarketDepth]));
+        assert!(live_batch_writable(false, none, &LIVE_TICK_TABLES));
+        assert!(live_batch_writable(false, none, &[GatedTable::MarketDepth]));
+    }
+
+    /// B1 review: only a CREATE or a `DEDUP ENABLE` decides the keyed verdict;
+    /// a column self-heal does not.
+    #[test]
+    fn test_ddl_is_key_bearing_splits_create_and_dedup_from_column_self_heals() {
+        let ticks = crate::tick_persistence::ticks_ensure_statements();
+        let keyed = ticks.iter().filter(|d| ddl_is_key_bearing(d)).count();
+        assert_eq!(keyed, 2, "the CREATE and the DEDUP ENABLE");
+        assert!(ticks.iter().any(|d| d.contains("ADD COLUMN")));
+        assert!(!ddl_is_key_bearing(
+            "ALTER TABLE ticks ADD COLUMN IF NOT EXISTS x LONG"
+        ));
+    }
+
+    /// `mark_table_keyed` opens the same bit `mark_table_ensured` does.
+    #[test]
+    fn test_mark_table_keyed_sets_the_process_bit() {
+        mark_table_keyed(GatedTable::MarketDepthBook);
+        assert!(EnsuredTables::current().contains(GatedTable::MarketDepthBook));
+    }
+
+    /// The hold line is written once per process, however many batches wait.
+    #[test]
+    fn test_note_live_batch_held_logs_once_per_process() {
+        note_live_batch_held("ticks");
+        assert!(LIVE_HOLD_LOGGED.load(Ordering::Acquire));
+        note_live_batch_held("market_depth");
+        assert!(LIVE_HOLD_LOGGED.load(Ordering::Acquire));
+    }
 
     #[test]
     fn test_from_measurement_reads_the_writer_constant_names() {
@@ -489,11 +835,10 @@ mod tests {
             (
                 include_str!("tick_persistence.rs"),
                 "fn ensure_ticks_table(",
-                "if every_statement_accepted {",
-                &[
-                    "let mut every_statement_accepted = true;",
-                    "every_statement_accepted = false;",
-                ],
+                // B1 review 3: the statements run in `ensure_ticks_tables_verdict`
+                // (its facts are checked below); the marks stay here.
+                "if verdict.every_statement_accepted {",
+                &["let verdict = ensure_ticks_tables_verdict("],
                 &["GatedTable::Ticks)", "GatedTable::TickQuotes)"],
             ),
             (
@@ -521,6 +866,24 @@ mod tests {
                 &["GatedTable::MarketDepthBook,"],
             ),
         ];
+        let ticks_verdict = function_body(
+            include_str!("tick_persistence.rs"),
+            "async fn ensure_ticks_tables_verdict(",
+        );
+        for fact in [
+            "let mut every_statement_accepted = true;",
+            "every_statement_accepted = false;",
+            "verdict.every_statement_accepted = every_statement_accepted;",
+        ] {
+            assert!(
+                ticks_verdict.contains(fact),
+                "ensure_ticks_tables_verdict: no `{fact}`"
+            );
+        }
+        assert!(
+            !ticks_verdict.contains("mark_table_"),
+            "the verdict function marks nothing; only its caller does"
+        );
         for (source, signature, opener, facts, tables) in cases {
             let body = function_body(source, signature);
             for fact in facts {

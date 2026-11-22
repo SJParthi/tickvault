@@ -6,7 +6,10 @@
 //! Every test asserts the outcome (the action, the guard, the ack, the
 //! counter and the coded log line), never only that a line ran. Logs are
 //! captured with a thread-local `tracing` subscriber and counters with a
-//! scoped `metrics` recorder, so nothing process-wide is installed.
+//! scoped `metrics` recorder, so nothing process-wide is installed (the one
+//! exception is an inert `NoSubscriber` dispatcher kept registered so that
+//! callsite interest is never cached from a thread with no subscriber; it is
+//! not a default and sees no event).
 //!
 //! Process-wide registers: only out-of-range indices are written (which the
 //! registers refuse), except slot 26, which no real pool owns (the two
@@ -125,6 +128,9 @@ mod tests {
 
     /// Runs `f` with a thread-local TRACE subscriber and a scoped recorder.
     fn capture<R>(f: impl FnOnce() -> R) -> Captured<R> {
+        // A second, inert dispatcher for the whole process: without it a test
+        // thread with no subscriber can cache a callsite as `never` first.
+        crate::test_support::keep_callsite_interest_shared();
         let buf = LogBuf::default();
         let writer = buf.clone();
         let subscriber = tracing_subscriber::fmt()

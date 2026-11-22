@@ -281,6 +281,26 @@ fn partition_in_repair_days(
             <= i64::from(CONTRACT_NAME_REPAIR_LOOKBACK_DAYS) + 1
 }
 
+/// Whether a repair run is in progress right now and can rewrite rows of IST
+/// `day` (any table it repairs). Read by the daily Brutex export (owner
+/// Quote 60, 2026-11-14 third review), which never exports a day while a
+/// run may rewrite it: the run takes only the shared side of the archive
+/// quiesce lock, as the export does, so the two would otherwise overlap. One
+/// atomic load, O(1).
+#[must_use]
+pub fn repair_run_covers_day(day: chrono::NaiveDate) -> bool {
+    run_covers_day(
+        RUNNING_REPAIR_OLDEST_DAY.load(std::sync::atomic::Ordering::Acquire),
+        day,
+    )
+}
+
+/// [`repair_run_covers_day`] with the running run's oldest day given
+/// (`i32::MAX` = none running). Pure, O(1).
+fn run_covers_day(running_oldest_day: i32, day: chrono::NaiveDate) -> bool {
+    running_oldest_day != i32::MAX && chrono::Datelike::num_days_from_ce(&day) >= running_oldest_day
+}
+
 /// `true` when `day` is exactly `YYYY-MM-DD` in ASCII digits. Every SQL string
 /// below interpolates the day, so anything else is refused before it is used.
 #[must_use]
@@ -1038,6 +1058,31 @@ mod tests {
     /// Recheck of PR AA finding 1: the tables the archiver locks for the
     /// repair are exactly the ones the repair can rewrite: ticks, aux packets
     /// and every emitted candle table, and nothing else.
+    /// Owner Quote 60 (2026-11-14 third review): the export reads whether a
+    /// run in progress can rewrite a day: its own `today` and the lookback
+    /// days before it, nothing while no run is in progress, every day for a
+    /// run whose `today` did not parse.
+    #[test]
+    fn test_repair_run_covers_day_only_while_a_run_reaches_the_day() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 11, 14).expect("d");
+        let oldest = run_oldest_day("2026-11-14");
+        assert!(run_covers_day(oldest, today));
+        let reach = today
+            .checked_sub_days(chrono::Days::new(u64::from(
+                CONTRACT_NAME_REPAIR_LOOKBACK_DAYS,
+            )))
+            .expect("d");
+        assert!(run_covers_day(oldest, reach));
+        assert!(!run_covers_day(oldest, reach.pred_opt().expect("d")));
+        assert!(!run_covers_day(i32::MAX, today), "no run in progress");
+        assert!(run_covers_day(run_oldest_day("bad"), reach), "fail closed");
+        // The process reader: no run reaches a day this old (the one test
+        // that starts a run publishes 2999), so this holds under parallel tests.
+        assert!(!repair_run_covers_day(
+            chrono::NaiveDate::from_ymd_opt(1999, 1, 1).expect("d")
+        ));
+    }
+
     #[test]
     fn test_repair_may_rewrite_names_ticks_aux_and_every_candle_table() {
         assert!(repair_may_rewrite("ticks"));

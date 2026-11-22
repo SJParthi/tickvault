@@ -310,6 +310,7 @@ pub fn consensus_spot(
     underlying: &str,
     nearest: Option<i64>,
 ) -> Option<f64> {
+    // APPROVED: not an instrument key — the key is a spot price's f64 bit pattern.
     let mut tally: HashMap<u64, (usize, f64)> = HashMap::new();
     for c in candidates {
         if c.underlying != underlying || !is_nearest_expiry(c, nearest) {
@@ -667,6 +668,7 @@ pub fn stock_option_boot_set(
     let mut taken: HashSet<&str> = HashSet::with_capacity(budget);
     // Held contracts already emitted, so a contract listed twice in the
     // artifact is kept once.
+    // APPROVED: single-segment context — every id here is a stock-option leg (STOCK_OPTION_SEGMENT, checked against held above).
     let mut held_emitted: HashSet<u64> = HashSet::with_capacity(held.len());
     for candidate in &stock_candidates {
         laddered.insert(candidate.underlying.as_str());

@@ -244,9 +244,16 @@ fn the_alarm_file_discovery_actually_finds_files() {
 #[test]
 fn the_scan_is_not_vacuous() {
     let live = live_alarm_slugs();
+    // ⚠ FLOOR LOWERED 90 -> 60 on 2026-11-11 (operator Quote 53 alarm review,
+    // docs/audits/2026-11-alarm-review.md): 37 alarms were removed (44 in the first
+    // draft; seven came back after its reviews: errcode-stream-silent,
+    // live-universe-fallback, tick-spill-quarantined, wal-suspension-probe-blind,
+    // deploy-provenance-blind, boot-heartbeat-gate-errors and -not-invoked), 84 slugs
+    // remain (82 deployed in prod plus the two count-gated depth-account minter
+    // alarms). The floor sits 24 under the truth.
     assert!(
-        live.len() >= 90,
-        "expected ~102 live alarm slugs, parsed {}. A parser that silently returns few \
+        live.len() >= 60,
+        "expected ~84 live alarm slugs, parsed {}. A parser that silently returns few \
          or none makes both directions of this guard pass while proving nothing — which \
          is the exact false-OK shape it exists to stop.",
         live.len()
@@ -291,8 +298,14 @@ fn guard_self_test_parser_bites() {
     // `dhan-rest-only-noise-lock-2026-07-14.md` §2.5), and their three
     // ALARM_PHRASES rows came back in the same change. The four REST-leg
     // filters stay deleted. 18 + 3 = 21, measured.
+    //
+    // ⚠ FLOOR LOWERED 21 -> 18 on 2026-11-11 (operator Quote 53 alarm review,
+    // docs/audits/2026-11-alarm-review.md): four keys removed (`dh-906`,
+    // `resource-02`, `wal-suspend-01`, `scoreboard-01`), each with a review
+    // row and its ALARM_PHRASES row deleted in the same change. 22 - 4 = 18,
+    // measured.
     assert!(
-        keys.len() >= 21,
+        keys.len() >= 18,
         "error_code_alerts key extraction found only {} keys",
         keys.len()
     );

@@ -16,6 +16,8 @@
 //!
 //! Cases:
 //! - same commit, the swing was the runner: re-measured flat, gate passes;
+//! - same commit with a saved binary: still the head build on both sides
+//!   (2026-11-14, two builds of one commit failed the gate);
 //! - a real slowdown between two commits: still slower on the same runner,
 //!   gate still fails, and only on the bench that really slowed;
 //! - an absolute breach on a flagged bench survives the re-measure;
@@ -318,7 +320,7 @@ fn same_commit_runner_swing_passes_after_a_same_runner_re_measure() {
     );
     assert_eq!(rc, 0, "{out}");
     assert!(out.contains("3 flagged benchmark(s) re-measured"), "{out}");
-    assert!(out.contains("the head binary (same commit)"), "{out}");
+    assert!(out.contains("the head binary on both sides"), "{out}");
     let (rc, gate) = fx.gate();
     assert_eq!(rc, 0, "the runner swing must not fail the gate: {gate}");
     assert!(gate.contains("All benchmarks within budget."), "{gate}");
@@ -331,6 +333,36 @@ fn same_commit_runner_swing_passes_after_a_same_runner_re_measure() {
         assert!(!fx.criterion().join(id).join("tv_ab").exists());
         assert!(!fx.criterion().join(id).join("tv_ab_orig_new").exists());
     }
+}
+
+#[test]
+fn same_commit_with_a_saved_binary_still_runs_the_head_build_on_both_sides() {
+    // Regression 2026-11-14: nightly run 43536429172 against baseline run
+    // 43476616865, both on commit e9b812d. The baseline run saved its own
+    // build of the SAME commit; that build measures 20% faster here (code
+    // layout differs between two builds), so pitting it against the head
+    // build failed the 5% gate on unchanged code.
+    let fx = Fixture::new(400.0, true);
+    assert_eq!(fx.first_gate().0, 2);
+    let (rc, out) = fx.recheck(
+        HEAD_SHA,
+        &[
+            ("tv_ab_bins_pipeline", 1000.0),
+            ("deps_pipeline", 1200.0),
+            ("tv_ab_bins_seal_path", 330.0),
+            ("deps_seal_path", 400.0),
+        ],
+    );
+    assert_eq!(rc, 0, "{out}");
+    assert!(out.contains("BASELINE: the head commit"), "{out}");
+    assert!(out.contains("SAME-COMMIT"), "{out}");
+    assert!(out.contains("the head binary on both sides"), "{out}");
+    assert!(!out.contains("the baseline run's saved binary"), "{out}");
+    let (rc, gate) = fx.gate();
+    assert_eq!(
+        rc, 0,
+        "two builds of one commit must not fail the gate: {gate}"
+    );
 }
 
 #[test]
@@ -592,6 +624,51 @@ fn the_workflow_runs_the_re_measure_only_on_a_regression_and_regates() {
     assert!(tool < regate && regate < keep && keep < late);
     // The saved binaries ride in the Criterion dir, which the save step saves.
     assert!(gate.contains("target/criterion/tv_ab_bins"));
+}
+
+#[test]
+fn the_step_summary_says_when_no_baseline_was_restored() {
+    // Runs the gate step's REAL summary line under bash, with and without a
+    // restored cache key: a missed restore means the gate judged absolute
+    // budgets only, and the summary must say so.
+    let wf = std::fs::read_to_string(repo_root().join(".github/workflows/bench.yml"))
+        .expect("bench.yml"); // APPROVED: test
+    let line = wf
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with("printf '## Bench Gate Results"))
+        .expect("summary line"); // APPROVED: test
+    let tmp = TempDir::new("summary");
+    std::fs::write(
+        tmp.0.join("gate-output.log"),
+        "  All benchmarks within budget.\n",
+    )
+    .expect("write"); // APPROVED: test
+    let summary = |key: Option<&str>| -> String {
+        let out_file = tmp.0.join("summary.md");
+        let _ = std::fs::remove_file(&out_file);
+        let mut cmd = Command::new("bash");
+        cmd.args(["-c", line])
+            .current_dir(&tmp.0)
+            .env("GITHUB_STEP_SUMMARY", &out_file)
+            .env_remove("BENCH_AB_BASELINE_KEY");
+        if let Some(k) = key {
+            cmd.env("BENCH_AB_BASELINE_KEY", k);
+        }
+        let st = cmd.status().expect("bash runs"); // APPROVED: test
+        assert!(st.success());
+        std::fs::read_to_string(&out_file).expect("summary written") // APPROVED: test
+    };
+    for missed in [None, Some("")] {
+        let s = summary(missed);
+        assert!(s.contains("NONE (cache restore missed)"), "{s}");
+        assert!(s.contains("NO 5% regression check"), "{s}");
+        assert!(s.contains("All benchmarks within budget."), "{s}");
+    }
+    let key = format!("criterion-baseline-5cc632cfbd58-42311492058-{HEAD_SHA}");
+    let s = summary(Some(&key));
+    assert!(s.contains(&format!("Baseline restored: {key}")), "{s}");
+    assert!(!s.contains("NONE"), "{s}");
 }
 
 #[test]

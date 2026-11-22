@@ -51,7 +51,18 @@ unsound = "all"
 # via reqwest's disabled `http3` feature) and its ignore was likewise
 # removed from .cargo/audit.toml after the quinn-proto 0.11.15 lock bump.
 # Both advisories are now resolved in the lockfile, so no ignore is needed.
-ignore = []
+# 2026-11-17: RUSTSEC-2026-0543 (chrono) and RUSTSEC-2026-0555 (chrono-tz),
+# published that day, mark both crates UNMAINTAINED: no vulnerability, and
+# "No safe upgrade is available". chrono is also a dependency of questdb-rs,
+# so it cannot leave the tree today. Owner card 2026-11-17, "Allow now,
+# replace later (Recommended)": ignored here with this note; chrono-tz is to
+# be replaced next (IST is a fixed +05:30 offset), and the chrono migration
+# is its own project. Remove each entry in the PR that removes its crate.
+# 2026-11-18: chrono-tz removed (its one use, a test, now uses the fixed
+# +05:30 offset), so its RUSTSEC-2026-0555 entry is removed with it.
+ignore = [
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained, no fix exists; questdb-rs depends on it; owner card 2026-11-17 Allow now, replace later" },
+]
 
 # --- Licenses: Block incompatible licenses ---
 [licenses]

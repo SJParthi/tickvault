@@ -75,6 +75,9 @@ pub mod silent_swap;
 pub mod subscription_builder;
 pub mod tls;
 pub mod types;
+// 2026-11-13 (audit B2 finding 7): the TCP dial with SO_KEEPALIVE on, so the
+// kernel keepalive ladder in the sysctl file applies to every Dhan socket.
+pub mod ws_dial;
 
 // PR #4 (2026-05-19): depth_connection re-exports retired.
 pub use order_update_connection::run_order_update_connection;

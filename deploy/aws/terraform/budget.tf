@@ -240,14 +240,25 @@ resource "aws_budgets_budget" "tv_monthly" {
   # 2026-11-02 (operator Quotes 37 and 45, daily-universe §0): the
   # October-only allowance has expired. Apply the already-authorized $75
   # standing native line; the historical Lambda/digest settings remain $185
-  # and their unchanged UTC-month clamp already enforces $75 from November.
+  # and their unchanged UTC-month clamp already enforces $75 from November
+  # (superseded for November 2026 only by the 2026-11-11 entry below).
   # 2026-11-11 (operator Quote 52, daily-universe §0): $75 -> $90 for
   #   NOVEMBER 2026 only (about $21 of the month was two disks attached to
   #   nothing; the owner deletes them in the console). The Lambda clamps
   #   November 2026 to $90 and December onward to $75 in code; this native
   #   stop goes back to "75" on or after 1 December (the lockstep guard
   #   fails the build from December while it still reads 90).
-  limit_amount      = "90"
+  # 2026-11-11 (operator Quote 54, daily-universe §0, owner card "Cap ₹5,500"):
+  #   from 1 December 2026 the standing line is $62 a month, GST included
+  #   (about ₹5,500), replacing $75. The Lambda clamps December onward to $62
+  #   in code now; this native stop stays "90" until the end of November and
+  #   moves to "62" (not "75") in a follow-up change on or after 1 December,
+  #   never before (the lockstep guard requires exactly "62" from December).
+  # 2026-11-14 (operator Quote 59, daily-universe §0, owner card "$140
+  #   (Recommended)"): November 2026 only, $90 -> $140, so the box keeps running
+  #   ($60.83 spent by 14 Nov, AWS forecast $126). From 1 December this native
+  #   stop moves to "62" exactly as Quote 54 set (follow-up on or after 1 Dec).
+  limit_amount      = "140"
   limit_unit        = "USD"
   time_unit         = "MONTHLY"
   time_period_start = "2026-05-01_00:00"

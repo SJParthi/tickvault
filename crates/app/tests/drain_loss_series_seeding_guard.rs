@@ -216,17 +216,37 @@ fn the_ws_lag_exclusion_family_is_seeded_on_every_label_set() {
             .find("fn histogram_for")
             .expect("histogram_for");
     let ctor = &STACK[start..end];
+    // Speed fix 4 (2026-11-17): three of the reasons (`ltt_not_advanced`,
+    // `not_new_trade`, `not_a_trade`) moved to `DrainCounters`, which the
+    // drain adds once per frame. Read them from `counters()`, so the six
+    // reasons are still all checked against the seed.
+    let drain_start = STACK
+        .find("pub fn counters() -> &'static DrainCounters {")
+        .expect("counters() must exist");
+    let drain_ctor = &STACK[drain_start..];
+    let drain_ctor = &drain_ctor[..drain_ctor.find("\n}\n").expect("counters() end")];
+    let lag_in_drain: Vec<&str> = drain_ctor
+        .split("WS_LAG_EXCLUDED_COUNTER,\n            \"reason\" => \"")
+        .skip(1)
+        .filter_map(|rest| rest.split('"').next())
+        .collect();
+    assert_eq!(
+        lag_in_drain,
+        ["ltt_not_advanced", "not_new_trade", "not_a_trade"],
+        "DrainCounters lag-exclusion reasons changed"
+    );
     let emitted: Vec<&str> = ctor
         .split("\"reason\" => \"")
         .skip(1)
         .filter_map(|rest| rest.split('"').next())
+        .chain(lag_in_drain)
         .collect();
     // 5 → 6 on 2026-11-06 (plan PR AL-1 review): `not_new_trade`, a folded
     // packet that carried no new trade, counted apart from `not_a_trade`.
     assert_eq!(
         emitted.len(),
         6,
-        "WsLagHandles::new reasons changed: {emitted:?}"
+        "lag-exclusion reasons changed: {emitted:?}"
     );
     for reason in emitted {
         assert!(

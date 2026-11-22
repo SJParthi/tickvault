@@ -245,7 +245,7 @@ pub(crate) fn depth_hour_cannot_clear_tonight(
 #[must_use]
 pub(crate) fn process_depth_ack_bound_trusted() -> bool {
     depth_ack_bound_trusted(
-        crate::wal_clock_step::clock_step_window().is_some(),
+        crate::wal_clock_step::clock_step_windows().is_recorded(),
         crate::ws_frame_spill::current_frame_seq(),
         crate::wal_applied_watermark::wall_nanos(),
     )
@@ -429,9 +429,9 @@ pub(crate) struct InFlightInputs<'a> {
     pub(crate) last_frame_seq: u64,
     /// The wall clock now, UTC nanoseconds.
     pub(crate) wall_nanos: u64,
-    /// The wall-clock step window this process recorded (UTC nanos), or
-    /// `None` (`crate::wal_clock_step::clock_step_window`).
-    pub(crate) clock_step: Option<(u64, u64)>,
+    /// The wall-clock step windows this process recorded (UTC nanos), empty
+    /// when none (`crate::wal_clock_step::clock_step_windows`).
+    pub(crate) clock_step: crate::wal_clock_step::StepWindows,
 }
 
 /// Whether any row of the hour spanning `span` may still be on its way to
@@ -462,10 +462,11 @@ pub(crate) fn hour_in_flight_verdict(
     }
     // PR AA review finding 2 (reworked on its recheck): an hour a recorded
     // clock step reaches is judged against the step's whole window too, since
-    // its rows can carry any sequence of the window.
-    if let Some(window) = inputs.clock_step
-        && crate::wal_clock_step::window_overlaps(Some(window), span.lo, span.hi)
-    {
+    // its rows can carry any sequence of the window. ⚠ CHANGED 2026-11-16:
+    // each recorded window separately, so an hour is judged only against the
+    // windows it overlaps, never against every hour between two unrelated
+    // steps.
+    for window in inputs.clock_step.overlapping(span.lo, span.hi) {
         let widened = HourFrameSpan {
             lo: span.lo.min(window.0),
             hi: span.hi.max(window.1),
@@ -531,9 +532,9 @@ pub(crate) struct ProcessInFlightState<'a> {
     pub(crate) watermark: &'a crate::wal_applied_watermark::AppliedWatermark,
     /// The after-close depth marks (the process one: `deferred_depth()`).
     pub(crate) deferred: &'a crate::wal_deferred_depth::DeferredDepth,
-    /// The recorded wall-clock step window.
-    pub(crate) clock_window: &'a dyn Fn() -> Option<(u64, u64)>,
-    /// Drops the step window when settled; whether it was dropped.
+    /// The recorded wall-clock step windows.
+    pub(crate) clock_window: &'a dyn Fn() -> crate::wal_clock_step::StepWindows,
+    /// Drops one step window when settled; whether it was dropped.
     pub(crate) retire_clock_window: &'a dyn Fn((u64, u64), bool) -> bool,
     /// The newest frame sequence minted in this process.
     pub(crate) last_frame_seq: &'a dyn Fn() -> u64,
@@ -551,7 +552,7 @@ pub(crate) fn process_in_flight_verdict(table: &str, span: HourFrameSpan) -> InF
         &ProcessInFlightState {
             watermark: crate::wal_applied_watermark::applied_watermark(),
             deferred: crate::wal_deferred_depth::deferred_depth(),
-            clock_window: &crate::wal_clock_step::clock_step_window,
+            clock_window: &crate::wal_clock_step::clock_step_windows,
             retire_clock_window: &crate::wal_clock_step::retire_clock_step_window_if_settled,
             last_frame_seq: &crate::ws_frame_spill::current_frame_seq,
             wall_nanos: &crate::wal_applied_watermark::wall_nanos,
@@ -582,7 +583,10 @@ pub(crate) fn process_in_flight_verdict_on(
     // PR AA finding 2 recheck: a step window that holds nothing on its way
     // for either sink is dropped (and the drop persisted), so a window from
     // a step long ago does not keep judging later hours against all of it.
-    if let Some(window) = clock_step {
+    // ⚠ CHANGED 2026-11-16: each window is judged and retired on its own
+    // (at most `MAX_STEP_WINDOWS`), so a new step never keeps an old,
+    // settled one alive.
+    if clock_step.is_recorded() {
         let depth_marks = state.deferred.snapshot();
         let sink_inputs = |sink: AppliedSink, deferred| InFlightInputs {
             wal_bound: watermark.is_bound(),
@@ -595,14 +599,16 @@ pub(crate) fn process_in_flight_verdict_on(
             },
             last_frame_seq: 0,
             wall_nanos: 0,
-            clock_step: None,
+            clock_step: crate::wal_clock_step::StepWindows::EMPTY,
         };
-        let settled = clock_step_window_settled(
-            window,
-            &sink_inputs(AppliedSink::Ticks, None),
-            &sink_inputs(AppliedSink::Depth, Some(&depth_marks)),
-        );
-        if (state.retire_clock_window)(window, settled) {
+        let ticks_inputs = sink_inputs(AppliedSink::Ticks, None);
+        let depth_inputs = sink_inputs(AppliedSink::Depth, Some(&depth_marks));
+        let mut retired = false;
+        for window in clock_step.iter() {
+            let settled = clock_step_window_settled(window, &ticks_inputs, &depth_inputs);
+            retired |= (state.retire_clock_window)(window, settled);
+        }
+        if retired {
             clock_step = (state.clock_window)();
         }
     }
@@ -1303,7 +1309,7 @@ mod tests {
             acked_high: span.hi + REPLAY_REORDER_SLACK_SEQ + 1,
             last_frame_seq: span.hi + 3_600 * SEC,
             wall_nanos: span.hi + 3_600 * SEC,
-            clock_step: None,
+            clock_step: crate::wal_clock_step::StepWindows::EMPTY,
         }
     }
 
@@ -1472,7 +1478,7 @@ mod tests {
         let step_at = 1_794_029_700 * SEC;
         let window = crate::wal_clock_step::step_window(step_at - 30 * SEC, step_at, 600 * SEC);
         let stepped = InFlightInputs {
-            clock_step: window,
+            clock_step: window.into(),
             ..clear_inputs(&applied, span)
         };
         assert!(stepped.last_frame_seq <= stepped.wall_nanos);
@@ -1488,7 +1494,7 @@ mod tests {
         // An hour the window does not reach is not held for it.
         let far = hour_frame_seq_span("2026-11-07T08").expect("span");
         let far_inputs = InFlightInputs {
-            clock_step: window,
+            clock_step: window.into(),
             ..clear_inputs(&applied, far)
         };
         assert_eq!(
@@ -1507,7 +1513,8 @@ mod tests {
         // 2026-11-07 11:59:45 IST = 06:29:45 UTC.
         let step_at = 1_794_032_985 * SEC;
         let inputs = InFlightInputs {
-            clock_step: crate::wal_clock_step::step_window(step_at - 30 * SEC, step_at, 600 * SEC),
+            clock_step: crate::wal_clock_step::step_window(step_at - 30 * SEC, step_at, 600 * SEC)
+                .into(),
             ..clear_inputs(&applied, span)
         };
         assert_eq!(
@@ -1530,7 +1537,7 @@ mod tests {
         let past_window = window.1 + REPLAY_REORDER_SLACK_SEQ + 1;
         let applied = AppliedSnapshot::default();
         let settled = InFlightInputs {
-            clock_step: Some(window),
+            clock_step: Some(window).into(),
             acked_high: past_window,
             last_frame_seq: past_window,
             wall_nanos: past_window,
@@ -1556,7 +1563,7 @@ mod tests {
         // The mark is outside the hour's own span: without the step it reads
         // clear, which is the defect.
         let unstepped = InFlightInputs {
-            clock_step: None,
+            clock_step: crate::wal_clock_step::StepWindows::EMPTY,
             applied: &marked,
             ..settled
         };
@@ -1588,7 +1595,7 @@ mod tests {
         let marked = watermark.snapshot();
         let inputs = InFlightInputs {
             applied: &marked,
-            clock_step: window,
+            clock_step: window.into(),
             acked_high: past_window,
             last_frame_seq: past_window,
             wall_nanos: past_window,
@@ -1600,7 +1607,8 @@ mod tests {
         );
         // The window seen from the new anchor alone misses the hour.
         let seen_only = InFlightInputs {
-            clock_step: crate::wal_clock_step::step_window(new_anchor, new_anchor, 600 * SEC),
+            clock_step: crate::wal_clock_step::step_window(new_anchor, new_anchor, 600 * SEC)
+                .into(),
             ..inputs
         };
         assert_eq!(
@@ -1820,6 +1828,262 @@ mod tests {
         dir
     }
 
+    // ---- separate step windows (2026-11-16) ------------------------------
+
+    /// Inputs where only the acknowledgement can hold: nothing unapplied,
+    /// no rescue floor, the clock not ahead.
+    fn ack_only_inputs(
+        applied: &AppliedSnapshot,
+        acked_high: u64,
+        clock_step: crate::wal_clock_step::StepWindows,
+    ) -> InFlightInputs<'_> {
+        InFlightInputs {
+            wal_bound: true,
+            applied,
+            deferred: None,
+            rescue_floor_lowest: u64::MAX,
+            acked_high,
+            last_frame_seq: 0,
+            wall_nanos: u64::MAX / 2,
+            clock_step,
+        }
+    }
+
+    fn hour_span_at(lo: u64) -> HourFrameSpan {
+        HourFrameSpan {
+            lo,
+            hi: lo + 3_600 * SEC,
+        }
+    }
+
+    /// Regression: 16 Nov 2026 live. A step on 12 Nov and one on 16 Nov were
+    /// one union, so every hour between (13 Nov 09..15) was held as
+    /// `clock_stepped`. Two steps 4 days apart now hold only the hours that
+    /// overlap each. Bites: with the windows folded into one hull (the old
+    /// union), the hour between reads `ClockStepped`.
+    #[test]
+    fn test_regression_two_steps_days_apart_hold_only_the_hours_overlapping_each() {
+        use crate::wal_clock_step::{ClockStepLog, StepWindows};
+        let day = 86_400 * SEC;
+        let first = 1_794_480_080 * SEC; // 12 Nov 2026 16:11 IST
+        let second = first + 4 * day; // 16 Nov 2026 16:11 IST
+        let log = ClockStepLog::new();
+        log.note(first, first, 1_760_000_000);
+        log.note(second, second, 1_105_000_000);
+        let windows = log.windows();
+        assert_eq!(windows.len(), 2, "{windows:?}");
+        let applied = AppliedSnapshot::default();
+        // An hour on 13 Nov, acknowledged past its own end but not past the
+        // newest step.
+        let between = hour_span_at(first + day - 7 * 3_600 * SEC);
+        let acked = between.hi + REPLAY_REORDER_SLACK_SEQ + 1;
+        assert_eq!(
+            hour_in_flight_verdict(between, &ack_only_inputs(&applied, acked, windows)),
+            InFlightVerdict::Clear,
+            "an hour between the two steps is not held for them"
+        );
+        let hull = windows.iter().fold(None::<(u64, u64)>, |acc, (lo, hi)| {
+            Some(acc.map_or((lo, hi), |(a, b)| (a.min(lo), b.max(hi))))
+        });
+        assert_eq!(
+            hour_in_flight_verdict(between, &ack_only_inputs(&applied, acked, hull.into())),
+            InFlightVerdict::ClockStepped,
+            "the old union held it"
+        );
+        // The hour the second step lies in, acknowledged past its own span
+        // but not past that step's window, is held.
+        let near = hour_span_at(second - 3_600 * SEC + 10 * SEC);
+        let acked_near = near.hi + REPLAY_REORDER_SLACK_SEQ + 1;
+        assert_eq!(
+            hour_in_flight_verdict(near, &ack_only_inputs(&applied, acked_near, windows)),
+            InFlightVerdict::ClockStepped
+        );
+        let _: StepWindows = windows;
+    }
+
+    /// Regression: 16 Nov 2026 live, point 2. A window carried over from the
+    /// last process retires once it reads settled even while a newer step's
+    /// window does not. With one union the new step merged into the carried
+    /// window, and the union could settle only once both did, so a carried
+    /// 12 Nov step lived on through every later step. Bites: with the
+    /// windows folded into one union, the carried window never retires here.
+    #[test]
+    fn test_regression_a_carried_window_retires_once_settled_while_a_newer_one_stays() {
+        use crate::wal_clock_step::ClockStepLog;
+        let day = 86_400 * SEC;
+        let old_at = 1_794_480_080 * SEC;
+        let new_at = old_at + 4 * day;
+        let dir = reader_test_dir("carried-retire");
+        let earlier = ClockStepLog::new();
+        earlier.bind(&dir, old_at);
+        earlier.note(old_at, old_at, 1_760_000_000);
+        earlier.persist_if_dirty();
+        let log = ClockStepLog::new();
+        log.bind(&dir, new_at - 10 * SEC);
+        let carried = log.windows().iter().next().expect("carried over");
+        log.note(new_at, new_at, 1_105_000_000);
+        assert_eq!(log.windows().len(), 2);
+
+        let wm = AppliedWatermark::new_for_tests();
+        let wm_dir = reader_test_dir("carried-retire-wm");
+        wm.bind(&wm_dir);
+        // Both sinks acknowledged past the carried window, not the new one.
+        let past_carried = carried.1 + REPLAY_REORDER_SLACK_SEQ + 1;
+        wm.note_ticks_acked(past_carried);
+        wm.note_depth_acked(past_carried);
+        let marks = DeferredDepth::new_for_tests();
+        let log_window = || log.windows();
+        let log_retire = |w: (u64, u64), s: bool| log.retire_if_settled(w, s);
+        let at_wall = || new_at + 3_600 * SEC;
+        let no_lead = || 0;
+        let verdict = process_in_flight_verdict_on(
+            &ProcessInFlightState {
+                watermark: &wm,
+                deferred: &marks,
+                clock_window: &log_window,
+                retire_clock_window: &log_retire,
+                last_frame_seq: &no_lead,
+                wall_nanos: &at_wall,
+            },
+            DEPTH,
+            hour_span_at(old_at - 3_600 * SEC + 20 * SEC),
+        );
+        assert_eq!(verdict, InFlightVerdict::Clear);
+        let left: Vec<_> = log.windows().iter().collect();
+        assert_eq!(left.len(), 1, "the carried window retired: {left:?}");
+        assert!(left[0].0 > carried.1, "the newer window stays");
+        // The drop is persisted: a restart carries only the newer window.
+        log.persist_if_dirty();
+        let restarted = ClockStepLog::new();
+        restarted.bind(&dir, new_at + day);
+        assert_eq!(restarted.windows().iter().collect::<Vec<_>>(), left);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&wm_dir);
+    }
+
+    /// Regression: 17 Nov 2026 live. The old one-window union of 12 to 16
+    /// Nov (1,257 buckets) loaded as one window and never retired: the
+    /// applied watermark read every range of 128 buckets or wider as
+    /// unapplied, so the window never settled and every hour inside it read
+    /// `ClockStepped` (51 partitions held) over a clean state. Bites: with
+    /// the old wide-range rule the window is not settled and the hour reads
+    /// `ClockStepped`.
+    #[test]
+    fn test_regression_a_four_day_step_window_over_a_clean_state_settles_and_retires() {
+        use crate::wal_clock_step::StepWindows;
+        let window = (1_794_480_050_881_500_204_u64, 1_794_825_737_596_131_328_u64);
+        let wm = AppliedWatermark::new_for_tests();
+        let wm_dir = reader_test_dir("four-day-window");
+        wm.bind(&wm_dir);
+        let past = window.1 + REPLAY_REORDER_SLACK_SEQ + 1;
+        wm.note_ticks_acked(past);
+        wm.note_depth_acked(past);
+        let marks = DeferredDepth::new_for_tests();
+        let retired = std::cell::Cell::new(false);
+        let settled_seen = std::cell::Cell::new(None);
+        let windows = || {
+            if retired.get() {
+                StepWindows::EMPTY
+            } else {
+                StepWindows::from(Some(window))
+            }
+        };
+        let retire = |w: (u64, u64), settled: bool| {
+            assert_eq!(w, window);
+            settled_seen.set(Some(settled));
+            if settled {
+                retired.set(true);
+            }
+            settled
+        };
+        let at_wall = || past + 3_600 * SEC;
+        let no_lead = || 0;
+        let hour = hour_span_at(window.0 + 86_400 * SEC);
+        let state = ProcessInFlightState {
+            watermark: &wm,
+            deferred: &marks,
+            clock_window: &windows,
+            retire_clock_window: &retire,
+            last_frame_seq: &no_lead,
+            wall_nanos: &at_wall,
+        };
+        assert_eq!(
+            process_in_flight_verdict_on(&state, DEPTH, hour),
+            InFlightVerdict::Clear
+        );
+        assert_eq!(settled_seen.get(), Some(true), "the window read settled");
+        assert!(retired.get(), "and retired");
+
+        // Judged directly against the window (before it retired): clear.
+        let applied = wm.snapshot();
+        let inputs = ack_only_inputs(&applied, past, StepWindows::from(Some(window)));
+        assert_eq!(
+            hour_in_flight_verdict(hour, &inputs),
+            InFlightVerdict::Clear
+        );
+        // One unapplied mark anywhere inside the window still holds the hour.
+        wm.note_unapplied(window.0 + 3 * 86_400 * SEC);
+        let marked = wm.snapshot();
+        let inputs = ack_only_inputs(&marked, past, StepWindows::from(Some(window)));
+        assert_eq!(
+            hour_in_flight_verdict(hour, &inputs),
+            InFlightVerdict::ClockStepped
+        );
+        let _ = std::fs::remove_dir_all(&wm_dir);
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(256))]
+
+        /// 2026-11-16: the hours the separate windows hold are a SUPERSET of
+        /// the hours any true step window reaches (each true window is
+        /// inside a recorded one, so never less is held) and a SUBSET of the
+        /// hours the old single union held. Steps up to 20 (past the cap of
+        /// 8), spread over 10 days; the acknowledgement is the holding check.
+        #[test]
+        fn proptest_separate_windows_hold_a_superset_of_true_steps_and_a_subset_of_the_union(
+            steps in proptest::collection::vec((0_u64..864_000, 2_u64..900), 1..20),
+            hours in proptest::collection::vec(0_u64..240, 1..12),
+            ack_secs in 0_u64..864_000,
+        ) {
+            use crate::wal_clock_step::{step_window, ClockStepLog, StepWindows};
+            let base = 1_794_000_000 * SEC;
+            let log = ClockStepLog::new();
+            let mut truth = Vec::new();
+            for (at, mag) in &steps {
+                let at = base + at * SEC;
+                log.note(at, at, mag * SEC);
+                truth.push(step_window(at, at, mag * SEC).expect("a step"));
+            }
+            let windows = log.windows();
+            proptest::prop_assert!(windows.len() <= crate::wal_clock_step::MAX_STEP_WINDOWS);
+            let hull = truth.iter().fold((u64::MAX, 0), |(a, b), &(lo, hi)| (a.min(lo), b.max(hi)));
+            for &(lo, hi) in &truth {
+                proptest::prop_assert!(
+                    windows.iter().any(|(n_lo, n_hi)| n_lo <= lo && hi <= n_hi),
+                    "true window {:?} not inside {:?}", (lo, hi), windows
+                );
+            }
+            for (lo, hi) in windows.iter() {
+                proptest::prop_assert!(hull.0 <= lo && hi <= hull.1);
+            }
+            let applied = AppliedSnapshot::default();
+            let acked = base + ack_secs * SEC;
+            let stepped = |span: HourFrameSpan, w: StepWindows| {
+                hour_in_flight_verdict(span, &ack_only_inputs(&applied, acked, w))
+                    == InFlightVerdict::ClockStepped
+            };
+            for h in hours {
+                let span = hour_span_at(base + h * 3_600 * SEC);
+                let by_truth = truth.iter().any(|&t| stepped(span, Some(t).into()));
+                let by_new = stepped(span, windows);
+                let by_union = stepped(span, Some(hull).into());
+                proptest::prop_assert!(!by_truth || by_new, "a true step's hour is held");
+                proptest::prop_assert!(!by_new || by_union, "never more than the union");
+            }
+        }
+    }
+
     /// The process reader over test-owned state reads each input it is
     /// given (PR AA review finding 9): unbound, unacked, the right sink's
     /// ack and rescue floor, the after-close marks on depth tables only,
@@ -1832,7 +2096,7 @@ mod tests {
         let span = the_span();
         let past_span = span.hi + REPLAY_REORDER_SLACK_SEQ + 1;
         let wall = span.hi + 3_600 * SEC;
-        let no_window = || None;
+        let no_window = || crate::wal_clock_step::StepWindows::EMPTY;
         let no_retire = |_w: (u64, u64), _s: bool| false;
         let at_wall = || wall;
         let verdict_with =
@@ -1941,9 +2205,9 @@ mod tests {
         //    acked (and kept), then retired once both sinks pass it.
         let log = ClockStepLog::new();
         log.note(span.hi, span.hi, 10 * SEC);
-        let window = log.window().expect("window recorded");
+        let window = log.windows().iter().next().expect("window recorded");
         assert!(window.1 > past_span + REPLAY_REORDER_SLACK_SEQ);
-        let log_window = || log.window();
+        let log_window = || log.windows();
         let log_retire = |w: (u64, u64), s: bool| log.retire_if_settled(w, s);
         let stepped = |wm: &AppliedWatermark| {
             process_in_flight_verdict_on(
@@ -1960,12 +2224,19 @@ mod tests {
             )
         };
         assert_eq!(stepped(&wm), InFlightVerdict::ClockStepped);
-        assert_eq!(log.window(), Some(window), "not settled, so not retired");
+        assert_eq!(
+            log.windows(),
+            Some(window).into(),
+            "not settled, so not retired"
+        );
         let past_window = window.1 + REPLAY_REORDER_SLACK_SEQ + 1;
         wm.note_depth_acked(past_window);
         wm.note_ticks_acked(past_window);
         assert_eq!(stepped(&wm), InFlightVerdict::Clear);
-        assert_eq!(log.window(), None, "settled, so retired and re-read");
+        assert!(
+            !log.windows().is_recorded(),
+            "settled, so retired and re-read"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2068,7 +2339,7 @@ mod tests {
         // the banned-pattern scanner's test-block tracking (it counts braces).
         let body = &body[..body.find("\n\u{7d}\n").expect("end")];
         let reads_in_order = |body: &str| {
-            let step = body.find("crate::wal_clock_step::clock_step_window().is_some(),");
+            let step = body.find("crate::wal_clock_step::clock_step_windows().is_recorded(),");
             let seq = body.find("crate::ws_frame_spill::current_frame_seq(),");
             let wall = body.find("crate::wal_applied_watermark::wall_nanos(),");
             body.contains("depth_ack_bound_trusted(")
@@ -2108,7 +2379,7 @@ mod tests {
         let once = [
             "watermark: crate::wal_applied_watermark::applied_watermark(),",
             "deferred: crate::wal_deferred_depth::deferred_depth(),",
-            "clock_window: &crate::wal_clock_step::clock_step_window,",
+            "clock_window: &crate::wal_clock_step::clock_step_windows,",
             "retire_clock_window: &crate::wal_clock_step::retire_clock_step_window_if_settled,",
             "last_frame_seq: &crate::ws_frame_spill::current_frame_seq,",
             "wall_nanos: &crate::wal_applied_watermark::wall_nanos,",

@@ -49,6 +49,23 @@ fn repo_root() -> PathBuf {
 /// This list may SHRINK freely. Growing it is a deliberate edit, in the same
 /// change, with the reason visible to a reviewer.
 const ALLOWED_IGNORED: &[(&str, &str)] = &[
+    // Added 2026-11-17 with the silence arm slot cells: two wall-clock
+    // measurement harnesses. One times the 30 s silence arm at 20,000
+    // instruments with the probe and with the slot cells; the other compares
+    // one std (SipHash), ahash and dense-array probe. Both print timings and
+    // gate nothing (a wall-clock number would flake on a shared runner); the
+    // arm's gates are the DHAT gate `dhat_silence_scan`, the frozen-oracle
+    // proptest and `silence_arm_slot_guard`. Run them with:
+    //
+    //   cargo test --release -p tickvault-app --lib silence_arm_cost -- --ignored --nocapture
+    (
+        "crates/app/src/dhan_feed_stack/silence_arm_cost.rs",
+        "silence_arm_cost_at_the_authorized_ceiling",
+    ),
+    (
+        "crates/app/src/dhan_feed_stack/silence_arm_cost.rs",
+        "probe_cost_std_vs_ahash_vs_dense",
+    ),
     // Added 2026-11-07 with plan item PR AA step 3 (owner Quote 51): a probe
     // of whether QuestDB re-creates a dropped WAL hour partition when a late
     // row for that hour is inserted. It needs a scratch QuestDB, so it cannot
@@ -199,10 +216,32 @@ const ALLOWED_IGNORED: &[(&str, &str)] = &[
     // boundary values) run in every suite. Re-run it whenever the arithmetic
     // path changes:
     //
-    //   cargo test -p tickvault-common --release --lib -- --ignored every_f32
+    //   cargo test -p tickvault-common --release --test price_fast_path_harness -- --ignored text_path_for_every_f32
     (
-        "crates/common/src/price_precision.rs",
+        "crates/common/tests/price_fast_path_harness.rs",
         "test_f32_to_f64_clean_matches_text_path_for_every_f32",
+    ),
+    // Added 2026-11-17 with the two-decimal fast path (plan ITEM DT): the
+    // same shape as the entry above, new `f32_to_f64_clean` against the
+    // frozen pre-fast-path search for all 2^32 inputs. Measured: 0
+    // differences, 417 s on 4 cores in release; a debug
+    // CI build would take far too long. It is not the gate: the bound-band
+    // test (100,000 f32 steps either side of 2^17, tiny values, every paise
+    // price to 1,40,000 rupees) and two proptests beside it run in every
+    // suite. Re-run it whenever the fast path changes:
+    //
+    //   cargo test -p tickvault-common --release --test price_fast_path_harness -- --ignored frozen_search_for_every_f32
+    (
+        "crates/common/tests/price_fast_path_harness.rs",
+        "test_f32_to_f64_clean_matches_frozen_search_for_every_f32",
+    ),
+    // Added 2026-11-17 (plan ITEM DT): a wall-clock harness that times the
+    // fast path against the frozen search and prints both; on a shared CI
+    // runner it would flake. It gates nothing; output equality on its own
+    // input mix is asserted inside it and by the tests above.
+    (
+        "crates/common/tests/price_fast_path_harness.rs",
+        "test_f32_to_f64_clean_fast_path_timing",
     ),
     // Added 2026-10-30 with the tick row fast price path (plan ITEM DT): the
     // same shape as the entry above. It checks `tick_price_f64` against
@@ -276,6 +315,18 @@ const ALLOWED_IGNORED: &[(&str, &str)] = &[
     (
         "crates/app/src/subscribe_reconcile.rs",
         "sweep_cost_at_the_authorized_ceiling",
+    ),
+    // Added 2026-11-13 with plan item LF-8: times the offline live-fill
+    // replay over a synthetic full day and prints the cost. Same shape as the
+    // harnesses above: a wall-clock figure on a shared CI runner is a flake,
+    // so it is run in release by hand and never gates a merge. The replay's
+    // behaviour is gated by the ordinary tests in the same file and by the
+    // golden day (`live_fill_replay_golden.rs`).
+    //
+    //   cargo test --release -p tickvault-app --lib replay_full_day_cost_harness -- --ignored --nocapture
+    (
+        "crates/app/src/live_fill/replay/replay_tests.rs",
+        "replay_full_day_cost_harness",
     ),
     (
         "crates/storage/tests/critical_errcode_alarm_coverage_guard.rs",

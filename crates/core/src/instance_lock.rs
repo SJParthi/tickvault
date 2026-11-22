@@ -1736,6 +1736,7 @@ mod tests {
                 .with_ansi(false)
                 .with_max_level(tracing::Level::TRACE)
                 .finish();
+            crate::test_support::keep_callsite_interest_shared();
             tracing::subscriber::set_default(subscriber)
         }
     }

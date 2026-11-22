@@ -97,6 +97,30 @@ mod shutdown_residue;
 // Live audit LH-05 (2026-10-29): the worst delivery delay split by segment
 // class (index/cash vs contracts), local /metrics only.
 mod ws_lag_class;
+// Plan item LF-6b (2026-11-12): the live paper fill chain's tap on this drain.
+pub mod live_fill_tap;
+// Plan item LF-8 (2026-11-12): the drain's per-tick fold verdict, pure, shared
+// with the offline replay so the two cannot drift.
+pub mod fold_verdict;
+// Operator Quote 61 (2026-11-14): exact repeats of a no-trade-today row skipped.
+mod aux_repeat;
+// Audit finding 3 (2026-11-14): the exit seal's window, Muhurat session included.
+pub mod mid_session_exit;
+// 2026-11-15 audit (live-5): the WAL replay is paced on a non-trading day.
+mod replay_pace;
+// 2026-11-17: the 30 s silence arm's per-report tally.
+mod inline_depth_sample;
+mod silence_tally;
+// Speed fix 4 (2026-11-17): the per-frame counter tally, its own file.
+mod frame_tally;
+// Scope lock 2026-11-20: the drain's side of the Dhan trade-time correction.
+mod ltt_feed;
+// Noise lock §2.24: the DHAN-FEED-TIME-01 page.
+mod feed_time_page;
+
+// Quote 63: the one-off past-day refold behind `tickvault day-repair`.
+pub(crate) mod day_rebuild;
+use frame_tally::FrameTally;
 use std::time::Instant;
 
 use secrecy::ExposeSecret;
@@ -117,9 +141,7 @@ use tickvault_core::parser::depth::{
     DepthFeedKind, DepthLevelBuffer, DepthPayload, DepthSide, DepthSplitStop, parse_depth_packet,
     split_depth_frame,
 };
-use tickvault_core::parser::dispatcher::{
-    count_packets_by_response_code, dispatch_frame, dispatch_frame_uncounted,
-};
+use tickvault_core::parser::dispatcher::dispatch_frame;
 use tickvault_core::pipeline::tick_gap_detector::{
     DetectorConfig, LttVerdict, SilenceVerdict, TickAssessment, TickGapDetector, TickObservation,
     VolumeVerdict,
@@ -139,10 +161,11 @@ use tickvault_core::websocket::pool_supervisor::{
     take_main_feed_reconnect_recovery_max_ms,
 };
 use tickvault_storage::depth_persistence::{
-    DEPTH_KIND_5, DEPTH_KIND_20, DEPTH_KIND_200, DEPTH_SIDE_ASK, DEPTH_SIDE_BID, DepthBookRow,
-    DepthRow, DepthWriter, MAX_DEPTH_BOOK_LEVELS, depth_segment_label,
+    DEPTH_KIND_5, DEPTH_KIND_20, DEPTH_KIND_200, DEPTH_SIDE_ASK, DEPTH_SIDE_BID, DepthBookPair,
+    DepthBookRow, DepthRow, DepthWriter, MAX_DEPTH_BOOK_LEVELS, depth_segment_label,
 };
 use tickvault_storage::feed_aux_persistence::{AuxPacketKind, AuxPacketRow, aux_price};
+use tickvault_storage::hot_path_telemetry::{Stage as HotPathStage, StageTimer};
 use tickvault_storage::tick_persistence::TickWriter;
 use tickvault_storage::ws_frame_spill::{WalEndpoint, WsFrameSpill, WsType};
 use tickvault_trading::candles::multi_tf_aggregator::AGGREGATOR_MAX_SLOTS;
@@ -328,13 +351,18 @@ static WS_LAG_MAX_MILLIS: std::sync::atomic::AtomicI64 = std::sync::atomic::Atom
 /// The same sample also goes into its segment class's maximum
 /// ([`ws_lag_class`], one compare and one relaxed `fetch_max`), published
 /// beside this one as `tv_dhan_ws_lag_max_ms_by_class`.
-fn record_ws_lag_max(segment_code: u8, exchange_timestamp: u32, received_at_nanos: i64) {
+///
+/// ⚠ CHANGED 2026-11-17 (speed fix 4): takes the whole-millisecond lag
+/// [`record_ws_lag`] already computed for the same tick (its return value)
+/// instead of working it out a second time from the stamp and the receipt.
+/// Same arithmetic, done once: `None` (an implausible stamp) and a
+/// non-positive lag still add nothing.
+fn record_ws_lag_max(segment_code: u8, lag_whole_ms: Option<i64>) {
     record_ws_lag_max_into(
         &WS_LAG_MAX_MILLIS,
         &ws_lag_class::WS_LAG_MAX_BY_CLASS,
         segment_code,
-        exchange_timestamp,
-        received_at_nanos,
+        lag_whole_ms,
     );
 }
 
@@ -346,10 +374,9 @@ fn record_ws_lag_max_into(
     max_millis: &std::sync::atomic::AtomicI64,
     by_class: &ws_lag_class::LagMaxByClass,
     segment_code: u8,
-    exchange_timestamp: u32,
-    received_at_nanos: i64,
+    lag_whole_ms: Option<i64>,
 ) {
-    if let Some(lag_ms) = ws_lag_whole_ms(exchange_timestamp, received_at_nanos)
+    if let Some(lag_ms) = lag_whole_ms
         && lag_ms > 0
     {
         fetch_max_if_above(max_millis, lag_ms);
@@ -1418,6 +1445,17 @@ pub enum IngestOutcome {
         /// cumulative regression, a backup copy accepted late, or an illiquid
         /// contract's first packet all carry an old trade time that is not lag.
         advanced: bool,
+        /// The first packet folded live for the instrument traded while this
+        /// process listened (`ConsumeStats::fresh_first`, LF-6b): a fresh
+        /// trade the live paper fill chain must price, often the 09:15:00 open.
+        fresh_first: bool,
+        /// A real trade older than the newest one seen
+        /// (`ConsumeStats::older_trade`, LF-6b).
+        older_trade: bool,
+        /// The fold's per-tick volume (`ConsumeStats::volume_delta` and
+        /// `first_bucket_volume_delta`, LF-9): handed to the live fill tap so
+        /// the chain's bars carry the stored candle's volume.
+        volume: live_fill_tap::TapVolume,
     },
     /// The frame sequence would not narrow onto `capture_seq` (year-2262
     /// class). Nothing was folded, nothing was written.
@@ -1495,6 +1533,9 @@ pub enum IngestOutcome {
 /// `TF_COUNT` scalar folds in the aggregator, one ILP row append. No heap
 /// allocation in steady state.
 pub struct LiveIngest {
+    /// B1 review: the live table gate [`Self::replay_tables_keyed`] reads.
+    /// Always `live_tables_writable` outside tests. One call per replay round.
+    replay_gate: fn(&[tickvault_storage::ilp_table_gate::GatedTable]) -> bool,
     /// Optional sink for the 5 depth levels that ride INLINE in every
     /// Full-mode tick packet (2026-08-19).
     ///
@@ -1513,6 +1554,11 @@ pub struct LiveIngest {
     /// that part was always true, and it is what keeps every test and every
     /// other caller unaffected.
     inline_depth: Option<DepthIngest>,
+    inline_depth_sample: inline_depth_sample::InlineDepthSampler,
+    /// The live paper fill chain's tap (plan item LF-6b). `None` unless
+    /// `[live_fill] enabled` AND an approved strategy engine exists, which is
+    /// never today; see `live_fill::select_engine`.
+    live_fill_tap: Option<live_fill_tap::LiveFillTap>,
     detector: TickGapDetector,
     subscribe_reconcile: Option<Arc<crate::subscribe_reconcile::SubscribeReconcile>>,
     /// Per slot, the depth-200 baseline the cross-feed check last acted on
@@ -1714,6 +1760,8 @@ pub struct LiveIngest {
     /// the volume ranking, whose monotonicity gate a stale cumulative would
     /// re-latch; that ranking is removed with `top_volume`.
     replaying_wal: bool,
+    /// Quote 61: the last written `no_trade_today` row per composite key.
+    aux_repeat: tickvault_storage::feed_aux_repeat::AuxRepeatFilter,
     /// A market-data floor (Unix nanos) given to this ingest IN ADDITION to
     /// the process-wide one (`market_data_floor`); [`refold_wal_frames`]
     /// judges receipts against the higher of the two. Production leaves it
@@ -1725,6 +1773,15 @@ pub struct LiveIngest {
     /// Quote 43). Set once per frame by the live drain and the replay; one
     /// `bool` store.
     frame_receipt_is_wal_stamp: bool,
+    /// `true` while the frame being drained has no WAL copy (the WAL refused
+    /// it): its `no_trade_today` rows are never skipped (Quote 61, 2026-11-14
+    /// audit fix). Set per frame by the live drain, `false` on replay.
+    frame_wal_unbacked: bool,
+    /// Dhan trade-time correction controller (scope lock 2026-11-20); inert
+    /// until `with_ltt_correction`.
+    ltt: tickvault_storage::ltt_correction::LttController,
+    /// §2.24 feed-time page counts (live index ticks, frames).
+    feed_time: feed_time_page::FeedTimeTally,
     /// Late-attach seed batches waiting for the drain's idle arm (plan item
     /// DT-A1, 2026-10-28), seeded [`SEED_STEP_INSTRUMENTS`] at a time.
     seed_queue: SeedQueue,
@@ -1860,6 +1917,57 @@ impl LiveIngest {
         self
     }
 
+    /// Arms the live paper fill chain's tap (plan item LF-6b). Builder, so
+    /// every caller that does not ask for it keeps the tap off by
+    /// construction.
+    #[must_use]
+    pub fn with_live_fill_tap(mut self, tap: live_fill_tap::LiveFillTap) -> Self {
+        self.live_fill_tap = Some(tap);
+        self
+    }
+
+    /// Ticks the live fill tap dropped so far; `None` while the tap is off.
+    #[must_use]
+    pub fn live_fill_tap_dropped(&self) -> Option<u64> {
+        self.live_fill_tap
+            .as_ref()
+            .map(live_fill_tap::LiveFillTap::dropped)
+    }
+
+    /// The drain abandoned `abandoned_bytes` of a main-feed frame (LF-6b):
+    /// a live frame's lost tail moves the live fill tap's loss count, so the
+    /// chain taints the candles it may have touched. O(1), no allocation; the
+    /// give-up arms only.
+    #[inline]
+    pub(crate) fn note_live_fill_abandoned(&mut self, connection_index: u8, abandoned_bytes: u64) {
+        if abandoned_bytes > 0 {
+            self.note_live_fill_loss(connection_index);
+        }
+    }
+
+    /// Wakes the live fill chain thread once for the frame just walked
+    /// (§28.6 review: never per tick). O(1); one branch when idle.
+    #[inline]
+    // TEST-EXEMPT: one-line forward to LiveFillTap::flush_wake (tested in live_fill_tap.rs); its one call per frame is pinned by live_fill_wake_wiring_guard.rs.
+    pub(crate) fn flush_live_fill_wake(&mut self) {
+        if let Some(tap) = self.live_fill_tap.as_mut() {
+            tap.flush_wake();
+        }
+    }
+
+    /// A live tick the chain will not see although it may have traded (an
+    /// abandoned frame tail, or a folded tick whose row append failed, LF-6b):
+    /// moves the live fill tap's loss count. O(1), no allocation; loss arms
+    /// only.
+    #[inline]
+    pub(crate) fn note_live_fill_loss(&mut self, connection_index: u8) {
+        if live_fill_tap::tap_gate(connection_index, self.replaying_wal)
+            && let Some(tap) = self.live_fill_tap.as_mut()
+        {
+            tap.note_upstream_loss();
+        }
+    }
+
     /// Stores a wall-clock reading, whole IST seconds, for the catch-up seal
     /// cutoff cap ([`Self::catch_up_cutoff`]). A reading that does not fit
     /// (before the epoch, or past 2106) is ignored and the previous one kept.
@@ -1975,6 +2083,19 @@ impl LiveIngest {
         self
     }
 
+    /// Attaches the expected-vs-first-seen subscription book (plan item 3b)
+    /// that the 30 s silence arm judges on every scan (2026-11-17: a builder,
+    /// so the production site and the DHAT gate attach it the same way).
+    /// O(1).
+    #[must_use]
+    pub fn with_subscribe_reconcile(
+        mut self,
+        book: Arc<crate::subscribe_reconcile::SubscribeReconcile>,
+    ) -> Self {
+        self.subscribe_reconcile = Some(book);
+        self
+    }
+
     /// Replaces the candle fold with one pre-sized for `capacity` instruments
     /// (clamped to [`AGGREGATOR_MAX_SLOTS`]) — plan item DT-A6, 2026-10-28.
     ///
@@ -2013,8 +2134,11 @@ impl LiveIngest {
     #[must_use]
     pub fn new(writer: TickWriter, capacity: usize) -> Self {
         Self {
+            replay_gate: tickvault_storage::ilp_table_gate::live_tables_writable,
             // OFF unless explicitly enabled — see `with_inline_depth`.
             inline_depth: None,
+            inline_depth_sample: Default::default(),
+            live_fill_tap: None,
             // Plan PR AL-5 (2026-11-06): the live lane's detector gives each
             // seeded NSE_FNO contract a 10-minute warmup and floors its judged
             // cadence at 60 s (`DetectorConfig::live_lane`); indices and cash
@@ -2074,8 +2198,12 @@ impl LiveIngest {
             catch_up_overrun_counter: metrics::counter!(CATCHUP_SEAL_OVERRUN_COUNTER),
             catch_up_progress: &CATCHUP_PROGRESS,
             replaying_wal: false,
+            aux_repeat: aux_repeat::production_filter(),
             market_data_floor_unix_nanos: None,
             frame_receipt_is_wal_stamp: true,
+            frame_wal_unbacked: false,
+            ltt: ltt_feed::inert_controller(),
+            feed_time: feed_time_page::FeedTimeTally::default(),
             seed_queue: SeedQueue::new(),
         }
     }
@@ -2790,6 +2918,30 @@ impl LiveIngest {
         }
     }
 
+    /// Whether a replay may post now: `ticks` and `tick_quotes` and, with
+    /// inline depth, its depth table are keyed in this process, or the live
+    /// gate was never armed (B1 review). The boot refold and each catch-up
+    /// round wait on it. `feed_aux_packets` is not required (B1 review 2),
+    /// nor a table other than `ticks` recorded un-keyable (B1 review 3,
+    /// `catchup_stop::replay_ready`). Cold, a few Acquire loads.
+    #[must_use]
+    pub fn replay_tables_keyed(&self) -> bool {
+        self.replay_keyed_check()()
+    }
+
+    /// [`Self::replay_tables_keyed`] as a `Send` closure over copies (the
+    /// gate and the static table lists), so the lane can re-read it across an
+    /// `.await` while it waits (B1 review 2) without borrowing the ingest.
+    pub fn replay_keyed_check(&self) -> impl Fn() -> bool + Send + Copy + 'static {
+        let gate = self.replay_gate;
+        let depth = self
+            .inline_depth
+            .as_ref()
+            .map(DepthIngest::gated_table_sets);
+        let unkeyable = tickvault_storage::ilp_table_gate::table_unkeyable;
+        move || catchup_stop::replay_ready(gate, unkeyable, depth)
+    }
+
     /// Rows appended but not yet flushed.
     #[must_use]
     pub const fn pending_rows(&self) -> u64 {
@@ -2836,14 +2988,6 @@ impl LiveIngest {
         }
     }
 
-    /// Persists a tick that `ticks` refuses outright (the prior-day connect
-    /// snapshot) as a `feed_aux_packets` row of `kind`. O(1).
-    fn append_aux_tick(&mut self, kind: AuxPacketKind, tick: &ParsedTick, capture_seq: i64) {
-        if let Some(row) = AuxPacketRow::from_tick(kind, tick, capture_seq) {
-            let _appended = self.append_aux_row(&row);
-        }
-    }
-
     /// One aux append through the tick writer; counts the row as pending so
     /// the size trigger and the flush see it. A failure is already counted and
     /// logged inside the writer.
@@ -2871,7 +3015,9 @@ impl LiveIngest {
         frame_seq: u64,
         recv_monotonic_millis: u64,
     ) -> IngestOutcome {
-        self.ingest_tick_at(tick, frame_seq, 0, recv_monotonic_millis)
+        let outcome = self.ingest_tick_at(tick, frame_seq, 0, recv_monotonic_millis);
+        count_row_ingested(&outcome);
+        outcome
     }
 
     /// Marks every pending row on this ingest's writers as lacking WAL backing
@@ -2936,6 +3082,14 @@ impl LiveIngest {
     /// old comment's fear — trading a visible duplicate for an invisible
     /// collision — does not apply to a scheme where collisions are impossible
     /// by construction rather than unlikely by argument.
+    ///
+    /// # Counting (⚠ CHANGED 2026-11-17, speed fix 4)
+    ///
+    /// This does NOT add to `tv_dhan_feed_ingest_ticks_total`. A caller counts
+    /// the row from the outcome: [`count_row_ingested`] once per call
+    /// ([`Self::ingest_tick`], the WAL refold), or the live drain once per
+    /// frame through `FrameTally`. Same total; one atomic per frame instead of
+    /// one per tick on the drain.
     pub fn ingest_tick_at(
         &mut self,
         tick: &ParsedTick,
@@ -3253,19 +3407,17 @@ impl LiveIngest {
         // idempotent) and skips the bar. A connect snapshot
         // (`receipt_day_mismatch`) and a no-receipt frame stay HARD.
         // `websocket-connection-scope-lock.md` 2026-09-23 (THIRD).
-        let prior_session_replay = stats.stale_trading_day
-            && !stats.receipt_day_mismatch
-            && tick.received_at_nanos > 0
-            && !stats.refused_price
-            && !stats.refused_timestamp;
-        let hard_refusal = stats.refused_price
-            || stats.refused_timestamp
-            || (stats.stale_trading_day && !prior_session_replay)
-            || stats.future_trading_day;
+        //
+        // 2026-11-12 (plan item LF-8): the three bindings (`prior_session_replay`,
+        // `hard_refusal`, `candle_only_refusal`) moved UNCHANGED into the pure
+        // `fold_verdict::fold_verdict`, so the offline replay reaches the same
+        // verdict; the reasoning stays here, beside the counters.
+        let verdict = fold_verdict::fold_verdict(&stats, tick.received_at_nanos);
 
         // Two refuse only the CANDLE and keep the row — see above. They are
-        // mutually exclusive with the three by construction, which is why this
-        // reads as a plain `!hard_refusal` rather than repeating them.
+        // mutually exclusive with the three by construction, which is why the
+        // candle-only set in `fold_verdict::fold_verdict` reads as a plain
+        // `!hard_refusal` rather than repeating them.
         // `stale_trading_day` joins the candle-only set on 2026-08-26.
         //
         // Dhan sends the LAST TRADE TIME, so a dormant contract snapshotted
@@ -3317,15 +3469,9 @@ impl LiveIngest {
         // describes them as candle-only and is annotated rather than rewritten,
         // per house convention — its REASONING is the record of why the row was
         // kept, and why that reasoning failed for `ticks` specifically.
-        let candle_only_refusal = (stats.out_of_session
-            || stats.untraded_sentinel
-            || stats.untraded_timestamp
-            || stats.out_of_band_timestamp
-            || stats.slot_exhausted
-            || prior_session_replay)
-            && !hard_refusal;
-
-        if hard_refusal {
+        // (`candle_only_refusal` is computed in `fold_verdict::fold_verdict`,
+        // see the 2026-11-12 note above.)
+        if let fold_verdict::FoldVerdict::HardRefusal { wrong_day } = verdict {
             let reason = if stats.refused_price {
                 self.refused_price = self.refused_price.saturating_add(1);
                 "price"
@@ -3356,13 +3502,13 @@ impl LiveIngest {
             // `receipt_day_mismatch` only ever rides a day refusal, and price
             // and timestamp are judged first above — so this is exactly "the
             // day rule refused it, and nothing else did".
-            if stats.receipt_day_mismatch && !stats.refused_price && !stats.refused_timestamp {
-                // Item 45h (zero loss, 2026-09-29): the prior-day connect
-                // snapshot is a real received packet. It must never reach
-                // `ticks` (2026-09-10 directive) and never a candle, so it is
-                // kept in `feed_aux_packets`, stamped at RECEIPT, where no
-                // candle reads it. One ILP append, no allocation.
-                self.append_aux_tick(AuxPacketKind::ConnectSnapshot, tick, capture_seq);
+            if wrong_day {
+                // Item 45h: a live packet for a contract with no trade yet
+                // today never reaches `ticks` (2026-09-10) or a candle; it is
+                // kept in `feed_aux_packets` (`no_trade_today`), stamped at
+                // RECEIPT. Quote 61 (2026-11-14): an exact repeat of the
+                // contract's previous row is skipped. O(1), no allocation.
+                self.append_no_trade_today(tick, capture_seq);
                 return IngestOutcome::RefusedWrongDay;
             }
             return IngestOutcome::AggregatorRefused;
@@ -3389,8 +3535,12 @@ impl LiveIngest {
         // is never reached, and rows accumulate in the ILP buffer forever
         // while every metric reports success.
         self.pending_rows = self.pending_rows.saturating_add(1);
-        counters().ingest_ticks.increment(1);
-        if candle_only_refusal {
+        // `tv_dhan_feed_ingest_ticks_total` is NOT counted here since
+        // 2026-11-17 (speed fix 4): every return below this line is a written
+        // row (`WrittenOutOfSession` or `Folded`), so callers count it from
+        // the outcome (`count_row_ingested`); the live drain adds it once per
+        // frame through `FrameTally`.
+        if verdict == fold_verdict::FoldVerdict::CandleOnly {
             // Counted under the SAME `out_of_session` reason as before, so the
             // existing 30s delta report and any dashboard built on it keep
             // meaning what they meant: "this many ticks opened no candle
@@ -3463,6 +3613,9 @@ impl LiveIngest {
             amended: stats.amended_count,
             repeat_quote: stats.repeat_quote,
             advanced: stats.advanced,
+            fresh_first: stats.fresh_first,
+            older_trade: stats.older_trade,
+            volume: live_fill_tap::TapVolume::from_stats(&stats),
         }
     }
 
@@ -3949,83 +4102,50 @@ impl LiveIngest {
         now_millis: u64,
         worst: &mut [SilentInstrument; WORST_SILENT_NAMED],
     ) -> (u64, u64, usize) {
-        self.scan_silence_named_at(now_millis, worst, Instant::now())
+        self.scan_silence_named_at(now_millis, worst, Instant::now(), None)
     }
 
     /// Inject the same monotonic instant for the whole cold sweep. Keeping this
     /// seam private lets tests age queued subscriptions without wall-clock sleeps.
+    /// `reconcile_clock` is the reconcile's `(IST seconds of day, IST day)`;
+    /// `None` reads the wall clock (`finish_now`), as production does.
     fn scan_silence_named_at(
         &self,
         now_millis: u64,
         worst: &mut [SilentInstrument; WORST_SILENT_NAMED],
         reconcile_now: Instant,
+        reconcile_clock: Option<(u32, i64)>,
     ) -> (u64, u64, usize) {
-        let mut silent = 0u64;
-        let mut never = 0u64;
-        let mut named = 0usize;
-        let mut classes = ClassLiveness::default();
+        let mut tally = silence_tally::SilenceTally::default();
         let mut reconcile = self
             .subscribe_reconcile
             .as_ref()
             .map(|book| book.sweep_at(reconcile_now));
-        self.detector.scan_silence(now_millis, |report| {
-            if let Some(sweep) = reconcile.as_mut() {
-                sweep.note(&report);
-            }
-            // CLASS ROLLUP — folded here, BEFORE the alarm filter below, and
-            // deliberately not behind `counts_toward_alarm()`.
-            //
-            // That filter is `!sparse && (Exceeded | NeverTicked)`, so it
-            // drops HEALTHY instruments. Reusing it as the class denominator
-            // would leave a denominator of "only the troubled ones", making
-            // `never == eligible` true the moment any instrument in a segment
-            // had never ticked — the detector would fire on a healthy lane
-            // every sweep. The rollup therefore does its own classification
-            // from the raw report, and rides this sweep rather than adding a
-            // second O(n) pass over the universe.
-            classes.observe(
-                report.key.1,
-                report.sparse,
-                report.verdict == SilenceVerdict::NeverTicked,
-                report.silent_millis > report.expected_millis,
-            );
-            if !report.counts_toward_alarm() {
-                return;
-            }
-            // `NeverTicked` is returned by `classify_silence` the instant an
-            // instrument is seeded, with NO elapsed-time condition — it means
-            // "has never ticked", full stop. Counting it raw would report
-            // every instrument in the book as silent for the whole window
-            // between subscribing and the first tick, which is a false alarm
-            // on every single boot. `silent_millis` is time-since-seeding for
-            // this verdict, so requiring it to clear the same quiet ceiling
-            // the other verdicts are judged against gives the subscribe a
-            // fair chance to produce something first.
-            //
-            // Found by a test, not by review: the first version asserted a
-            // freshly-seeded instrument reports nothing and it reported (1,1).
-            if report.silent_millis <= report.expected_millis {
-                return;
-            }
-            silent = silent.saturating_add(1);
-            if report.verdict == SilenceVerdict::NeverTicked {
-                never = never.saturating_add(1);
-            }
-            named = rank_silent(
-                worst,
-                named,
-                SilentInstrument {
-                    security_id: report.key.0,
-                    segment: report.key.1,
-                    silent_millis: report.silent_millis,
-                    expected_millis: report.expected_millis,
-                    never_ticked: report.verdict == SilenceVerdict::NeverTicked,
-                },
-            );
-        });
+        // 2026-11-17: the scan hands out each report's detector slot, so the
+        // reconcile judges it from a dense per-slot cell instead of a hash
+        // probe per report (`ReconcileSweep::note_at_slot`; it falls back to
+        // the probe whenever the cell cannot be trusted). Live on 17 Nov the
+        // arm took about 2.9 ms per firing at 20,000 instruments, about 85% of
+        // it the probe (release harness cold median 3,171.8 µs before).
+        self.detector
+            .scan_silence_slots(now_millis, |slot, report| {
+                if let Some(sweep) = reconcile.as_mut() {
+                    sweep.note_at_slot(slot, &report);
+                }
+                tally.observe(worst, &report);
+            });
         if let Some(sweep) = reconcile {
-            sweep.finish_now();
+            match reconcile_clock {
+                Some((secs, day)) => sweep.finish_at(secs, day),
+                None => sweep.finish_now(),
+            };
         }
+        let silence_tally::SilenceTally {
+            silent,
+            never,
+            named,
+            classes,
+        } = tally;
         metrics::gauge!(INSTRUMENTS_SILENT_GAUGE).set(silent as f64);
         metrics::gauge!(INSTRUMENTS_NEVER_TICKED_GAUGE).set(never as f64);
         // CORRECTED 2026-09-10: the class verdict is judged ONLY inside the
@@ -4229,6 +4349,7 @@ impl LiveIngest {
         history: Option<&crate::main_feed_backup::PersistedBackupHistory>,
     ) {
         self.replay_backup_loaded = true;
+        metrics::counter!(crate::main_feed_backup::BACKUP_REPLAY_UNJUDGED_COUNTER).increment(0);
         self.replay_backup = history.and_then(crate::main_feed_backup::ReplayBackup::new);
     }
 
@@ -4816,6 +4937,15 @@ pub struct DrainCounters {
     /// header they point at decoded cleanly (item 44b). Separate from
     /// `unparseable`/`abandoned_bytes` so a recovery is never read as a loss.
     unknown_skipped: metrics::Counter,
+    /// `tv_dhan_ws_lag_excluded_total{reason="ltt_not_advanced"}`: repeated
+    /// quotes kept out of the lag histogram. Same key `WsLagHandles` held until
+    /// 2026-11-17 (speed fix 4), so the series is unchanged; it moved here so
+    /// the drain adds it once per frame through `FrameTally`.
+    lag_excluded_ltt_not_advanced: metrics::Counter,
+    /// `tv_dhan_ws_lag_excluded_total{reason="not_new_trade"}` (same move).
+    lag_excluded_not_new_trade: metrics::Counter,
+    /// `tv_dhan_ws_lag_excluded_total{reason="not_a_trade"}` (same move).
+    lag_excluded_not_a_trade: metrics::Counter,
 }
 
 impl DrainCounters {
@@ -4906,6 +5036,18 @@ pub fn counters() -> &'static DrainCounters {
         main_feed_length_mismatch: metrics::counter!(DRAIN_FRAMES_COUNTER, "outcome" => "length_mismatch"),
         abandoned_bytes: metrics::counter!(DRAIN_ABANDONED_BYTES_COUNTER),
         unknown_skipped: metrics::counter!(DRAIN_UNKNOWN_PACKET_SKIPPED_COUNTER),
+        lag_excluded_ltt_not_advanced: metrics::counter!(
+            WS_LAG_EXCLUDED_COUNTER,
+            "reason" => "ltt_not_advanced"
+        ),
+        lag_excluded_not_new_trade: metrics::counter!(
+            WS_LAG_EXCLUDED_COUNTER,
+            "reason" => "not_new_trade"
+        ),
+        lag_excluded_not_a_trade: metrics::counter!(
+            WS_LAG_EXCLUDED_COUNTER,
+            "reason" => "not_a_trade"
+        ),
     })
 }
 
@@ -6258,7 +6400,7 @@ pub const CATCHUP_SEAL_STEP_SLOTS: usize = 256;
 /// margin applied: a WAL replay judges late ticks by the SAME margin the live
 /// catch-up seal uses (plan ITEM 47, review round 7). One allocation of the
 /// slot table and one of the index, at construction only.
-fn live_fold(capacity: usize) -> MultiTfAggregator {
+pub(crate) fn live_fold(capacity: usize) -> MultiTfAggregator {
     let mut aggregator = MultiTfAggregator::with_capacity(FeedStrategy::DEFAULT, capacity);
     aggregator.set_catch_up_margin_secs(CATCHUP_LATENESS_MARGIN_SECS);
     aggregator
@@ -6952,6 +7094,33 @@ fn silence_scan_pending(silent: u64, never: u64, never_reported: bool) -> bool {
     went_quiet > 0 || (never > 0 && !never_reported)
 }
 
+/// Percent of tracked instruments that must be quiet together before the
+/// silent-instrument check PAGES (noise lock §2.19, owner card "Only real
+/// feed trouble (Recommended)", 2026-11-11). Below it the episode is one
+/// coded `warn!`: on 2026-11-11 every page named 1 to 3 of 19,868 slow
+/// stocks with nothing never-ticked.
+const SILENCE_PAGE_FLOOR_PERCENT: u64 = 1;
+
+/// The quiet count at which an episode pages: `ceil(tracked × 1%)`, at
+/// least 1 (so a four-index fallback universe still pages on one). O(1).
+fn silence_page_floor(tracked: u64) -> u64 {
+    tracked
+        .saturating_mul(SILENCE_PAGE_FLOOR_PERCENT)
+        .div_ceil(100)
+        .max(1)
+}
+
+/// Whether a confirmed silence episode PAGES (§2.19): a never-ticked
+/// instrument new this session, or at least `silence_page_floor(tracked)`
+/// instruments that TICKED and then went quiet together. `silent` includes the
+/// never-ticked set (`counts_toward_alarm` is `Exceeded | NeverTicked`), so the
+/// floor is judged on `silent - never`: a never-ticked set already paged must
+/// not lift one slow stock over the floor for the rest of the session (review
+/// 2026-11-11). Otherwise the episode is logged at `warn!`. O(1), pure.
+fn silence_warrants_page(silent: u64, never: u64, never_reported: bool, tracked: u64) -> bool {
+    (never > 0 && !never_reported) || silent.saturating_sub(never) >= silence_page_floor(tracked)
+}
+
 fn silence_page_is_cooling(last_page_secs: Option<u64>, now_secs: u64, cooldown: u64) -> bool {
     // saturating_sub, because a clock that steps backwards (NTP correction)
     // must not wrap into a gigantic elapsed value and silently clear the
@@ -7077,8 +7246,12 @@ async fn run_frame_drain(
     // Consecutive alarm-worthy scans, and whether we have already paged for
     // this episode. Edge-triggered per audit Rule 4: the rising edge fires
     // once, the falling edge logs recovery at info and re-arms.
+    let mut feed_time_page = feed_time_page::FeedTimePage::start(); // §2.24
     let mut silent_scans: u32 = 0;
     let mut silence_reported = false;
+    // §2.19: an episode below the paging floor is logged once at `warn!`.
+    // A separate latch, so an episode that grows past the floor still pages.
+    let mut silence_logged = false;
     // Never-ticked instruments are paged once per session; see
     // `silence_scan_pending` for why this is a separate latch.
     let mut never_reported = false;
@@ -7254,6 +7427,11 @@ async fn run_frame_drain(
                 // feeding one to the main-feed dispatcher makes byte 0 a length
                 // low-byte that matches no response code, so every depth frame
                 // would be counted "unparseable" and silently lost.
+                // B3 (2026-11-13): where the `drain_frame_post` stage starts.
+                // A main-feed frame sets it to the instant its own stages end;
+                // any other frame keeps it at the frame timer's start, so its
+                // own handling is inside the post stage (see below).
+                let mut post_start: Option<std::time::Instant> = None;
                 match frame.endpoint {
                     DhanEndpointType::MainFeed => {
                         let outcome = drain_main_feed_frame(
@@ -7264,6 +7442,7 @@ async fn run_frame_drain(
                         // own work. One clock read and four relaxed atomics,
                         // no allocation.
                         let frame_work_end = std::time::Instant::now();
+                        post_start = Some(frame_work_end);
                         // The frame's duration, computed once for both stages.
                         let frame_work =
                             frame_work_end.saturating_duration_since(frame_work_start);
@@ -7294,6 +7473,10 @@ async fn run_frame_drain(
                             )
                             .unwrap_or(u64::MAX),
                         );
+                        // §28.6: one chain wake per frame, after the walk and
+                        // after the three stage timings above, so its futex
+                        // wake is never counted as fold work.
+                        ingest.flush_live_fill_wake();
                         folded = folded.saturating_add(outcome.folded);
                         unparseable = unparseable.saturating_add(outcome.unparseable);
                         // Stamp the SOCKET as delivering, gated on the frame
@@ -7503,6 +7686,13 @@ async fn run_frame_drain(
                     }
                     DhanEndpointType::OrderUpdate => c.non_tick.increment(1),
                 }
+                // B3 review round 3: a depth or order-update frame has no stage
+                // of its own, so its post sample starts at the frame timer's
+                // start and covers its own handling too (depth decode and
+                // staging, O(levels), and the ghost resend). Before, it started
+                // here and that handling was timed by no stage. No extra clock
+                // read: the instant is the one the heartbeat already took.
+                let post_start = post_start.unwrap_or(frame_work_start);
 
                 // SIZE trigger. Rows sitting in the ILP buffer have NOT reached
                 // QuestDB — an unflushed buffer is not storage, it is a leak
@@ -7535,6 +7725,19 @@ async fn run_frame_drain(
                 if seen.is_multiple_of(DRAIN_REPORT_EVERY) {
                     publish_fold_depth(&ingest);
                 }
+                // B3 (2026-11-13): the frame arm's work after the fold (the
+                // stamping above, the size-trigger and unbacked hand-offs, the
+                // 1,024-frame publish), which `drain_main_frame`,
+                // `drain_main_tick` and `receipt_to_fold` end before; for a
+                // depth or order-update frame it also holds that frame's own
+                // handling, from the frame timer's start. A
+                // hand-off with no spare batch reserves and touches a fresh
+                // one right here, so this is where that cost shows. One clock
+                // read and four relaxed atomics, no allocation.
+                tickvault_storage::hot_path_telemetry::record_stage(
+                    tickvault_storage::hot_path_telemetry::Stage::DrainFramePost,
+                    post_start.elapsed(),
+                );
             }
             // The ring tail is done once the frame arm finds the ring EMPTY.
             // `consume_budget` and not a ready future: when the task's
@@ -7619,10 +7822,13 @@ async fn run_frame_drain(
             // instrument sit unflushed below the size threshold waiting for a
             // next tick which, at the close, never comes.
             _ = flush_timer.tick() => {
+                // 2026-11-16: every non-frame arm times itself (one stage per arm).
+                let arm = StageTimer::start(HotPathStage::DrainArmFlush);
                 // Beats with no frames too, so an idle drain reads fresh and a
                 // wedged one reads stale within one publish interval.
-                tickvault_storage::hot_path_telemetry::beat(
+                tickvault_storage::hot_path_telemetry::beat_at(
                     tickvault_storage::hot_path_telemetry::HotTask::FrameDrain,
+                    arm.started_at(),
                 );
                 flush_ticks_and_record(&mut ingest, &feed_health);
                 // ITEM 57b: depth on every `DEPTH_TIMER_FLUSH_EVERY_TICKS`th
@@ -7653,6 +7859,7 @@ async fn run_frame_drain(
             // O(1). The slots are visited from the idle arm below, a bounded
             // step at a time, and the sweep's totals are reported there.
             _ = catchup_timer.tick() => {
+                let _arm = StageTimer::start(HotPathStage::DrainArmCatchup);
                 // A real clock reading for the cutoff cap, so the cap keeps
                 // moving in a quiet market (the top-volume timers that did
                 // this until 2026-10-22 are gone, plan item 62).
@@ -7677,6 +7884,7 @@ async fn run_frame_drain(
             // behind ~22,000 hash inserts. The arm takes no batch while the
             // pre-sized queue is full, so the bounded channel holds the rest.
             maybe_seed = seed_rx.recv(), if !seed_closed && ingest.seed_queue_has_room() => {
+                let _arm = StageTimer::start(HotPathStage::DrainArmSeed);
                 if let Some(batch) = maybe_seed {
                     let now_millis = u64::try_from(
                         chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0).max(0) / 1_000_000,
@@ -7696,6 +7904,8 @@ async fn run_frame_drain(
                 }
             }
             _ = silence_timer.tick() => {
+                let _arm = StageTimer::start(HotPathStage::DrainArmSilence);
+                feed_time_page.scan(&mut ingest); // §2.24: before the session gate below
                 // Daily rollover for the ranking state, checked on the 30s arm
                 // rather than given a timer of its own: it is a cheap integer
                 // compare, and a whole tokio timer to fire once a day would be
@@ -7987,6 +8197,10 @@ async fn run_frame_drain(
                 // week's measurement, and the depth-200 cross-feed check.
                 // Both cold: O(slots) every 30 s.
                 tickvault_core::websocket::pool_supervisor::publish_frame_gap_peaks();
+                // LF-6b: the live fill tap's drops since the last publish.
+                if let Some(tap) = ingest.live_fill_tap.as_mut() {
+                    tap.publish_dropped();
+                }
                 let _ = ingest.check_depth200_cross_feed(
                     now_millis,
                     configured_frame_silence_fast_path(),
@@ -8056,6 +8270,7 @@ async fn run_frame_drain(
                 {
                     silent_scans = 0;
                     silence_reported = false;
+                    silence_logged = false;
                     never_reported = false;
                     continue;
                 }
@@ -8081,6 +8296,7 @@ async fn run_frame_drain(
                     // the cooldown at the emit below, and the measured numbers
                     // recorded there.
                     silence_reported = false;
+                    silence_logged = false;
                     continue;
                 }
                 silent_scans = silent_scans.saturating_add(1);
@@ -8121,7 +8337,38 @@ async fn run_frame_drain(
                 let now_secs = now_millis / 1_000;
                 let cooling =
                     silence_page_is_cooling(last_silence_page, now_secs, SILENCE_PAGE_COOLDOWN_SECS);
-                if silent_scans >= SILENCE_SCANS_BEFORE_ALERT && !silence_reported && !cooling {
+                // §2.19 (2026-11-11): below the floor the episode is logged, not paged.
+                let tracked_now = ingest.tracked_instruments() as u64;
+                let pages = silence_warrants_page(silent, never, never_reported, tracked_now);
+                if silent_scans >= SILENCE_SCANS_BEFORE_ALERT
+                    && !silence_reported
+                    && !silence_logged
+                    && !pages
+                {
+                    silence_logged = true;
+                    warn!(
+                        code = ErrorCode::RiskGapTickGap.code_str(),
+                        silent,
+                        never_ticked = never,
+                        tracked = tracked_now,
+                        page_floor = silence_page_floor(tracked_now),
+                        consecutive_scans = silent_scans,
+                        "Dhan live feed: {silent} subscribed instrument(s) are quiet beyond their \
+                         own learned cadence, below the paging floor (1% of tracked); logged and \
+                         counted, not paged"
+                    );
+                    for entry in worst_silent.iter().take(named) {
+                        warn!(
+                            code = ErrorCode::RiskGapTickGap.code_str(),
+                            security_id = entry.security_id,
+                            segment = entry.segment.as_str(),
+                            silent_millis = entry.silent_millis,
+                            expected_millis = entry.expected_millis,
+                            "quiet instrument named (below the paging floor)"
+                        );
+                    }
+                }
+                if silent_scans >= SILENCE_SCANS_BEFORE_ALERT && !silence_reported && !cooling && pages {
                     silence_reported = true;
                     if never > 0 {
                         never_reported = true;
@@ -8201,6 +8448,7 @@ async fn run_frame_drain(
             // idle work — the baseline rolls and the catch-up seal too — one
             // bounded step per call, in the priority `step_idle_work` states.
             () = tokio::task::coop::consume_budget(), if ingest.idle_work_pending() => {
+                let _arm = StageTimer::start(HotPathStage::DrainArmIdle);
                 let step = ingest.step_idle_work();
                 if let Some((requested, added)) = step.seed_done {
                     log_seed_batch_done(&ingest, requested, added);
@@ -8267,7 +8515,7 @@ async fn run_frame_drain(
     // Only after the session. An exit inside the ingest window (a deploy, a
     // restart) leaves every open bucket missing its remaining trades, so it
     // seals only the complete ones and withholds the rest (audit PR31b-2).
-    let (close_emitted, close_dropped) = if is_mid_session_exit(now_ist_secs_of_day()) {
+    let (close_emitted, close_dropped) = if mid_session_exit::is_mid_session_exit_now() {
         ingest.seal_complete_buckets_at_mid_session_exit()
     } else {
         ingest.seal_open_buckets_at_close()
@@ -8472,95 +8720,6 @@ fn drain_may_shed_depth(frame: &CapturedFrame) -> bool {
             .allow_drain_shed(frame.seq, WsType::LiveFeed)
 }
 
-/// Per-frame counter sums for [`drain_main_feed_frame`] (plan ITEM DT,
-/// sub-µs drain, 2026-10-30), added to the shared counters once, when the
-/// tally drops at the end of the walk (every return path).
-///
-/// `metrics` counters are atomic read-modify-writes once a recorder is
-/// installed. The drain paid two per tick packet: the response-code count
-/// inside `dispatch_frame` and the `folded` outcome. Here the code count is
-/// kept as one run of equal codes (a frame is almost always one code
-/// throughout), flushed when the code changes, so a frame costs one increment
-/// per run and one for `folded`, whatever its packet count. The totals equal
-/// the per-packet increments exactly; only when they land moves, by at most
-/// one frame.
-///
-/// O(1) per packet: one compare and one add. No allocation.
-struct FrameTally<'c> {
-    counters: &'c DrainCounters,
-    /// Packets folded or written this frame (the `folded` outcome).
-    folded: u64,
-    /// The current run of one response code.
-    run: CodeRun,
-}
-
-impl<'c> FrameTally<'c> {
-    const fn new(counters: &'c DrainCounters) -> Self {
-        Self {
-            counters,
-            folded: 0,
-            run: CodeRun::new(),
-        }
-    }
-
-    /// Counts one dispatched packet under its response code.
-    #[inline]
-    fn count_packet(&mut self, code: u8) {
-        if let Some((done, packets)) = self.run.push(code) {
-            count_packets_by_response_code(done, packets);
-        }
-    }
-}
-
-impl Drop for FrameTally<'_> {
-    fn drop(&mut self) {
-        if let Some((code, packets)) = self.run.take() {
-            count_packets_by_response_code(code, packets);
-        }
-        if self.folded > 0 {
-            self.counters.folded.increment(self.folded);
-        }
-    }
-}
-
-/// One run of equal response codes, for [`FrameTally`]. Pure, so the "every
-/// packet counted once under its own code" rule is property-tested on its
-/// own (`frame_tally_tests`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct CodeRun {
-    /// Response code of the run; meaningful only while `len > 0`.
-    code: u8,
-    /// Packets in the run.
-    len: u64,
-}
-
-impl CodeRun {
-    const fn new() -> Self {
-        Self { code: 0, len: 0 }
-    }
-
-    /// Adds one packet of `code`. Returns the run it ended, `(code, packets)`,
-    /// when `code` differs from the current run's. O(1).
-    #[inline]
-    fn push(&mut self, code: u8) -> Option<(u8, u64)> {
-        let ended = (self.len > 0 && code != self.code).then_some((self.code, self.len));
-        if ended.is_some() {
-            self.len = 0;
-        }
-        self.code = code;
-        self.len = self.len.saturating_add(1);
-        ended
-    }
-
-    /// Ends the current run, returning it when it holds any packet. O(1).
-    #[inline]
-    fn take(&mut self) -> Option<(u8, u64)> {
-        let run = (self.len > 0).then_some((self.code, self.len));
-        self.len = 0;
-        run
-    }
-}
-
 /// Parses and folds ONE main-feed frame. Split out so the endpoint routing in
 /// the drain reads as routing rather than as a wall of parse logic.
 /// Decode one captured WebSocket frame and fold every packet it carries.
@@ -8588,6 +8747,8 @@ pub fn drain_main_feed_frame(
     // the WAL recorded as receipt-unknown keeps its packets in `ticks`.
     ingest.frame_receipt_is_wal_stamp =
         crate::tick_quote_route::receipt_is_wal_stamp(frame.received_at_nanos);
+    ingest.frame_wal_unbacked = !frame.wal_backed;
+    ingest.ltt_on_live_frame(frame); // DHAN-LTT: before any packet is dispatched
     // A single WebSocket message may carry SEVERAL stacked packets — the
     // frame cap is `MAX_PACKETS_PER_FRAME` (70,000) of them. Walking the frame
     // packet by packet is what stops packets 2..N being silently discarded.
@@ -8641,6 +8802,7 @@ pub fn drain_main_feed_frame(
                     c.truncated.increment(1);
                     let abandoned = frame.bytes.len().saturating_sub(offset) as u64;
                     c.abandoned_bytes.increment(abandoned);
+                    ingest.note_live_fill_abandoned(frame.connection_index, abandoned);
                     out.abandoned_bytes = out.abandoned_bytes.saturating_add(abandoned);
                     return out;
                 }
@@ -8656,6 +8818,7 @@ pub fn drain_main_feed_frame(
             // message.
             let abandoned = frame.bytes.len().saturating_sub(offset) as u64;
             c.abandoned_bytes.increment(abandoned);
+            ingest.note_live_fill_abandoned(frame.connection_index, abandoned);
             out.abandoned_bytes = out.abandoned_bytes.saturating_add(abandoned);
             return out;
         };
@@ -8664,6 +8827,7 @@ pub fn drain_main_feed_frame(
             c.truncated.increment(1);
             let abandoned = frame.bytes.len().saturating_sub(offset) as u64;
             c.abandoned_bytes.increment(abandoned);
+            ingest.note_live_fill_abandoned(frame.connection_index, abandoned);
             out.abandoned_bytes = out.abandoned_bytes.saturating_add(abandoned);
             return out;
         }
@@ -8693,7 +8857,12 @@ pub fn drain_main_feed_frame(
         if let Some(&code) = frame.bytes.get(offset) {
             tally.count_packet(code);
         }
-        match dispatch_frame_uncounted(&frame.bytes[offset..end], received_at_nanos) {
+        let packet = &frame.bytes[offset..end];
+        match ltt_feed::dispatch_main_feed_packet(
+            packet,
+            received_at_nanos,
+            ingest.frame_receipt_is_wal_stamp,
+        ) {
             // The SECOND copy of a packet for a contract subscribed on two
             // main-feed sockets (scope lock 2026-10-02): the first copy was
             // folded and written; this one is counted and skipped whole — no
@@ -8758,8 +8927,8 @@ pub fn drain_main_feed_frame(
                         // the `capture_seq` derivation inside. The frame stamp
                         // alone repeats across every packet in the frame, and
                         // the level ordinal alone repeats across every frame.
-                        out.inline_depth_rows =
-                            out.inline_depth_rows.saturating_add(append_inline_depth(
+                        let rows = ingest.inline_depth_sample.time(|| {
+                            append_inline_depth(
                                 sink,
                                 t,
                                 levels,
@@ -8768,7 +8937,9 @@ pub fn drain_main_feed_frame(
                                 packets,
                                 frame.connection_index != u8::MAX,
                                 c,
-                            ));
+                            )
+                        });
+                        out.inline_depth_rows = out.inline_depth_rows.saturating_add(rows);
                     } else {
                         c.shed_inline_depth.increment(1);
                         // Item 45a: keep this frame's segment until the
@@ -8787,6 +8958,7 @@ pub fn drain_main_feed_frame(
                 // PR DP-6: the frame's tick count, the weight of its per-tick
                 // `drain_main_tick` sample.
                 out.tick_packets = out.tick_packets.saturating_add(1);
+                ingest.ltt_observe(packet, tick, frame); // DHAN-LTT: raw-time vote
                 // Delivery lag is recorded AFTER the fold below (2026-09-23,
                 // FIFTH scope-lock row), because only the fold knows whether
                 // this packet is a REPEATED quote — same trade time, same
@@ -8881,31 +9053,71 @@ pub fn drain_main_feed_frame(
                 // accepted late) is excluded too. Live that day the F&O worst
                 // delay read 4,038,655 ms while the index/spot class read
                 // 1,923 ms: an illiquid contract's old trade time is not lag.
+                //
+                // ⚠ CHANGED 2026-11-17 (speed fix 4): the three exclusion
+                // counts go into the frame's `tally` (one plain add each) and
+                // are added to their counters once, when the walk ends; the
+                // lag is worked out once and handed to the worst-delay
+                // recorder. The histogram, the day distribution, the maxima
+                // and the clamp and garbage counters stay per tick.
                 match outcome {
                     IngestOutcome::Folded {
                         repeat_quote: true, ..
-                    } => record_ws_lag_repeat_excluded(),
+                    } => tally.exclude_repeat(),
                     IngestOutcome::Folded {
                         advanced: false, ..
-                    } => record_ws_lag_not_new_trade_excluded(),
+                    } => tally.exclude_not_new_trade(),
                     IngestOutcome::Folded { .. } => {
-                        record_ws_lag(frame.connection_index, tick, received_at_nanos);
+                        let lag_whole_ms =
+                            record_ws_lag(frame.connection_index, tick, received_at_nanos);
                         // Worst delay on a LIVE socket only: a replayed WAL
                         // frame (`u8::MAX`) carries its replay time.
                         if frame.connection_index != u8::MAX {
-                            record_ws_lag_max(
-                                tick.exchange_segment_code,
-                                tick.exchange_timestamp,
-                                received_at_nanos,
-                            );
+                            record_ws_lag_max(tick.exchange_segment_code, lag_whole_ms);
                         }
                     }
-                    _ => record_ws_lag_not_a_trade_excluded(),
+                    _ => tally.exclude_not_a_trade(),
                 }
                 match outcome {
                     IngestOutcome::Folded { .. } => {
                         tally.folded = tally.folded.saturating_add(1);
                         out.folded = out.folded.saturating_add(1);
+                        // LF-6b: the live paper fill chain sees every tick the
+                        // fold accepted, from a live socket only (never a
+                        // replayed WAL frame, never while the backlog is
+                        // re-folded). One branch while off; O(1), no
+                        // allocation, never a wait while on. `new_trade`: a
+                        // new trade, or a first packet that traded while we
+                        // listened (the 09:15:00 open); a repeat quote or a
+                        // connect snapshot carries an old trade time and
+                        // price, which the chain must never treat as a candle
+                        // price. `older_trade`: a real older trade (late path).
+                        let tap_open =
+                            live_fill_tap::tap_gate(frame.connection_index, ingest.replaying_wal);
+                        if tap_open && let Some(tap) = ingest.live_fill_tap.as_mut() {
+                            let best = match parsed {
+                                ParsedFrame::TickWithDepth(_, levels) => levels.first(),
+                                _ => None,
+                            };
+                            let (new_trade, older_trade, volume) = match outcome {
+                                IngestOutcome::Folded {
+                                    advanced,
+                                    fresh_first,
+                                    older_trade,
+                                    volume,
+                                    ..
+                                } => {
+                                    let (n, o) = fold_verdict::tap_trade_flags(
+                                        advanced,
+                                        fresh_first,
+                                        older_trade,
+                                    );
+                                    (n, o, volume)
+                                }
+                                _ => (false, false, live_fill_tap::TapVolume::default()),
+                            };
+                            let _queued = tap.offer(tick, best, new_trade, older_trade, volume);
+                        }
                     }
                     IngestOutcome::WrittenOutOfSession => {
                         // A ROW was written, so it counts as folded for the
@@ -8924,7 +9136,13 @@ pub fn drain_main_feed_frame(
                     IngestOutcome::AggregatorRefused | IngestOutcome::RefusedWrongDay => {
                         c.aggregator_refused.increment(1)
                     }
-                    IngestOutcome::WriteFailed => c.write_failed.increment(1),
+                    IngestOutcome::WriteFailed => {
+                        c.write_failed.increment(1);
+                        // LF-6b: the tick WAS folded, but its row did not
+                        // stage; the live paper fill chain's candles must not
+                        // trust the stretch it touched.
+                        ingest.note_live_fill_loss(frame.connection_index);
+                    }
                 }
             }
             // A disconnect the drain DECODED. It is split out of the untyped
@@ -9099,6 +9317,7 @@ pub fn drain_main_feed_frame(
             // integer 1.
             let abandoned = frame.bytes.len().saturating_sub(offset) as u64;
             c.abandoned_bytes.increment(abandoned);
+            ingest.note_live_fill_abandoned(frame.connection_index, abandoned);
             out.abandoned_bytes = out.abandoned_bytes.saturating_add(abandoned);
             return out;
         }
@@ -9317,8 +9536,13 @@ impl DepthIngest {
     // TEST-EXEMPT: thin constructor; the routing is exercised through
     // `rewrite_inline_depth` via `for_test_book_only`.
     fn new_book_only(questdb: &tickvault_common::config::QuestDbConfig, since: i64) -> Self {
+        // PR AA-G (finding 17 review, 2026-11-11): a pin cut on this
+        // synchronous writer commits from inside an append; it holds the
+        // archive quiesce lock like the pass's own flushes do.
+        let mut writer = DepthWriter::new_book(questdb, Feed::Dhan);
+        writer.hold_archive_quiesce_on_pin_cut();
         Self {
-            writer: DepthWriter::new_book(questdb, Feed::Dhan),
+            writer,
             buf: DepthLevelBuffer::new(),
             book: Some(BookMode::boxed_book_only(since)),
             writer_thread: None,
@@ -9798,6 +10022,38 @@ impl DepthIngest {
     pub const fn is_offloaded(&self) -> bool {
         self.writer.is_offloaded()
     }
+    /// Whether every writer this ingest routes rows to may post now: its
+    /// table is keyed, or the live gate was never armed (B1 review). Read by
+    /// the after-close pass once a round. Cold.
+    #[must_use]
+    pub fn table_keyed(&self) -> bool {
+        self.writer.table_keyed()
+            && self
+                .book
+                .as_ref()
+                .is_none_or(|b| b.book_only || b.levels.table_keyed())
+    }
+
+    /// The gated tables this ingest posts into: its writer's, and its level
+    /// writer's while a book mode still writes levels (B1 review 2: the
+    /// lane's replay check reads them through its own gate). O(1).
+    #[must_use]
+    // WIRING-EXEMPT: called as a path (`map(DepthIngest::gated_table_sets)`) in `LiveIngest::replay_keyed_check`, never by name with parentheses.
+    pub fn gated_table_sets(
+        &self,
+    ) -> (
+        &'static [tickvault_storage::ilp_table_gate::GatedTable],
+        Option<&'static [tickvault_storage::ilp_table_gate::GatedTable]>,
+    ) {
+        (
+            self.writer.gated_tables(),
+            self.book
+                .as_ref()
+                .filter(|b| !b.book_only)
+                .map(|b| b.levels.gated_tables()),
+        )
+    }
+
     /// Rows appended but not yet flushed.
     #[must_use]
     // TEST-EXEMPT: observability accessor, asserted by the depth drain tests.
@@ -10186,6 +10442,11 @@ fn append_inline_depth(
 /// exactly as the level path does; a refused level is NaN in its slot and
 /// counted refused. Returns the levels stored (the same unit the level path
 /// counts), at most ten.
+///
+/// Speed fix 5 (2026-11-17): both sides are filled on the stack and handed
+/// to the writer in ONE append (`DepthWriter::append_book_pair`), which does
+/// the work the two rows share once. Same rows, bytes and counter totals as
+/// two single appends.
 fn append_inline_depth_book(
     sink: &mut DepthIngest,
     levels: &[tickvault_common::tick_types::MarketDepthLevel; 5],
@@ -10195,17 +10456,20 @@ fn append_inline_depth_book(
     ts_nanos: i64,
     c: &DrainCounters,
 ) -> u64 {
-    let Some(b) = sink.book.as_deref_mut() else {
+    if sink.book.is_none() {
         // Unreachable: the caller checked `writes_book`. Counted all the same.
         c.depth_refused.increment(1);
         return 0;
-    };
+    }
     let plausible = |p: f32| depth_level_price_is_plausible(f64::from(p));
-    let mut rows = 0_u64;
-    for side in [DEPTH_SIDE_BID, DEPTH_SIDE_ASK] {
-        let mut stored = 0_u64;
+    // [side][slot], side 0 = bid, 1 = ask.
+    let mut price = [[0.0_f64; 5]; 2];
+    let mut quantity = [[0.0_f64; 5]; 2];
+    let mut orders_at = [[0.0_f64; 5]; 2];
+    let mut stored = [0_u64; 2];
+    for side in 0..2 {
         for (slot, level) in levels.iter().enumerate() {
-            let (price, quantity, orders) = if side == DEPTH_SIDE_BID {
+            let (p, q, o) = if side == 0 {
                 (level.bid_price, level.bid_quantity, level.bid_orders)
             } else {
                 (level.ask_price, level.ask_quantity, level.ask_orders)
@@ -10219,29 +10483,41 @@ fn append_inline_depth_book(
             // `implausible_kept`; only a non-finite price (NaN or infinity,
             // which QuestDB cannot hold as a value) is stored as NaN, with its
             // quantity and orders still kept, and counted `refused`.
-            b.quantity[slot] = f64::from(quantity);
-            b.orders[slot] = f64::from(orders);
-            if plausible(price) {
-                b.price[slot] = tickvault_common::price_precision::f32_to_f64_clean(price);
-                stored = stored.saturating_add(1);
-            } else if price.is_finite() {
-                b.price[slot] = tickvault_common::price_precision::f32_to_f64_clean(price);
-                stored = stored.saturating_add(1);
+            quantity[side][slot] = f64::from(q);
+            orders_at[side][slot] = f64::from(o);
+            if plausible(p) {
+                price[side][slot] = tickvault_common::price_precision::f32_to_f64_clean(p);
+                stored[side] = stored[side].saturating_add(1);
+            } else if p.is_finite() {
+                price[side][slot] = tickvault_common::price_precision::f32_to_f64_clean(p);
+                stored[side] = stored[side].saturating_add(1);
                 c.depth_implausible_kept.increment(1);
             } else {
-                b.price[slot] = f64::NAN;
+                price[side][slot] = f64::NAN;
                 c.depth_refused.increment(1);
             }
         }
-        let key = BookKey {
-            security_id,
-            segment,
-            depth_kind: DEPTH_KIND_5,
-            side,
-            capture_seq,
-            ts_nanos,
-        };
-        if append_book_slots(&mut sink.writer, b, levels.len(), &key) {
+    }
+    let [bid_prices, ask_prices] = &price;
+    let [bid_quantities, ask_quantities] = &quantity;
+    let [bid_orders, ask_orders] = &orders_at;
+    let pair = DepthBookPair {
+        security_id,
+        segment,
+        depth_kind: DEPTH_KIND_5,
+        bid_prices,
+        bid_quantities,
+        bid_orders,
+        ask_prices,
+        ask_quantities,
+        ask_orders,
+        capture_seq,
+        ts_nanos,
+    };
+    let (bid, ask) = sink.writer.append_book_pair(&pair);
+    let mut rows = 0_u64;
+    for (outcome, stored) in [(bid.is_ok(), stored[0]), (ask.is_ok(), stored[1])] {
+        if outcome {
             rows = rows.saturating_add(stored);
         } else {
             c.depth_refused.increment(stored);
@@ -10716,7 +10992,16 @@ pub const WS_LAG_EXCLUDED_COUNTER: &str = "tv_dhan_ws_lag_excluded_total";
 /// can recover precision the vendor never transmitted.
 #[must_use]
 pub fn ws_lag_ms(exchange_timestamp: u32, received_at_nanos: i64) -> Option<WsLag> {
-    let lag_ms = ws_lag_whole_ms(exchange_timestamp, received_at_nanos)?;
+    ws_lag_from_whole_ms(ws_lag_whole_ms(exchange_timestamp, received_at_nanos))
+}
+
+/// The classification half of [`ws_lag_ms`], over a lag
+/// [`ws_lag_whole_ms`] already computed (speed fix 4, 2026-11-17): lets
+/// [`record_ws_lag`] classify the same number it returns to the worst-delay
+/// recorder, so the arithmetic runs once per tick. O(1), no allocation.
+#[inline]
+fn ws_lag_from_whole_ms(lag_whole_ms: Option<i64>) -> Option<WsLag> {
+    let lag_ms = lag_whole_ms?;
     if lag_ms < 0 {
         return Some(WsLag::ClampedNegative);
     }
@@ -10805,20 +11090,10 @@ struct WsLagHandles {
     unknown_slot: metrics::Counter,
     excluded_clamped_negative: metrics::Counter,
     excluded_implausible_ltt: metrics::Counter,
-    /// A REPEATED quote (same trade time, price and cumulative volume as the
-    /// previous packet). Its stamp is the time of an earlier trade, so its
-    /// "lag" is how long the instrument has been quiet. Counted, not recorded.
-    excluded_ltt_not_advanced: metrics::Counter,
-    /// A tick the fold did not accept as a trade, most often a contract that
-    /// has not traded today carrying an earlier day's trade time. Counted, not
-    /// recorded (2026-10-05).
-    excluded_not_a_trade: metrics::Counter,
-    /// A folded packet that carried no NEW trade (plan PR AL-1, 2026-11-06):
-    /// the first packet after a subscribe, a book or OI update with the same
-    /// cumulative, a stale regression, or the packet ending a replay gap. Its
-    /// trade time can be hours old. Counted under its own reason so the
-    /// 2026-10-05 `not_a_trade` series keeps its meaning.
-    excluded_not_new_trade: metrics::Counter,
+    // ⚠ CHANGED 2026-11-17 (speed fix 4): the `ltt_not_advanced`,
+    // `not_a_trade` and `not_new_trade` exclusion handles moved to
+    // `DrainCounters` (same keys), so the drain adds them once per frame
+    // through `FrameTally` instead of once per tick here.
 }
 
 impl WsLagHandles {
@@ -10839,18 +11114,6 @@ impl WsLagHandles {
             excluded_implausible_ltt: metrics::counter!(
                 WS_LAG_EXCLUDED_COUNTER,
                 "reason" => "implausible_ltt"
-            ),
-            excluded_ltt_not_advanced: metrics::counter!(
-                WS_LAG_EXCLUDED_COUNTER,
-                "reason" => "ltt_not_advanced"
-            ),
-            excluded_not_a_trade: metrics::counter!(
-                WS_LAG_EXCLUDED_COUNTER,
-                "reason" => "not_a_trade"
-            ),
-            excluded_not_new_trade: metrics::counter!(
-                WS_LAG_EXCLUDED_COUNTER,
-                "reason" => "not_new_trade"
             ),
         }
     }
@@ -11462,9 +11725,19 @@ pub fn escalate_refused_seal(seal: &tickvault_trading::candles::BufferedSeal) ->
 /// `pub` so `crates/app/tests/dhat_ws_lag.rs` can measure it from an
 /// integration test. The allocation this function must not do is invisible to
 /// a unit test; it needs a DHAT profiler, and that needs a test binary.
-pub fn record_ws_lag(connection_index: u8, tick: &ParsedTick, received_at_nanos: i64) {
+///
+/// Returns the signed whole-millisecond lag it classified (`None` for an
+/// implausible stamp), the input [`record_ws_lag_max`] takes, so the drain
+/// works the lag out once per tick (speed fix 4, 2026-11-17). Recording is
+/// unchanged.
+pub fn record_ws_lag(
+    connection_index: u8,
+    tick: &ParsedTick,
+    received_at_nanos: i64,
+) -> Option<i64> {
     let handles = ws_lag_handles();
-    match ws_lag_ms(tick.exchange_timestamp, received_at_nanos) {
+    let lag_whole_ms = ws_lag_whole_ms(tick.exchange_timestamp, received_at_nanos);
+    match ws_lag_from_whole_ms(lag_whole_ms) {
         Some(WsLag::Measured(ms)) => {
             // Also fold into the DAY distribution the 15:45 scoreboard
             // persists. Added 2026-09-05: the fold lost its last production
@@ -11504,36 +11777,18 @@ pub fn record_ws_lag(connection_index: u8, tick: &ParsedTick, received_at_nanos:
             handles.excluded_implausible_ltt.increment(1);
         }
     }
+    lag_whole_ms
 }
 
-/// Counts a REPEATED quote as excluded from the delivery-lag measurement.
-///
-/// A repeat carries the trade time, price and cumulative volume of the
-/// previous packet — Dhan re-sending a quote because the book or OI moved. Its
-/// "receipt − LTT" is the time since the instrument last TRADED, not the time
-/// the packet spent in transit, so recording it would report a quiet market as
-/// a slow feed. Live on 2026-09-23 that was the difference between a ~1 s
-/// median and a ~10 s p90. One relaxed atomic add; no allocation. It feeds
-/// neither the histogram nor the 15:45 day distribution.
-pub fn record_ws_lag_repeat_excluded() {
-    ws_lag_handles().excluded_ltt_not_advanced.increment(1);
-}
-
-/// Counts a tick the fold did not accept as a trade (out of session, an
-/// earlier trading day, a refused price or time, a failed write) as excluded
-/// from the delivery-lag measurement. Its stamp is not the time of a trade
-/// that just happened, so its "receipt − LTT" is not transit time. One
-/// relaxed atomic add; no allocation (2026-10-05).
-pub fn record_ws_lag_not_a_trade_excluded() {
-    ws_lag_handles().excluded_not_a_trade.increment(1);
-}
-
-/// Counts a folded packet that carried no NEW trade (plan PR AL-1,
-/// 2026-11-06) as excluded from the delivery-lag measurement, under reason
-/// `not_new_trade`. One relaxed atomic add; no allocation.
-fn record_ws_lag_not_new_trade_excluded() {
-    ws_lag_handles().excluded_not_new_trade.increment(1);
-}
+// ⚠ REMOVED 2026-11-17 (speed fix 4): `record_ws_lag_repeat_excluded`,
+// `record_ws_lag_not_a_trade_excluded` and `record_ws_lag_not_new_trade_excluded`.
+// Each made one atomic add per excluded tick; the drain now counts those
+// three reasons in its `FrameTally` and adds each once per frame (same
+// series, same totals at the end of every frame). Why each reason is kept out
+// of the lag histogram is on the `FrameTally` fields. A repeat carries the
+// trade time of an earlier trade, so its "receipt − LTT" is the time since the
+// instrument last traded, not transit time: live on 2026-09-23 that was the
+// difference between a ~1 s median and a ~10 s p90.
 
 /// Outcome of [`ws_lag_ms`] for a tick that DOES carry a usable timestamp.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -11741,6 +11996,8 @@ pub struct DhanFeedStackParams {
     /// whether the evidence-confirmed frame-silence redials count only
     /// (`shadow`, the default), act, or are off.
     pub frame_silence_fast_path: FrameSilenceFastPath,
+    /// `[dhan_feed] ltt_utc_autocorrect` (scope lock 2026-11-20).
+    pub ltt_utc_autocorrect: tickvault_common::config::LttUtcAutocorrect,
     pub questdb: QuestDbConfig,
     /// The process-wide write-ahead log every captured frame lands in BEFORE
     /// it is visible to the fold. `None` refuses the lane: capture-at-receipt
@@ -16125,7 +16382,7 @@ fn close_lane_before_dial(
         );
     }
     // The drain's tail.
-    let (close_emitted, close_dropped) = if is_mid_session_exit(now_ist_secs_of_day()) {
+    let (close_emitted, close_dropped) = if mid_session_exit::is_mid_session_exit_now() {
         ingest.seal_complete_buckets_at_mid_session_exit()
     } else {
         ingest.seal_open_buckets_at_close()
@@ -16150,6 +16407,19 @@ fn close_lane_before_dial(
          closed; no socket was opened and no frame drain was started. Any write-ahead \
          log segment not yet confirmed stays on disk and is re-read on the next boot."
     );
+}
+
+/// Adds one to `tv_dhan_feed_ingest_ticks_total` when `outcome` is a written
+/// row (`Folded` or `WrittenOutOfSession`): the count
+/// [`LiveIngest::ingest_tick_at`] made itself until speed fix 4
+/// (2026-11-17). For a caller with no frame tally. O(1), no allocation.
+fn count_row_ingested(outcome: &IngestOutcome) {
+    if matches!(
+        outcome,
+        IngestOutcome::Folded { .. } | IngestOutcome::WrittenOutOfSession
+    ) {
+        counters().ingest_ticks.increment(1);
+    }
 }
 
 /// Fold ONE replayed tick and classify the outcome.
@@ -16216,6 +16486,10 @@ fn refold_one_tick(
         // was produced. It is a row, so it belongs on the row side.
         IngestOutcome::Folded { .. } | IngestOutcome::WrittenOutOfSession => {
             out.refolded = out.refolded.saturating_add(1);
+            // Per call, as before speed fix 4 (2026-11-17): the replay has no
+            // frame tally, and a count held for later could be lost if the
+            // lane never starts.
+            counters().ingest_ticks.increment(1);
         }
         // Refused by the day rule, on the same receipt clock the live feed
         // used — not loss, and not recovered either. Its own bucket, so the
@@ -16262,17 +16536,12 @@ fn pace_stall_warn_due(latch: &AtomicBool, stalls: u32) -> bool {
 /// behaviour (rescue, replay again at the next out-of-session boot) is the
 /// better trade. Outside it, the same wall-clock budget the catch-up drain
 /// uses (`wal_catchup_budget_secs`), so a pre-open boot still stops pacing
-/// by 08:58.
+/// by 08:58. On a weekend or NSE holiday the window holds no live data, so
+/// the replay is paced there too (2026-11-15 audit, live-5; no calendar: as
+/// before). See `replay_pace`.
 #[must_use]
 pub fn wal_replay_pace_until(ist_secs_of_day: u64, now: Instant) -> Option<Instant> {
-    let start = tickvault_common::constants::TICK_PERSIST_START_SECS_OF_DAY_IST as u64;
-    let end = TICK_PERSIST_END_SECS_OF_DAY_IST as u64;
-    if ist_secs_of_day >= start && ist_secs_of_day < end {
-        return None;
-    }
-    now.checked_add(std::time::Duration::from_secs(wal_catchup_budget_secs(
-        ist_secs_of_day,
-    )))
+    replay_pace::wal_replay_pace_until_on(ist_secs_of_day, now, silence_page_allowed_today())
 }
 
 /// The pacing loop, with its effects passed in so it can be tested without a
@@ -16496,6 +16765,8 @@ pub fn refold_wal_frames(
     // `replaying_wal` field for why a replayed frame must never reach the
     // volume ranking.
     ingest.replaying_wal = true;
+    // Quote 61: a pass re-reading frames writes each contract's first row again.
+    ingest.aux_repeat.clear();
     // Plan ITEM 47: while replaying, a candle the replay could only partly
     // see is counted instead of emitted, so it never overwrites the complete
     // candle the live process already stored under the same key.
@@ -16652,6 +16923,7 @@ pub fn refold_wal_frames(
         // in `ticks` either way).
         ingest.frame_receipt_is_wal_stamp =
             crate::tick_quote_route::receipt_is_wal_stamp(*wal_received_at_nanos);
+        ingest.frame_wal_unbacked = false;
         // Plan ITEM 47: frames before this one were not replayed, so no
         // instrument's volume baseline may carry across. `while`, not `if`,
         // so a duplicate index is consumed rather than stalling the cursor.
@@ -16661,7 +16933,7 @@ pub fn refold_wal_frames(
                 break;
             }
             if gap_idx == frame_idx && !gap_marked_here {
-                ingest.aggregator.mark_replay_gap();
+                ingest.mark_replay_gap();
                 out.gaps_marked = out.gaps_marked.saturating_add(1);
                 gap_marked_here = true;
             }
@@ -16688,7 +16960,7 @@ pub fn refold_wal_frames(
         if skipped_below_floor {
             skipped_below_floor = false;
             if !gap_marked_here {
-                ingest.aggregator.mark_replay_gap();
+                ingest.mark_replay_gap();
                 out.gaps_marked = out.gaps_marked.saturating_add(1);
             }
         }
@@ -17153,6 +17425,8 @@ pub fn refold_wal_frames(
     // here, which is why the guard is set and cleared in this function and
     // not at either caller.
     ingest.replaying_wal = false;
+    // Quote 61: live must never skip against a replayed (older) row.
+    ingest.aux_repeat.clear();
     // Plan ITEM 47: replay mode stays ON across the boot replay and every
     // catch-up round, which are consecutive with nothing live folded between
     // them. It ends once, at the hand-over to the live drain
@@ -17544,8 +17818,18 @@ async fn run_dhan_feed_stack(mut params: DhanFeedStackParams) {
     // after boot never move the slot table or rehash its index inside a
     // frame. Address space only; see `with_fold_capacity` for the bytes.
     .with_fold_capacity(AGGREGATOR_MAX_SLOTS)
-    .with_inline_depth(DepthIngest::new(&params.questdb, depth_book_since));
-    ingest.subscribe_reconcile = Some(Arc::clone(&subscribe_reconcile));
+    .with_inline_depth(DepthIngest::new(&params.questdb, depth_book_since))
+    .with_subscribe_reconcile(Arc::clone(&subscribe_reconcile))
+    .with_ltt_correction(
+        params.ltt_utc_autocorrect,
+        ltt_feed::production_writer(params.ltt_utc_autocorrect),
+    );
+    // LF-6b: the live paper fill chain's tap, only when the boot built the
+    // chain (an approved strategy engine exists); never today.
+    if let Some(link) = crate::live_fill::take_tap_sender() {
+        ingest = ingest.with_live_fill_tap(live_fill_tap::LiveFillTap::from_link(link));
+        info!("live paper fill chain: tap armed on the frame drain");
+    }
     info!(
         boot_instruments = capacity,
         fold_slots = ingest.fold_slot_capacity(),
@@ -17664,10 +17948,8 @@ async fn run_dhan_feed_stack(mut params: DhanFeedStackParams) {
         // back-to-back archive partitions. Finding 6: the registration
         // `main.rs` took before it spawned the archive loops is reused, so it
         // has covered the whole bring-up; a fresh one only when it is gone.
-        let _old_hour_replay = params
-            .boot_replay_intent
-            .take()
-            .unwrap_or_else(tickvault_storage::archive_quiesce::intend_old_hour_replay);
+        // B1 review 3: held here, released by a shut-gate wait below.
+        let mut old_hour_replay = params.boot_replay_intent.take();
         // ORDERING PIN -- added 2026-08-28.
         //
         // Every candle this refold seals goes through the seal closure, which
@@ -17706,12 +17988,43 @@ async fn run_dhan_feed_stack(mut params: DhanFeedStackParams) {
             ))
             .await;
         }
+        // B1 review 2: wait for the background DDL re-run to key the tables
+        // (about 30 s after a boot DDL that gave up) instead of reading the
+        // gate once. B1 review 3: ONE deadline for this wait and the catch-up
+        // round's (zero in the capture window), a shut gate releases the
+        // archive registration for the wait, an un-keyable `ticks` ends it.
+        let replay_gate_deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_secs(catchup_stop::replay_gate_wait_secs(
+                now_ist_secs_of_day(),
+            ));
+        let replay_gate_stop = || shutdown_requested() || catchup_stop::replay_cannot_open();
+        // B1 review 5: how long the gate wait took bounds what follows it
+        // (the refold may start only before the cutoff, and the catch-up
+        // clock is the budget less the wait), so the dial, not only the
+        // wait, keeps its bound.
+        let replay_gate_started = tokio::time::Instant::now();
+        let replay_gate_shut = seal_writer_ready && !(ingest.replay_keyed_check())();
+        let boot_tables_keyed = !seal_writer_ready
+            || shutdown_requested()
+            || catchup_stop::wait_for_tables_keyed_releasing(
+                &mut old_hour_replay,
+                ingest.replay_keyed_check(),
+                replay_gate_stop,
+                replay_gate_deadline,
+            )
+            .await;
+        let gate_waited_secs =
+            catchup_stop::gate_wait_secs(replay_gate_shut, replay_gate_started.elapsed());
+        let boot_tables_keyed = boot_tables_keyed
+            && catchup_stop::refold_may_start_after_wait(now_ist_secs_of_day(), gate_waited_secs);
+        let _old_hour_replay = old_hour_replay
+            .unwrap_or_else(tickvault_storage::archive_quiesce::intend_old_hour_replay);
         // PR AA (owner Quote 51): the boot refold writes rows into OLD hours,
         // so it runs only while no archiver is copying and dropping one of
         // them. 09:00 to 15:40 IST it only tries (the morning boot never
         // waits on an archive); outside it waits at most 60 s. Released
         // right after the refold's flush and ack (`drop` below the chain).
-        let boot_quiesce = if seal_writer_ready && !shutdown_requested() {
+        let boot_quiesce = if seal_writer_ready && !shutdown_requested() && boot_tables_keyed {
             tickvault_storage::archive_quiesce::archive_quiesce_for_replay(
                 now_ist_secs_of_day(),
                 tickvault_storage::archive_quiesce::QuiesceWriter::BootRefold,
@@ -17743,6 +18056,20 @@ async fn run_dhan_feed_stack(mut params: DhanFeedStackParams) {
                  write-ahead log frames are not folded now and are re-offered on the \
                  next boot"
             );
+        } else if !boot_tables_keyed {
+            // B1 review: the rows would only be rescued to a spill file that
+            // cannot drain either; the staged frames stay unconfirmed. Reached
+            // only after the bounded wait above (B1 review 2).
+            warn!(
+                code = ErrorCode::WsGapConnectionState.code_str(),
+                source = "boot_refold_table_not_keyed",
+                staged_frames = params.wal_replay_live_feed.len(),
+                gate_waited_secs,
+                "Dhan live feed: the boot WAL refold did not run, the tick or depth table is \
+                 not keyed yet (the boot DDL was refused), or it was keyed too close to the \
+                 session for a refold before the sockets dial. The staged frames are kept and \
+                 re-offered (deferred, not lost)."
+            );
         } else if boot_quiesce.is_none() {
             // The partition archiver held the old-hour writers out: fold
             // nothing. The staged segments stay unconfirmed, so the catch-up
@@ -17756,6 +18083,8 @@ async fn run_dhan_feed_stack(mut params: DhanFeedStackParams) {
                  the boot WAL refold did not run. The staged write-ahead log frames are \
                  kept and re-offered (deferred, not lost)."
             );
+        } else if ltt_feed::replay_held(&params.wal_replay_live_feed, "boot_refold") {
+            // DHAN-LTT-02: a held day; the staged frames stay unconfirmed.
         } else {
             let unlanded_before =
                 tickvault_storage::wal_applied_watermark::applied_watermark().unlanded_snapshot();
@@ -17940,8 +18269,12 @@ async fn run_dhan_feed_stack(mut params: DhanFeedStackParams) {
                 "WAL catch-up drain started outside the capture window — full budget"
             );
         }
+        // B1 review 5: the gate wait spent part of this budget already; the
+        // drain takes what is left, not a fresh budget.
+        let catchup_clock_secs =
+            catchup_stop::catchup_budget_after_gate_wait(catchup_budget_secs, gate_waited_secs);
         let catchup_deadline =
-            tokio::time::Instant::now() + std::time::Duration::from_secs(catchup_budget_secs);
+            tokio::time::Instant::now() + std::time::Duration::from_secs(catchup_clock_secs);
         let mut rounds = 0u32;
         let mut catchup_frames = 0usize;
         let mut catchup_ticks = 0u64;
@@ -18120,6 +18453,26 @@ async fn run_dhan_feed_stack(mut params: DhanFeedStackParams) {
                 );
                 break;
             }
+            // B1 review: never replay into a table this process has not keyed;
+            // B1 review 2: wait for it; B1 review 3: on the refold's deadline.
+            let round_keyed = catchup_stop::wait_for_tables_keyed(
+                ingest.replay_keyed_check(),
+                replay_gate_stop,
+                replay_gate_deadline.min(catchup_deadline),
+            )
+            .await;
+            if let Some(stop) = catchup_stop::round_start_stop(round_keyed) {
+                catchup_early_stop = stop;
+                warn!(
+                    code = ErrorCode::WsSpill01WriterRespawn.code_str(),
+                    source = "wal_catchup_table_not_keyed",
+                    round = rounds,
+                    "WAL catch-up drain stopped: the tick or depth table is not keyed with its \
+                     DEDUP key yet (the boot DDL was refused). Nothing is lost; every segment \
+                     not reached stays a `*.wal` file for the next drain or boot."
+                );
+                break;
+            }
             let wal_dir = crate::boot_helpers::ws_wal_dir();
             let mut batch = match tickvault_storage::ws_frame_spill::replay_all_with_report_fenced(
                 &wal_dir,
@@ -18153,19 +18506,14 @@ async fn run_dhan_feed_stack(mut params: DhanFeedStackParams) {
                 REPLAY_DEFERRED_PAGED.load(std::sync::atomic::Ordering::Relaxed),
             ) {
                 REPLAY_DEFERRED_PAGED.store(true, std::sync::atomic::Ordering::Relaxed);
-                error!(
-                    code = ErrorCode::WsSpill01WriterRespawn.code_str(),
-                    source = "replay_deferred",
-                    deferred_segments = batch.deferred_segments,
-                    bytes_replayed = batch.bytes_replayed,
-                    budget_bytes = batch.budget_bytes,
+                // 2026-11-11 (noise lock §2.17 note, §2.20): a coded WARN on the
+                // planned evening-drain boot or a shrinking backlog, else the ERROR.
+                tickvault_storage::wal_replay_frame_cap::report_catchup_replay_deferred(
+                    tickvault_storage::wal_replay_frame_cap::replay_limit_verdict_this_boot(),
+                    batch.deferred_segments,
+                    batch.bytes_replayed,
+                    batch.budget_bytes,
                     rounds,
-                    "WAL replay DEFERRED segments past its RAM budget — nothing is stranded \
-                     (a deferred segment stays a `*.wal` file and is re-globbed next round or \
-                     next boot), but those frames are on disk rather than in the database \
-                     until then. A deferral on every boot means the WAL is growing faster \
-                     than replay drains it: a capacity problem, not a recovery one. Reported \
-                     once per boot."
                 );
             }
             if batch.frames.is_empty() {
@@ -18176,14 +18524,12 @@ async fn run_dhan_feed_stack(mut params: DhanFeedStackParams) {
                         || batch.trailing_gap
                         || batch.leading_gap,
                 );
-                catchup_drained = batch.deferred_segments == 0
-                    && !batch.stopped_for_disk
-                    && !batch.stopped_for_frame_cap
-                    && !batch.stopped_for_memory;
+                catchup_drained = catchup_stop::batch_stop_reason(&batch).is_none();
                 catchup_early_stop =
                     catchup_stop::batch_stop_reason(&batch).unwrap_or(catchup_early_stop);
                 break;
             }
+            let round_read_failed = batch.read_failed_segments;
             // Count what this lane does NOT fold before dropping it.
             //
             // The filter below is correct — the re-injection path expects
@@ -18303,6 +18649,10 @@ async fn run_dhan_feed_stack(mut params: DhanFeedStackParams) {
                 // staged -- confirm so the loop cannot spin on them forever.
                 tickvault_storage::ws_frame_spill::confirm_replayed(&wal_dir);
                 rounds = rounds.saturating_add(1);
+                if let Some(stop) = catchup_stop::round_end_stop(round_read_failed) {
+                    catchup_early_stop = stop;
+                    break;
+                }
                 continue;
             }
             // Audit R1: paced like the boot pass, and never past this
@@ -18317,6 +18667,7 @@ async fn run_dhan_feed_stack(mut params: DhanFeedStackParams) {
             // segments: zero progress from 21 to 26 Oct.
             let mut round_landed = true;
             let mut round_quiesce_held = false;
+            let mut round_ltt_held = false;
             let mut round_frames = 0usize;
             let mut round_ticks = 0u64;
             let mut round_lost = 0u64;
@@ -18356,6 +18707,10 @@ async fn run_dhan_feed_stack(mut params: DhanFeedStackParams) {
                         round_quiesce_held = true;
                         break;
                     };
+                    if ltt_feed::replay_held(chunk, "catchup") {
+                        round_ltt_held = true; // DHAN-LTT-02: before this segment settles
+                        break;
+                    }
                     let unlanded_before = applied_watermark().unlanded_snapshot();
                     let outcome =
                         refold_wal_frames(&mut ingest, chunk, &gaps_in_chunk, round_pace_until);
@@ -18396,6 +18751,10 @@ async fn run_dhan_feed_stack(mut params: DhanFeedStackParams) {
                 catchup_early_stop = catchup_stop::STOP_ACK_TIMEOUT;
                 break;
             }
+            if round_ltt_held {
+                catchup_early_stop = catchup_stop::STOP_LTT_DAY_HELD;
+                break;
+            }
             if round_quiesce_held {
                 catchup_early_stop = catchup_stop::STOP_ARCHIVE_QUIESCE;
                 if catchup_stop::quiesce_stop_needs_own_line(rounds, catchup_early_stop) {
@@ -18432,6 +18791,12 @@ async fn run_dhan_feed_stack(mut params: DhanFeedStackParams) {
                 pace_waits,
                 "WAL catch-up drain round complete"
             );
+            // B1 review: a segment this round's pass put back unread would be
+            // re-read (and its retries spent) by every later round.
+            if let Some(stop) = catchup_stop::round_end_stop(round_read_failed) {
+                catchup_early_stop = stop;
+                break;
+            }
         }
         replay_ended_on_gap = !catchup_drained || catchup_prev_trailing_gap.unwrap_or(true);
         if catchup_drained {
@@ -18971,17 +19336,24 @@ async fn run_dhan_feed_stack(mut params: DhanFeedStackParams) {
 /// trading morning at ~09:01.
 const CONTINUOUS_SESSION_START_SECS_OF_DAY_IST: u64 = 9 * 3_600 + 15 * 60;
 
+/// IST seconds-of-day at which continuous trading ends (15:30:00), the end of
+/// the silence page (2026-11-15 audit, live-1: it ended at the 15:40 capture
+/// end and paged every day at 15:31 when the options stopped). Capture still
+/// runs to `TICK_PERSIST_END_SECS_OF_DAY_IST`.
+const CONTINUOUS_SESSION_END_SECS_OF_DAY_IST: u64 = 15 * 3_600 + 30 * 60;
+const _: () =
+    assert!(CONTINUOUS_SESSION_END_SECS_OF_DAY_IST <= TICK_PERSIST_END_SECS_OF_DAY_IST as u64);
+
 /// True when `secs_of_day` (IST) is inside the window where an instrument is
 /// EXPECTED to be ticking, so silence is evidence of a fault.
 ///
 /// Narrower than the persistence window on purpose — see
 /// [`CONTINUOUS_SESSION_START_SECS_OF_DAY_IST`] for why the 09:00–09:15
-/// pre-open is excluded. Pure and total, so both boundaries are testable
-/// without a clock.
+/// pre-open is excluded, and the end constant for the 15:30–15:40 tail.
 #[must_use]
 pub const fn is_within_market_hours_ist(secs_of_day: u64) -> bool {
     secs_of_day >= CONTINUOUS_SESSION_START_SECS_OF_DAY_IST
-        && secs_of_day < TICK_PERSIST_END_SECS_OF_DAY_IST as u64
+        && secs_of_day < CONTINUOUS_SESSION_END_SECS_OF_DAY_IST
 }
 
 /// The Muhurat evening session's continuous part: the Muhurat persist window
@@ -19028,6 +19400,18 @@ pub const fn ist_secs_of_day_from_millis(now_millis: u64) -> u64 {
 /// window, 09:00 to `TICK_PERSIST_END_SECS_OF_DAY_IST` (audit PR31b-2). Such
 /// an exit withholds the open bars instead of writing them truncated. Pure
 /// and total, so both boundaries are testable without a clock.
+///
+/// B1 review (2026-11-13): the window is NOT widened by the catch-up seal's
+/// late-delivery margin. An exit at 15:40 to 15:44 withholding open bars
+/// lost the day's last bar of every timeframe for every instrument (the
+/// 15:00 hourly bar, the 15:30 half-hour bar and the final minutes), for good,
+/// since a restart cannot rebuild a bucket that began before its capture
+/// start. Force-sealing them misses only a trade delivered after the exit,
+/// which the measured lag (at most 199 s) makes rare.
+///
+/// The REGULAR window only. Both exits call
+/// [`mid_session_exit::is_mid_session_exit_now`], which adds a Muhurat date's
+/// session (audit finding 3, 2026-11-14).
 #[must_use]
 pub const fn is_mid_session_exit(secs_of_day: u64) -> bool {
     secs_of_day >= tickvault_common::constants::TICK_PERSIST_START_SECS_OF_DAY_IST as u64
@@ -19061,6 +19445,16 @@ const IN_SESSION_1000_IST_MILLIS: u64 = (4 * 3_600 + 30 * 60) * 1_000;
 #[cfg(test)]
 #[path = "dhan_feed_stack/subscribe_reconcile_tests.rs"]
 mod subscribe_reconcile_tests;
+
+// The 30 s silence arm's wall-clock harness (2026-11-17), `#[ignore]`d.
+#[cfg(test)]
+#[path = "dhan_feed_stack/silence_arm_cost.rs"]
+mod silence_arm_cost;
+
+// The silence arm's slot-cell path against a frozen copy of the arm before it.
+#[cfg(test)]
+#[path = "dhan_feed_stack/silence_slot_oracle_tests.rs"]
+mod silence_slot_oracle_tests;
 
 #[cfg(test)]
 mod tests {
@@ -19940,7 +20334,7 @@ mod tests {
         let idx = ExchangeSegment::IdxI.binary_code();
         let fno = ExchangeSegment::NseFno.binary_code();
         let rec = |code: u8, ts: u32, recv: i64| {
-            record_ws_lag_max_into(&max, &by_class, code, ts, recv);
+            record_ws_lag_max_into(&max, &by_class, code, ws_lag_whole_ms(ts, recv));
         };
         // The class split (LH-05) leaves this gauge unchanged: it still takes
         // the maximum across every segment. The INDEX tick carries the largest
@@ -20312,108 +20706,6 @@ mod tests {
             !body.contains("metrics::histogram!"),
             "record_ws_lag must use pre-resolved handles, not the macro"
         );
-    }
-
-    #[test]
-    fn test_record_ws_lag_repeat_excluded_counts_a_repeated_quote_and_skips_the_lag_histogram() {
-        // A repeat must land on the `ltt_not_advanced` exclusion counter, never
-        // on the clamp or garbage counters. Checked against the helper's body,
-        // because a counter handle cannot be read back in-process.
-        record_ws_lag_repeat_excluded();
-        let helper_src = include_str!("dhan_feed_stack.rs");
-        let helper = helper_src
-            .find("pub fn record_ws_lag_repeat_excluded() {")
-            .map(|at| &helper_src[at..])
-            .and_then(|tail| tail.find('}').map(|end| &tail[..end]))
-            .expect("the repeat-exclusion helper must exist");
-        assert!(
-            helper.contains(".excluded_ltt_not_advanced.increment(1)"),
-            "a repeat must increment the ltt_not_advanced exclusion counter, got: {helper}"
-        );
-
-        // Source-scan the drain: the lag is recorded AFTER the fold, and only
-        // on the non-repeat arm. Recording before the fold (the pre-2026-09-23
-        // shape) cannot know a packet is a repeat.
-        let src = include_str!("dhan_feed_stack.rs");
-        let prod = &src[..src.find("#[cfg(test)]").unwrap_or(src.len())];
-        let fold = prod
-            .find("let outcome = ingest.ingest_tick_at(tick, frame.seq, packets, recv_millis);")
-            .expect("the drain's fold call must exist");
-        let excluded = prod
-            .find("=> record_ws_lag_repeat_excluded(),")
-            .expect("the drain must count repeats as excluded");
-        let measured = prod
-            .find("record_ws_lag(frame.connection_index, tick, received_at_nanos);")
-            .expect("the drain must still record real lag");
-        assert!(
-            fold < excluded && fold < measured,
-            "lag must be recorded after the fold, which is the only place a repeat is known"
-        );
-        assert_eq!(
-            prod.matches("record_ws_lag(frame.connection_index").count(),
-            1,
-            "exactly one live lag-recording site"
-        );
-    }
-
-    #[test]
-    fn test_record_ws_lag_not_a_trade_excluded_only_an_accepted_trade_is_a_lag_sample() {
-        // 2026-10-05: out-of-session ticks (a contract not traded today,
-        // carrying an earlier day's trade time) went into the lag histogram
-        // and read as option sockets delivering most packets over 60 s. The
-        // drain must record lag on the accepted-trade arm only and count
-        // every other outcome on its own exclusion reason.
-        record_ws_lag_not_a_trade_excluded();
-        let src = include_str!("dhan_feed_stack.rs");
-        let helper = src
-            .find("pub fn record_ws_lag_not_a_trade_excluded() {")
-            .map(|at| &src[at..])
-            .and_then(|tail| tail.find('}').map(|end| &tail[..end]))
-            .expect("the not-a-trade exclusion helper must exist");
-        assert!(
-            helper.contains(".excluded_not_a_trade.increment(1)"),
-            "a refused or out-of-session tick must increment the not_a_trade counter, got: {helper}"
-        );
-
-        let prod = &src[..src.find("#[cfg(test)]").unwrap_or(src.len())];
-        let fold = prod
-            .find("let outcome = ingest.ingest_tick_at(tick, frame.seq, packets, recv_millis);")
-            .expect("the drain's fold call must exist");
-        let arm = &prod[fold..];
-        let folded_arm = arm
-            .find("IngestOutcome::Folded { .. } => {")
-            .expect("lag must be recorded inside the accepted-trade arm");
-        let measured = arm
-            .find("record_ws_lag(frame.connection_index, tick, received_at_nanos);")
-            .expect("the drain must still record real lag");
-        let other = arm
-            .find("_ => record_ws_lag_not_a_trade_excluded(),")
-            .expect("every other outcome must be counted as not a trade");
-        assert!(
-            folded_arm < measured && measured < other,
-            "the lag sample must sit inside the Folded arm, before the catch-all"
-        );
-        // Plan PR AL-1 (2026-11-06): a folded packet that is not a new trade
-        // is excluded BEFORE the arm that records lag.
-        let not_advanced = arm
-            .find("advanced: false, ..")
-            .expect("a not-advanced fold must be excluded from the lag sample");
-        assert!(
-            not_advanced < folded_arm,
-            "the not-advanced exclusion must come before the recording arm"
-        );
-        assert!(
-            src.contains("\"reason\" => \"not_a_trade\""),
-            "the exclusion reason label must be registered"
-        );
-        // Review 2026-11-06: a not-NEW-trade packet is counted under its own
-        // reason, so the 2026-10-05 `not_a_trade` series keeps its meaning.
-        let after: String = arm[not_advanced..].chars().take(120).collect();
-        assert!(
-            after.contains("record_ws_lag_not_new_trade_excluded()"),
-            "the not-advanced arm must count `not_new_trade`"
-        );
-        assert!(src.contains("\"reason\" => \"not_new_trade\""));
     }
 
     use tickvault_common::constants::TICK_PERSIST_START_SECS_OF_DAY_IST;
@@ -21906,6 +22198,7 @@ mod tests {
             main_feed_backup_top_n: 0,
             subscribe_reconcile_auto_resubscribe: false,
             frame_silence_fast_path: FrameSilenceFastPath::default(),
+            ltt_utc_autocorrect: tickvault_common::config::LttUtcAutocorrect::Off,
             dhan_enabled: false,
             instance_lock_held: Arc::new(AtomicBool::new(false)),
             // A disabled lane never reaches the re-fold, which is exactly why
@@ -22879,7 +23172,7 @@ mod tests {
     fn the_late_depth_paths_use_the_late_trigger_and_the_live_drain_does_not() {
         let pass = include_str!("dhan_feed_stack/deferred_depth_pass.rs");
         let pass_prod = pass.split("#[cfg(test)]").next().unwrap_or(pass);
-        assert!(pass_prod.contains("sink.late_flush_due() && sink.flush()"));
+        assert!(pass_prod.contains("if sink.late_flush_due() {"));
         assert!(
             !pass_prod.contains("sink.flush_due()"),
             "the after-close pass writes late rows only"
@@ -23899,6 +24192,75 @@ mod tests {
     }
 
     #[test]
+    fn test_replay_tables_keyed_reads_open_in_a_process_that_never_armed_the_gate() {
+        // B1 review: the gate is armed only by the boot DDL step, which no
+        // unit test here runs, so a replay posts as before. The shut side is
+        // proven by `test_regression_table_keyed_false_carries_every_bucket_without_writing`
+        // and the storage `live_write_gate_arm` binary.
+        let plain = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
+        assert!(plain.replay_tables_keyed());
+        let depth = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8)
+            .with_inline_depth(DepthIngest::for_test());
+        assert!(depth.replay_tables_keyed());
+    }
+
+    /// Regression, B1 review 2 (2026-11-13): nothing failed when
+    /// `replay_tables_keyed` read open regardless. Through the seam: a shut
+    /// tick table, or a shut inline-depth table, reads not keyed; an unkeyed
+    /// `feed_aux_packets` alone does not hold the replay (the writer thread
+    /// sets those rows aside).
+    /// B1 review 2: `replay_keyed_check` is a `Send` copy of the same verdict
+    /// (the lane re-reads it across an `.await`), and `gated_table_sets`
+    /// names one table per depth writer.
+    #[test]
+    fn test_replay_keyed_check_and_gated_table_sets_match_the_replay_verdict() {
+        fn is_send<T: Send + 'static>(_: &T) {}
+        let depth = DepthIngest::for_test();
+        let (writer, levels) = depth.gated_table_sets();
+        assert_eq!(writer.len(), 1);
+        assert!(levels.is_none(), "no book mode: no second level writer");
+        let ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8).with_inline_depth(depth);
+        let check = ingest.replay_keyed_check();
+        is_send(&check);
+        assert_eq!(check(), ingest.replay_tables_keyed());
+    }
+
+    #[test]
+    fn test_regression_replay_tables_keyed_reads_shut_through_its_seam() {
+        use tickvault_storage::ilp_table_gate::GatedTable;
+        // The seam is the private `replay_gate` field, set directly here (a
+        // `#[cfg(test)]` method in the impl would cut the file's production
+        // half short for the source scans that split at the first one).
+        let with_gate = |ingest: LiveIngest, gate: fn(&[GatedTable]) -> bool| {
+            let mut ingest = ingest;
+            ingest.replay_gate = gate;
+            ingest
+        };
+        let plain = with_gate(LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8), |_| {
+            false
+        });
+        assert!(!plain.replay_tables_keyed());
+        let depth = with_gate(
+            LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8)
+                .with_inline_depth(DepthIngest::for_test()),
+            |t| !t.contains(&GatedTable::MarketDepth),
+        );
+        assert!(
+            !depth.replay_tables_keyed(),
+            "the inline depth table is shut"
+        );
+        let aux = with_gate(
+            LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8)
+                .with_inline_depth(DepthIngest::for_test()),
+            |t| !t.contains(&GatedTable::FeedAuxPackets),
+        );
+        assert!(
+            aux.replay_tables_keyed(),
+            "an unkeyed aux table alone does not hold it"
+        );
+    }
+
+    #[test]
     fn test_is_mid_session_exit_covers_the_ingest_window_only() {
         let start = u64::from(tickvault_common::constants::TICK_PERSIST_START_SECS_OF_DAY_IST);
         let end = u64::from(TICK_PERSIST_END_SECS_OF_DAY_IST);
@@ -23906,7 +24268,16 @@ mod tests {
         assert!(!is_mid_session_exit(start - 1));
         assert!(is_mid_session_exit(start));
         assert!(is_mid_session_exit(end - 1));
+        // Regression, B1 review (2026-11-13): an exit at 15:40 to 15:44 is
+        // NOT mid-session. Withholding there lost the day's final bar of
+        // every timeframe for every instrument; force-sealing writes them.
+        let margin = u64::from(CATCHUP_LATENESS_MARGIN_SECS);
         assert!(!is_mid_session_exit(end), "15:40 is after the session");
+        assert!(
+            !is_mid_session_exit(end + 90),
+            "15:41:30 force-seals the final bars"
+        );
+        assert!(!is_mid_session_exit(end + margin - 1));
         assert!(!is_mid_session_exit(17 * 3_600 + 30 * 60), "the 17:30 stop");
     }
 
@@ -26035,6 +26406,11 @@ mod tests {
         );
     }
 
+    // B3 (2026-11-13) drain_frame_post tests and the 2026-11-16 drain arm
+    // stage tests live in `dhan_feed_stack/tests/` (size pin).
+    mod b3_post_frame_tests;
+    mod drain_arm_timing_tests;
+
     /// The drain must exit on the shutdown signal **while the ring is still
     /// open** — the exit path that did not exist until 2026-08-14.
     ///
@@ -26722,14 +27098,16 @@ mod tests {
     /// The market-hours gate on the silence PAGE, at its exact boundaries.
     ///
     /// Pure and total, so the edges are pinned without a clock. The gate is
-    /// half-open on purpose: 09:00:00 is in, 15:40:00 is out. An inclusive
-    /// upper bound would page on the very second the persistence window
-    /// closes, which is the one second the whole universe is guaranteed to
-    /// look silent.
+    /// half-open on purpose: 09:15:00 is in, 15:30:00 is out (2026-11-15
+    /// audit, live-1: it was 15:40, and the options stopping at 15:30 paged
+    /// every trading day at 15:31). 15:30 to 15:40 is still captured.
     #[test]
     fn test_is_within_market_hours_ist_gates_the_silence_page_to_continuous_trading() {
         let open = CONTINUOUS_SESSION_START_SECS_OF_DAY_IST;
-        let close = u64::from(TICK_PERSIST_END_SECS_OF_DAY_IST);
+        let close = 15 * 3_600 + 30 * 60; // 15:30:00 IST, a literal so a revert bites
+        assert!(!is_within_market_hours_ist(
+            u64::from(TICK_PERSIST_END_SECS_OF_DAY_IST) - 1
+        ));
 
         assert!(!is_within_market_hours_ist(0), "midnight is not in session");
         assert!(
@@ -27668,12 +28046,17 @@ mod wal_refold_tests {
 
     /// A ticker packet on IDX_I, the shape the 2026-09-23 replay carried.
     fn replay_ticker(security_id: u32, ltt_ist_secs: u32) -> bytes::Bytes {
+        // Dhan sends UTC epoch from receipt 2026-11-20 00:00 IST (scope lock
+        // 2026-11-21) and every caller here stamps a receipt of "now", so the
+        // packet carries the UTC form; the dispatcher adds 19,800 s back.
+        let raw =
+            ltt_ist_secs.saturating_sub(tickvault_storage::ltt_correction::LTT_UTC_OFFSET_SECS);
         let mut p = [0u8; 16];
         p[0] = 2; // response code: ticker
         p[1] = 16; // message length
         p[4..8].copy_from_slice(&security_id.to_le_bytes());
         p[8..12].copy_from_slice(&24_000.0_f32.to_le_bytes());
-        p[12..16].copy_from_slice(&ltt_ist_secs.to_le_bytes());
+        p[12..16].copy_from_slice(&raw.to_le_bytes());
         bytes::Bytes::copy_from_slice(&p)
     }
 
@@ -28376,27 +28759,6 @@ mod wal_refold_tests {
         let past = sim.clock.get();
         assert_eq!(run_pace(&sim, Some(past)), 0);
         assert_eq!(sim.flushes.get(), 1);
-    }
-
-    #[test]
-    fn test_wal_replay_pace_until_is_none_inside_the_capture_window() {
-        let now = Instant::now();
-        let start = tickvault_common::constants::TICK_PERSIST_START_SECS_OF_DAY_IST as u64;
-        let end = TICK_PERSIST_END_SECS_OF_DAY_IST as u64;
-        assert_eq!(wal_replay_pace_until(start, now), None, "09:00 is live");
-        assert_eq!(wal_replay_pace_until(end - 1, now), None);
-        // After the close: the full catch-up budget.
-        assert_eq!(
-            wal_replay_pace_until(end, now),
-            Some(now + std::time::Duration::from_secs(WAL_CATCHUP_BUDGET_SECS))
-        );
-        // 08:30 pre-open: never past the 08:58 stop.
-        let at_0830 = 8 * 3_600 + 30 * 60;
-        let until = wal_replay_pace_until(at_0830, now).expect("pre-open is paced");
-        assert!(
-            until.duration_since(now).as_secs()
-                <= WAL_CATCHUP_PREOPEN_STOP_SECS_OF_DAY_IST.saturating_sub(at_0830)
-        );
     }
 
     #[test]
@@ -29246,7 +29608,9 @@ mod host_sizing_tests {
 
 #[cfg(test)]
 mod silence_latch_tests {
-    use super::{silence_page_is_cooling, silence_scan_pending};
+    use super::{
+        silence_page_floor, silence_page_is_cooling, silence_scan_pending, silence_warrants_page,
+    };
 
     /// Audit 2026-10-06 F1: never-ticked far strikes must not hold the latch.
     ///
@@ -29295,6 +29659,49 @@ mod silence_latch_tests {
             "one page for the never-ticked strikes at the open, one for the \
              11:00 episode; the old latch gave only the first"
         );
+    }
+
+    #[test]
+    fn test_silence_page_floor_is_one_percent_rounded_up_and_at_least_one() {
+        // §2.19 (2026-11-11): 1% of tracked, rounded up, never below 1.
+        assert_eq!(silence_page_floor(19_868), 199);
+        assert_eq!(silence_page_floor(100), 1);
+        assert_eq!(silence_page_floor(101), 2);
+        assert_eq!(silence_page_floor(4), 1);
+        assert_eq!(silence_page_floor(0), 1);
+        assert_eq!(silence_page_floor(u64::MAX), u64::MAX.div_ceil(100));
+    }
+
+    #[test]
+    fn test_regression_silence_warrants_page_ignores_a_few_slow_stocks() {
+        // Regression: 2026-11-11 — seven SOS pages, each naming 1 to 3 of
+        // 19,868 slow NSE_EQ stocks with never_ticked = 0.
+        for silent in 1..=3 {
+            assert!(!silence_warrants_page(silent, 0, false, 19_868));
+        }
+        assert!(!silence_warrants_page(198, 0, false, 19_868));
+        // Real feed trouble: 1% or more quiet together.
+        assert!(silence_warrants_page(199, 0, false, 19_868));
+        assert!(silence_warrants_page(19_868, 0, true, 19_868));
+        // A never-ticked instrument new this session always pages.
+        assert!(silence_warrants_page(1, 1, false, 19_868));
+        // Once reported, the same never-ticked set does not page again.
+        assert!(!silence_warrants_page(3, 1, true, 19_868));
+        // The four-index fallback universe still pages on one quiet index.
+        assert!(silence_warrants_page(1, 0, true, 4));
+    }
+
+    #[test]
+    fn test_regression_a_reported_never_ticked_set_does_not_lift_a_slow_stock_over_the_floor() {
+        // Regression: 2026-11-11 review — `silent` includes never-ticked
+        // instruments. After 5,000 never-ticked contracts paged once, one slow
+        // stock (silent 5,001, never 5,000) must not page again.
+        assert!(!silence_warrants_page(5_001, 5_000, true, 19_868));
+        assert!(!silence_warrants_page(5_198, 5_000, true, 19_868));
+        // 199 instruments that ticked and then went quiet still page.
+        assert!(silence_warrants_page(5_199, 5_000, true, 19_868));
+        // A count inconsistency (never > silent) never underflows into a page.
+        assert!(!silence_warrants_page(2, 5, true, 19_868));
     }
 
     #[test]
@@ -30665,6 +31072,7 @@ mod frame_walk_accounting_tests {
         let history = |set: &crate::main_feed_backup::PersistedBackupSet| {
             crate::main_feed_backup::PersistedBackupHistory {
                 publications: vec![set.clone()],
+                trimmed_through_day: None,
             }
         };
         let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
@@ -32564,8 +32972,12 @@ mod item_44_tests {
             "the catch-up deadline must be sized by the clock-aware budget"
         );
         assert!(
-            prod.contains("from_secs(catchup_budget_secs)"),
-            "the deadline must use the resolved budget, not the raw 300 s const"
+            prod.contains("from_secs(catchup_clock_secs)")
+                && prod.contains(
+                    "catchup_budget_after_gate_wait(catchup_budget_secs, gate_waited_secs)"
+                ),
+            "the deadline must use the resolved budget less the gate wait (B1 review 5), \
+             not the raw 300 s const"
         );
         assert!(
             !prod.contains("from_secs(WAL_CATCHUP_BUDGET_SECS)"),
@@ -32816,6 +33228,8 @@ mod feed_aux_tests;
 
 #[cfg(test)]
 mod l3_audit_tests;
+#[cfg(test)]
+mod live_fill_tap_drain_tests;
 #[cfg(test)]
 mod reserved_connections_tests;
 
@@ -33275,7 +33689,8 @@ mod shutdown_before_dial_tests {
     /// The calls of the drain's shutdown tail, in order. Each must appear in
     /// both bodies, and in this order in both.
     // `shutdown_top_volume_writer` left the tail on 2026-10-22 (plan item 62).
-    const SHUTDOWN_TAIL: [&str; 10] = [
+    const SHUTDOWN_TAIL: [&str; 11] = [
+        "mid_session_exit::is_mid_session_exit_now()",
         "seal_complete_buckets_at_mid_session_exit()",
         "seal_open_buckets_at_close()",
         "flush_and_record(",

@@ -7,7 +7,7 @@
 //! | Layer | When | What | On a violation |
 //! |---|---|---|---|
 //! | subscribe time | every contract attach attempt, in RAM, before the selection reaches the wire | every selected option's expiry must be on or after today AND equal to the nearest real expiry of its underlying, recomputed here from the day's contract file, independently of the selector | the contract is REFUSED (dropped from the selection), counted, one coded `error!` (`EXPIRY-SCOPE-01`) |
-//! | daily | 15:50 IST on trading days, its own task | today's distinct `(security_id, segment, contract)` of `NSE_FNO` / `BSE_FNO` from `candles_1m`, each contract's expiry (stored name, or the contract file), judged against the same nearest-expiry table | one `expiry_scope_audit` row (`clean` / `violation` / `partial`), local metrics, one coded `error!` |
+//! | daily | 15:50 IST on session days (trading days and Muhurat dates), its own task | today's distinct `(security_id, segment, contract)` of `NSE_FNO` / `BSE_FNO` from `candles_1m`, each contract's expiry (stored name, or the contract file), judged against the same nearest-expiry table | one `expiry_scope_audit` row (`clean` / `violation` / `partial`), local metrics, one coded `error!` |
 //!
 //! ### Why refuse at subscribe time instead of only counting
 //!
@@ -1453,7 +1453,13 @@ pub fn pre_register_expiry_scope_metrics() {
     }
 }
 
-fn now_utc_nanos() -> i64 {
+/// The wall clock, UTC epoch nanos. Named `wall_now_...` on purpose (B3
+/// review, 2026-11-13): the clocked task's functions take their clock as a
+/// parameter named `now_utc_nanos`. If this function had that name too, a
+/// refactor that dropped the parameter would still compile, the call would
+/// bind here, and the task would read the wall clock again with every test
+/// still green. With distinct names, a dropped parameter fails to compile.
+fn wall_now_utc_nanos() -> i64 {
     chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
 }
 
@@ -1466,13 +1472,35 @@ fn secs_of_day(ist_nanos: i64) -> u32 {
     u32::try_from(ist_nanos.rem_euclid(NANOS_PER_DAY) / NANOS_PER_SEC).unwrap_or(0)
 }
 
-/// Spawns the daily check on its own task (never the frame drain). Returns
-/// the task handle.
-// TEST-EXEMPT: tokio::spawn wrapper over the unit-tested pure parts (parse_contract_label, build_expiry_index, classify_candle_contracts, classify_expiry_scope, expiry_scope_sql, parse_candle_contract_rows, secs_until_expiry_scope_check, secs_until_after_checked_day); spawn site pinned by test_main_wires_spawn_expiry_scope_check.
+/// Spawns the daily check on its own task (never the frame drain), reading
+/// the wall clock. Returns the task handle.
+// TEST-EXEMPT: tokio::spawn wrapper over the unit-tested pure parts (parse_contract_label, build_expiry_index, classify_candle_contracts, classify_expiry_scope, expiry_scope_sql, parse_candle_contract_rows, secs_until_expiry_scope_check, secs_until_after_checked_day); spawn site pinned by test_main_wires_spawn_expiry_scope_check; the task body is driven end to end through spawn_expiry_scope_check_with_clock in tests/cov_xvs_expiry_spawn.rs.
 pub fn spawn_expiry_scope_check(
     questdb: QuestDbConfig,
     calendar: Arc<TradingCalendar>,
 ) -> tokio::task::JoinHandle<()> {
+    spawn_expiry_scope_check_with_clock(questdb, calendar, wall_now_utc_nanos)
+}
+
+/// [`spawn_expiry_scope_check`] with the clock passed in: `now_utc_nanos`
+/// returns the current UTC epoch nanos and is read at every point the task
+/// reads the time (today's date, the wait to 15:50 IST, the readiness wait's
+/// sleep to the live-final instant, the sleep past the checked day, and the
+/// row's `checked_at`). Production passes the wall
+/// clock; a test passes a fixed weekday and a fixed weekend instant, so the
+/// run path and the weekend path both run on every test run instead of only
+/// on the IST weekday CI happens to start on (B3 review, 2026-11-13: the
+/// production coverage floor depended on it). The sleeps are tokio sleeps
+/// either way. O(1) per call.
+// TEST-EXEMPT: tokio::spawn wrapper; driven end to end with a fixed clock (weekday and weekend) by tests/cov_xvs_expiry_spawn.rs.
+pub fn spawn_expiry_scope_check_with_clock<C>(
+    questdb: QuestDbConfig,
+    calendar: Arc<TradingCalendar>,
+    now_utc_nanos: C,
+) -> tokio::task::JoinHandle<()>
+where
+    C: Fn() -> i64 + Send + Sync + 'static,
+{
     pre_register_expiry_scope_metrics();
     tokio::spawn(async move {
         tickvault_storage::expiry_scope_audit_persistence::ensure_expiry_scope_audit_table(
@@ -1482,11 +1510,15 @@ pub fn spawn_expiry_scope_check(
         loop {
             let now_ist = now_utc_nanos().saturating_add(IST_UTC_OFFSET_NANOS);
             let today = ist_date_of(now_ist);
-            let trading = today.is_some_and(|d| calendar.is_trading_day(d));
-            if let (true, Some(day)) = (trading, today) {
+            // A session day, Muhurat included (operator Quote 49, B3
+            // review 2026-11-13): `is_trading_day` is false for a Muhurat
+            // session on a weekend or a holiday, so that day's candles were
+            // never checked and no row was written.
+            let session_day = today.is_some_and(|d| calendar.is_session_day(d));
+            if let (true, Some(day)) = (session_day, today) {
                 let wait = secs_until_expiry_scope_check(secs_of_day(now_ist));
                 tokio::time::sleep(Duration::from_secs(wait)).await;
-                run_one_check(&questdb, day, now_ist).await;
+                run_one_check(&questdb, day, now_ist, &now_utc_nanos).await;
             }
             // Sleep to just past the END of the day this iteration looked at
             // (a multi-day process), measured from that day, never from the
@@ -1524,17 +1556,26 @@ async fn read_candle_contracts(
     parse_candle_contract_rows(&body)
 }
 
-async fn run_one_check(questdb: &QuestDbConfig, day: NaiveDate, day_ist_nanos: i64) {
+async fn run_one_check(
+    questdb: &QuestDbConfig,
+    day: NaiveDate,
+    day_ist_nanos: i64,
+    now_utc_nanos: &(impl Fn() -> i64 + Sync),
+) {
     let today_ymd = ymd_of(day);
     // The same three barriers the 1-minute cross-check waits for: today's
     // candles sealed, drained and applied. The read runs either way (a
     // violation found is real); a live side that is not final is never
     // `clean`.
-    let readiness = crate::dhan_live_crossverify_boot::live_side_readiness(
+    // The wait reads this task's clock too (B3 review, 2026-11-13), so its
+    // sleep to the live-final instant follows an injected clock in tests.
+    let now_unix_secs = || now_utc_nanos().div_euclid(NANOS_PER_SEC);
+    let readiness = crate::dhan_live_crossverify_boot::live_side_readiness_with_clock(
         &format!("http://{}:{}/exec", questdb.host, questdb.http_port),
         day,
         day_ist_nanos.saturating_sub(day_ist_nanos.rem_euclid(NANOS_PER_DAY)),
         tokio::time::Instant::now() + Duration::from_secs(EXPIRY_SCOPE_READINESS_WAIT_SECS),
+        &now_unix_secs,
     )
     .await;
     let live_not_final = readiness_reason(readiness);

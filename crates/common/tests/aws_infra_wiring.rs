@@ -188,48 +188,27 @@ fn test_deploy_aws_does_not_auto_seed_prod_secrets() {
 
 #[test]
 fn test_cloudwatch_operator_dashboard_exists() {
-    // The CloudWatch-only runtime has NO Grafana — the operator dashboard is a
-    // native CloudWatch dashboard (deploy/aws/terraform/dashboard.tf). It must
-    // exist + chart only metrics the CW agent actually scrapes (the allowlist
-    // in user-data prometheus.yaml) + reference real alarm resources, so a
-    // terraform apply doesn't fail and no widget is empty.
-    let dash = std::fs::read_to_string(workspace_root().join("deploy/aws/terraform/dashboard.tf"))
-        .expect("dashboard.tf must be readable"); // APPROVED: test
+    // Name kept so the test-count ratchet holds; the meaning is reversed.
+    // Operator Quote 53 (2026-11-11, card "Delete the CloudWatch dashboard")
+    // deleted deploy/aws/terraform/dashboard.tf and its dashboard_url output,
+    // reversing Quote 37's "dashboard KEPT". The operator portal and Telegram
+    // stay. Bringing the dashboard back needs a fresh dated owner quote.
+    let dir = workspace_root().join("deploy/aws/terraform");
     assert!(
-        dash.contains("resource \"aws_cloudwatch_dashboard\" \"operator\""),
-        "dashboard.tf must declare the operator CloudWatch dashboard"
+        !dir.join("dashboard.tf").exists(),
+        "dashboard.tf is back; Quote 53 deleted the CloudWatch dashboard"
     );
-    // A few signal metrics that MUST be charted (and are in the scrape allowlist).
-    // (PR-C2, 2026-07-13: tv_realtime_guarantee_score replaced by the Groww
-    // lag gauge — the score widget retired with the PARKed SLO publisher.)
-    // (2026-07-15: the Groww lag gauge replaced by tv_rest_1m_fire_heartbeat
-    // — its sample producer died with the Groww live feed.)
-    // (2026-09-16: tv_rest_1m_fire_heartbeat replaced by
-    // tv_dhan_feed_last_tick_age_secs — its three producers died with the
-    // per-minute REST legs, removed under the operator's sockets-only
-    // directive, no-rest-except-live-feed-2026-06-27.md §12.10. Twice now the
-    // "single most important signal" tile has lost its metric to a scope
-    // change, which is the reason this list is a REQUIREMENT and not a
-    // comment: the widget cannot quietly go blank.)
-    // (2026-07-17, stage-3 dead-WS sweep: tv_aggregator_seals_emitted_total
-    // left this list — its widget retired with the tick aggregator; the
-    // series can never publish again.)
-    for metric in &[
-        "tv_dhan_feed_last_tick_age_secs",
-        "tv_questdb_disconnected_seconds",
-        "tv_token_remaining_seconds",
-    ] {
-        assert!(
-            dash.contains(metric),
-            "operator dashboard must chart {metric} (a scraped Tickvault/Prod metric)"
-        );
-    }
-    // The dashboard_url output lets the operator jump straight to it.
-    let outputs = std::fs::read_to_string(workspace_root().join("deploy/aws/terraform/outputs.tf"))
-        .expect("outputs.tf must be readable"); // APPROVED: test
+    let outputs =
+        std::fs::read_to_string(dir.join("outputs.tf")).expect("outputs.tf must be readable"); // APPROVED: test
+    let live_outputs: String = outputs
+        .lines()
+        .map(|l| l.split('#').next().unwrap_or(""))
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
-        outputs.contains("dashboard_url"),
-        "outputs.tf must expose dashboard_url for one-click console access"
+        !live_outputs.contains("dashboard_url")
+            && !live_outputs.contains("aws_cloudwatch_dashboard"),
+        "outputs.tf still exposes the deleted dashboard"
     );
 }
 
@@ -497,9 +476,27 @@ fn test_terraform_tv_cold_lifecycle_never_expires_and_tiers_down() {
         lifecycle.contains("GLACIER_IR"),
         "the tv_cold lifecycle must transition to Glacier IR"
     );
+    // Operator Quote 53 (2026-11-11): raw-frames/ moves to Glacier Instant
+    // Retrieval after 30 days (was Deep Archive under ITEM 45f), current and
+    // noncurrent versions, and nothing goes to Deep Archive any more.
     assert!(
-        lifecycle.contains("prefix = \"raw-frames/\"") && lifecycle.contains("DEEP_ARCHIVE"),
-        "the tv_cold lifecycle must move raw-frames/ to Deep Archive (ITEM 45f)"
+        lifecycle.contains("prefix = \"raw-frames/\"")
+            && lifecycle.contains("id     = \"raw-frames-glacier-ir\"")
+            && lifecycle.contains("noncurrent_version_transition"),
+        "the tv_cold lifecycle must move raw-frames/ to Glacier IR, current and \
+         noncurrent (Quote 53). Found:\n{lifecycle}"
+    );
+    assert!(
+        !lifecycle.contains("DEEP_ARCHIVE") && !lifecycle.contains("\"GLACIER\""),
+        "Quote 53 REJECTs Deep Archive or Glacier Flexible in tv_cold. Found:\n{lifecycle}"
+    );
+    assert!(
+        !lifecycle.contains("questdb-partitions/")
+            && !lifecycle.contains("deploys/")
+            && !lifecycle.contains("instrument-snapshots/")
+            && !lifecycle.contains("prefix = \"logs/\""),
+        "Quote 53 REJECTs a new transition rule for questdb-partitions/, deploys/, \
+         instrument-snapshots/ or logs/. Found:\n{lifecycle}"
     );
     assert!(
         lifecycle.contains("depends_on = [aws_s3_bucket_versioning.tv_cold]"),
@@ -561,8 +558,8 @@ fn test_terraform_cold_bucket_keeps_everything() {
         );
     }
     assert!(
-        lifecycle.contains("prefix = \"raw-frames/\"") && lifecycle.contains("DEEP_ARCHIVE"),
-        "raw frames must move to Deep Archive, not be deleted"
+        lifecycle.contains("prefix = \"raw-frames/\"") && lifecycle.contains("\"GLACIER_IR\""),
+        "raw frames must move to Glacier IR (Quote 53), not be deleted"
     );
     let versioning = terraform_block(
         &content,
@@ -593,11 +590,15 @@ fn test_terraform_oidc_role_restricts_to_repo() {
 fn test_terraform_alarms_publish_to_sns() {
     let content = std::fs::read_to_string(workspace_root().join("deploy/aws/terraform/alarms.tf"))
         .expect("alarms.tf must be readable"); // APPROVED: test
-    // All 5 alarms must reference the SNS topic for Telegram fan-out.
+    // Every alarm in the file must reference the SNS topic for Telegram
+    // fan-out. Two alarms since 2026-11-11 (operator Quote 53 alarm review,
+    // docs/audits/2026-11-alarm-review.md): the instance and system status
+    // checks, which also carry the EC2 reboot and recover self-heal actions.
     let alarm_count = content.matches("aws_sns_topic.tv_alerts.arn").count();
     assert!(
-        alarm_count >= 5,
-        "alarms.tf must wire >= 5 alarms to tv_alerts SNS (found {alarm_count})"
+        alarm_count >= 2 && content.contains("arn:aws:automate:${var.aws_region}:ec2:recover"),
+        "alarms.tf must wire the system status alarm to tv_alerts SNS and keep its \
+         EC2 recover action (found {alarm_count} SNS references)"
     );
 }
 

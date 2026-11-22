@@ -62,6 +62,13 @@ const LOG_ONLY_CODES: &[&str] = &[
     "DH-909",
     "DH-910",
     "DHAN-LIVE-XVERIFY-01",
+    // 2026-11-21 (scope lock 2026-11-20): the Dhan trade-time correction's own
+    // lines. Never paged: noise lock §2.24 REJECT "paging the correction's own
+    // coded warnings"; DHAN-FEED-TIME-01 is the page.
+    "DHAN-LTT-01",
+    "DHAN-LTT-02",
+    // DISK-WATCHER-01: its alarm left 2026-11-11 (operator Quote 53 alarm review).
+    "DISK-WATCHER-01",
     "DRAIN-HOLD-01",
     "EXIT-ORDER-01",
     "EXIT-VERIFY-01",
@@ -97,6 +104,16 @@ const LOG_ONLY_CODES: &[&str] = &[
     "LAMBDA-PROV-01",
     "LAMBDA-START-01",
     "LAMBDA-START-02",
+    // 2026-11-12 (plan item LF-7): the daily live paper fill calibration
+    // report. A report step failed (files kept, retried) or a paper fill sits
+    // outside the re-priced worst case. Log only: noise lock §2.22 and its
+    // 2026-11-12 note allow no new page without a dated row.
+    "LIVE-FILL-01",
+    "LIVE-FILL-02",
+    // 2026-11-12 (plan item LF-6a): the once-per-session handshake timing
+    // check failed an attempt or a write. A measurement, log only; the failed
+    // attempt is itself a row in `network_rtt_session`.
+    "NET-RTT-01",
     "OMS-GAP-01",
     "OMS-GAP-02",
     "OMS-GAP-04",
@@ -122,6 +139,8 @@ const LOG_ONLY_CODES: &[&str] = &[
     "TELEGRAM-03",
     "TF-VERIFY-01",
     "TF-VERIFY-02",
+    // TICK-FLUSH-01: its alarm left 2026-11-11 (operator Quote 53 alarm review).
+    "TICK-FLUSH-01",
     "TICK-GAP-01",
     "WS-GAP-01",
     "WS-GAP-04",

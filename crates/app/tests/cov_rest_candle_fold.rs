@@ -36,6 +36,16 @@ use tokio::sync::mpsc;
 // Process-global harness: recorder, tracing sink, RAM store
 // ---------------------------------------------------------------------------
 
+/// Keeps a second, inert `tracing` dispatcher registered for the whole test
+/// process. While a scoped subscriber is the only registered dispatcher,
+/// tracing-core caches a callsite as `never` when a thread with no
+/// subscriber reaches it first, and the scoped subscriber then misses the
+/// line. Call before installing the scoped subscriber.
+fn keep_callsite_interest_shared() {
+    static ANCHOR: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+    ANCHOR.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+}
+
 fn harness() -> &'static PrometheusHandle {
     static H: OnceLock<PrometheusHandle> = OnceLock::new();
     H.get_or_init(|| {
@@ -743,6 +753,7 @@ async fn test_rest_candle_fold_run_response_byte_cap_accepts_exact_and_refuses_o
     drop(tx);
     let captured = CapturedLog::default();
     let writer = captured.clone();
+    keep_callsite_interest_shared();
     let subscriber = tracing_subscriber::fmt()
         .with_ansi(false)
         .without_time()

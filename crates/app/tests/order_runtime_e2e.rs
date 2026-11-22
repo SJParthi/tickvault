@@ -102,6 +102,7 @@ async fn order_runtime_e2e_orphan_updates_and_mark_drain() {
 
     let supervisor = spawn_order_runtime(OrderRuntimeParams {
         leg_pnl_tx: None,
+        live_fill: None,
         config,
         notifier,
         calendar,
@@ -201,6 +202,7 @@ async fn order_runtime_e2e_mark_channel_close_does_not_exit_the_loop() {
 
     let supervisor = spawn_order_runtime(OrderRuntimeParams {
         leg_pnl_tx: None,
+        live_fill: None,
         config,
         notifier,
         calendar,

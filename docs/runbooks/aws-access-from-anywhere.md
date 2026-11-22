@@ -28,21 +28,19 @@ Instance id: **`i-0b956d0209231a48b`** (`tv-prod-app`). Region: `ap-south-1`.
 
 ---
 
-## 1. The CloudWatch dashboard — no tunnel needed
+## 1. The operator portal — no tunnel needed
 
-The visual operator page (app health, market-data flow, alarms) is in the AWS
-Console — open it from **any browser, even your phone**, just by logging into
-AWS:
+> ⚠ From December 2026 the CloudWatch dashboard is deleted (operator Quote 53 of 2026-11-11, `docs/audits/2026-11-alarm-review.md`). Use the operator portal and Telegram instead. The old path was: AWS Console → CloudWatch → Dashboards → **`tv-prod-operator`**
 
-> AWS Console → CloudWatch → Dashboards → **`tv-prod-operator`**
-
-Or get the direct URL after deploy:
+The visual operator page is now the operator portal, open from **any browser,
+even your phone**. Get its address after deploy:
 ```bash
-cd deploy/aws/terraform && terraform output dashboard_url
+cd deploy/aws/terraform && terraform output operator_portal_url
 ```
 
-This needs **no tunnel** — it's a native AWS console page. Logs, metrics,
-alarms, and the live alarm-status strip are all there.
+(`terraform output dashboard_url` no longer works: that output was deleted with
+the dashboard.) Logs and alarms stay in the AWS Console: CloudWatch → Log groups,
+and CloudWatch → Alarms.
 
 ---
 
@@ -139,7 +137,7 @@ Or the repo's Makefile shortcuts (from `~/tickvault`):
 ```bash
 make aws-ssm            # interactive shell
 make aws-ssm-command    # tails the last 50 app-log lines
-make aws-outputs        # instance_id, dashboard_url, etc.
+make aws-outputs        # instance_id, operator_portal_url, etc. (no dashboard_url since 2026-11-11)
 make aws-cost           # current month bill estimate
 ```
 
@@ -166,7 +164,7 @@ make aws-cost           # current month bill estimate
 | Instance metadata | IMDSv2 required |
 | Access audit | every SSM session is logged in CloudTrail (who/when/what) |
 
-**The "from anywhere" you wanted = AWS Console (dashboard/logs/alarms) + SSM
+**The "from anywhere" you wanted = the operator portal + AWS Console (logs/alarms) + SSM
 tunnels (QuestDB/API).** Works from Mac, IntelliJ terminal, or any laptop with
 the AWS CLI — fully independent of your local Macbook, fully secure.
 

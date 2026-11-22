@@ -78,21 +78,8 @@ resource "aws_cloudwatch_log_group" "questdb_console_proxy" {
 # account-wide aggregate across every log group.
 # ---------------------------------------------------------------------------
 
-resource "aws_cloudwatch_metric_alarm" "logs_ingestion_runaway" {
-  alarm_name          = "tv-${var.environment}-logs-ingestion-runaway"
-  alarm_description   = "CloudWatch Logs ingested > ~5 GB in 24h across the account — a log runaway is burning the budget. Find the offender: aws logs describe-log-groups --query 'sort_by(logGroups,&storedBytes)[-5:]'"
-  namespace           = "AWS/Logs"
-  metric_name         = "IncomingBytes"
-  statistic           = "Sum"
-  period              = 86400 # 1 day — threshold is a per-day byte budget
-  evaluation_periods  = 1
-  threshold           = 5368709120 # 5 GiB/day
-  comparison_operator = "GreaterThanThreshold"
-  treat_missing_data  = "notBreaching"
-
-  alarm_actions = [aws_sns_topic.tv_alerts.arn]
-  ok_actions    = [aws_sns_topic.tv_alerts.arn]
-}
+# alarm "logs_ingestion_runaway" REMOVED 2026-11-11 (operator Quote 53, alarm review
+# docs/audits/2026-11-alarm-review.md). The comments above are kept as history.
 
 # ---------------------------------------------------------------------------
 # App log-group ingestion SILENCE alarm — the inverse of the runaway guard.

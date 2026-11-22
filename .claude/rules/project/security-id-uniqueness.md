@@ -64,6 +64,10 @@ one of them, leading to:
 5. **New subscription-plan / registry code** MUST use
    `(security_id, ExchangeSegment)` for dedup. Regression tests
    `subscription_planner::tests::test_regression_*` enforce this.
+   *(⚠ CORRECTED 2026-11-15, audit repo-2: the planner and its
+   `test_regression_*` tests were deleted; no test of that name exists. New
+   subscription code is held to this by the banned-pattern hook, layer 5
+   below.)*
 
 ## Enforcement (7 layers, all merged 2026-04-17)
 
@@ -103,6 +107,32 @@ one of them, leading to:
    per-boot alert. Ratchet: `test_cross_segment_log_level_is_info_not_error`
    in `instrument_registry.rs` blocks regressions back to `error!`.
 
+> **⚠ CORRECTED 2026-11-15 (audit repo-2) — most of these seven layers no
+> longer exist.** Checked in the tree that day:
+>
+> - Layers 1, 2 and 6 went with the deleted planner
+>   (`subscription_planner.rs`) and universe builder (`universe_builder.rs`).
+>   `test_regression_seen_ids_key_type_is_pair` and
+>   `tv_fno_universe_derivative_collisions_total` match nothing in `crates/`.
+> - Layer 7: no production code emits
+>   `tv_instrument_registry_cross_segment_collisions` or
+>   `tv_instrument_registry_total_entries`, and `/health` and `make doctor`
+>   do not read them. `cross_segment_collisions()` and `collision_pairs()`
+>   have test callers only. So "collisions = 0" anywhere is an absence, not
+>   a measurement. The `info!`-level ratchet
+>   `test_cross_segment_log_level_is_info_not_error` still exists.
+> - Layers 3, 4 and 5 still hold: the composite `by_composite` index, the
+>   storage DEDUP meta-guard, and the banned-pattern hook (category 5).
+> - Layer 5 was widened the same day (audit repo-1): it now also scans
+>   every file under `crates/app/src/` and `crates/storage/src/`, and it
+>   bans `HashSet<u64>` and `HashMap<u64, _>` too (`SecurityId` is `u64`).
+>   The 14 bare-id sets and maps found there carry an `// APPROVED:` line
+>   saying why (single-segment, not an instrument key, or a bare id on
+>   purpose). Limit: the gate matches type names as text, so a type alias, a
+>   `BTreeSet<u64>` or an inferred type still gets through.
+>
+> The text above is kept as history.
+
 ## Dashboard enforcement
 
 - Grafana dashboards must not use `count_distinct(security_id)` on
@@ -115,6 +145,10 @@ one of them, leading to:
   `SELECT count(*) AS total FROM (SELECT DISTINCT security_id,
   segment FROM ticks)`.
 
+> **⚠ CORRECTED 2026-11-15 (audit repo-2):** the dashboard guard named above
+> was RETIRED with Grafana (2026-05-19) and does not exist; nothing enforces
+> this section today.
+
 ## Where this rule fires (auto-loaded paths)
 
 - `crates/core/src/instrument/subscription_planner.rs`
@@ -125,6 +159,15 @@ one of them, leading to:
 - `crates/trading/src/greeks/aggregator.rs` (option state)
 - Any file containing `HashSet<u32>`, `HashSet<SecurityId>`,
   `HashMap<u32,`, `HashMap<SecurityId,`.
+
+> **⚠ CORRECTED 2026-11-15 (audits repo-1 and repo-2):** four of the paths
+> above were deleted: `subscription_planner.rs`, `universe_builder.rs`,
+> `pipeline/tick_processor.rs` and `greeks/aggregator.rs`. The live
+> instrument code is in `crates/app/src/` (the `dhan_*universe*.rs`,
+> `depth_*.rs`, `option_rank.rs`, `order_runtime.rs` and feed-stack files)
+> and `crates/storage/src/`. The banned-pattern hook scans those trees, the
+> old `crates/{common,core,trading}/src/{instrument,pipeline,websocket,greeks}/`
+> paths and `instrument_registry.rs`.
 
 ## Historical context
 

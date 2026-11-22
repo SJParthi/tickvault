@@ -255,6 +255,35 @@ impl OrderCircuitBreaker {
         prev_failures >= self.failure_threshold
     }
 
+    /// Gives back the HalfOpen probe that a `check()` just took, when the
+    /// caller then refused the request itself before sending anything (a halt,
+    /// readiness or sandbox refusal, or a failed token fetch), or the broker's
+    /// answer was a class this breaker does not count (a throttle, an 805, a
+    /// failed token refresh: R19), so no outcome is recorded. Added 2026-11-13
+    /// (audit B2, widened by its follow-up the same day): without it
+    /// the probe flag stayed set with no success or failure ever recorded, so
+    /// `check()` refused every later order with "probe already in flight"
+    /// until the daily reset. Does nothing unless the breaker reads HalfOpen,
+    /// so it never touches an open window or a closed breaker. The OMS owns
+    /// the breaker through `&mut self`, so while it reads HalfOpen with the
+    /// flag set, the probe can only be the one the same call took. O(1), at
+    /// most three atomic loads and one store.
+    pub fn release_probe(&self) {
+        if self.state() == CircuitState::HalfOpen {
+            self.half_open_probe_sent.store(false, Ordering::Release);
+        }
+    }
+
+    /// Test seam: a breaker past its open window, waiting for its first
+    /// probe (a unit test cannot advance the wall clock).
+    #[cfg(test)]
+    pub(crate) fn force_half_open_for_test(&self) {
+        self.consecutive_failures
+            .store(self.failure_threshold, Ordering::Relaxed);
+        self.opened_at_secs.store(1, Ordering::Relaxed);
+        self.half_open_probe_sent.store(false, Ordering::Relaxed);
+    }
+
     /// Resets the circuit breaker to closed state (operator override).
     pub fn reset(&self) {
         self.consecutive_failures.store(0, Ordering::Relaxed);
@@ -703,6 +732,34 @@ mod tests {
         // Third check also fails
         let r3 = cb.check();
         assert!(r3.is_err());
+    }
+
+    /// Audit B2 (2026-11-13): a probe taken by `check()` and then refused by
+    /// the caller is given back, so the next request may probe.
+    #[test]
+    fn test_release_probe_after_force_half_open_for_test_frees_the_probe() {
+        let cb = OrderCircuitBreaker::new();
+        cb.force_half_open_for_test();
+        assert!(cb.check().is_ok(), "first check takes the probe");
+        assert!(cb.check().is_err(), "probe in flight");
+        cb.release_probe();
+        assert!(cb.check().is_ok(), "released probe can be taken again");
+    }
+
+    /// `release_probe` never touches a closed breaker or an open window.
+    #[test]
+    fn test_release_probe_is_a_no_op_outside_half_open() {
+        let cb = OrderCircuitBreaker::new();
+        cb.release_probe();
+        assert_eq!(cb.state(), CircuitState::Closed);
+        for _ in 0..OMS_CIRCUIT_BREAKER_FAILURE_THRESHOLD {
+            cb.record_failure();
+        }
+        assert_eq!(cb.state(), CircuitState::Open);
+        cb.half_open_probe_sent.store(true, Ordering::Relaxed);
+        cb.release_probe();
+        assert!(cb.half_open_probe_sent.load(Ordering::Relaxed));
+        assert_eq!(cb.state(), CircuitState::Open);
     }
 
     // -----------------------------------------------------------------------

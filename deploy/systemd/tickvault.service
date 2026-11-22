@@ -302,6 +302,30 @@ Environment=TICKVAULT_TOKIO_WORKER_THREADS=2
 # are off, so nothing else changes.
 Environment=TICKVAULT_DRAIN_THREAD=on
 Environment=TICKVAULT_BACKGROUND_CORE=0
+#
+# Owner decision, Thu 12 Nov 2026 ~16:15 IST (card in the session): "Yes,
+# both, measure 1 day (Recommended)" — "Turn on top priority for the 2 feed
+# threads and keep the monitoring agent on core 0. Measure the next full
+# trading day against today; undo if ticks lost, the database falling
+# behind, or worse numbers."
+#
+# Measured 12 Nov (live, host_capacity_minute + /proc/<tid>/schedstat): the
+# host is 15-20% busy, yet the frame drain waited 133 s for core 1 against
+# 268 s of run time, worst seconds 36 ms (drain) and 41 ms (reader), because
+# both are SCHED_OTHER threads waking each other ~38M times a day. Real-time
+# priority (readers SCHED_FIFO 2, drain SCHED_FIFO 1) lets a woken hot
+# thread run at once instead of waiting a 1.4 ms EEVDF slice. Guarded by the
+# kernel RT throttle (sched_rt_runtime_us 950000 of 1000000 on the box,
+# verified 12 Nov): a stuck hot thread still leaves core 1 5%, and the app
+# refuses RT outright if the throttle is off (HOT-PATH-03 hot_rt_refused).
+# QuestDB is unaffected: it is pinned to core 0.
+#
+# REVIEW with the 16:15 IST capacity verdict of the first session that runs
+# it, against 12 Nov: reader/drain CPU wait, worst second, receipt_to_fold
+# and ring_dwell p99, ticks lost 0, ring refusals 0, QuestDB backlog. To
+# switch off: delete the two lines below in an after-close update.
+Environment=TICKVAULT_HOT_RT_PRIORITY=1
+LimitRTPRIO=2
 
 # ---------------------------------------------------------------------------
 # Hot-thread placement (plan ITEM DT, 2026-10-30) — ALL OFF by default

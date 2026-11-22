@@ -144,11 +144,36 @@ fn oms_wiring_keeps_typed_degrade_shape() {
              degrade shape — missing: {needle}"
         );
     }
+    // PR C (no-rest rule §12.16): order_runtime.rs reaches the shared builder
+    // through `order_prewarm::order_runtime_http_client`, which calls
+    // `build_oms_http_client` (pre-warm off, or no TLS config) or
+    // `build_oms_http_client_with_tls` (same pinned builder and degrade). The
+    // same typed-degrade shape is then pinned in order_prewarm.rs.
+    let prewarm_src =
+        std::fs::read_to_string(app_src("order_prewarm.rs")).expect("order_prewarm.rs");
+    let prewarm = production_region(&prewarm_src);
+    for needle in [
+        "-> Result<reqwest::Client, HttpClientBuildError>",
+        "crate::oms_wiring::build_oms_http_client,",
+        "crate::oms_wiring::build_oms_http_client_with_tls(",
+    ] {
+        assert!(
+            prewarm.contains(needle),
+            "order_prewarm.rs must build the order client via the shared oms_wiring \
+             builders with the typed Result — missing: {needle}"
+        );
+    }
+    assert!(
+        !prewarm.contains(".unwrap()") && !prewarm.contains(".expect("),
+        "order_prewarm.rs must consume the builder's Result via a degrade path, never unwrap"
+    );
     for caller in ["order_runtime.rs", "trading_pipeline.rs"] {
         let src = std::fs::read_to_string(app_src(caller)).expect(caller);
         let prod = production_region(&src);
         assert!(
-            prod.contains("build_oms_http_client()"),
+            prod.contains("build_oms_http_client()")
+                || (caller == "order_runtime.rs"
+                    && prod.contains("crate::order_prewarm::order_runtime_http_client(")),
             "{caller} must keep building the OMS client via the shared \
              oms_wiring builder"
         );

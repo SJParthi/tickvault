@@ -747,63 +747,11 @@ resource "aws_cloudwatch_metric_alarm" "dhan_contract_universe_failed" {
 # and still readable on the box's :9091/metrics; it is simply not chartable
 # off-box until the selector has room. deploy/aws/EMF-METRIC-SELECTOR-NOTES.md
 # carries the wider record of that rationing.
-resource "aws_cloudwatch_metric_alarm" "tick_spill_replay_failing" {
-  alarm_name        = "tv-${var.environment}-tick-spill-replay-failing"
-  alarm_description = "The automatic drain could not return rescued ticks to the database. The rows are NOT lost — they are on the box as valid line protocol in data/spill/ticks/ — but they are not queryable, and the spill directory is now growing toward its 512 MiB cap, past which the writer stops rescuing and starts dropping. Causes, in order of likelihood: QuestDB is down or refusing writes; or the disk is full so the drained file cannot be emptied. Triage: journalctl -u tickvault for TICK-FLUSH-01 and for the drain's round summary, then ls -la data/spill/ticks/ — a non-empty .ilp file is unrecovered ticks. Manual recovery, unchanged and always available: curl --data-binary @<file> http://<questdb>:9000/write"
+# alarm "tick_spill_replay_failing" REMOVED 2026-11-11 (operator Quote 53, alarm review
+# docs/audits/2026-11-alarm-review.md). The comments above are kept as history.
 
-  comparison_operator = "GreaterThanOrEqualToThreshold"
-  threshold           = 1
-  evaluation_periods  = 1
-  metric_name         = "tv_tick_spill_replay_failed_total"
-  namespace           = local.app_namespace
-  # The drain runs every 5 minutes, so one period matches one round.
-  #
-  # notBreaching: the box is stopped overnight and publishes nothing, which is
-  # health, not a failing drain. The dark-lane case belongs to
-  # dhan_no_ticks_flowing, which treats missing data as breaching and is gated.
-  period             = 300
-  statistic          = "Sum"
-  dimensions         = local.app_dimensions
-  treat_missing_data = "notBreaching"
-
-  # 2026-09-23 (dhan-rest-only-noise-lock §2.3x): gate-listed, so it ships
-  # DISARMED — terraform's default is armed, and every apply would re-arm it
-  # outside the window the market-hours gate Lambda owns.
-  actions_enabled = false
-  alarm_actions   = local.app_alarm_actions
-  # The counter is cumulative and only a successful round changes the outcome.
-  # A round succeeding does not un-happen the failure that preceded it.
-  ok_actions = []
-}
-
-resource "aws_cloudwatch_metric_alarm" "ticks_spilling" {
-  alarm_name        = "tv-${var.environment}-ticks-spilling"
-  alarm_description = "A QuestDB tick flush failed and the buffer was rescued to disk instead of being discarded. No ticks are lost yet — this is the rescue tier working — but a flush failing at all means QuestDB write latency is degrading under the live load, and sustained spilling ends at the 512 MiB cap where the writer starts dropping for real. Triage: check QuestDB health and disk pressure first (make doctor), then watch whether tv-<env>-tick-spill-replay-failing follows: spilling that drains is deferred recovery, spilling that does not drain is a countdown."
-
-  comparison_operator = "GreaterThanOrEqualToThreshold"
-  threshold           = 1
-  # M-of-N since 2026-08-28. Was evaluation_periods = 1, which re-entered
-  # ALARM on every window with a non-zero delta: a flapping condition paged the
-  # operator once per period all session (five alarms on a ~7-minute loop on
-  # 2026-08-28). With 1-of-3 the FIRST breach still pages immediately - so
-  # detection is not delayed by a single second - but the alarm stays in ALARM
-  # through interleaved zero windows instead of resolving and re-firing.
-  evaluation_periods  = 3
-  datapoints_to_alarm = 1
-  metric_name         = "tv_ticks_spilled_total"
-  namespace           = local.app_namespace
-  period              = 300
-  statistic           = "Sum"
-  dimensions          = local.app_dimensions
-  treat_missing_data  = "notBreaching"
-
-  # 2026-09-23 (dhan-rest-only-noise-lock §2.3x): gate-listed, so it ships
-  # DISARMED — terraform's default is armed, and every apply would re-arm it
-  # outside the window the market-hours gate Lambda owns.
-  actions_enabled = false
-  alarm_actions   = local.app_alarm_actions
-  ok_actions      = []
-}
+# alarm "ticks_spilling" REMOVED 2026-11-11 (operator Quote 53, alarm review
+# docs/audits/2026-11-alarm-review.md). The comments above are kept as history.
 
 # ---------------------------------------------------------------------------
 # 13. DEPTH STEERING STOPPED — REMOVED 2026-10-22
@@ -849,39 +797,8 @@ resource "aws_cloudwatch_metric_alarm" "ticks_spilling" {
 # after the 15:30 close every socket legitimately stops delivering, the gauge
 # climbs past 600 within ten minutes, and the alarm fires on a market that is
 # simply shut. That is the fastest way to train an operator to ignore it.
-resource "aws_cloudwatch_metric_alarm" "dhan_worst_socket_deaf" {
-  alarm_name        = "tv-${var.environment}-dhan-worst-socket-deaf"
-  alarm_description = "ONE Dhan socket has delivered nothing for ~10 minutes DURING MARKET HOURS while the lane as a whole looks healthy. This is the deaf-socket case: a connection that keeps answering pings but stops sending data never trips the idle watchdog (it is not silent), never reconnects (nothing is retrying), and does not move the lane-level tick-age gauge (the other fifteen sockets are fine). Read this AGAINST tv_dhan_feed_last_tick_age_secs on the live-lane dashboard row: this one climbing ALONE is a single deaf socket; both climbing is the whole feed and alarm 11 will have fired too. Triage: (1) tv_dhan_ws_worst_conn_tick_age_secs_by_pool and the per-connection detail on /metrics name WHICH socket. (2) tv_dhan_ws_alive_connections - is it still dialed. (3) tv_dhan_feed_instruments_never_ticked - a subscribe that silently did not take looks the same from here. (4) journalctl -u tickvault for WS-GAP-03 and the subscribe batches. A value of -1 means no connection has ticked yet and is NOT a fault."
-
-  comparison_operator = "GreaterThanOrEqualToThreshold"
-  threshold           = 600
-  evaluation_periods  = 1
-  metric_name         = "tv_dhan_ws_worst_conn_tick_age_secs"
-  namespace           = local.app_namespace
-  period              = 300
-  # Maximum, never Average: a window holding one fresh scrape and four stale
-  # ones is still a window in which that socket was silent, and averaging would
-  # let a single late frame erase four minutes of nothing.
-  statistic = "Maximum"
-  # `{host}` — the metric is unlabelled and the EMF processor declares exactly
-  # one dimension set. Per-socket attribution lives on /metrics deliberately:
-  # sixteen CloudWatch dimensions would cost ~$4.80/mo to answer a yes/no
-  # question this one series answers.
-  dimensions = local.app_dimensions
-
-  # A stopped box publishes nothing, and that is health rather than a deaf
-  # socket. Absence-must-page is alarms 11 and 13's job, not this one's.
-  treat_missing_data = "notBreaching"
-
-  # Actions OFF by default; the market-hours gate Lambda flips them ON
-  # 09:20-15:40 IST Mon-Fri. WITHOUT THIS LINE THIS ALARM PAGES EVERY EVENING
-  # AT ~15:40, when every socket legitimately stops delivering.
-  actions_enabled = false
-  alarm_actions   = local.app_alarm_actions
-  # A socket resuming IS a real, self-explanatory recovery — unlike the loss
-  # counters, where a delta returning to zero never means the data came back.
-  ok_actions = local.app_alarm_ok
-}
+# alarm "dhan_worst_socket_deaf" REMOVED 2026-11-11 (operator Quote 53, alarm review
+# docs/audits/2026-11-alarm-review.md). The comments above are kept as history.
 
 # ---------------------------------------------------------------------------
 # 14. WAL REPLAY MET A RECORD FORMAT IT CANNOT READ — the deploy-rollback
@@ -947,30 +864,8 @@ resource "aws_cloudwatch_metric_alarm" "wal_replay_unknown_magic" {
 # still running — when a seal cannot be handed to the writer and is escalated
 # to disk. On a healthy lane it is exactly zero.
 # ---------------------------------------------------------------------------
-resource "aws_cloudwatch_metric_alarm" "seal_writer_rescued" {
-  alarm_name        = "tv-${var.environment}-seal-writer-rescued"
-  alarm_description = "Sealed candles could not reach the seal writer and were escalated to disk. On a healthy lane this is exactly zero, so any reading means the writer is dead, its channel is saturated, or the whole session is running on the disk tier. This is the ONLY signal for that: the seal-writer drain alarm publishes from inside the writer's own loop, so a dead writer stops moving it and it reads a healthy zero. Triage: (1) check whether the seal writer task is alive at all - a panic aborts the process, so a quiet exit or a persistently full channel is the case this catches; (2) check the spill and DLQ directories for the escalated seals, which are recoverable text; (3) a restart respawns the writer, since it has none of its own. Candles already escalated are on disk, not lost - but they are not in the database until they are replayed."
-
-  comparison_operator = "GreaterThanOrEqualToThreshold"
-  threshold           = 1
-  evaluation_periods  = 1
-  metric_name         = "tv_dhan_feed_seals_rescued_total"
-  namespace           = local.app_namespace
-  period              = 300
-  statistic           = "Sum"
-  dimensions          = local.app_dimensions
-
-  # notBreaching: the box is stopped overnight, so no-data is the normal
-  # off-hours state. This alarm reports a DEFECT, never silence — the dark-lane
-  # case belongs to dhan-no-ticks-flowing.
-  treat_missing_data = "notBreaching"
-
-  alarm_actions = local.app_alarm_actions
-  # NO ok_actions. The counter falling back to zero means no ADDITIONAL seals
-  # were escalated; it does not mean the writer recovered or that the escalated
-  # seals reached the database.
-  ok_actions = []
-}
+# alarm "seal_writer_rescued" REMOVED 2026-11-11 (operator Quote 53, alarm review
+# docs/audits/2026-11-alarm-review.md). The comments above are kept as history.
 
 # ---------------------------------------------------------------------------
 # Family (5) alarm 17 — an instrument was permanently refused a candle slot.
@@ -1060,27 +955,8 @@ resource "aws_cloudwatch_metric_alarm" "tick_spill_quarantined" {
 # copy of a shed frame. A backlog that never drains eventually gets pruned
 # instead of replayed, and nothing said so.
 # ---------------------------------------------------------------------------
-resource "aws_cloudwatch_metric_alarm" "wal_catchup_budget_exhausted" {
-  alarm_name        = "tv-${var.environment}-wal-catchup-budget-exhausted"
-  alarm_description = "The boot catch-up drain ran out of its time or round budget with write-ahead log segments still unreplayed. Those segments are NOT lost right now - they stay on disk and the next boot will try again - but they are now racing the age-and-byte prune, which deletes old segments and can take the last copy of a frame that was never folded. A backlog that never drains is eventually pruned instead of replayed. Triage: (1) measure the spill directory size against the replay budget - if the backlog is larger than one pass can carry, it will never catch up on its own; (2) the usual cause is a long outage or a slow database, so check whether the write path is keeping up now; (3) a manual replay is possible while the segments still exist. This fires at boot, so it is normal to see it once after a long outage and alarming to see it every morning."
-
-  comparison_operator = "GreaterThanOrEqualToThreshold"
-  threshold           = 1
-  evaluation_periods  = 1
-  metric_name         = "tv_wal_catchup_budget_exhausted_total"
-  namespace           = local.app_namespace
-  period              = 300
-  statistic           = "Sum"
-  dimensions          = local.app_dimensions
-
-  # UNGATED and notBreaching, like the WAL-replay alarms: the catch-up drain
-  # runs at BOOT, and the box boots at 08:30 - before the market-hours gate
-  # opens - so gating it would make it structurally unable to fire.
-  treat_missing_data = "notBreaching"
-
-  alarm_actions = local.app_alarm_actions
-  ok_actions    = []
-}
+# alarm "wal_catchup_budget_exhausted" REMOVED 2026-11-11 (operator Quote 53, alarm review
+# docs/audits/2026-11-alarm-review.md). The comments above are kept as history.
 
 # ---------------------------------------------------------------------------
 # Family (5) alarm 19 — a writer shutdown that abandoned its queue.
@@ -1188,24 +1064,8 @@ resource "aws_cloudwatch_metric_alarm" "wal_spill_shutdown_incomplete" {
   ok_actions    = []
 }
 
-resource "aws_cloudwatch_metric_alarm" "wal_replay_restore_failed" {
-  alarm_name        = "tv-${var.environment}-wal-replay-restore-failed"
-  alarm_description = "A WAL segment the replay budget DEFERRED could not be moved back into the live directory. The deferral itself is normal and designed — whatever a boot does not reach stays a *.wal file and is re-globbed next boot — but a segment that fails to be restored is one no later boot will find. Triage: look for orphaned segments in the staging directory and move them back by hand before the next boot; the frames are still on disk until someone deletes them."
-
-  comparison_operator = "GreaterThanOrEqualToThreshold"
-  threshold           = 1
-  evaluation_periods  = 3
-  datapoints_to_alarm = 1
-  metric_name         = "tv_wal_replay_restore_failed_total"
-  namespace           = local.app_namespace
-  period              = 300
-  statistic           = "Sum"
-  dimensions          = local.app_dimensions
-  treat_missing_data  = "notBreaching"
-
-  alarm_actions = local.app_alarm_actions
-  ok_actions    = []
-}
+# alarm "wal_replay_restore_failed" REMOVED 2026-11-11 (operator Quote 53, alarm review
+# docs/audits/2026-11-alarm-review.md). The comments above are kept as history.
 
 # ---------------------------------------------------------------------------
 # Candle-fold refusal RATE (§2.3t of dhan-rest-only-noise-lock-2026-07-14.md,
@@ -1227,58 +1087,8 @@ resource "aws_cloudwatch_metric_alarm" "wal_replay_restore_failed" {
 # 2026-08-27, 7.0% on 2026-08-28, ~8.5% on 2026-09-03). Below that the reading
 # sits inside a range this system has run at for a week; above it, a quarter of
 # all ticks carry timestamps the fold rejects, which is a vendor feed degrading.
-resource "aws_cloudwatch_metric_alarm" "aggregator_refusal_rate_high" {
-  alarm_name        = "tv-${var.environment}-aggregator-refusal-rate-high"
-  alarm_description = "More than a quarter of incoming ticks are being refused a candle bucket. THE ROWS ARE STILL BEING WRITTEN - this is not tick loss and no price data is missing. What it means is that Dhan's timestamps are degrading: ticks stamped for another trading day, or outside a plausible time band, cannot be placed in a minute bucket. Measured baselines here are 2.4%, 7.0% and 8.5%, so a sustained reading above 25% is a vendor data-quality regression, not normal variance. Triage: (1) the 30-second WARN line in the app log breaks the refusals down by reason - stale_trading_day and out_of_band_timestamp are the two abnormal ones; (2) check whether it is one instrument or the whole universe; (3) candles for the refused ticks cannot be rebuilt later, but the ticks themselves are queryable and a backfill from them is possible; (4) nothing in this codebase can fix a vendor's clock - if it persists it is a support ticket."
-
-  comparison_operator = "GreaterThanThreshold"
-  threshold           = 25
-  evaluation_periods  = 2
-  datapoints_to_alarm = 2
-
-  # No data = no ticks, which is NOT this alarm's question -
-  # `dhan-no-ticks-flowing` owns that. A zero denominator yields no datapoint,
-  # which this setting handles correctly.
-  treat_missing_data = "notBreaching"
-
-  metric_query {
-    id          = "refusal_pct"
-    expression  = "100 * refused / ingested"
-    label       = "Ticks refused a candle bucket (%% of ingest)"
-    return_data = true
-  }
-
-  metric_query {
-    id = "refused"
-    metric {
-      metric_name = "tv_aggregator_tick_refused_total"
-      namespace   = local.app_namespace
-      period      = 300
-      stat        = "Sum"
-      dimensions  = local.app_dimensions
-    }
-  }
-
-  metric_query {
-    id = "ingested"
-    metric {
-      metric_name = "tv_dhan_feed_ingest_ticks_total"
-      namespace   = local.app_namespace
-      period      = 300
-      stat        = "Sum"
-      dimensions  = local.app_dimensions
-    }
-  }
-
-  # 2026-09-23 (dhan-rest-only-noise-lock §2.3x): gate-listed, so it ships
-  # DISARMED — terraform's default is armed, and every apply would re-arm it
-  # outside the window the market-hours gate Lambda owns.
-  actions_enabled = false
-  alarm_actions   = local.app_alarm_actions
-  # NO ok_actions. A ratio falling back is the vendor recovering or the window
-  # ageing out - neither is a repair anyone performed.
-  ok_actions = []
-}
+# alarm "aggregator_refusal_rate_high" REMOVED 2026-11-11 (operator Quote 53, alarm review
+# docs/audits/2026-11-alarm-review.md). The comments above are kept as history.
 
 # ---------------------------------------------------------------------------
 # Ring dwell -- the EARLY WARNING for every loss mechanism on our side of the
@@ -1288,42 +1098,8 @@ resource "aws_cloudwatch_metric_alarm" "aggregator_refusal_rate_high" {
 # reading it -- the most valuable unwatched signal in the lane, because it
 # measures the APPROACH to a loss rather than a loss that already happened.
 # ---------------------------------------------------------------------------
-resource "aws_cloudwatch_metric_alarm" "dhan_ring_dwell_high" {
-  alarm_name        = "tv-${var.environment}-dhan-ring-dwell-high"
-  alarm_description = "Frames are waiting too long in the Dhan frame ring before the fold picks them up. This fires BEFORE ws-ring-full, which is the point where frames are actually refused - it is the early warning, not the loss. Threshold 2000ms sits far above normal (the fold is a fixed-offset decode, so normal dwell is milliseconds) and deliberately BELOW both the 5000ms inline-depth ILP flush ceiling and the ~5200ms point at which the 65536-frame ring overflows at the 12500/sec open burst. Triage: (1) tv_dhan_feed_ring_resident_pct - how full is the ring. (2) tv_dhan_feed_pending_rows and the QuestDB write path - a stalled ILP flush is the usual cause and blocks the fold for up to 5s. (3) tv_spill_dir_free_bytes - a saturated disk stalls the writer, which backs up the fold. (4) tv_dhan_feed_ingest_ticks_total - is the burst simply large. NOT a detector of upstream vendor tick loss: dwell measures the queue BETWEEN the reader and the fold, so a stalled READ task leaves it flat."
-
-  comparison_operator = "GreaterThanOrEqualToThreshold"
-  threshold           = 2000
-  # 2 x 300s. The gauge is a per-window MAXIMUM that resets after each publish
-  # (a sticky max reads alarming forever after one stall), so a single spike in
-  # one window is not a page; the condition recurring in two consecutive
-  # windows is.
-  evaluation_periods = 2
-  metric_name        = "tv_dhan_feed_ring_dwell_max_ms"
-  namespace          = local.app_namespace
-  period             = 300
-  # Maximum, not Average: the worst wait in the window IS the signal, and
-  # averaging would let four healthy scrapes erase one five-second stall.
-  statistic  = "Maximum"
-  dimensions = local.app_dimensions
-
-  # The gauge publishes only while the drain runs, and the box is stopped
-  # overnight, so no-data is the normal off-hours state. Breaching here would
-  # page every night and weekend. The dark-lane case is already owned by
-  # dhan-no-ticks-flowing -- a second alarm on the same absence would page
-  # twice for one outage.
-  treat_missing_data = "notBreaching"
-
-  # Ungated, unlike the market-hours alarms: absent off-hours by construction,
-  # so a gate would add a Lambda dependency and buy nothing.
-  actions_enabled = true
-
-  alarm_actions = local.app_alarm_actions
-  # ok_actions ARE set here, unlike the disk gauges: those recover only when an
-  # operator frees space or the datapoint ages out, whereas a falling dwell is
-  # self-evidently the fold catching up -- a genuine recovery worth telling.
-  ok_actions = local.app_alarm_actions
-}
+# alarm "dhan_ring_dwell_high" REMOVED 2026-11-11 (operator Quote 53, alarm review
+# docs/audits/2026-11-alarm-review.md). The comments above are kept as history.
 
 # ---------------------------------------------------------------------------
 # DELAY pages -- authorized 2026-09-25, dhan-rest-only-noise-lock-2026-07-14.md
@@ -1333,57 +1109,11 @@ resource "aws_cloudwatch_metric_alarm" "dhan_ring_dwell_high" {
 # 2026-09-25" -- the §2.3n lever requirement is NOT met, and that note says so.
 # ---------------------------------------------------------------------------
 
-resource "aws_cloudwatch_metric_alarm" "dhan_feed_delay_high" {
-  alarm_name        = "tv-${var.environment}-dhan-feed-delay-high"
-  alarm_description = "Dhan INDEX and CASH-STOCK price updates (class index_spot) carried trade timestamps at least 60 seconds older than local receipt time. Only new trades count: a packet whose volume rose (or, for an index, whose trade second moved forward); first packets after a subscribe, repeated quotes, stale copies, refused ticks and WAL replay are excluded. Minimum of the peak-held gauge over two 300-second periods means every observed gauge sample in those periods breached, not every trade or every instant. Stock options (class fno) are dashboard-only: a sparse contract's new trade can carry an old trade second. Check clock-probe freshness, ring dwell and socket freshness. This does not isolate vendor transport delay or detect ticks never sent. No recovery page is sent, so a later ALARM can follow an unannounced OK."
+# alarm "dhan_feed_delay_high" REMOVED 2026-11-11 (operator Quote 53, alarm review
+# docs/audits/2026-11-alarm-review.md). The comments above are kept as history.
 
-  comparison_operator = "GreaterThanOrEqualToThreshold"
-  threshold           = 60000
-  evaluation_periods  = 2
-  datapoints_to_alarm = 2
-  # 2026-11-06 (noise lock §2.6 dated row, owner card "Index feed only
-  # (Recommended)"): re-pointed from the all-segment `tv_dhan_ws_lag_max_ms`
-  # to the index/spot class of the by-class gauge. Live that day the F&O
-  # class read 4,038,655 ms while index_spot read 1,923 ms, so the page sat in
-  # ALARM all session for illiquid options. The class dimension is shipped by
-  # the agent's second EMF declaration, filtered to index_spot only (one
-  # series; never per instrument, never per connection).
-  metric_name = "tv_dhan_ws_lag_max_ms_by_class"
-  namespace   = local.app_namespace
-  period      = 300
-  # Minimum (§2.6): all observed samples of the minute-peak gauge must
-  # breach in both periods. This is recurring observed trade age, not a
-  # continuous-delay or all-trades guarantee; missing samples are not proof.
-  statistic  = "Minimum"
-  dimensions = merge(local.app_dimensions, { class = "index_spot" })
-
-  # Published only while the drain runs; the box is stopped overnight.
-  treat_missing_data = "notBreaching"
-  actions_enabled    = true
-  alarm_actions      = local.app_alarm_actions
-  # NO ok_actions (§2.6): a peak falling back is the window ageing out.
-  ok_actions = []
-}
-
-resource "aws_cloudwatch_metric_alarm" "dhan_main_reconnect_slow" {
-  alarm_name        = "tv-${var.environment}-dhan-main-reconnect-slow"
-  alarm_description = "A Dhan MAIN-FEED socket took 15 seconds or more to deliver its first data after the connection was lost, counting every failed re-dial and the waits between them. Normal is about 2 seconds. The main feed was blind for that long on one outage. Counts RE-dials only (a socket that has delivered before), inside 09:15-15:30 IST only, so the morning's first dial and a reconnect across the close never count. Depth sockets are excluded on purpose: depth-200 re-dials about once a minute by design. Triage: (1) tv_dhan_ws_reconnect_total - one slow reconnect or many. (2) tv_dhan_ws_dial_ms - was the DIAL slow (network) or the first frame (vendor). (3) The WS-GAP-03 log lines for the socket."
-
-  comparison_operator = "GreaterThanOrEqualToThreshold"
-  threshold           = 15000
-  evaluation_periods  = 1
-  metric_name         = "tv_dhan_ws_main_reconnect_recovery_max_ms"
-  namespace           = local.app_namespace
-  period              = 300
-  statistic           = "Maximum"
-  dimensions          = local.app_dimensions
-
-  # Zero on every window without a re-dial; absent overnight.
-  treat_missing_data = "notBreaching"
-  actions_enabled    = true
-  alarm_actions      = local.app_alarm_actions
-  ok_actions         = []
-}
+# alarm "dhan_main_reconnect_slow" REMOVED 2026-11-11 (operator Quote 53, alarm review
+# docs/audits/2026-11-alarm-review.md). The comments above are kept as history.
 
 # 2026-10-22: `dhan_depth_new_contract_blank` (§2.6) was REMOVED by the alarm
 # review under operator Quote 37 (dhan-rest-only-noise-lock-2026-07-14.md

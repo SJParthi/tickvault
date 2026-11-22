@@ -329,3 +329,45 @@ The record now includes `coverage_complete`; legacy files without it remain unkn
 Historical readiness is no longer inferred from an older date (§12.15.16). No date-specific replay/finality oracle is wired, so historical reads report unknown/not applied and cannot write the archive-release marker even when their comparison and persistence otherwise succeed. Existing retry/final-failure handling is used, with no new reason or page family. The existing hold ceiling and disk-pressure exceptions remain; a hold is not indefinite. Existing markers are not removed or recertified. These are source changes awaiting exact-candidate tests and deployment; no live outcome is implied.
 
 The worker and supervisor serialize their paged-marker read, report and write within this process. A successful marker write suppresses a concurrent duplicate. Failure to save the marker still warns and permits a later page, so duplicate notifications remain possible after persistence failure, marker loss or separate processes. This correction adds no alarm, metric or suppression state and does not make disk I/O bounded. Authored concurrency/write-failure regressions still require execution.
+
+## §7. 2026-11-16 — the shadow split of diverged cells (§12.15.17)
+
+Rule: `no-rest-except-live-feed-2026-06-27.md` §12.15.17. A measurement only:
+no new error code, source, alarm, filter, page or EMF name, and none of these
+columns changes `cells_diverged`, `missing_rest`, the outcome, the day marker
+or the S3 hold.
+
+**Why.** About 187,000 diverged cells a day were mostly two known vendor
+shapes: Dhan starts a minute at the previous minute's last price, and files
+packets by its own clock, so its close is often a price inside our own bar.
+These columns separate those from the cells nothing explains.
+
+| Column (LONG, `dhan_live_crossverify_daily`) | Means | How to read it |
+|---|---|---|
+| `cells_boundary_consistent` | diverged cells whose Dhan value fits a known vendor shape: open = our previous existing bar's close; high = max(our high, previous close); low = min(our low, previous close); close inside our own [low, high] | high is normal; it says the difference is a vendor shape, not that our capture is right |
+| `cells_close_within_bar` | the close part of `cells_boundary_consistent` | a bound, not proof: Dhan's close is a price our own bar traded through |
+| `cells_unexplained` | diverged cells nothing above explains | the number to watch day over day; `cells_boundary_consistent + cells_unexplained = cells_diverged` |
+| `cells_unexplained_open` / `_high` / `_low` / `_close` | `cells_unexplained` by field | a jump in one field points at one part of the fold (open: first tick of the minute; high/low: a missed or wrong extreme; close: last tick) |
+| `index_missing_rest_closing` | of `missing_rest`, index minutes from 15:30 IST to the session end | expected: Dhan publishes no closing-session index bars. Still counted in `missing_rest` too |
+
+The previous bar is our previous EXISTING bar of the same instrument. A
+minute we missed is skipped, so after a gap Dhan's open can be a price we
+never captured and the cell reads unexplained (never the other way). The
+first minute of an instrument's day has no previous bar. A row written before
+16 Nov 2026 carries no value in these columns.
+
+```sql
+-- The split over the last 30 days, newest attempt last.
+SELECT trading_date_ist, outcome, cells_diverged,
+       cells_boundary_consistent, cells_close_within_bar, cells_unexplained,
+       cells_unexplained_open, cells_unexplained_high,
+       cells_unexplained_low, cells_unexplained_close,
+       missing_rest, index_missing_rest_closing, attempt_at
+FROM dhan_live_crossverify_daily
+WHERE trading_date_ist > dateadd('d', -30, now())
+ORDER BY trading_date_ist, attempt_at;
+```
+
+The same counts are on the "Dhan 1-minute cross-verification finished" log
+line (`cells_boundary_consistent`, `cells_close_within_bar`,
+`cells_unexplained`, `cells_unexplained_open` ... `index_missing_rest_closing`).

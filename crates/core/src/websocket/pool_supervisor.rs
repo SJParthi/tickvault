@@ -473,6 +473,7 @@ const _: () = {
 /// What the evidence-based fast paths do: off, count only (the default), or
 /// act. Owned by the config crate, re-exported here.
 pub use tickvault_common::config::FrameSilenceFastPath;
+pub mod live_shed;
 
 /// Why a frame-silence redial fired. Audit and counter label only; every
 /// basis schedules the same `ReconnectReason::IdleSilence` redial.
@@ -5059,7 +5060,7 @@ impl ConnectionSupervisor {
 
     /// Feeds one event through the state machine and returns the action the
     /// shell must take. Total, allocation-free, O(1).
-    pub fn on_event(&mut self, event: ConnEvent, now: Instant) -> SupervisorAction {
+    fn on_event_inner(&mut self, event: ConnEvent, now: Instant) -> SupervisorAction {
         // Parking is terminal and absorbs everything — with ONE exception:
         // the overflow probe (D7 for the main feed, scope lock 2026-10-02 for
         // depth) may release a market-data socket parked for 805. Every other
@@ -8451,6 +8452,7 @@ impl WalRingSink {
     #[inline]
     fn note_ring_shed(&self, seq: u64) {
         note_ring_refused(self.endpoint == DhanEndpointType::MainFeed);
+        live_shed::note(self.endpoint == DhanEndpointType::MainFeed);
         let _mark = tickvault_storage::wal_frame_fate::frame_fate().note_shed(
             seq,
             tickvault_storage::wal_frame_fate::ShedKind::Ring,
@@ -8576,6 +8578,7 @@ impl FrameSink for WalRingSink {
                 // so marking it would protect nothing and the honest outcome
                 // is the total-loss one.
                 if wal_refused {
+                    live_shed::note(self.endpoint == DhanEndpointType::MainFeed);
                     return FrameSinkOutcome::WalDropped;
                 }
                 tickvault_storage::wal_applied_watermark::applied_watermark().note_unapplied(seq);
@@ -8591,6 +8594,7 @@ impl FrameSink for WalRingSink {
             RingReserve::SlotsFull => {
                 self.ring_full.increment(1);
                 if wal_refused {
+                    live_shed::note(self.endpoint == DhanEndpointType::MainFeed);
                     return FrameSinkOutcome::WalDropped;
                 }
                 tickvault_storage::wal_applied_watermark::applied_watermark().note_unapplied(seq);
@@ -8630,6 +8634,7 @@ impl FrameSink for WalRingSink {
                 self.ring_full.increment(1);
             }
             if wal_refused {
+                live_shed::note(self.endpoint == DhanEndpointType::MainFeed);
                 return FrameSinkOutcome::WalDropped;
             }
             tickvault_storage::wal_applied_watermark::applied_watermark().note_unapplied(seq);

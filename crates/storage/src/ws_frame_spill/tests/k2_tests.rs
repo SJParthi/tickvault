@@ -217,6 +217,9 @@ fn test_regression_k2_unreadable_segment_is_kept_for_retry_not_archived() {
         "A is staged"
     );
     assert_eq!(recorder.get(WAL_REPLAY_READ_RETRIED_COUNTER), 1);
+    // B1 (2026-11-13): the batch itself reports the unread segment, so a
+    // caller draining in rounds cannot mistake it for a drained backlog.
+    assert_eq!(first.read_failed_segments, 1);
     confirm_replayed(&dir);
     assert!(
         dir.join(b_name).is_dir(),
@@ -228,6 +231,13 @@ fn test_regression_k2_unreadable_segment_is_kept_for_retry_not_archived() {
     // which is the old behaviour, counted on the corrupted counter.
     let second = k2_replay(&dir).expect("pass 2");
     assert_eq!(second.frames.len(), 0);
+    // Regression B1: the exact shape that read as "drained" before: no
+    // frames, nothing deferred, only the unread segment left.
+    assert_eq!(second.deferred_segments, 0);
+    assert_eq!(
+        second.read_failed_segments, 1,
+        "an empty pass with an unread segment must say so"
+    );
     assert!(dir.join(b_name).is_dir(), "attempt 2 is still kept");
     let recorder = Da13dCounters::default();
     let _third = metrics::with_local_recorder(&recorder, || k2_replay(&dir)).expect("pass 3");
@@ -388,4 +398,77 @@ fn test_regression_k2_replay_header_no_longer_claims_recapture() {
     assert!(!src.contains(stale), "the stale re-capture claim is back");
     assert!(src.contains(concat!("ACK-BEFORE-", "CONFIRM")));
     assert!(src.contains(concat!("they are NEVER written ", "to the WAL a")));
+}
+
+// Regression: 2026-11-13 (B1 review): the read-failure count lived only in
+// memory, and a boot reads a failing segment at most twice (the boot pass,
+// then one catch-up round, which then stops on it), so the retry cap was
+// never reached: a segment that stays unreadable was never given up on or
+// counted on the paged corrupted counter. The count now survives a restart
+// in a book beside the WAL; the third failed read, on whichever boot, gives
+// the segment up.
+#[test]
+fn test_regression_b1_read_failure_count_survives_a_restart_and_reaches_the_cap() {
+    let dir = tmp_dir("b1-io-retry-book");
+    let b_name = "ws-frames-77777777770000000012.wal";
+    // An unreadable segment (a directory under a segment's name: EISDIR).
+    std::fs::create_dir_all(dir.join(b_name)).unwrap();
+    let book = dir.join(READ_FAILURE_BOOK_FILE);
+    // B1 review 4: a production boot reads a failing segment TWICE in
+    // seconds (the boot pass, then the first catch-up round). Both count as
+    // one boot in the book, so a short blip on one boot never uses two of
+    // the three attempts.
+    for boot in 1..=2u32 {
+        for pass_in_boot in 1..=2u32 {
+            let pass = k2_replay(&dir).expect("pass");
+            assert_eq!(
+                pass.read_failed_segments, 1,
+                "boot {boot} pass {pass_in_boot} keeps it"
+            );
+            assert!(dir.join(b_name).is_dir(), "boot {boot} does not archive it");
+            let text = std::fs::read_to_string(&book).expect("the book is written");
+            assert_eq!(
+                text,
+                format!("{boot} {b_name}\n"),
+                "one per boot, not per pass"
+            );
+        }
+        // A restart: this process's memory is gone, the book stays.
+        forget_in_memory_for_test(b_name);
+    }
+    let recorder = Da13dCounters::default();
+    let third = metrics::with_local_recorder(&recorder, || k2_replay(&dir)).expect("boot 3");
+    assert_eq!(third.read_failed_segments, 0, "given up, not kept");
+    assert_eq!(
+        recorder.get("tv_wal_replay_corrupted_segments_total"),
+        1,
+        "the third failed read across restarts is counted on the paged counter"
+    );
+    assert!(!book.exists(), "a given-up segment leaves the book");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// B1 review: a counted segment that reads again leaves the book, so a
+// later, unrelated failure starts from one.
+#[test]
+fn test_b1_a_segment_that_reads_again_leaves_the_book() {
+    let dir = tmp_dir("b1-io-retry-forget");
+    let name = "ws-frames-77777777770000000013.wal";
+    std::fs::create_dir_all(dir.join(name)).unwrap();
+    let book = dir.join(READ_FAILURE_BOOK_FILE);
+    let _ = k2_replay(&dir).expect("pass 1");
+    assert!(book.exists());
+    std::fs::remove_dir(dir.join(name)).unwrap();
+    std::fs::write(
+        dir.join(name),
+        encode_v4_record_raw(WsType::LiveFeed, 500, 5, 0, &[5; 8]),
+    )
+    .unwrap();
+    let pass = k2_replay(&dir).expect("pass 2");
+    assert_eq!(pass.read_failed_segments, 0);
+    assert!(
+        !book.exists(),
+        "read again: the count is forgotten on disk too"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }

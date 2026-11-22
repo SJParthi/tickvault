@@ -31,7 +31,7 @@ checklist or in a dedicated "Per-Item Guarantee Matrix" subsection:
 
 | Demand | Mechanical proof artefact | Real-time check | Per-item gate |
 |---|---|---|---|
-| 100% code coverage | `quality/crate-coverage-thresholds.toml` ratcheted per-crate floors (72.6–99.4, target 100%), floors only move up; `scripts/coverage-gate.sh` | ~~post-merge llvm-cov report~~ **⚠ CORRECTED 2026-10-11:** llvm-cov on every PR, inside All Green (the `coverage-and-perf` job is in its needs list), and again after merge | item PR includes coverage delta |
+| 100% code coverage | `quality/crate-coverage-thresholds.toml` ratcheted per-crate floors (86.4–99.4 on the test-inclusive gate figure since 2026-11-13, plus production-only `[production]` floors; target 100%), floors only move up; `scripts/coverage-gate.sh` | ~~post-merge llvm-cov report~~ **⚠ CORRECTED 2026-10-11:** llvm-cov on every PR, inside All Green (the `coverage-and-perf` job is in its needs list), and again after merge | item PR includes coverage delta |
 | 100% audit coverage | `<event>_audit` table per typed event with DEDUP UPSERT KEYS | `mcp__tickvault-logs__questdb_sql` | item adds/extends audit table |
 | 100% testing coverage | 22 test categories per `testing.md` (unit/integration/property/loom/dhat/fuzz/mutation/sanitizer/coverage/etc.) | `cargo test --workspace` green | item declares which 22 it covers |
 | 100% code checks | banned-pattern + pub-fn-test + pub-fn-wiring + plan-verify + secret-scan + 8 pre-commit gates | pre-push mandatory | all gates green |
@@ -110,6 +110,17 @@ Every NEW Claude Code session auto-runs at start:
 
 These are SessionStart hooks in `.claude/settings.json` lines 168-181.
 **Fire automatically on every session, no manual setup.**
+
+> **⚠ CORRECTED 2026-11-15 (audit repo-3) — the table above is not what
+> runs.** `.claude/settings.json` wires only TWO SessionStart hooks:
+> `session-sanity.sh` (branch and uncommitted check, auto-save snapshots,
+> the last 10 errors from the newest `errors.jsonl` file, and the error
+> summary glance) and `session-auto-health.sh` (`scripts/doctor.sh`,
+> `scripts/validate-automation.sh` and `scripts/mcp-doctor.sh` in the background;
+> results go to a log file under `data/logs/`). `session-context-brief.sh`
+> exists but nothing runs it. A command hook cannot call an MCP tool, so
+> `run_doctor` and `summary_snapshot` do not run at start: the session must
+> call them itself. The old text is kept as history.
 
 ## Per-session deep-research demand
 

@@ -138,6 +138,10 @@ pub struct SpillReplayOutcome {
     /// because they hold a row for a table this process has not yet ensured
     /// (2026-11-07, `ilp_table_gate`).
     pub files_held_table_not_ensured: usize,
+    /// B1 review 4: lines of a table not yet ensured moved out of a tick
+    /// rescue file into that table's own held file, so the file's tick rows
+    /// could be posted.
+    pub lines_moved_to_held_file: u64,
     /// Files left as they are because the partition archiver held the old-hour
     /// writers out for longer than the bounded wait (PR AA, owner Quote 51).
     /// The round ended there; the file is offered again next round.
@@ -170,6 +174,9 @@ impl SpillReplayOutcome {
         self.files_held_table_not_ensured = self
             .files_held_table_not_ensured
             .saturating_add(other.files_held_table_not_ensured);
+        self.lines_moved_to_held_file = self
+            .lines_moved_to_held_file
+            .saturating_add(other.lines_moved_to_held_file);
         self.files_held_archive_quiesce = self
             .files_held_archive_quiesce
             .saturating_add(other.files_held_archive_quiesce);
@@ -1683,6 +1690,12 @@ fn line_is_positively_out_of_window(line: &[u8], is_arrival_clock: bool) -> bool
     // to the depth spill, and is then DELETED on replay. The file is truncated
     // either way, so those bytes are gone permanently. That is the same defect
     // the writer fix closed, surviving one tier down in the rescue path.
+    // B1 (2026-11-13): both predicates below judge the row with the Muhurat
+    // flag of the ROW's own IST date (`session_window::row_day_had_muhurat`,
+    // B1 review 2), so a Muhurat evening row replayed on a later day is kept.
+    // B1 review 5: the replay had its own copy of that per-date lookup; it is
+    // gone, so the writers and the replay share one definition. Pinned by
+    // `crates/storage/tests/muhurat_spill_replay_window.rs`.
     if is_arrival_clock {
         !tickvault_common::session_window::arrival_row_is_in_an_open_window(nanos)
     } else {
@@ -1778,19 +1791,39 @@ pub fn split_at_line_boundary(bytes: &[u8], range: std::ops::Range<usize>) -> Op
     // exactly AT the middle (the byte before it is a newline) is found.
     let mid = (start + (end - start) / 2).saturating_sub(1).max(start);
     // O(1) EXEMPT: begin — cold line isolation, bounded by the chunk size.
-    // A split point is the byte AFTER a newline, strictly inside the range.
-    let after = bytes[mid..end.saturating_sub(1)]
-        .iter()
-        .position(|b| *b == b'\n')
-        .map(|i| mid + i + 1);
+    // A split point is the byte AFTER a row-ending newline, strictly inside
+    // the range. B1 (2026-11-13): a newline escaped inside an ILP string
+    // field (the audit tables write `\` + LF there) does not end a row, so a
+    // split never lands inside one row.
+    let after = (mid..end.saturating_sub(1))
+        .find(|&i| is_row_end(bytes, i))
+        .map(|i| i + 1);
     let split = after.or_else(|| {
-        bytes[start..mid]
-            .iter()
-            .rposition(|b| *b == b'\n')
-            .map(|i| start + i + 1)
+        (start..mid)
+            .rev()
+            .find(|&i| is_row_end(bytes, i))
+            .map(|i| i + 1)
     });
     // O(1) EXEMPT: end
     split.filter(|s| *s > start && *s < end)
+}
+
+/// Whether `bytes[i]` is a newline that ends an ILP row: a newline preceded
+/// by an EVEN run of backslashes (an odd run means the newline itself is
+/// escaped inside a string field). Cold path; O(backslash run).
+#[must_use]
+pub(crate) fn is_row_end(bytes: &[u8], i: usize) -> bool {
+    if bytes.get(i) != Some(&b'\n') {
+        return false;
+    }
+    let run = bytes
+        .get(..i)
+        .unwrap_or_default()
+        .iter()
+        .rev()
+        .take_while(|b| **b == b'\\')
+        .count();
+    run % 2 == 0
 }
 
 /// Finds the lines QuestDB refuses in a chunk it permanently refused whole.
@@ -1884,6 +1917,108 @@ pub(crate) fn set_aside_rejected_lines(
 ) -> std::io::Result<u64> {
     set_aside_lines_with_suffix(dir, spill_path, chunk, rejected, REJECTED_LINES_SUFFIX)
 }
+
+/// What [`split_unensured_out_of_tick_file`] did with one chunk.
+enum HeldSplit {
+    /// Hold the whole file as before: not a tick rescue file, or the chunk
+    /// names another table not yet ensured (`ticks` itself, or a depth row).
+    HoldWholeFile,
+    /// Moving the held lines failed; nothing from the chunk is posted.
+    Failed(std::io::Error),
+    /// The chunk without the held lines, and how many lines were moved.
+    Kept(Vec<u8>, u64),
+}
+
+/// B1 review 4: for a tick rescue file (`ticks-<feed>-<hour>.ilp`), moves the
+/// lines of `tick_quotes` and `feed_aux_packets` (when not yet ensured) to
+/// that table's own held file, `held-<table>-replay-<feed>-<hour>.ilp` in the same
+/// folder (synced, and the folder synced, before the caller advances past
+/// them), and returns the rest of the chunk. The held file is held whole by
+/// the next rounds until its table is ensured, as the writer's own
+/// set-aside files are. `-replay-` keeps it apart from the file the writer
+/// thread appends to. A crash after the move and before the resume offset is
+/// recorded moves the same lines again; both tables' DEDUP keys carry
+/// `capture_seq`, so the copy upserts onto itself. Cold: O(chunk).
+fn split_unensured_out_of_tick_file(
+    dir: &Path,
+    spill_path: &Path,
+    chunk: &[u8],
+    ensured: crate::ilp_table_gate::EnsuredTables,
+) -> HeldSplit {
+    use crate::ilp_table_gate::GatedTable;
+    use std::io::Write as _;
+    let Some(rest) = spill_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.strip_prefix("ticks-"))
+    else {
+        return HeldSplit::HoldWholeFile;
+    };
+    let table_of = |line: &[u8]| {
+        GatedTable::from_measurement(crate::ilp_table_gate::measurement_name(line))
+            .filter(|t| !ensured.contains(*t))
+    };
+    let mut kept: Vec<u8> = Vec::with_capacity(chunk.len()); // APPROVED: cold replay path, once per held chunk
+    let mut moved: Vec<(GatedTable, Vec<u8>)> = Vec::new(); // APPROVED: cold, at most one entry per gated table
+    let mut lines = 0_u64;
+    // O(1) EXEMPT: begin, cold, bounded by one chunk
+    for line in chunk.split_inclusive(|b| *b == b'\n') {
+        match table_of(line) {
+            None => kept.extend_from_slice(line),
+            // Only the two tables the tick writer stages beside its ticks
+            // are moved; anything else (`ticks` itself, or a depth row that
+            // has no business in a tick file) holds the file as before.
+            Some(table @ (GatedTable::TickQuotes | GatedTable::FeedAuxPackets)) => {
+                lines = lines.saturating_add(1);
+                let at = match moved.iter().position(|(t, _)| *t == table) {
+                    Some(at) => at,
+                    None => {
+                        moved.push((table, Vec::new()));
+                        moved.len() - 1
+                    }
+                };
+                if let Some((_, out)) = moved.get_mut(at) {
+                    out.extend_from_slice(line);
+                    if line.last() != Some(&b'\n') {
+                        out.push(b'\n');
+                    }
+                }
+            }
+            Some(_) => return HeldSplit::HoldWholeFile,
+        }
+    }
+    // O(1) EXEMPT: end
+    for (table, bytes) in &moved {
+        let target = dir.join(format!(
+            "{}-replay-{rest}",
+            crate::tick_persistence::held_spill_prefix(*table)
+        ));
+        let written = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&target)
+            .and_then(|mut file| {
+                file.write_all(bytes)?;
+                file.sync_data()
+            });
+        if let Err(err) = written {
+            return HeldSplit::Failed(err);
+        }
+    }
+    if !moved.is_empty() {
+        if let Err(err) = std::fs::File::open(dir).and_then(|d| d.sync_all()) {
+            return HeldSplit::Failed(err);
+        }
+        metrics::counter!(SPILL_LINES_MOVED_TO_HELD_FILE_COUNTER).increment(lines);
+    }
+    HeldSplit::Kept(kept, lines)
+}
+
+/// B1 review 4: lines moved out of a tick rescue file into their table's own
+/// held file by [`split_unensured_out_of_tick_file`]. Not a loss (the lines
+/// are kept and replayed once the table is ensured). Local `/metrics` only.
+pub const SPILL_LINES_MOVED_TO_HELD_FILE_COUNTER: &str =
+    "tv_spill_replay_lines_moved_to_held_file_total";
 
 /// [`set_aside_rejected_lines`] into `quarantine/<file><suffix>`: the same
 /// append and sync, for any reason a line is kept out of the database
@@ -2380,12 +2515,53 @@ pub(crate) async fn replay_spill_dir_quiesced(
                 // timestamp named `timestamp`. Hold the file here, before the
                 // floor and window steps set anything aside or count it, so
                 // the next round sees this chunk exactly as it is now.
+                //
+                // B1 review 4 (2026-11-13): a tick rescue file (`ticks-*.ilp`)
+                // can hold `tick_quotes` / `feed_aux_packets` rows beside its
+                // ticks (every rescue route but the writer's set-aside writes
+                // the whole staged batch). Holding the whole file for one of
+                // those tables kept every tick after that row out of QuestDB
+                // until the table was repaired by hand. When `ticks` itself is
+                // ensured, the held table's lines are moved to that table's
+                // own held file and the rest of the chunk is posted.
+                let mut split_kept: Option<Vec<u8>> = None;
                 if let Some(table) =
                     crate::ilp_table_gate::first_unensured_in_lines(raw, view.ensured_tables)
                 {
-                    held_table = Some(table);
-                    break 'file;
+                    match split_unensured_out_of_tick_file(dir, &path, raw, view.ensured_tables) {
+                        HeldSplit::HoldWholeFile => {
+                            held_table = Some(table);
+                            break 'file;
+                        }
+                        HeldSplit::Failed(err) => {
+                            // B1 review 5: held, not failed. A failed move
+                            // (full disk, an unwritable held-file path) used
+                            // to stop the whole round, so every spill file
+                            // behind this one waited too. It is held exactly
+                            // as before B1 (the file and its offset are kept,
+                            // the round moves on to the next file).
+                            warn!(
+                                code = ErrorCode::TickSpill01FileQuarantined.code_str(),
+                                source = "spill_held_lines_set_aside_failed",
+                                path = %path.display(),
+                                table = table.name(),
+                                %err,
+                                "tick spill rows for a table not yet created with its keys \
+                                 could NOT be moved to their own held file; the spill file is \
+                                 held intact and retried next round, nothing from this chunk \
+                                 is posted, and the next spill file is still replayed"
+                            );
+                            held_table = Some(table);
+                            break 'file;
+                        }
+                        HeldSplit::Kept(kept, moved) => {
+                            outcome.lines_moved_to_held_file =
+                                outcome.lines_moved_to_held_file.saturating_add(moved);
+                            split_kept = Some(kept);
+                        }
+                    }
                 }
+                let raw: &[u8] = split_kept.as_deref().unwrap_or(raw);
                 // The market-data floor FIRST (live audit F2/F5/F6,
                 // 2026-10-29): the window filter judges the time of day only,
                 // so after a wipe a file holding rows from earlier days was
@@ -5028,6 +5204,29 @@ pub(crate) mod tests {
         // A torn tail (no final newline) is its own line.
         let torn = b"aa\nbbbbbbbb";
         assert_eq!(split_at_line_boundary(torn, 0..torn.len()), Some(3));
+        // Regression B1 (2026-11-13): a newline escaped inside a string field
+        // (`\` + LF, as the audit writers emit) is not a row end, so the
+        // split never cuts a row in two; an escaped backslash before a real
+        // newline still ends the row.
+        let escaped = b"t x=1i 1\nt s=\"a\\\nb\" 2\n";
+        assert_eq!(
+            split_at_line_boundary(escaped, 0..escaped.len()),
+            Some(9),
+            "the newline at 16 is escaped inside the string, not a row end"
+        );
+        assert!(!is_row_end(escaped, 16));
+    }
+
+    #[test]
+    fn test_is_row_end_counts_the_backslash_run() {
+        assert!(
+            !is_row_end(b"x\\\n", 2),
+            "one backslash escapes the newline"
+        );
+        assert!(is_row_end(b"x\\\\\n", 3), "an escaped backslash does not");
+        assert!(is_row_end(b"\n", 0));
+        assert!(!is_row_end(b"x", 0), "not a newline");
+        assert!(!is_row_end(b"x", 5), "out of range");
     }
 
     /// The defect: a torn line in the middle of a spill file used to
@@ -7282,6 +7481,137 @@ ticks,segment=NSE_EQ,feed=dhan security_id=4i 4\n";
         assert_eq!(out.files_held_table_not_ensured, 0);
         forget_resume_offset(&held);
         forget_resume_offset(&other);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression, B1 review 4: a tick rescue file written by a route other
+    /// than the writer's set-aside (the rescue thread, the drain's inline
+    /// spill, or a batch rescued while `ticks` was not keyed) holds
+    /// `feed_aux_packets` and `tick_quotes` rows beside its ticks. With only
+    /// those tables not ensured, the replay used to hold the whole file from
+    /// the first such row, so the ticks after it never reached QuestDB. Now
+    /// the held tables' lines move to their own held files and the ticks are
+    /// posted; the held files are held whole until their table is ensured.
+    ///
+    /// Bite: make `split_unensured_out_of_tick_file` return `HoldWholeFile`
+    /// and the tick line is never posted (first assert).
+    #[tokio::test]
+    async fn test_regression_a_held_table_in_a_tick_file_never_holds_its_ticks() {
+        use crate::ilp_table_gate::{EnsuredTables, GatedTable};
+        let dir = temp_dir("mixed-tick-file");
+        let path = dir.join("ticks-dhan-2026111309.ilp");
+        let aux = tick_line_on_day(7).replacen("ticks,", "feed_aux_packets,", 1);
+        let quote = tick_line_on_day(7).replacen("ticks,", "tick_quotes,", 1);
+        let tick = tick_line_on_day(7).replacen("ltp=", "ltp_mark=1.0,ltp=", 1);
+        std::fs::write(&path, format!("{aux}{tick}{quote}")).expect("write"); // APPROVED: test
+        let (url, seen, server) = spawn_recording_server().await;
+        let client = crate::http_client::build_probe_client(5).expect("client"); // APPROVED: test
+        let mut view = test_spill_view();
+        view.ensured_tables = EnsuredTables::NONE
+            .with(GatedTable::Ticks)
+            .with(GatedTable::MarketDepth)
+            .with(GatedTable::MarketDepthBook);
+        let out = replay_spill_dir(&dir, &url, &client, &view).await;
+        let posted = String::from_utf8(seen.lock().expect("lock").clone()).expect("utf8");
+        assert!(posted.contains(&tick), "the tick row is posted: {posted:?}");
+        assert!(
+            !posted.contains(&aux),
+            "an unensured aux row is never posted"
+        );
+        assert!(
+            !posted.contains(&quote),
+            "an unensured quote row is never posted"
+        );
+        assert_eq!(out.lines_moved_to_held_file, 2, "{out:?}");
+        assert_eq!(out.files_failed, 0);
+        let aux_file = dir.join("held-feed_aux_packets-replay-dhan-2026111309.ilp");
+        let quote_file = dir.join("held-tick_quotes-replay-dhan-2026111309.ilp");
+        assert_eq!(std::fs::read_to_string(&aux_file).expect("aux held"), aux);
+        assert_eq!(
+            std::fs::read_to_string(&quote_file).expect("quote held"),
+            quote
+        );
+
+        // A later round holds the held files whole, posting nothing.
+        seen.lock().expect("lock").clear();
+        let out = replay_spill_dir(&dir, &url, &client, &view).await;
+        let posted = String::from_utf8(seen.lock().expect("lock").clone()).expect("utf8");
+        assert!(
+            !posted.contains(&aux) && !posted.contains(&quote),
+            "{posted:?}"
+        );
+        assert_eq!(out.files_held_table_not_ensured, 2, "{out:?}");
+        assert_eq!(
+            out.lines_moved_to_held_file, 0,
+            "a held file is never split again"
+        );
+
+        // Once ensured, they drain.
+        seen.lock().expect("lock").clear();
+        view.ensured_tables = EnsuredTables::ALL;
+        let _ = replay_spill_dir(&dir, &url, &client, &view).await;
+        server.abort();
+        let posted = String::from_utf8(seen.lock().expect("lock").clone()).expect("utf8");
+        assert!(
+            posted.contains(&aux) && posted.contains(&quote),
+            "{posted:?}"
+        );
+        forget_resume_offset(&path);
+        forget_resume_offset(&aux_file);
+        forget_resume_offset(&quote_file);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression, B1 review 5: when the held lines of a mixed tick file
+    /// cannot be moved to their own held file (here a directory sits on the
+    /// held-file path), the file is HELD as before B1 and the round carries
+    /// on. It used to stop the whole round, so a pure tick file behind it was
+    /// never posted while the move kept failing (a full disk, for one).
+    ///
+    /// Bite: set `failed = true` in the `HeldSplit::Failed` arm and the second
+    /// file's tick is never posted (first assert).
+    #[tokio::test]
+    async fn test_regression_a_failed_held_move_holds_the_file_and_the_round_goes_on() {
+        use crate::ilp_table_gate::{EnsuredTables, GatedTable};
+        let dir = temp_dir("held-move-failed");
+        let mixed = dir.join("ticks-dhan-2026111309.ilp");
+        let aux = tick_line_on_day(7).replacen("ticks,", "feed_aux_packets,", 1);
+        let tick = tick_line_on_day(7).replacen("ltp=", "ltp_mark=1.0,ltp=", 1);
+        std::fs::write(&mixed, format!("{aux}{tick}")).expect("write"); // APPROVED: test
+        std::fs::create_dir_all(dir.join("held-feed_aux_packets-replay-dhan-2026111309.ilp"))
+            .expect("squatting directory");
+        let pure = dir.join("ticks-dhan-2026111310.ilp");
+        let later = tick_line_on_day(7).replacen("ltp=", "ltp_later=2.0,ltp=", 1);
+        std::fs::write(&pure, &later).expect("write"); // APPROVED: test
+        let (url, seen, server) = spawn_recording_server().await;
+        let client = crate::http_client::build_probe_client(5).expect("client"); // APPROVED: test
+        let mut view = test_spill_view();
+        view.ensured_tables = EnsuredTables::NONE
+            .with(GatedTable::Ticks)
+            .with(GatedTable::MarketDepth)
+            .with(GatedTable::MarketDepthBook);
+        let out = replay_spill_dir(&dir, &url, &client, &view).await;
+        server.abort();
+        let posted = String::from_utf8(seen.lock().expect("lock").clone()).expect("utf8");
+        assert!(
+            posted.contains(&later),
+            "the file behind a failed move is still posted: {posted:?}"
+        );
+        assert!(!posted.contains(&aux), "the unensured row is never posted");
+        assert!(
+            !posted.contains(&tick),
+            "nothing from the chunk whose move failed is posted"
+        );
+        assert_eq!(out.files_failed, 0, "a failed move is a hold: {out:?}");
+        assert_eq!(out.files_held_table_not_ensured, 1, "{out:?}");
+        assert_eq!(
+            std::fs::read_to_string(&mixed).expect("read"),
+            format!("{aux}{tick}"),
+            "the held file is kept byte for byte"
+        );
+        assert_eq!(resume_offset_for(&mixed), 0, "its offset does not move");
+        forget_resume_offset(&mixed);
+        forget_resume_offset(&pure);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

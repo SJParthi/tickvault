@@ -396,6 +396,8 @@ let utc_epoch = ltt as i64 - 19800;
 
 > Dhan v1 Historical Data used custom epoch from Jan 1, 1980 IST — v2 uses standard UNIX epoch for REST, IST epoch for WebSocket.
 
+> **⚠ CHANGED BY DHAN 2026-11-20 (Verified, Dhan support ticket #6684672, 21 Nov 2026):** the Live Market Feed LTT changed from IST-based to UTC-based epoch effective 20 Nov 2026, before the market opened, "part of an API restructuring exercise ... to standardise the timestamp format across all API endpoints", and "UTC-based epoch is now the permanent format for all Live Market Feed timestamps". From a frame receipt of 2026-11-20 00:00 IST, WebSocket LTT is standard UNIX epoch like §12a (IST = raw + 19,800 s); earlier receipts are IST epoch as written in this section, which is kept as the original documentation. tickvault rule: `websocket-connection-scope-lock.md` §"2026-11-21".
+
 ---
 
 ## 13. Conditional Trigger Enums

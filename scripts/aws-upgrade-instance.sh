@@ -180,15 +180,15 @@ is_uint() { case "$1" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
 
 if [ -n "$EBS_SIZE" ]; then
   is_uint "$EBS_SIZE" || die "--ebs-size must be a positive integer (GB)."
-  { [ "$EBS_SIZE" -ge 10 ] && [ "$EBS_SIZE" -le 200 ]; } || die "--ebs-size must be 10–200 GB (matches Terraform ebs_gp3_size_gb range)."
+  { [ "$EBS_SIZE" -ge 10 ] && [ "$EBS_SIZE" -le 150 ]; } || die "--ebs-size must be 10–150 GB (Quote 51: no bigger disk than the 150 GB root)."
 fi
 if [ -n "$EBS_IOPS" ]; then
   is_uint "$EBS_IOPS" || die "--ebs-iops must be a positive integer."
-  { [ "$EBS_IOPS" -ge 3000 ] && [ "$EBS_IOPS" -le 16000 ]; } || die "--ebs-iops must be 3000–16000 (gp3 range; matches Terraform ebs_gp3_iops)."
+  { [ "$EBS_IOPS" -ge 3000 ] && [ "$EBS_IOPS" -le 3000 ]; } || die "--ebs-iops must be 3000 (Quote 30: no IOPS above 3,000 without a fresh dated owner quote)."
 fi
 if [ -n "$EBS_THROUGHPUT" ]; then
   is_uint "$EBS_THROUGHPUT" || die "--ebs-throughput must be a positive integer (MiB/s)."
-  { [ "$EBS_THROUGHPUT" -ge 125 ] && [ "$EBS_THROUGHPUT" -le 1000 ]; } || die "--ebs-throughput must be 125–1000 MiB/s (gp3 range; matches Terraform ebs_gp3_throughput)."
+  { [ "$EBS_THROUGHPUT" -ge 125 ] && [ "$EBS_THROUGHPUT" -le 125 ]; } || die "--ebs-throughput must be 125 MiB/s (Quotes 32/33: a raise needs a fresh dated owner quote)."
 fi
 if [ -n "$QDB_MEM" ]; then
   # STRICT regex anchor — a shell glob ([1-9]*[gGmM]) would let metacharacters

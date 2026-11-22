@@ -18,6 +18,15 @@
 //! - a contract-name table is republished mid-run (outside the window), so a
 //!   measured cycle pins a NEW table on its first row.
 //!
+//! Speed fix 5 review (2026-11-17): the drain now hands the inline book to
+//! the writer as one pair (`DepthWriter::append_book_pair`), and finds the
+//! name table through the generation-checked pin. Every cycle therefore
+//! appends its packets alternately as a pair and as two single sides, the
+//! FIRST packet of each cycle as a pair, so the pair path is measured right
+//! after a hand-off (an empty recycled batch: the table is loaded and
+//! pinned), right after the republish (a new generation), and while the
+//! generation still matches the batch's last pin (no load).
+//!
 //! Only the drain's calls are inside the window. Stall rows carry capture
 //! sequence 0 (no WAL record), so no hand-off takes a rescue floor.
 //!
@@ -39,8 +48,8 @@ use tickvault_storage::candle_contract_labels::{
     CandleContractLabels, publish_candle_contract_labels,
 };
 use tickvault_storage::depth_persistence::{
-    DEPTH_KIND_5, DEPTH_SIDE_ASK, DEPTH_SIDE_BID, DepthBookRow, DepthFlushBatch, DepthRescueBatch,
-    DepthRescueSink, DepthWriter, DepthWriterSink,
+    DEPTH_KIND_5, DEPTH_SIDE_ASK, DEPTH_SIDE_BID, DepthBookPair, DepthBookRow, DepthFlushBatch,
+    DepthRescueBatch, DepthRescueSink, DepthWriter, DepthWriterSink,
 };
 
 /// Measured cycles per shape.
@@ -51,8 +60,11 @@ const CYCLES: usize = 6;
 /// full, identical cycle, so a real per-cycle allocation recurs every time.
 const ATTEMPTS: usize = 3;
 
-/// Rows (sides) appended per cycle: three Full packets.
-const SIDES_PER_CYCLE: usize = 6;
+/// Full packets appended per cycle (two sides each).
+const PACKETS_PER_CYCLE: usize = 3;
+
+/// Rows (sides) appended per cycle.
+const SIDES_PER_CYCLE: usize = PACKETS_PER_CYCLE * 2;
 
 /// 2026-10-29 10:00:00 IST as IST-epoch nanos, inside the session window.
 const SESSION_TS_NANOS: i64 = 1_793_268_000_000_000_000;
@@ -61,21 +73,44 @@ const PRICES: [f64; 5] = [24_500.25, 24_500.2, 24_500.15, 24_500.1, 24_500.05];
 const QUANTITIES: [f64; 5] = [750.0, 900.0, 1_050.0, 1_200.0, 1_350.0];
 const ORDERS: [f64; 5] = [3.0, 4.0, 5.0, 6.0, 7.0];
 
-fn side(i: usize, seq: i64) -> DepthBookRow<'static> {
-    DepthBookRow {
-        security_id: 52_000 + (i as i64 / 2) % 8,
-        segment: "NSE_FNO",
-        depth_kind: DEPTH_KIND_5,
-        side: if i.is_multiple_of(2) {
-            DEPTH_SIDE_BID
-        } else {
-            DEPTH_SIDE_ASK
-        },
-        prices: &PRICES,
-        quantities: &QUANTITIES,
-        orders: &ORDERS,
-        capture_seq: seq,
-        ts_nanos: SESSION_TS_NANOS + i as i64,
+/// One Full packet's book (packet `p`, capture sequence `seq`): as a pair
+/// through `append_book_pair` (the drain's inline path) when `as_pair`,
+/// else as the bid and the ask single appends. Both write the same rows.
+fn append_packet(w: &mut DepthWriter, p: usize, seq: i64, as_pair: bool) {
+    let security_id = 52_000 + (p as i64) % 8;
+    let ts_nanos = SESSION_TS_NANOS + p as i64;
+    if as_pair {
+        let pair = DepthBookPair {
+            security_id,
+            segment: "NSE_FNO",
+            depth_kind: DEPTH_KIND_5,
+            bid_prices: &PRICES,
+            bid_quantities: &QUANTITIES,
+            bid_orders: &ORDERS,
+            ask_prices: &PRICES,
+            ask_quantities: &QUANTITIES,
+            ask_orders: &ORDERS,
+            capture_seq: seq,
+            ts_nanos,
+        };
+        let (bid, ask) = w.append_book_pair(&pair);
+        bid.expect("append bid");
+        ask.expect("append ask");
+        return;
+    }
+    for side in [DEPTH_SIDE_BID, DEPTH_SIDE_ASK] {
+        let row = DepthBookRow {
+            security_id,
+            segment: "NSE_FNO",
+            depth_kind: DEPTH_KIND_5,
+            side,
+            prices: &PRICES,
+            quantities: &QUANTITIES,
+            orders: &ORDERS,
+            capture_seq: seq,
+            ts_nanos,
+        };
+        w.append_book_row(&row).expect("append");
     }
 }
 
@@ -151,10 +186,10 @@ impl Lane {
         let (out, spares) = self.before_hand_off();
         let (w, i, seq) = (&mut self.w, &mut self.i, &mut self.seq);
         let got = measure(|| {
-            for _ in 0..SIDES_PER_CYCLE {
+            for j in 0..PACKETS_PER_CYCLE {
                 *i += 1;
                 *seq += 1;
-                w.append_book_row(&side(*i, *seq)).expect("append");
+                append_packet(w, *i, *seq, j.is_multiple_of(2));
             }
             w.flush().expect("hand off");
         });
@@ -175,9 +210,9 @@ impl Lane {
         let (out, spares) = self.before_hand_off();
         let (w, i) = (&mut self.w, &mut self.i);
         let got = measure(|| {
-            for _ in 0..SIDES_PER_CYCLE {
+            for j in 0..PACKETS_PER_CYCLE {
                 *i += 1;
-                w.append_book_row(&side(*i, 0)).expect("append");
+                append_packet(w, *i, 0, j.is_multiple_of(2));
             }
             assert!(w.discard_pending() > 0, "handed to the rescue queue");
         });

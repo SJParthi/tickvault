@@ -149,8 +149,15 @@ pub mod delay_render;
 // RESTORED 2026-10-26 (plan item K4): the Dhan live lane writes `ticks`
 // again, so the daily conservation check writes new rows into the retained
 // table. `tick_conservation_ledger` is the process-side count it reads.
+/// The one-off 20 Nov repair's own audit table (daily-universe Quote 63).
+pub mod day_repair_audit_persistence;
+pub mod day_repair_coverage;
 /// The daily expiry-scope check's audit table (owner 2026-10-28).
 pub mod expiry_scope_audit_persistence;
+/// The daily live paper fill calibration report's summary row (plan item LF-7).
+pub mod live_fill_report_persistence;
+/// The once-per-session TCP + TLS handshake timing table (plan item LF-6a).
+pub mod network_rtt_session_persistence;
 pub mod table_storage_probe;
 pub mod tick_conservation_audit_persistence;
 pub mod tick_conservation_ledger;
@@ -235,12 +242,21 @@ pub mod partition_manager;
 // row-count- and size-verified; gated on [partition_retention]
 // archive_enabled (serde default false).
 pub mod partition_archive;
+// Daily-universe Quote 63 (2026-11-20): days held out of the archiver, the
+// Brutex export and the cross-check catch-up until a verified repair.
+pub mod held_days;
+// Scope lock 2026-11-20: Dhan sent trade times as UTC; the armed per-day
+// correction table, record, detector and controller.
+pub mod ltt_correction;
 pub mod s3_cold;
 /// Read-only fetch of a published brutex strategy (rule brutex-strategy-host-2026-10-29.md).
 pub mod strategy_recipe_fetch;
 // Plan item 45e-1 (2026-10-02): raw WAL segments uploaded to the cold bucket,
 // verified, and marked, before any WAL prune may delete them.
 pub mod raw_frame_upload;
+// Plan item LF-8 (2026-11-12): read-only fetch of one day of raw segments
+// for the offline live-fill replay (List + Get only).
+pub mod raw_frame_fetch;
 // Plan item 66 (2026-10-21, Quotes 32/33/34): the one-off 2026-10-22
 // rebuild's file-copy and restore primitives were DELETED 2026-10-29 with
 // the rebuild and wipe tools that used them (rust-only lock §§0.13/0.14).
@@ -248,8 +264,13 @@ pub mod raw_frame_upload;
 // audit — rebuild of the table deleted in #T4 (2026-05-20) on the modern
 // ILP-over-HTTP template with event-in-key DEDUP (AUDIT-06).
 pub mod order_audit_persistence;
-// Audit PR42b (2026-10-01): disk tier for the three order-side audit writers
-// (order_audit, pnl_audit, order_leg_pnl) — a failed flush is written to
+// Plan item LF-5 (2026-11-12, owner Quote 57): the paper order event log of
+// the live signal-timing work. One row per event; treated like order_audit
+// (never deleted, audit disk tier on a failed flush).
+pub mod live_order_events_persistence;
+// Audit PR42b (2026-10-01): disk tier for the four order-side audit writers
+// (order_audit, pnl_audit, order_leg_pnl, and live_order_events since
+// 2026-11-12, plan item LF-5) — a failed flush is written to
 // data/spill/audit/<table>/ and replayed by one drain task per table.
 pub mod audit_spill;
 // Full-fidelity order/position push-event capture (design 2026-07-18;
@@ -317,9 +338,12 @@ pub mod depth_spill_frame;
 pub mod depth_stage;
 // Plan item 45h (2026-10-02): the feed packets the parser decodes and the fold
 // does not use (open interest, previous close, market status, disconnect, the
-// connect snapshot, out-of-window ticks). Rows ride the `ticks` writer's
+// no-trade-today packet, out-of-window ticks). Rows ride the `ticks` writer's
 // buffer, offload thread and spill tier.
 pub mod feed_aux_persistence;
+// Operator Quote 61 (2026-11-14): exact repeats of a contract's
+// `no_trade_today` row are skipped; O(1) per packet, 25,000 keys, cleared daily.
+pub mod feed_aux_repeat;
 // Real-time proof that the live path is not waiting (2026-10-02): per-stage
 // latency buckets, stall counters and task heartbeats, Prometheus only.
 pub mod hot_path_telemetry;
@@ -374,6 +398,9 @@ pub mod wal_reorder_guard;
 // PR RD-1 (2026-11-08, Quote 41): the per-boot replay frame cap in force,
 // raised once to 5x for a planned evening-drain boot.
 pub mod wal_replay_frame_cap;
+// Noise lock §2.20 (2026-11-11): is the WAL replay backlog shrinking between
+// two starts? A replay-limit line pages only when it is not.
+pub mod wal_backlog_trend;
 // Applied-watermark for the frame WAL (2026-09-05): a restart must never replay
 // frames whose rows already reached the database. Sibling of `ws_frame_spill`.
 pub mod wal_applied_watermark;

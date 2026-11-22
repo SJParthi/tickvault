@@ -76,6 +76,10 @@ pub mod tick_conservation;
 // The expiry-scope guarantee (owner 2026-10-28): subscribe-time refusal +
 // the 15:50 IST daily check into `expiry_scope_audit`.
 pub mod expiry_scope_check;
+// Plan item LF-6a (Quote 57, 2026-11-12): the clock-offset page (noise lock
+// §2.22) and the once-per-session TCP + TLS handshake timing table.
+pub mod clock_offset_page;
+pub mod network_rtt;
 // Plan item M5 (2026-10-27): routes a no-new-trade packet to `tick_quotes`.
 pub mod tick_quote_route;
 // PR #8a (2026-05-19) — Slice 1: 09:15:00 IST `DayOhlcTracker::arm_sid()`
@@ -95,6 +99,8 @@ pub mod boot_helpers;
 pub mod boot_wal_confirm;
 /// After-close repair of `contract` names a boot wrote blank (2026-10-09).
 pub mod contract_name_repair_boot;
+// Owner Quote 60: the daily Brutex export scheduler.
+pub mod brutex_export_boot;
 /// The previous close per instrument, fed from the response-code-6 packets
 /// the drain used to decode and discard. Without it the gainer-eligibility
 /// filter has nothing to divide by.
@@ -217,6 +223,9 @@ pub mod volume_semantics_probe;
 // PR #3 (2026-05-19): `greeks_pipeline` module DELETED. Greeks
 // pipeline retired alongside the indices-only universe. Option Chain
 // REST overlay (PR #8) ships Dhan-computed greeks separately.
+/// `tickvault day-repair`: the one-off repair of the held day 2026-11-20
+/// (daily-universe Quote 63, rust-only §0.21); deleted after the run.
+pub mod day_repair;
 /// The depth-20 / depth-200 on-off switch (owner, 2026-10-21).
 pub mod depth_switch;
 /// The after-close drain hold (operator Quote 31, 2026-10-21): keeps the box
@@ -263,6 +272,16 @@ pub mod infra;
 /// quiet where `/proc` is absent.
 pub mod kernel_rx_queue_sampler;
 pub mod leg_identity;
+/// The live PAPER fill chain (plan item LF-6b): tap → strategy candles →
+/// approved brutex engine → held order with its worst-case fill → paper OMS.
+/// Off by default; idles until an approved strategy crate exists.
+pub mod live_fill;
+/// The daily live paper fill calibration report (plan item LF-7): re-prices
+/// each paper order from the stored 1 s candles, writes five files per day and
+/// copies them to the cold bucket. Paper only, log-only codes.
+pub mod live_fill_report;
+/// The `live_order_events` writer task (ensure, disk-tier drain, ILP writer).
+pub mod live_order_events_boot;
 pub mod log_coalescer;
 /// `tickvault strategy-dry-run`: load, verify and replay published brutex strategy folders (no order, no live change).
 pub mod strategy_dry_run;
@@ -335,6 +354,9 @@ pub mod order_leg_pnl_boot;
 /// pnl_audit tables via one bounded mpsc(1024) consumer task; daily
 /// OnEod heartbeat + counters-vs-rows reconcile (OMS-GAP-02 on mismatch).
 pub mod order_observability;
+/// Connect-only TLS pre-warm of the order REST host at 09:14 IST (owner card
+/// 2026-11-13, no-rest rule §12.16). Default OFF.
+pub mod order_prewarm;
 /// Order runtime (dry-run) — cluster A, operator directive 2026-07-14
 /// (`.claude/plans/active-plan-order-runtime-dryrun.md`): the single-owner
 /// supervised task owning the paper OMS + RiskEngine on the dhan-off prod
@@ -351,6 +373,9 @@ pub mod subsystem_memory;
 /// Plan item 4 (2026-10-30): boot wiring for the background-task heartbeats
 /// and the memory action ladder (`tv-task-watch`).
 pub mod task_watch_boot;
+/// Plan item UTC-SAFETY (daily-universe §28.7, 2026-11-21): while today's
+/// feed-time alarm is on, the paper path opens no new entries; exits pass.
+pub mod trade_safety;
 pub mod trading_pipeline;
 // Dead live-WS sweep stage 1 (2026-07-17, operator directive via
 // coordinator): `wal_reinject` module DELETED — its own PR-C2 comments

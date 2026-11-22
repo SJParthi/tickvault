@@ -130,8 +130,10 @@ fn emf_selected() -> BTreeSet<String> {
             .unwrap_or(chunk.len());
         names.insert(format!("tv_{}", &chunk[..end]));
     }
+    // Floor 50 -> 30 on 2026-11-11: operator Quote 53 trimmed the selector to
+    // the 44 names a kept alarm reads (docs/audits/2026-11-alarm-review.md).
     assert!(
-        names.len() > 50,
+        names.len() > 30,
         "parsed only {} EMF names — the selector parser is broken",
         names.len()
     );
@@ -409,8 +411,10 @@ fn every_emf_selected_loss_series_is_seeded() {
         .iter()
         .filter(|n| LOSS_WORDS.iter().any(|w| n.contains(w)))
         .collect();
+    // Floor 30 -> 15 on 2026-11-11: operator Quote 53 left 19 loss-shaped
+    // names in the selector (the ones a kept alarm reads, measured).
     assert!(
-        loss.len() >= 30,
+        loss.len() >= 15,
         "only {} loss-shaped EMF series found — the filter or the selector \
          parse is broken and this test would pass vacuously",
         loss.len()

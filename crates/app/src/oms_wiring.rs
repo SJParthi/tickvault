@@ -65,20 +65,46 @@ impl TokenProvider for TokenHandleBridge {
 /// Returns [`HttpClientBuildError`] when `ClientBuilder::build()` fails
 /// (TLS backend init, DNS resolver init, fd exhaustion).
 pub fn build_oms_http_client() -> Result<reqwest::Client, HttpClientBuildError> {
-    let built = client_from_build_result(
-        reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(std::time::Duration::from_secs(
-                tickvault_common::constants::OMS_HTTP_TIMEOUT_SECS,
-            ))
-            .connect_timeout(std::time::Duration::from_secs(
-                tickvault_common::constants::OMS_HTTP_CONNECT_TIMEOUT_SECS,
-            ))
-            .pool_idle_timeout(std::time::Duration::from_secs(
-                tickvault_common::constants::OMS_HTTP_POOL_IDLE_TIMEOUT_SECS,
-            ))
-            .build(),
-    );
+    report_oms_client_build(client_from_build_result(oms_client_builder().build()))
+}
+
+/// [`build_oms_http_client`] over a caller-supplied rustls config: the same
+/// pinned timeouts, redirect policy and HTTP-CLIENT-01 degrade, with the TLS
+/// config handed to reqwest as given (reqwest sets no ALPN on this path). Used
+/// ONLY by the order host pre-warm (`order_prewarm`, no-rest rule §12.16), so
+/// the order client and the pre-warm share one session store and verifier.
+///
+/// # Errors
+///
+/// As [`build_oms_http_client`].
+pub fn build_oms_http_client_with_tls(
+    tls: rustls::ClientConfig,
+) -> Result<reqwest::Client, HttpClientBuildError> {
+    report_oms_client_build(client_from_build_result(
+        oms_client_builder().tls_backend_preconfigured(tls).build(),
+    ))
+}
+
+/// The OMS client builder with the pinned `OMS_HTTP_*` settings.
+fn oms_client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(
+            tickvault_common::constants::OMS_HTTP_TIMEOUT_SECS,
+        ))
+        .connect_timeout(std::time::Duration::from_secs(
+            tickvault_common::constants::OMS_HTTP_CONNECT_TIMEOUT_SECS,
+        ))
+        .pool_idle_timeout(std::time::Duration::from_secs(
+            tickvault_common::constants::OMS_HTTP_POOL_IDLE_TIMEOUT_SECS,
+        ))
+}
+
+/// Logs and counts a failed OMS client build (HTTP-CLIENT-01), then passes
+/// the result through.
+fn report_oms_client_build(
+    built: Result<reqwest::Client, HttpClientBuildError>,
+) -> Result<reqwest::Client, HttpClientBuildError> {
     if let Err(err) = &built {
         tracing::error!(
             code = ErrorCode::HttpClient01BuildFailed.code_str(),

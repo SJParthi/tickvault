@@ -69,7 +69,7 @@ The `.mcp.json` `tickvault-logs` entry is loaded automatically — same MCP tool
 
 | Demand | Mechanical proof artefact | Real-time check tool |
 |---|---|---|
-| 100% code coverage | `quality/crate-coverage-thresholds.toml` ratcheted per-crate floors (72.6–99.4, target 100%), floors only move up | `scripts/coverage-gate.sh` in CI |
+| 100% code coverage | `quality/crate-coverage-thresholds.toml` ratcheted per-crate floors (86.4–99.4 on the test-inclusive gate figure since 2026-11-13, plus production-only `[production]` floors; target 100%), floors only move up | `scripts/coverage-gate.sh` in CI |
 | 100% audit coverage | `<event>_audit` table with DEDUP UPSERT KEYS | `mcp__tickvault-logs__questdb_sql` |
 | 100% testing coverage | 22 test categories per `testing.md` (unit/integration/property/loom/dhat/fuzz/mutation/sanitizer/coverage/etc.) | `cargo test --workspace` green |
 | 100% code checks | banned-pattern + pub-fn-test + pub-fn-wiring + plan-verify + secret-scan + 8 pre-commit gates | pre-push mandatory |
@@ -260,7 +260,7 @@ For every plan item / new feature / Telegram message / docs:
 >
 > **2026-07-15:** the GROWW live WS is ALSO retired (operator Q1, received directly in this session: *"remove the whole Groww live feed; keep only spot 1m and option chain for both brokers; go."*) — the market-data runtime is REST-only for both brokers, live market-data WS count = 0; see `websocket-connection-scope-lock.md` "2026-07-15 Amendment".
 >
-> **⚠ 2026-07-14 — Groww ORDER-SIDE build authorized, live fire LOCKED (pointer):** the operator authorized BUILDING + INTEGRATING the Groww order-side (orders / smart orders / portfolio / margin / user) **entirely behind a 4-gate live-fire lattice** — `.claude/rules/project/groww-second-feed-scope-2026-06-19.md` §39 + `.claude/rules/project/no-rest-except-live-feed-2026-06-27.md` §10 (each gate build-failure-ratcheted by `crates/common/tests/groww_order_lattice_guard.rs`). NO Groww order fires until a separate future dated live-orders enable; `dry_run` stays `true` and the §28 strategy/indicator boundary stays frozen. This is a market-data-WS-neutral change — it adds NO WebSocket connection.
+> **⚠ 2026-07-14 — Groww ORDER-SIDE build authorized, live fire LOCKED (pointer):** the operator authorized BUILDING + INTEGRATING the Groww order-side (orders / smart orders / portfolio / margin / user) **entirely behind a 4-gate live-fire lattice** — `.claude/rules/project/groww-second-feed-scope-2026-06-19.md` §39 + `.claude/rules/project/no-rest-except-live-feed-2026-06-27.md` §10 (each gate build-failure-ratcheted by `crates/common/tests/groww_order_lattice_guard.rs`). NO Groww order fires until a separate future dated live-orders enable; `dry_run` stays `true` and the §28 strategy/indicator boundary stays frozen. This is a market-data-WS-neutral change — it adds NO WebSocket connection. (⚠ CORRECTED 2026-11-15: `groww_order_lattice_guard.rs` was deleted 2026-08-21 with the Groww order side; NOT ENFORCED.)
 >
 > **⚠ ALLOWED-INSTRUMENTS SUPERSEDED 2026-05-27 by [`daily-universe-scope-expansion-2026-05-27.md`](./daily-universe-scope-expansion-2026-05-27.md):** main-feed expanded from 4 IDX_I SIDs to ~250 daily-fetched SIDs (all NSE indices + 1 BSE SENSEX + unique F&O underlyings, all Quote mode). The 2-WebSocket lock (1 main-feed + 1 order-update FOREVER) is UNCHANGED — only the instrument set on the single main-feed conn expanded per operator approval 2026-05-27. The 2026-05-15 verbatim quote below still binds the 2-WS architecture.
 >
@@ -325,7 +325,7 @@ For every plan item / new feature / Telegram message / docs:
 | `resilience_sla_alert_guard.rs` | `cargo test` | every counter has an alert rule **⚠ CORRECTED 2026-10-12 (deep audit TRU-8): `resilience_sla_alert_guard.rs` does not exist in the tree; NOT ENFORCED.** |
 | `error_level_meta_guard.rs` | `cargo test` | flush/persist failures use `error!` not `warn!` |
 | `scripts/bench-gate.sh` | post-merge | 5% regression budget on hot-path benches |
-| `scripts/coverage-gate.sh` | post-merge | ratcheted per-crate floors (72.6–99.4, target 100%) per crate |
+| `scripts/coverage-gate.sh` | post-merge | ratcheted per-crate floors (86.4–99.4 on the test-inclusive gate figure since 2026-11-13, plus production-only `[production]` floors; target 100%) per crate |
 | `block-bypass.sh` (wired via `pre-tool-dispatch.sh`) | pre-bash | `--no-verify`, `git stash push/pop/apply/save`, `--dangerously-skip-permissions`, `gh pr merge --admin`, force-push to main/master |
 | GitHub Actions CI | every PR | full 22-test battery + mutation + fuzz |
 

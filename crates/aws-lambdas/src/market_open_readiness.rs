@@ -51,8 +51,9 @@ use crate::time::IST_OFFSET_SECS;
 /// own terraform disproves):
 ///   1. the NSE-holiday gate (tickvault-holiday-gate.service) — the
 ///      common case;
-///   2. the hourly hard-stop-guard's in-window budget breach_stop (its
-///      hourly cron's 03:00 UTC tick IS 08:30 IST; budget-guards.tf) and
+///   2. the hourly hard-stop-guard's budget breach_stop (since 2026-11-13 it
+///      runs at minute 50, 02:50 UTC = 08:20 IST and 03:50 UTC = 09:20 IST, so
+///      it no longer has a run inside 08:25-08:45; budget-guards.tf) and
 ///      the SNS-driven budget-killswitch — BOTH page in the SAME
 ///      invocation, AFTER stopping (stop-first is their deliberate
 ///      spend-cap ordering), so the operator is normally paged by the

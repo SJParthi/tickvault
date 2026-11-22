@@ -217,30 +217,8 @@ resource "aws_cloudwatch_metric_alarm" "token_remaining_low" {
 # functional-dormant today) — these increment the counter/alarm but
 # produce NO Telegram/audit row (the fire_alert at that transition is a
 # Phase-1 follow-up). The alarm and the Telegram are NOT one signal chain.
-resource "aws_cloudwatch_metric_alarm" "orders_rejected" {
-  alarm_name          = "tv-${var.environment}-orders-rejected"
-  alarm_description   = "One or more orders rejected in the last 5 minutes. Could be DH-905 (bad input), DH-906 (order error), or risk-gate denial."
-  comparison_operator = "GreaterThanThreshold"
-  evaluation_periods  = 1
-  metric_name         = "tv_orders_rejected_total"
-  namespace           = local.app_namespace
-  period              = 300
-  statistic           = "Sum"
-  threshold           = 0
-  treat_missing_data  = "notBreaching"
-  dimensions          = local.app_dimensions
-  alarm_actions       = local.app_alarm_actions
-  # 2026-07-14 cluster-C order-side: ok_actions STRIPPED. The rejected
-  # count returning to 0 is not an all-clear (the rejected orders exist;
-  # the rejection cause may persist) — the auto-OK paged a Rule-11 false
-  # recovery on every episode aging out. The counter is now also
-  # pre-registered at 0 in main.rs (first-sample-baseline lesson) so a
-  # single-rejection session (place-time class — the counter emit at the
-  # place_order Err arm, C4) actually pages — see
-  # deploy/aws/terraform/order-side-alarms.tf +
-  # crates/app/tests/order_side_paging_wiring_guard.rs.
-  ok_actions = []
-}
+# alarm "orders_rejected" REMOVED 2026-11-11 (operator Quote 53, alarm review
+# docs/audits/2026-11-alarm-review.md). The comments above are kept as history.
 
 # ---------------------------------------------------------------------------
 # RETIRED (PR-C2, 2026-07-13): `realtime_guarantee_critical`
@@ -253,21 +231,8 @@ resource "aws_cloudwatch_metric_alarm" "orders_rejected" {
 # ---------------------------------------------------------------------------
 # 12. Wall-clock skew > 1s — IST timestamp math at risk
 # ---------------------------------------------------------------------------
-resource "aws_cloudwatch_metric_alarm" "clock_skew_high" {
-  alarm_name          = "tv-${var.environment}-clock-skew-high"
-  alarm_description   = "Wall-clock skew > 1s vs trusted source. IST timestamps may cross day boundaries. BOOT-03 fires at >2s. See BOOT-03 runbook."
-  comparison_operator = "GreaterThanThreshold"
-  evaluation_periods  = 2
-  metric_name         = "tv_clock_skew_seconds"
-  namespace           = local.app_namespace
-  period              = 60
-  statistic           = "Maximum"
-  threshold           = 1
-  treat_missing_data  = "notBreaching"
-  dimensions          = local.app_dimensions
-  alarm_actions       = local.app_alarm_actions
-  ok_actions          = local.app_alarm_ok
-}
+# alarm "clock_skew_high" REMOVED 2026-11-11 (operator Quote 53, alarm review
+# docs/audits/2026-11-alarm-review.md). The comments above are kept as history.
 
 # ---------------------------------------------------------------------------
 # 13. Root volume filling — the "grow online when the alarm fires" trigger
@@ -316,7 +281,7 @@ resource "aws_cloudwatch_metric_alarm" "clock_skew_high" {
 # ---------------------------------------------------------------------------
 resource "aws_cloudwatch_metric_alarm" "disk_used_high" {
   alarm_name          = "tv-${var.environment}-disk-used-high"
-  alarm_description   = "Root volume > 90% full - the CEILING, not the early warning (tv-<env>-disk-fill-rate-high is the trend alarm that should fire days before this one). Raised 75->90 on 2026-08-25: the box was structurally stuck at 86%, so at 75 this alarm was permanently latched in ALARM, could never transition, and could never page again. Grow online (no downtime): scripts/aws-upgrade-instance.sh --ebs-size N (modify-volume; grown 30->50 on 2026-07-13, 100->200 on 2026-08-21), then on the box: sudo growpart /dev/nvme0n1 1 && sudo xfs_growfs / (or the next daily boot's cloud-init growpart/resizefs). gp3 grows online and can NEVER shrink. First check whether retention is actually running: SELECT outcome, count() FROM partition_archive_audit. See may31-inplace-upgrade-and-access.md §2.1."
+  alarm_description   = "Root volume > 90% full - the CEILING. There is NO early-warning trend alarm any more: tv-<env>-disk-fill-rate-high was removed 2026-11-11 (operator Quote 53, docs/audits/2026-11-alarm-review.md), so this page can be the first sign of a fill that has been building for days. Read tv_spill_dir_free_bytes on the box to judge how fast it is filling. Raised 75->90 on 2026-08-25: the box was structurally stuck at 86%, so at 75 this alarm was permanently latched in ALARM, could never transition, and could never page again. Grow online (no downtime): scripts/aws-upgrade-instance.sh --ebs-size N (modify-volume; grown 30->50 on 2026-07-13, 100->200 on 2026-08-21), then on the box: sudo growpart /dev/nvme0n1 1 && sudo xfs_growfs / (or the next daily boot's cloud-init growpart/resizefs). gp3 grows online and can NEVER shrink. First check whether retention is actually running: SELECT outcome, count() FROM partition_archive_audit. See may31-inplace-upgrade-and-access.md §2.1."
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 1
   threshold           = 90
@@ -378,90 +343,8 @@ resource "aws_cloudwatch_metric_alarm" "disk_used_high" {
 # strongly negative; GreaterThanThreshold ignores that, which is correct — the
 # disk shrinking is the outcome we want.
 # ---------------------------------------------------------------------------
-resource "aws_cloudwatch_metric_alarm" "disk_fill_rate_high" {
-  alarm_name          = "tv-${var.environment}-disk-fill-rate-high"
-  alarm_description   = "Root volume is FILLING at more than 4 percentage points per day, sustained across two consecutive 6-hour windows (~12h). This is the early warning: at this rate the headroom below the 90% ceiling is gone inside about a working week, so grow the volume in a maintenance window rather than mid-session. FIRST check whether retention is running at all - the 2026-08-25 state was 1,000 archive attempts, all failed, zero partitions ever dropped, which is a fill trend with a fixable cause: SELECT outcome, count() FROM partition_archive_audit. If archival is healthy and the trend is real ingest growth, grow gp3 online (scripts/aws-upgrade-instance.sh --ebs-size N, then growpart + xfs_growfs) - it can never shrink, so go up in steps. Companion ceiling alarm: tv-<env>-disk-used-high."
-  comparison_operator = "GreaterThanThreshold"
-  threshold           = 4
-  evaluation_periods  = 2
-  datapoints_to_alarm = 2
-  treat_missing_data  = "notBreaching"
-  alarm_actions       = local.app_alarm_actions
-  # NO ok_actions. The rate falling back below 4 pts/day means the disk is
-  # filling more slowly, never that the space came back - and after a real
-  # grow the operator already knows. An auto-OK would read as "resolved" while
-  # the volume is still fuller than it was (Rule 11, no false recovery).
-  ok_actions = []
-
-  # WHY THIS ALARM DOES NOT USE METRICS INSIGHTS, unlike its sibling
-  # `disk_used_high` (2026-08-25, decided on MEASURED data).
-  #
-  # It shipped in #1805 as a Metrics Insights alarm at period 21600 (6h) x 2
-  # evaluations = 12h, and AWS rejected it on every apply:
-  #
-  #   ValidationError: MetricsInsights monitors cannot be checked across
-  #   more than 3 hours
-  #
-  # That froze the whole apply lane for hours - terraform stops at the first
-  # failing resource, so every later change sat on main undeployed.
-  #
-  # The first repair narrowed the window to 1h x 2 = 2h to fit the cap. That
-  # applied, and it was WRONG. Real hourly rates on this volume, read from
-  # CloudWatch over 48h, are violent: +230, +278, +181, +147 points/day on
-  # ordinary consecutive hours (compaction and archival churn), against a
-  # threshold of 4. Two of those in a row is an ALARM, so the "fix" converted
-  # a never-applying alarm into one that pages several times a day.
-  #
-  # No legal Insights window can work here. The measured 24h drift - the REAL
-  # signal - was +10.9 points/day while hourly NOISE reaches +280. Only a
-  # window long enough to span the overnight stop averages the churn out, and
-  # 12h is over the 3h Insights cap by construction.
-  #
-  # So this uses a plain metric block with explicit dimensions, which has no
-  # such cap. That is exactly the fallback #1805's own header named and hoped
-  # to avoid: "alarm the raw CWAgent metric with explicit device/fstype
-  # dimensions ... should only be taken if forced". We are forced, and unlike
-  # that author we could VERIFY the dimensions against the live account rather
-  # than guess them - `aws cloudwatch list-metrics --namespace CWAgent
-  # --metric-name disk_used_percent` returns exactly ONE series:
-  # path=/, InstanceId=i-0c3fe906dad5492fc, device=nvme0n1p1, fstype=xfs.
-  #
-  # THE FRAGILITY THIS BUYS, stated plainly: device and fstype are pinned. An
-  # instance recreate onto non-nvme storage, or a filesystem change, silently
-  # sends this alarm to INSUFFICIENT_DATA - a dead monitor. That is accepted
-  # HERE and only here because `disk_used_high` is the backstop and it is
-  # dimension-agnostic: it still fires at 90% full whatever the device is
-  # called. The fragile alarm is the early warning; the robust one is the
-  # safety net. Re-run the list-metrics command above after any instance
-  # recreate.
-  metric_query {
-    id          = "disk_pct"
-    return_data = false
-
-    metric {
-      namespace   = "CWAgent"
-      metric_name = "disk_used_percent"
-      period      = 21600
-      stat        = "Maximum"
-
-      dimensions = {
-        InstanceId = aws_instance.tv_app.id
-        path       = "/"
-        device     = "nvme0n1p1"
-        fstype     = "xfs"
-      }
-    }
-  }
-
-  metric_query {
-    id = "fill_rate_per_day"
-    # RATE() is per SECOND; x86400 renders the threshold in points per day,
-    # which is the unit the operator actually reasons in.
-    expression  = "RATE(disk_pct) * 86400"
-    label       = "root volume fill rate (percentage points per day)"
-    return_data = true
-  }
-}
+# alarm "disk_fill_rate_high" REMOVED 2026-11-11 (operator Quote 53, alarm review
+# docs/audits/2026-11-alarm-review.md). The comments above are kept as history.
 
 # ---------------------------------------------------------------------------
 # RETIRED (PR-C2, 2026-07-13): `ws_frame_dropped_no_wal`
@@ -478,21 +361,8 @@ resource "aws_cloudwatch_metric_alarm" "disk_fill_rate_high" {
 # rate-alarm (Sum over 5m) pages only on a FLAPPING watcher (a real bug),
 # not on a benign one-off respawn at shutdown.
 # ---------------------------------------------------------------------------
-resource "aws_cloudwatch_metric_alarm" "disk_watcher_respawn" {
-  alarm_name          = "tv-${var.environment}-disk-watcher-respawn"
-  alarm_description   = "Spill disk-health watcher is flapping — respawned >0 times in 5m. Disk-free monitoring (the disk-full + QuestDB-down early warning) keeps running via the supervisor, but a repeating respawn means a real bug; inspect the DISK-WATCHER-01 panic backtrace."
-  comparison_operator = "GreaterThanThreshold"
-  evaluation_periods  = 1
-  metric_name         = "tv_disk_watcher_respawn_total"
-  namespace           = local.app_namespace
-  period              = 300
-  statistic           = "Sum"
-  threshold           = 0
-  treat_missing_data  = "notBreaching"
-  dimensions          = local.app_dimensions
-  alarm_actions       = local.app_alarm_actions
-  ok_actions          = local.app_alarm_ok
-}
+# alarm "disk_watcher_respawn" REMOVED 2026-11-11 (operator Quote 53, alarm review
+# docs/audits/2026-11-alarm-review.md). The comments above are kept as history.
 
 # ---------------------------------------------------------------------------
 # 16b. Groww sidecar stall-restart storm — RETIRED 2026-07-15 (Groww
@@ -538,23 +408,8 @@ resource "aws_cloudwatch_metric_alarm" "disk_watcher_respawn" {
 # a CloudWatch Metrics Insights query so we do NOT pin CWAgent mem dimensions.
 # CWAgent already publishes mem_used_percent (user-data.sh.tftpl metrics block).
 # ---------------------------------------------------------------------------
-resource "aws_cloudwatch_metric_alarm" "mem_used_high" {
-  alarm_name          = "tv-${var.environment}-mem-used-high"
-  alarm_description   = "Host memory > 80% on r8g.xlarge (4 vCPU / 32 GiB — verified live 2026-08-12). Capacity signal — time to consider an instance upgrade (r8g.2xlarge 64 GiB is the rip-cord per daily-universe-scope-expansion-2026-05-27.md §7 Rule 2). NOTE: RESOURCE-02 is the PROCESS-level memory signal and fires earlier; this one is the whole HOST, including QuestDB's 12 GiB limit, so check which is actually growing before resizing. Run scripts/aws-upgrade-instance.sh --to <bigger-type> --ebs-size <GB> --qdb-mem <N>g AFTER the dated-quote + 4-file lock flip (§7 Mechanical Rule 1). Auto-detect only — never auto-upgrades. See docs/runbooks/instance-upgrade.md."
-  comparison_operator = "GreaterThanThreshold"
-  evaluation_periods  = 3
-  threshold           = 80
-  treat_missing_data  = "notBreaching"
-  alarm_actions       = local.app_alarm_actions
-  ok_actions          = local.app_alarm_ok
-
-  metric_query {
-    id          = "mem_used"
-    period      = 300
-    return_data = true
-    expression  = "SELECT MAX(mem_used_percent) FROM \"CWAgent\" WHERE InstanceId = '${aws_instance.tv_app.id}'"
-  }
-}
+# alarm "mem_used_high" REMOVED 2026-11-11 (operator Quote 53, alarm review
+# docs/audits/2026-11-alarm-review.md). The comments above are kept as history.
 
 # ---------------------------------------------------------------------------
 # Output — operator-facing reminder + alarm list
@@ -606,7 +461,7 @@ resource "aws_cloudwatch_metric_alarm" "mem_used_high" {
 # ---------------------------------------------------------------------------
 resource "aws_cloudwatch_metric_alarm" "spill_dir_free_low" {
   alarm_name          = "tv-${var.environment}-spill-dir-free-low"
-  alarm_description   = "Root volume free space is at or below 20 GiB - roughly ONE HOUR of headroom at the measured 24 GB/hour open burn. On 2026-08-25 this gauge went 38.8 GB -> 14.5 GB -> 20 KB across two hours and nothing was watching it; the volume then sat full for three hours and 15 QuestDB tables suspended themselves, which silently discards rows while ILP keeps ACKing. ACT NOW, in this order: (1) SELECT outcome, count() FROM partition_archive_audit - if archival is failing, that is the cause and it is fixable without spending money; (2) check pressure_hot_days is at its 2-day floor already; (3) grow gp3 online: scripts/aws-upgrade-instance.sh --ebs-size N, then on the box sudo growpart /dev/nvme0n1 1 && sudo xfs_growfs / . gp3 can NEVER shrink, so go up in steps. Companion alarms: tv-<env>-disk-used-high (the 90% ceiling) and tv-<env>-disk-fill-rate-high (the multi-day trend, which cannot see an intraday fill)."
+  alarm_description   = "Root volume free space is at or below 20 GiB - roughly ONE HOUR of headroom at the measured 24 GB/hour open burn. On 2026-08-25 this gauge went 38.8 GB -> 14.5 GB -> 20 KB across two hours and nothing was watching it; the volume then sat full for three hours and 15 QuestDB tables suspended themselves, which silently discards rows while ILP keeps ACKing. ACT NOW, in this order: (1) SELECT outcome, count() FROM partition_archive_audit - if archival is failing, that is the cause and it is fixable without spending money; (2) check pressure_hot_days is at its 2-day floor already; (3) grow gp3 online: scripts/aws-upgrade-instance.sh --ebs-size N, then on the box sudo growpart /dev/nvme0n1 1 && sudo xfs_growfs / . gp3 can NEVER shrink, so go up in steps. Companion alarm: tv-<env>-disk-used-high (the 90% ceiling). The multi-day trend alarm tv-<env>-disk-fill-rate-high was removed 2026-11-11 (operator Quote 53, docs/audits/2026-11-alarm-review.md), so nothing warns days ahead."
   comparison_operator = "LessThanOrEqualToThreshold"
   evaluation_periods  = 1
   metric_name         = "tv_spill_dir_free_bytes"
@@ -703,21 +558,8 @@ resource "aws_cloudwatch_metric_alarm" "questdb_wal_suspended" {
 # close when writes stop, so a green "recovered" at 16:00 would say the problem
 # was handled when what actually happened is that the day ended.
 # ---------------------------------------------------------------------------
-resource "aws_cloudwatch_metric_alarm" "questdb_wal_apply_lag" {
-  alarm_name          = "tv-${var.environment}-questdb-wal-apply-lag"
-  alarm_description   = "QuestDB WAL apply is falling behind: rows are ACKed and written to the WAL but are NOT yet queryable, so max(ts) on the affected table freezes while every ingest counter reads healthy and `suspended` stays FALSE. Triage: SELECT name, writerTxn, sequencerTxn, sequencerTxn-writerTxn AS behind FROM wal_tables() ORDER BY behind DESC. Nothing is LOST while this fires - the rows are on disk in the WAL and become visible when apply catches up - but a backlog that grows all session means intra-session queries on that table are stale by however long it has been behind. Check disk headroom and QuestDB CPU first; the usual cause on this box is market_depth arriving faster than apply can materialise it. Do NOT restart QuestDB mid-session to 'fix' it: the WAL is already durable and a restart risks the queued transactions for no gain."
-  comparison_operator = "GreaterThanOrEqualToThreshold"
-  evaluation_periods  = 2
-  metric_name         = "tv_questdb_wal_apply_lag_max"
-  namespace           = local.app_namespace
-  period              = 300
-  statistic           = "Maximum"
-  threshold           = 10000
-  treat_missing_data  = "notBreaching"
-  dimensions          = local.app_dimensions
-  alarm_actions       = local.app_alarm_actions
-  ok_actions          = []
-}
+# alarm "questdb_wal_apply_lag" REMOVED 2026-11-11 (operator Quote 53, alarm review
+# docs/audits/2026-11-alarm-review.md). The comments above are kept as history.
 
 # The WAL-suspension alarm above reads a GAUGE. This alarm watches the PRODUCER
 # of that gauge, and it exists because the gauge could once lie.
@@ -739,34 +581,13 @@ resource "aws_cloudwatch_metric_alarm" "questdb_wal_apply_lag" {
 # ok_actions is deliberately empty: this counter ages out of its 5-minute window
 # on its own, so a return to OK means the last failure fell off the edge, never
 # that the probe was repaired.
-resource "aws_cloudwatch_metric_alarm" "questdb_wal_probe_failed" {
-  alarm_name          = "tv-${var.environment}-questdb-wal-probe-failed"
-  alarm_description   = "The QuestDB WAL-suspension PROBE is failing, so tv_questdb_wal_suspended_tables is stale or absent and tv-<env>-questdb-wal-suspended cannot see a suspension. This is a blind-detector alarm, not a data-loss alarm - but the detector it guards is the ONLY thing that can see a suspended table silently ACKing and discarding ILP writes. Triage: grep the app log for WAL-SUSPEND-PROBE and read the failure reason. all_rows_skipped means QuestDB changed the shape of wal_tables() - most likely the `suspended` column now renders as a string rather than a boolean after an upgrade - and parse_wal_tables_response needs its accessor widened; the gauge is NOT to be trusted until it is. Other reasons are transport: check QuestDB is reachable on the health port. Verify by hand meanwhile: SELECT name, suspended FROM wal_tables() WHERE suspended = true."
-  comparison_operator = "GreaterThanOrEqualToThreshold"
-  # M-of-N since 2026-08-28. Was evaluation_periods = 1, which re-entered
-  # ALARM on every window with a non-zero delta: a flapping condition paged the
-  # operator once per period all session (five alarms on a ~7-minute loop on
-  # 2026-08-28). With 1-of-3 the FIRST breach still pages immediately - so
-  # detection is not delayed by a single second - but the alarm stays in ALARM
-  # through interleaved zero windows instead of resolving and re-firing.
-  evaluation_periods  = 3
-  datapoints_to_alarm = 1
-  metric_name         = "tv_wal_suspension_probe_failed_total"
-  namespace           = local.app_namespace
-  period              = 300
-  statistic           = "Sum"
-  threshold           = 1
-  treat_missing_data  = "notBreaching"
-  dimensions          = local.app_dimensions
-  alarm_actions       = local.app_alarm_actions
-  ok_actions          = []
-}
+# alarm "questdb_wal_probe_failed" REMOVED 2026-11-11 (operator Quote 53, alarm review
+# docs/audits/2026-11-alarm-review.md). The comments above are kept as history.
 
 output "app_cloudwatch_alarms" {
-  description = "The 12 application-level alarms declared in THIS file. The list below names EVERY alarm resource here and is pinned by cloudwatch_app_alarms_wiring.rs::the_app_alarms_output_names_every_alarm_in_the_file - a hand-maintained list silently omitted disk_fill_rate_high and questdb_wal_apply_lag, and the count in this very description read 15 against 12 resources and 10 listed, so it is derived and guarded now rather than copied. CORRECTED 2026-09-17, three claims at once: (a) the count; (b) \"2 more silent-feed alarms live in silent-feed-alarms.tf\" - that file declares ZERO and its own output says so, every one having been retired 2026-07-15/17 with its producer; (c) \"still well inside the $55 budget cap\" - the ceiling is $150 since 2026-08-25 (operator Quote 19), the AUTOMATIC STOP_EC2_INSTANCES action line is $135, and the September forecast measured 2026-09-06 was $142.24, i.e. ABOVE it - so a new alarm needs a lever, not a cost note (dhan-rest-only-noise-lock-2026-07-14.md section 2.3n). History kept: PR-C2 2026-07-13 retired 5 Dhan-lane alarms; order-update-ws-inactive retired 2026-07-14 per the Dhan noise lock; tick-gap-instruments-silent retired in PR-C3 2026-07-14; groww-ws-inactive + groww-stall-restart-storm retired 2026-07-15 with the Groww live feed; spill-dir-free-low + questdb-wal-suspended added 2026-08-25 (section 2.3g) and questdb-wal-probe-failed 2026-08-25 (section 2.3h, the blind-detector guard on that pair). The 2026-07-15 note that the Groww retirement ADDED tv_rest_1m_fire_heartbeat is itself superseded: that heartbeat lost its three producers with the per-minute REST legs on 2026-09-16, and the market-hours liveness alarm was re-pointed to tv_dhan_feed_last_tick_age_secs rather than retired."
+  description = "The 5 application-level alarms declared in THIS file (12 until 2026-11-11, when the operator Quote 53 alarm review, docs/audits/2026-11-alarm-review.md, removed seven). The list below names EVERY alarm resource here and is pinned by cloudwatch_app_alarms_wiring.rs::the_app_alarms_output_names_every_alarm_in_the_file - a hand-maintained list silently omitted disk_fill_rate_high and questdb_wal_apply_lag, and the count in this very description read 15 against 12 resources and 10 listed, so it is derived and guarded now rather than copied. CORRECTED 2026-09-17, three claims at once: (a) the count; (b) \"2 more silent-feed alarms live in silent-feed-alarms.tf\" - that file declares ZERO and its own output says so, every one having been retired 2026-07-15/17 with its producer; (c) \"still well inside the $55 budget cap\" - the ceiling is $150 since 2026-08-25 (operator Quote 19), the AUTOMATIC STOP_EC2_INSTANCES action line is $135, and the September forecast measured 2026-09-06 was $142.24, i.e. ABOVE it - so a new alarm needs a lever, not a cost note (dhan-rest-only-noise-lock-2026-07-14.md section 2.3n). History kept: PR-C2 2026-07-13 retired 5 Dhan-lane alarms; order-update-ws-inactive retired 2026-07-14 per the Dhan noise lock; tick-gap-instruments-silent retired in PR-C3 2026-07-14; groww-ws-inactive + groww-stall-restart-storm retired 2026-07-15 with the Groww live feed; spill-dir-free-low + questdb-wal-suspended added 2026-08-25 (section 2.3g) and questdb-wal-probe-failed 2026-08-25 (section 2.3h, the blind-detector guard on that pair). The 2026-07-15 note that the Groww retirement ADDED tv_rest_1m_fire_heartbeat is itself superseded: that heartbeat lost its three producers with the per-minute REST legs on 2026-09-16, and the market-hours liveness alarm was re-pointed to tv_dhan_feed_last_tick_age_secs rather than retired."
   value = [
     aws_cloudwatch_metric_alarm.disk_used_high.alarm_name,
-    aws_cloudwatch_metric_alarm.mem_used_high.alarm_name,
     # groww_ws_inactive + groww_stall_restart_storm retired 2026-07-15
     # (Groww live-feed retirement).
     aws_cloudwatch_metric_alarm.questdb_disconnected.alarm_name,
@@ -776,23 +597,17 @@ output "app_cloudwatch_alarms" {
     # dead-tick alarm chains; the ticks table has no writer anymore).
     # aggregator_no_seals retired 2026-07-15 (Groww live-feed retirement —
     # the seals metric lost its last live producer; see section 9 note).
-    aws_cloudwatch_metric_alarm.orders_rejected.alarm_name,
-    aws_cloudwatch_metric_alarm.clock_skew_high.alarm_name,
-    aws_cloudwatch_metric_alarm.disk_watcher_respawn.alarm_name,
     # Added 2026-08-25 per dhan-rest-only-noise-lock-2026-07-14.md §2.3g: on
     # 2026-08-25 the volume went 38.8 GB -> 20 KB free in two hours and 15
     # QuestDB tables suspended themselves, and NEITHER gauge had an alarm.
     aws_cloudwatch_metric_alarm.spill_dir_free_low.alarm_name,
     aws_cloudwatch_metric_alarm.questdb_wal_suspended.alarm_name,
-    aws_cloudwatch_metric_alarm.questdb_wal_probe_failed.alarm_name,
     # Added to the LIST 2026-09-17 — both alarms have been declared in this
     # file all along and were simply never listed here. An output named
     # `app_cloudwatch_alarms` that omits two of its file's alarms is the
     # quiet-inaccuracy class this repo keeps re-learning, so the omission is
     # now impossible: the guard named in the description above requires this
     # list to name every `aws_cloudwatch_metric_alarm` resource in the file.
-    aws_cloudwatch_metric_alarm.disk_fill_rate_high.alarm_name,
-    aws_cloudwatch_metric_alarm.questdb_wal_apply_lag.alarm_name,
     # late_tick_after_boundary retired 2026-07-18 (stage-4 unit A).
   ]
 }

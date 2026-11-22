@@ -321,8 +321,10 @@ fn config_muhurat_blocks_put_the_date_first() {
 }
 
 /// The dated liveness arming: one open (session start + 20 min) and one close
-/// (session end) per date, on the SAME gate Lambda, leaving the three
-/// weekday-only did-it-run alarms disarmed.
+/// (session end) per date, on the SAME gate Lambda, leaving every weekday-only
+/// did-it-run alarm in the gate's list disarmed. Since 2026-11-11 (Quote 53
+/// alarm review) that is only `boot_heartbeat_gate_not_invoked`; the
+/// deploy-watchdog and market-open-readiness ones were removed.
 #[test]
 fn each_muhurat_date_arms_and_disarms_the_liveness_gate() {
     let tf = code_only(&read("deploy/aws/terraform/market-hours-liveness-alarm.tf"));
@@ -336,8 +338,6 @@ fn each_muhurat_date_arms_and_disarms_the_liveness_gate() {
         "arn = aws_lambda_function.tv_market_hours_liveness_gate.arn",
         "input = jsonencode({ mode = \"close\" })",
         "skip_alarms = [",
-        "aws_cloudwatch_metric_alarm.deploy_watchdog_not_invoked.alarm_name,",
-        "aws_cloudwatch_metric_alarm.market_open_readiness_not_invoked.alarm_name,",
         "aws_cloudwatch_metric_alarm.boot_heartbeat_gate_not_invoked.alarm_name,",
         "resource \"aws_lambda_permission\" \"tv_market_hours_liveness_muhurat_open\" {",
         "resource \"aws_lambda_permission\" \"tv_market_hours_liveness_muhurat_close\" {",
@@ -345,6 +345,32 @@ fn each_muhurat_date_arms_and_disarms_the_liveness_gate() {
         assert!(
             tf.contains(needle),
             "market-hours-liveness-alarm.tf is missing `{needle}`"
+        );
+    }
+    // Every did-it-run alarm the gate arms must be in the Muhurat skip list:
+    // each watches a MON-FRI Lambda and would page on a weekend Muhurat date.
+    let names_start = tf
+        .find("ALARM_NAMES = join(")
+        .expect("the gate's ALARM_NAMES list");
+    let names_end = names_start + tf[names_start..].find("])").expect("ALARM_NAMES list end");
+    let skip_start = tf.find("skip_alarms = [").expect("the Muhurat skip list");
+    let skip_end = skip_start + tf[skip_start..].find(']').expect("skip list end");
+    let skip = &tf[skip_start..skip_end];
+    let armed_did_it_run: Vec<&str> = tf[names_start..names_end]
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.contains("_not_invoked.alarm_name"))
+        .collect();
+    assert!(
+        !armed_did_it_run.is_empty(),
+        "boot_heartbeat_gate_not_invoked must stay in ALARM_NAMES (Quote 53 review KEPT it)"
+    );
+    for entry in armed_did_it_run {
+        assert!(
+            skip.contains(entry),
+            "`{entry}` is in the gate's ALARM_NAMES but not in the Muhurat open's \
+             skip_alarms; it watches a MON-FRI Lambda and would page on a weekend \
+             Muhurat date"
         );
     }
     let gate = read("crates/aws-lambdas/src/market_hours_gate.rs");

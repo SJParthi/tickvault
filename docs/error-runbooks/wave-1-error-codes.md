@@ -2,7 +2,7 @@
 paths:
   - "crates/common/src/error_code.rs"
   - "crates/core/src/pipeline/prev_close_writer.rs"
-  - "crates/core/src/instrument/phase2_emit_guard.rs"
+  - "crates/core/src/instrument/phase2_emit_guard.rs"  # ⚠ CORRECTED 2026-11-15: deleted 2026-05-08 with the phase2 dispatcher; NOT ENFORCED
   - "crates/core/src/pipeline/prev_close_persist.rs"
   - "crates/core/src/pipeline/first_seen_set.rs"
   - "crates/app/src/main.rs"
@@ -186,7 +186,7 @@ acknowledged window, not the underlying value. The alert returns to
 OK on its own once the sample ages out, or immediately after a
 Prometheus restart.
 
-**Source:** `crates/core/src/instrument/phase2_emit_guard.rs::Drop`
+**Source:** `crates/core/src/instrument/phase2_emit_guard.rs::Drop` (⚠ CORRECTED 2026-11-15: this file was deleted 2026-05-08 with the phase2 dispatcher; NOT ENFORCED)
 
 ## PREVCLOSE-01 — previous_close ILP write or flush failed
 

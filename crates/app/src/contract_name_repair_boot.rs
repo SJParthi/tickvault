@@ -26,6 +26,11 @@
 //!   newer copy of a row replaced by the stored copy the statement read (see
 //!   the storage module's limits). The boot grace keeps the after-deploy run
 //!   clear of the boot's own frame-log replay.
+//! - ⚠ ADDED 2026-11-15 (audit exportflow-2): the end of each day's repair
+//!   (clean, or out of attempts) is written to a daily marker, so a process
+//!   started after that day's midnight reads it. A process that restarts
+//!   after midnight before its predecessor ended that day's repair still
+//!   waits for the next evening's run (it never seals early).
 
 use std::time::Duration;
 
@@ -84,6 +89,193 @@ impl RepairRunState {
         }
         self.attempts = self.attempts.saturating_add(1);
         self.finished = self.finished || failures == 0;
+    }
+}
+
+/// The IST days (days since 1970-01-01) whose after-close repair this
+/// process ended: `finished` for a run with no failure, `unclean` for a day
+/// whose attempts ran out with a failure left. Read by the daily Brutex
+/// export (owner Quote 60), which never runs the session day before the
+/// repair ended, and names an unclean one in its manifest (2026-11-14
+/// review: an exhausted day had read as cleanly finished, so a day could be
+/// sealed complete with blank contract names).
+pub(crate) struct RepairDayCells {
+    finished: std::sync::atomic::AtomicI64,
+    unclean: std::sync::atomic::AtomicI64,
+}
+
+impl RepairDayCells {
+    /// Nothing ended yet.
+    pub(crate) const fn new() -> Self {
+        Self {
+            finished: std::sync::atomic::AtomicI64::new(i64::MIN),
+            unclean: std::sync::atomic::AtomicI64::new(i64::MIN),
+        }
+    }
+}
+
+/// This process's repair days.
+static REPAIR_DAYS: RepairDayCells = RepairDayCells::new();
+
+/// How a day's after-close name repair stands in this process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepairDayState {
+    /// Still running, or not run yet.
+    Pending,
+    /// A run ended with no failure.
+    Clean,
+    /// Every attempt ran and a failure is left: names may still be blank.
+    GaveUpWithFailures,
+}
+
+/// Days since 1970-01-01 of an IST `YYYY-MM-DD`; `None` for a bad date.
+fn repair_day_key(day: &str) -> Option<i64> {
+    chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d")
+        .ok()
+        .map(|d| {
+            d.signed_duration_since(chrono::NaiveDate::default())
+                .num_days()
+        })
+}
+
+/// Records that `today`'s repair is over for this process when `state` says
+/// so: finished cleanly, or out of attempts with a failure left. O(1).
+fn note_repair_over(cells: &RepairDayCells, today: &str, state: &RepairRunState) {
+    let Some(key) = repair_day_key(today) else {
+        return;
+    };
+    if state.finished {
+        cells
+            .finished
+            .fetch_max(key, std::sync::atomic::Ordering::Relaxed);
+    } else if state.attempts >= REPAIR_MAX_ATTEMPTS_PER_DAY {
+        cells
+            .unclean
+            .fetch_max(key, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Records one finished run of `today` and, when the day is over for this
+/// process, publishes it to the Brutex export's readiness gate (owner
+/// Quote 60). The repair loop's only bookkeeping call (pinned by
+/// `test_the_repair_loop_publishes_through_record_run`). O(1).
+fn record_run(cells: &RepairDayCells, state: &mut RepairRunState, today: &str, failures: u32) {
+    state.record(today, failures);
+    note_repair_over(cells, today, state);
+}
+
+/// `day`'s state in `cells`. A clean run wins over an earlier exhaustion of
+/// the same day. O(1).
+fn state_in(cells: &RepairDayCells, day: chrono::NaiveDate) -> RepairDayState {
+    let key = day
+        .signed_duration_since(chrono::NaiveDate::default())
+        .num_days();
+    if cells.finished.load(std::sync::atomic::Ordering::Relaxed) == key {
+        RepairDayState::Clean
+    } else if cells.unclean.load(std::sync::atomic::Ordering::Relaxed) == key {
+        RepairDayState::GaveUpWithFailures
+    } else {
+        RepairDayState::Pending
+    }
+}
+
+/// How `day`'s names stand against this process's repair runs, counting a
+/// run of a LATER day whose lookback reaches it (2026-11-14 third review):
+/// the newest cleanly finished run of a day from `day` to
+/// [`REPAIR_LOOKBACK_DAYS`] after it makes `day` `Clean` (it named every
+/// blank its files can name, so no later run rewrites it); else the newest
+/// exhausted run in that reach makes it `GaveUpWithFailures`; else
+/// `Pending` (a run still to come may rewrite it). The cells keep only the
+/// newest day of each kind, so an older clean run beside a newer one out of
+/// reach reads `Pending` (the direction that waits). O(1).
+fn covered_state_in(cells: &RepairDayCells, day: chrono::NaiveDate) -> RepairDayState {
+    let key = day
+        .signed_duration_since(chrono::NaiveDate::default())
+        .num_days();
+    let in_reach = |run: i64| run >= key && run - key <= i64::from(REPAIR_LOOKBACK_DAYS);
+    if in_reach(cells.finished.load(std::sync::atomic::Ordering::Relaxed)) {
+        RepairDayState::Clean
+    } else if in_reach(cells.unclean.load(std::sync::atomic::Ordering::Relaxed)) {
+        RepairDayState::GaveUpWithFailures
+    } else {
+        RepairDayState::Pending
+    }
+}
+
+/// The daily marker task a CLEAN end of a day's repair is persisted under
+/// (2026-11-15 audit, exportflow-2), so a process that starts after that
+/// day's IST midnight (an evening-drain restart) still knows it. The cells
+/// above live only in the process that ran the repair.
+pub const REPAIR_CLEAN_MARKER_TASK: &str = "contract_name_repair_clean";
+
+/// The daily marker task an exhausted day's repair (attempts used up with a
+/// failure left) is persisted under (2026-11-15 audit, exportflow-2).
+pub const REPAIR_UNCLEAN_MARKER_TASK: &str = "contract_name_repair_unclean";
+
+/// The marker task to write for `state` once its day's repair is over in this
+/// process: clean, or out of attempts with a failure left; `None` while it is
+/// not over. Pure, O(1).
+fn repair_over_marker_task(state: &RepairRunState) -> Option<&'static str> {
+    if state.finished {
+        Some(REPAIR_CLEAN_MARKER_TASK)
+    } else if state.attempts >= REPAIR_MAX_ATTEMPTS_PER_DAY {
+        Some(REPAIR_UNCLEAN_MARKER_TASK)
+    } else {
+        None
+    }
+}
+
+/// `cells_state` (this process's view of `day`) with the persisted markers
+/// read only when this process has not ended that day's repair itself
+/// (`Pending` in the cells). This process's own end is the freshest, so it
+/// wins (2026-11-15 review: an older clean marker of an earlier process beat
+/// this process's later exhausted run and sealed the day complete). With the
+/// cells `Pending`: a clean marker alone makes it `Clean`, an unclean one
+/// (alone or beside a clean one) `GaveUpWithFailures`, none leaves it
+/// `Pending` (the direction that waits). Both markers exist only when a
+/// removal in [`persist_repair_over_with`] or [`clear_day_markers_with`]
+/// failed, so the failure is kept. O(1) plus at most two marker reads.
+fn state_with_markers(
+    cells_state: RepairDayState,
+    day: chrono::NaiveDate,
+    marker_exists: impl Fn(&str, chrono::NaiveDate) -> bool,
+) -> RepairDayState {
+    if cells_state != RepairDayState::Pending {
+        return cells_state;
+    }
+    if marker_exists(REPAIR_UNCLEAN_MARKER_TASK, day) {
+        RepairDayState::GaveUpWithFailures
+    } else if marker_exists(REPAIR_CLEAN_MARKER_TASK, day) {
+        RepairDayState::Clean
+    } else {
+        RepairDayState::Pending
+    }
+}
+
+/// [`covered_state_in`] on this process's repair days (owner Quote 60):
+/// what the Brutex export reads for a catch-up day. O(1).
+#[must_use]
+// TEST-EXEMPT: a load of the process cells; the rule is test_covered_state_counts_a_later_run_that_reaches_the_day
+pub fn repair_covered_state(day: chrono::NaiveDate) -> RepairDayState {
+    covered_state_in(&REPAIR_DAYS, day)
+}
+
+/// How the after-close name repair of `day` stands (owner Quote 60): this
+/// process's cells, and once `after_midnight` (the clock is past `day`'s
+/// date, so this process can no longer run that day's repair) also the
+/// markers a process that ended it persisted (2026-11-15 audit,
+/// exportflow-2: an evening-drain restart after midnight read `Pending`
+/// until the next evening's repair, about 15 hours later). On `day`'s own
+/// date this process runs its own repair and waits for it, as before. O(1)
+/// plus at most two marker reads.
+#[must_use]
+// TEST-EXEMPT: a load of the process cells and the markers; the rules are test_repair_state_is_set_only_when_the_day_is_over and test_state_with_markers_reads_a_persisted_end_after_midnight
+pub fn repair_state_for(day: chrono::NaiveDate, after_midnight: bool) -> RepairDayState {
+    let cells = state_in(&REPAIR_DAYS, day);
+    if after_midnight {
+        state_with_markers(cells, day, crate::daily_task_marker::daily_marker_exists)
+    } else {
+        cells
     }
 }
 
@@ -176,6 +368,108 @@ async fn run_once(client: &reqwest::Client, url: &str, today: &str) -> RepairDay
     total
 }
 
+/// Removes `task`'s marker for `day`; an absent marker is not an error.
+/// One file removal, cold.
+fn remove_repair_marker(task: &str, day: chrono::NaiveDate) -> std::io::Result<()> {
+    match std::fs::remove_file(crate::daily_task_marker::daily_marker_path(task, day)) {
+        Err(err) if err.kind() != std::io::ErrorKind::NotFound => Err(err),
+        _ => Ok(()),
+    }
+}
+
+/// Writes `task`'s marker for `day` (the production write behind the two
+/// helpers below). One small file write, cold.
+fn write_repair_marker(task: &str, day: chrono::NaiveDate) -> std::io::Result<()> {
+    crate::daily_task_marker::try_write_daily_marker(task, day).map(|_durability| ())
+}
+
+/// Clears `today`'s two markers before this process's first run of today
+/// (2026-11-15 review: a same-date restart runs the repair again, and an
+/// earlier process's clean marker read `Clean` while that rerun was still
+/// going or after it failed). With no marker the day reads `Pending` (it
+/// waits) until this run ends. A removal that fails can leave a marker an
+/// earlier process wrote, so the unclean marker is written then: the day
+/// reads `GaveUpWithFailures` (the failure note is kept) until this run
+/// ends, never `Clean`. Honest limit: if that write fails too, an old clean
+/// marker can stand while the rerun goes. At most three file operations,
+/// once per process per day, cold.
+fn clear_day_markers_with(
+    today: &str,
+    remove: impl Fn(&str, chrono::NaiveDate) -> std::io::Result<()>,
+    write: impl Fn(&str, chrono::NaiveDate) -> std::io::Result<()>,
+) {
+    let Ok(day) = chrono::NaiveDate::parse_from_str(today, "%Y-%m-%d") else {
+        return;
+    };
+    let unclean = remove(REPAIR_UNCLEAN_MARKER_TASK, day);
+    let clean = remove(REPAIR_CLEAN_MARKER_TASK, day);
+    if let Some(err) = unclean.err().or(clean.err()) {
+        let written = write(REPAIR_UNCLEAN_MARKER_TASK, day);
+        warn!(
+            %day,
+            error = %err,
+            unclean_marker_written = written.is_ok(),
+            "contract name repair: an earlier end of the day's repair could not be cleared \
+             before this rerun; the day reads as failed until this run ends"
+        );
+    }
+}
+
+/// [`clear_day_markers_with`] on the real marker folder.
+fn clear_day_markers(today: &str) {
+    clear_day_markers_with(today, remove_repair_marker, write_repair_marker);
+}
+
+/// Persists the end of `today`'s repair for a later process (2026-11-15
+/// audit, exportflow-2): one daily marker ([`repair_over_marker_task`]) once
+/// the day is over in this process; nothing while it is not. The OTHER marker
+/// is removed first (2026-11-15 review), so the latest end wins: markers carry
+/// no order across processes. A failed removal leaves both, which reads
+/// `GaveUpWithFailures` ([`state_with_markers`]); a failed write leaves this
+/// marker absent, so a later process reads `Pending` and waits (the safe
+/// direction). At most two small file operations, once per run, cold.
+fn persist_repair_over_with(
+    state: &RepairRunState,
+    today: &str,
+    remove: impl Fn(&str, chrono::NaiveDate) -> std::io::Result<()>,
+    write: impl Fn(&str, chrono::NaiveDate) -> std::io::Result<()>,
+) {
+    let Some(task) = repair_over_marker_task(state) else {
+        return;
+    };
+    let Ok(day) = chrono::NaiveDate::parse_from_str(today, "%Y-%m-%d") else {
+        return;
+    };
+    let other = if task == REPAIR_CLEAN_MARKER_TASK {
+        REPAIR_UNCLEAN_MARKER_TASK
+    } else {
+        REPAIR_CLEAN_MARKER_TASK
+    };
+    if let Err(err) = remove(other, day) {
+        warn!(
+            %day,
+            task = other,
+            error = %err,
+            "contract name repair: an earlier end of the day's repair was not removed; \
+             a process started after midnight reads the day as failed"
+        );
+    }
+    if let Err(err) = write(task, day) {
+        warn!(
+            %day,
+            task,
+            error = %err,
+            "contract name repair: the end of the day's repair was not persisted; a \
+             process started after midnight waits for the next run that reaches the day"
+        );
+    }
+}
+
+/// [`persist_repair_over_with`] on the real marker folder.
+fn persist_repair_over(state: &RepairRunState, today: &str) {
+    persist_repair_over_with(state, today, remove_repair_marker, write_repair_marker);
+}
+
 /// The outcome label of a finished run.
 #[must_use]
 pub fn run_outcome(failures: u32) -> &'static str {
@@ -213,11 +507,17 @@ pub async fn run_contract_name_repair_loop(config: QuestDbConfig) {
         if let Some(client) = client.as_ref()
             && repair_is_due(now, &today, &state)
         {
+            // 2026-11-15 review: an earlier process's end of today must not
+            // stand while this process reruns today's repair.
+            if state.day.as_deref() != Some(today.as_str()) {
+                clear_day_markers(&today);
+            }
             let total = run_once(client, &url, &today).await;
             let outcome = run_outcome(total.failures);
             metrics::counter!("tv_contract_name_repair_runs_total", "outcome" => outcome)
                 .increment(1);
-            state.record(&today, total.failures);
+            record_run(&REPAIR_DAYS, &mut state, &today, total.failures);
+            persist_repair_over(&state, &today);
             info!(
                 rows_restored = total.rows_restored,
                 failures = total.failures,
@@ -264,6 +564,273 @@ mod tests {
         state.record("2026-10-13", 0);
         assert!(state.finished);
         assert!(!repair_is_due(close, "2026-10-13", &state));
+    }
+
+    /// Owner Quote 60 (and the 2026-11-14 review): the export reads the
+    /// repair as over only once a run finished or the attempts ran out, and
+    /// tells the two apart.
+    #[test]
+    fn test_repair_state_is_set_only_when_the_day_is_over() {
+        let cells = RepairDayCells::new();
+        let day = chrono::NaiveDate::from_ymd_opt(2031, 1, 7).expect("date");
+        let mut state = RepairRunState::default();
+        record_run(&cells, &mut state, "2031-01-07", 2);
+        assert_eq!(
+            state_in(&cells, day),
+            RepairDayState::Pending,
+            "one failure is not the end"
+        );
+        record_run(&cells, &mut state, "2031-01-07", 0);
+        assert_eq!(state_in(&cells, day), RepairDayState::Clean);
+        assert_eq!(
+            state_in(&cells, day.pred_opt().expect("d")),
+            RepairDayState::Pending
+        );
+        assert_eq!(repair_day_key("bad"), None);
+    }
+
+    /// Regression (2026-11-14 third review, MEDIUM): a catch-up day reads
+    /// clean once a later run whose lookback reaches it finished cleanly;
+    /// before any such run it is pending (a run to come may rewrite it).
+    #[test]
+    fn test_covered_state_counts_a_later_run_that_reaches_the_day() {
+        let cells = RepairDayCells::new();
+        let past = chrono::NaiveDate::from_ymd_opt(2031, 1, 10).expect("date");
+        assert_eq!(covered_state_in(&cells, past), RepairDayState::Pending);
+        let mut state = RepairRunState::default();
+        record_run(&cells, &mut state, "2031-01-13", 0);
+        assert_eq!(covered_state_in(&cells, past), RepairDayState::Clean);
+        assert_eq!(
+            covered_state_in(&cells, past.succ_opt().expect("d")),
+            RepairDayState::Clean
+        );
+        let later = chrono::NaiveDate::from_ymd_opt(2031, 1, 14).expect("d");
+        assert_eq!(
+            covered_state_in(&cells, later),
+            RepairDayState::Pending,
+            "a later day than the run"
+        );
+        let early = chrono::NaiveDate::from_ymd_opt(2031, 1, 5).expect("d");
+        assert_eq!(
+            covered_state_in(&cells, early),
+            RepairDayState::Pending,
+            "out of the run's reach"
+        );
+        let cells = RepairDayCells::new();
+        let mut state = RepairRunState::default();
+        for _ in 0..REPAIR_MAX_ATTEMPTS_PER_DAY {
+            record_run(&cells, &mut state, "2031-01-12", 1);
+        }
+        assert_eq!(
+            covered_state_in(&cells, past),
+            RepairDayState::GaveUpWithFailures
+        );
+        assert_eq!(
+            repair_covered_state(chrono::NaiveDate::from_ymd_opt(1999, 1, 1).expect("d")),
+            RepairDayState::Pending
+        );
+    }
+
+    /// Regression (2026-11-14 review, MEDIUM): a day whose attempts all ran
+    /// with a failure left is NOT cleanly finished: the export names it.
+    #[test]
+    fn test_exhausted_repair_with_failures_is_not_clean() {
+        let cells = RepairDayCells::new();
+        let day = chrono::NaiveDate::from_ymd_opt(2031, 1, 8).expect("date");
+        let mut state = RepairRunState::default();
+        for _ in 0..REPAIR_MAX_ATTEMPTS_PER_DAY {
+            record_run(&cells, &mut state, "2031-01-08", 1);
+        }
+        assert_eq!(state_in(&cells, day), RepairDayState::GaveUpWithFailures);
+    }
+
+    /// The loop publishes through `record_run` on the process cells (a
+    /// revert to a bare `state.record` would leave the export gate forever
+    /// pending).
+    #[test]
+    fn test_the_repair_loop_publishes_through_record_run() {
+        let src = include_str!("contract_name_repair_boot.rs");
+        let body = src
+            .split("pub async fn run_contract_name_repair_loop")
+            .nth(1)
+            .and_then(|rest| rest.split("#[cfg(test)]").next())
+            .expect("loop body");
+        assert!(
+            body.contains("record_run(&REPAIR_DAYS, &mut state, &today, total.failures)"),
+            "the loop must publish each run through record_run"
+        );
+        assert!(
+            !body.contains("state.record("),
+            "no bare state.record in the loop"
+        );
+        // 2026-11-15 audit, exportflow-2: the end of a day is persisted
+        // right after it is recorded, for a process started after midnight.
+        let record = body
+            .find("record_run(&REPAIR_DAYS, &mut state, &today, total.failures)")
+            .expect("record");
+        let persist = body
+            .find("persist_repair_over(&state, &today);")
+            .expect("the loop must persist the end of the day's repair");
+        assert!(record < persist, "persisted after it is recorded");
+        // 2026-11-15 review: a rerun of today clears an earlier process's
+        // markers before it runs.
+        let clear = body
+            .find("clear_day_markers(&today);")
+            .expect("the loop must clear today's markers before its first run");
+        let run = body.find("run_once(client, &url, &today)").expect("run");
+        assert!(clear < run, "cleared before the run");
+        assert_eq!(
+            repair_state_for(
+                chrono::NaiveDate::from_ymd_opt(1999, 1, 1).expect("d"),
+                false
+            ),
+            RepairDayState::Pending
+        );
+        assert_eq!(
+            repair_state_for(
+                chrono::NaiveDate::from_ymd_opt(1999, 1, 1).expect("d"),
+                true
+            ),
+            RepairDayState::Pending,
+            "no marker for that day"
+        );
+    }
+
+    /// Regression (2026-11-15 audit, exportflow-2, MEDIUM): a process that
+    /// starts after the session day's midnight (the evening-drain restart)
+    /// has empty cells. The end a previous process persisted reads as that
+    /// day's state; with no marker the day stays `Pending` (it waits, it is
+    /// never sealed early); both markers together (a failed removal) read as
+    /// failed, never clean.
+    #[test]
+    fn test_state_with_markers_reads_a_persisted_end_after_midnight() {
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 11, 16).expect("date");
+        let fresh = RepairDayCells::new();
+        assert_eq!(state_in(&fresh, day), RepairDayState::Pending);
+        let none = |_: &str, _: chrono::NaiveDate| false;
+        let clean = |task: &str, d: chrono::NaiveDate| task == REPAIR_CLEAN_MARKER_TASK && d == day;
+        let unclean =
+            |task: &str, d: chrono::NaiveDate| task == REPAIR_UNCLEAN_MARKER_TASK && d == day;
+        let both = |_: &str, d: chrono::NaiveDate| d == day;
+        let pending = RepairDayState::Pending;
+        assert_eq!(state_with_markers(pending, day, none), pending);
+        assert_eq!(
+            state_with_markers(pending, day, clean),
+            RepairDayState::Clean
+        );
+        assert_eq!(
+            state_with_markers(pending, day, unclean),
+            RepairDayState::GaveUpWithFailures
+        );
+        assert_eq!(
+            state_with_markers(pending, day, both),
+            RepairDayState::GaveUpWithFailures,
+            "both markers mean a removal failed: the failure is kept"
+        );
+        let other_day = day.succ_opt().expect("d");
+        assert_eq!(state_with_markers(pending, other_day, clean), pending);
+        assert_eq!(
+            state_with_markers(RepairDayState::Clean, day, none),
+            RepairDayState::Clean
+        );
+        // What the loop persists: clean once finished, unclean once out of
+        // attempts with a failure left, nothing before.
+        let mut state = RepairRunState::default();
+        state.record("2026-11-16", 1);
+        assert_eq!(repair_over_marker_task(&state), None);
+        state.record("2026-11-16", 0);
+        assert_eq!(
+            repair_over_marker_task(&state),
+            Some(REPAIR_CLEAN_MARKER_TASK)
+        );
+        let mut state = RepairRunState::default();
+        for _ in 0..REPAIR_MAX_ATTEMPTS_PER_DAY {
+            state.record("2026-11-16", 1);
+        }
+        assert_eq!(
+            repair_over_marker_task(&state),
+            Some(REPAIR_UNCLEAN_MARKER_TASK)
+        );
+    }
+
+    /// Regression (2026-11-15 review of exportflow-2, MEDIUM): markers carry
+    /// no order across processes. Process A ended Mon clean; a same-date
+    /// restart B reran Mon's repair and ran out of attempts. After midnight
+    /// Mon must read `GaveUpWithFailures` (the failure note is kept), in B
+    /// itself and in a fresh process C, never `Clean`.
+    #[test]
+    fn test_state_with_markers_a_later_unclean_end_beats_an_earlier_clean_one() {
+        use std::cell::RefCell;
+        use std::collections::HashSet;
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 11, 16).expect("date");
+        let today = "2026-11-16";
+        let markers: RefCell<HashSet<(String, chrono::NaiveDate)>> = RefCell::new(HashSet::new());
+        let remove = |task: &str, d: chrono::NaiveDate| {
+            markers.borrow_mut().remove(&(task.to_string(), d));
+            Ok(())
+        };
+        let write = |task: &str, d: chrono::NaiveDate| {
+            markers.borrow_mut().insert((task.to_string(), d));
+            Ok(())
+        };
+        let exists =
+            |task: &str, d: chrono::NaiveDate| markers.borrow().contains(&(task.to_string(), d));
+        // Process A: clean end.
+        let mut a = RepairRunState::default();
+        a.record(today, 0);
+        persist_repair_over_with(&a, today, remove, write);
+        assert_eq!(
+            state_with_markers(RepairDayState::Pending, day, exists),
+            RepairDayState::Clean
+        );
+        // Process B, same date: its first run clears A's end, so the rerun
+        // in progress reads Pending (it waits).
+        clear_day_markers_with(today, remove, write);
+        assert_eq!(
+            state_with_markers(RepairDayState::Pending, day, exists),
+            RepairDayState::Pending,
+            "a rerun in progress waits"
+        );
+        let mut b = RepairRunState::default();
+        for _ in 0..REPAIR_MAX_ATTEMPTS_PER_DAY {
+            b.record(today, 1);
+            persist_repair_over_with(&b, today, remove, write);
+        }
+        assert!(
+            !exists(REPAIR_CLEAN_MARKER_TASK, day),
+            "only the latest end is kept"
+        );
+        assert!(exists(REPAIR_UNCLEAN_MARKER_TASK, day));
+        // B itself after midnight: its own end is the freshest.
+        assert_eq!(
+            state_with_markers(RepairDayState::GaveUpWithFailures, day, |_, _| true),
+            RepairDayState::GaveUpWithFailures,
+            "this process's own end beats any marker"
+        );
+        // A fresh process C after midnight reads the markers.
+        assert_eq!(
+            state_with_markers(RepairDayState::Pending, day, exists),
+            RepairDayState::GaveUpWithFailures
+        );
+        // A later clean end replaces the unclean one.
+        let mut c = RepairRunState::default();
+        c.record(today, 0);
+        persist_repair_over_with(&c, today, remove, write);
+        assert!(!exists(REPAIR_UNCLEAN_MARKER_TASK, day));
+        assert_eq!(
+            state_with_markers(RepairDayState::Pending, day, exists),
+            RepairDayState::Clean
+        );
+        // A removal that fails keeps the failure, never reads Clean.
+        let failing = |_: &str, _: chrono::NaiveDate| -> std::io::Result<()> {
+            Err(std::io::Error::other("read-only folder"))
+        };
+        clear_day_markers_with(today, failing, write);
+        assert_eq!(
+            state_with_markers(RepairDayState::Pending, day, exists),
+            RepairDayState::GaveUpWithFailures,
+            "a clean marker that could not be cleared reads as failed"
+        );
     }
 
     #[test]

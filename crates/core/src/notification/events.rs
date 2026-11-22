@@ -1093,15 +1093,11 @@ pub enum NotificationEvent {
     /// firing as High + SMS. Not episode-routed (`episode_key() == None`), so
     /// the episode machinery is untouched.
     CustomStatus { message: String },
-
-    /// Instant informational status ping (`Severity::Low` → NEVER SMS, but
-    /// `DispatchPolicy::Immediate` → delivered instantly as its own message,
-    /// NOT batched). Introduced 2026-07-10 for operator-notable-but-not-
-    /// actionable events that must be SEEN at once without paging: a mid-market
-    /// crash/restart recovery ("fast start") and the feed enable/disable toggle
-    /// acknowledgements. Like [`Self::CustomStatus`] it is NOT episode-routed
-    /// (`episode_key() == None`).
-    CustomStatusUrgent { message: String },
+    // RETIRED 2026-11-21: `CustomStatusUrgent` (instant Low status ping,
+    // 2026-07-10 FIX-5) deleted. Its last producer, the Dhan trade-time
+    // daily notice, went with the armed correction (scope lock 2026-11-21),
+    // and keeping it would have grown the shrink-only no-dispatcher list in
+    // `notification_variant_dispatch_guard.rs`.
     // RETIRED 2026-06-12: LastTickAfterBoundary deleted — it was defined but
     // NEVER emitted (0 production sites). The post-close-tick anomaly it
     // describes is ALREADY tracked by the `tv_late_tick_after_boundary_total`
@@ -2720,7 +2716,6 @@ impl NotificationEvent {
             }
             Self::Custom { message } => message.clone(),
             Self::CustomStatus { message } => message.clone(),
-            Self::CustomStatusUrgent { message } => message.clone(),
         }
     }
 
@@ -2805,7 +2800,6 @@ impl NotificationEvent {
             Self::HolidayCalendarCoverageLow { .. } => "HolidayCalendarCoverageLow",
             Self::Custom { .. } => "Custom",
             Self::CustomStatus { .. } => "CustomStatus",
-            Self::CustomStatusUrgent { .. } => "CustomStatusUrgent",
         }
     }
 
@@ -2993,9 +2987,6 @@ impl NotificationEvent {
             // Informational status ping — Low so it batches (digest / 60s
             // coalesce) and never fires SNS SMS (gate is `>= High`).
             Self::CustomStatus { .. } => Severity::Low,
-            // Instant status ping — Low (never SMS); `dispatch_policy()` forces
-            // Immediate so it ships at once instead of batching.
-            Self::CustomStatusUrgent { .. } => Severity::Low,
             Self::RiskHalt { .. } => Severity::Critical,
             Self::WebSocketReconnectionExhausted { .. } => Severity::Critical,
             Self::CircuitBreakerOpened { .. } => Severity::High,
@@ -3222,10 +3213,6 @@ impl NotificationEvent {
             Self::MarketOpenReadinessConfirmation { .. }
             | Self::MarketOpenStreamingConfirmation { .. }
             | Self::SelfTestPassed { .. } => DispatchPolicy::Immediate,
-            // Instant informational status ping (Low severity → never SMS, but
-            // ships immediately as its own message, not batched): a mid-market
-            // crash/restart recovery + the feed on/off toggle acknowledgements.
-            Self::CustomStatusUrgent { .. } => DispatchPolicy::Immediate,
             _ => DispatchPolicy::Default,
         }
     }
@@ -4362,44 +4349,6 @@ mod tests {
             severity < Severity::High,
             "CustomStatus must be below the SMS threshold"
         );
-    }
-
-    // -- CustomStatusUrgent (2026-07-10, FIX-5): instant but NEVER SMS --
-
-    #[test]
-    fn test_custom_status_urgent_is_immediate_and_low() {
-        use crate::notification::coalescer::{DispatchLane, classify_dispatch};
-        let event = NotificationEvent::CustomStatusUrgent {
-            message: "x".to_string(),
-        };
-        let severity = event.severity();
-        let policy = event.dispatch_policy();
-        // Instant: ships as its own message regardless of market phase.
-        assert_eq!(policy, DispatchPolicy::Immediate);
-        assert_eq!(
-            classify_dispatch(severity, policy, None, true),
-            DispatchLane::Immediate,
-        );
-        assert_eq!(
-            classify_dispatch(severity, policy, None, false),
-            DispatchLane::Immediate,
-        );
-        // But NEVER SMS: severity is Low, strictly below the `>= High` gate.
-        assert_eq!(severity, Severity::Low);
-        assert!(
-            severity < Severity::High,
-            "CustomStatusUrgent must be instant but below the SMS threshold"
-        );
-    }
-
-    #[test]
-    fn test_custom_status_urgent_episode_key_is_none_and_topic_distinct() {
-        let event = NotificationEvent::CustomStatusUrgent {
-            message: "payload".to_string(),
-        };
-        assert!(event.episode_key().is_none());
-        assert_eq!(event.topic(), "CustomStatusUrgent");
-        assert_eq!(event.to_message(), "payload");
     }
 
     #[test]

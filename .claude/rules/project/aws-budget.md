@@ -40,6 +40,50 @@ paths:
 >
 > **⚠ OPERATOR RULING 2026-07-19 — 30 GB accepted, t4g.medium as-of-now, NEW HARD TARGET < ₹1,000/mo:** verbatim quote + the itemized sub-1K path live in the dedicated "OPERATOR RULING 2026-07-19" section below. The base bill alone (~₹1,077/mo at the ~176-hr auto-schedule basis) EXCEEDS the target — <₹1,000 is UNREACHABLE without at least one operator-gated lever; see the lever table.
 
+## NOTE 2026-11-16 — the hard-stop guard now logs how old the Budgets figure is (no behaviour change)
+
+Measured 16 Nov 2026: the budget's `LastUpdatedTime` read 14 Nov 06:29 UTC, so the month-to-date figure the hourly hard-stop guard compares with the stop line trailed the bill by about two days, and a stop at the December $62 line can fire days after spend crosses it. The guard now reads `Budget.LastUpdatedTime` from the same free `DescribeBudget` call and adds two fields to its decision log line and result: `budget_data_age_hours` and `estimated_spend_now_usd` (spend projected at the figure's own daily rate; an ESTIMATE, labelled as one; left empty when the figure is stamped on UTC day 1 or 2, when it may still be last month's total). The stopped-box path (holding a budget stop) gets the warning below but adds no field to its own line. When the figure is over 48 hours old it writes one `LAMBDA-AWS-01` warning per run. **Nothing about when the box stops changed:** the stop still compares only `ActualSpend` with the line, pinned by `test_mtd_reading_stop_decision_is_unchanged_by_the_freshness_fields`. No new page, alarm, metric filter or EMF name; no metric filter reads the guard's log group (Verified in `deploy/aws/terraform`, 2026-11-16). Cost $0 (same call, a few more log bytes). Code: `crates/aws-lambdas/src/budget_spend.rs`, `crates/aws-lambdas/src/hard_stop_guard.rs` (`mtd_reading`).
+
+## COST NOTE 2026-11-14 — the daily Brutex export and its read-only role (Quote 60)
+
+Owner, 2026-11-14: "yes build the daily export and read-only login dude"; cards "Everything daily, kept forever", "CSV.gz, same as now (Recommended)", "Role your Mac login switches into (Recommended)". Full record and REJECT list: `daily-universe-scope-expansion-2026-05-27.md` §0 Quote 60. The first card priced a second copy of every day (about $4.5 more each month, breaking the ₹5,500 cap within months); the build does NOT make a second copy: it writes each partition to the archive's own key and the archive later reuses it.
+
+| Cost | Size | Basis |
+|---|---|---|
+| Manifest, counts file and DONE per day | about $0 (kilobytes a day) | Assumed |
+| Partitions in S3 earlier than the archive would put them (ticks ~15 days, candles ~90) while still on the box | roughly $1–2 a month | Assumed, sizes not measured |
+| PUT/HEAD/LIST requests | a few hundred a day, cents a month | Assumed |
+| Content-addressed copies for partitions changed after the export | Unknown | depends on late rows after 15:45; the export now waits for the evening WAL replay and for the after-close depth pass while it can still write (2026-11-14 review), which removes the regular cases. *(2026-11-14 evening audit: until then only the session day waited for the evening replay; a catch-up day 2 or more days old ran anyway, so shed frames of it replayed later made a second copy. A forced catch-up day now waits for that replay too, except on its last chance (no later trading day keeps it inside the 7-day window, so a weekend or holiday counts), when it still runs so it never leaves the window with no DONE. A replay counts as pending while one runs on the box, and on the planned evening restart until the drain hold first reports. Replayed rows of a day on its last chance can still make a second copy.)* |
+| **Largest hour export, unmeasured** (2026-11-14 evening audit): the sorted export of one `market_depth_book` hour (largest seen 607,945,897 B gzipped, 2026-11-12T09) must finish inside the 600 s export timeout | if it does not, that day gets no DONE after 3 attempts (no extra AWS cost, Brutex sees the day as not exported); QuestDB memory for the sort is Unknown | **Unknown, to be measured on the first live run (Mon 16 Nov)**. *(⚠ CHANGED 2026-11-15: the ordered export is now 10-minute `ts` slices of an hour (1 hour of a day), each its own request with its own 600 s timeout, the header written once, the same bytes as the single query (`partition_archive::sliced_export`, stub-tested for byte identity). The 600 s limit is now per slice (about a sixth of the hour's rows each), and a whole partition's export stops at 1,800 s. Whether one slice of that hour finishes in 600 s, and QuestDB's memory for it, are still Unknown until the first live run.)* |
+| **Disk-pressure archiving during the session** (2026-11-14 review): inside 08:30 to 15:40 IST the archiver never sorts, so a pressure pass that moves an hour whose ordered export object already sits at the canonical key writes a full content-addressed second copy of it (counted on `tv_partition_archive_export_unordered_in_session_total`) | once the export has run about 15 days, every hour moved under pressure during the session is a full second copy (100% of the bytes moved in session that day) | **Open owner decision, NOT accepted by any quote** (third review, 2026-11-14: this row said "accepted trade") *(⚠ CHANGED 2026-11-16: ACCEPTED by the owner, Quote 62 in `daily-universe-scope-expansion-2026-05-27.md`: "Ok whatever is recommended do it dude okay?", option (1). A weekly read-only check reports the month's `.sha-` copy size; past 20 GB in a month the owner is asked again. The schema/QuestDB-change row below stays open.)*; Unknown size, read the counter. Outside pressure a failed ordered export now keeps the partition, and a failed HeadObject no longer causes a copy. *(⚠ CHANGED 2026-11-15: a pressure pass inside that window now asks one HeadObject per candidate of an export table BEFORE the per-run cap (200), fills the cap with the partitions that have NOTHING at their canonical key, and gives an already-exported one only a slot they left; once one not-yet-exported partition has been dropped in that pass, every further exported one is left for a later pass (this also covers the uncapped passes from 08:30 to 08:45 and before a weekend Muhurat gate). So the copy now happens only when no not-yet-exported candidate of that pass was dropped before it: every candidate was already exported, or the others were held, failed or had their table's WAL behind; still counted on the same counter. That is the case, for example, before any of today's hours is 4 hours old (today's hours are exported only after the close); how often is Assumed, not measured. Cost: one HeadObject per eligible partition of an export table on each such pass (a few hundred with a 15-day backlog; cents a month, Assumed). The owner decision stays open.)* |
+| **Schema or QuestDB change** (third review): a column added to an export table, or a QuestDB upgrade that renders a value differently, makes every partition exported and not yet archived (about 15 days of hour tables, 90 days of candles) differ from its export object, so each goes up a second time, kept forever | one-time, up to about 15 days of tick and depth data plus 90 days of candles | **Open owner decision before any such change**; the manifest records each table's CSV header (`columns`) |
+| Box held until 18:00 while the session day waits for its soft gates with nothing else moving (the one-hour stall rule no longer releases a due export; never past its 20:45 horizon) | at most about 1.5 hours on such a day | Assumed, about $0.30 on that day |
+| **Box kept up after the close while the export runs** | **15 to 45 minutes a trading day at the r8g.large rate (the export waits for the hourly 15:15 candle, sealed about 16:19, so it runs about 16:20 to 16:45; the box stops after it, past 16:30)** | **Assumed, to be measured; this is the real added cost (about $0.05 to $0.15 a trading day, Assumed from the ~$0.19 per held hour figure)** |
+| Brutex downloads to the Mac | about $0.11/GB beyond the 100 GB a month free transfer; Glacier IR reads of `raw-frames/` older than 30 days about $0.03/GB more | Assumed; the one line Brutex's own use can move |
+
+December's $62 line (Quote 54) is unchanged.
+
+## OPERATOR RULING 2026-11-14 — November 2026 only: stop at $140 so the box keeps running; December onward stays $62 with GST (Quote 59)
+
+Owner, 2026-11-14: "dont sto pthis month dude let it run but by the srticter law stick to 5500 inr from decoemebr onwards with the strict estiamtion strict law taht to oafetr atx charegs dude okay?", then tapped "$140 (Recommended)" on the card "November: AWS has spent $60.83 so far and forecasts $126, so the current $90 stop would shut the server late this month." Full record and REJECT list: `daily-universe-scope-expansion-2026-05-27.md` §0 Quote 59.
+
+| | Before (Quote 52) | After (Quote 59) |
+|---|---|---|
+| November 2026 (`NOVEMBER_2026_KILL_USD`, code clamp + native `limit_amount`) | $90 | **$140**, November 2026 (UTC month) only |
+| From 1 December 2026 | $62, GST included (Quote 54) | **unchanged: $62 from 1 December**, GST included (about ₹5,500); native `limit_amount` "140" -> "62" on or after 1 December |
+
+## OPERATOR RULING 2026-11-11 (later) — from 1 December 2026 the stop line is $62, GST included (Quote 54)
+
+Owner, 2026-11-11, asked on a decision card "From December, should the AWS bill be hard-capped at ₹5,000 a month?", chose "Cap ₹5,500": "Stop line $62 (about ₹5,500 with GST). A bit of headroom above the expected bill, still close to ₹5,000." Full record and REJECT list: `daily-universe-scope-expansion-2026-05-27.md` §0 Quote 54. It supersedes Quote 53's "keep the $75 stop" row only; Quote 53's other rows (alarms, shipped metrics, dashboard, raw-frame storage class) stand.
+
+| | Before (Quotes 37 and 52) | After (Quote 54) |
+|---|---|---|
+| `STANDING_BUDGET_KILL_USD` (code clamp) | $75 from 1 December | **$62 from 1 December 2026**, GST included (the live budget counts tax, Quote 36) |
+| November 2026 (`NOVEMBER_2026_KILL_USD`, code clamp + native `limit_amount`) | $90 | **$90** (unchanged) |
+| October 2026 | $185 | $185 (unchanged, history) |
+| Native `limit_amount` (budget.tf) | "90" now, "75" on or after 1 December | "90" now, **"62"** in a follow-up on or after 1 December, never before; `budget_ceiling_lockstep_guard.rs` fails the build from 1 December unless it reads exactly 62 |
+| Expected bill | ~$56 a month with tax (Quote 53 estimate, Assumed) | unchanged; ₹5,000 is that estimate, not a guarantee. The hard maximum is the $62 stop |
+
 ## OPERATOR RULING 2026-11-11 — November 2026 only: stop at $90; the owner deletes the leftover disks
 
 Owner, 2026-11-11: tapped "Raise Nov to $90 only (Recommended)" and "Delete all (Recommended)" after a one-off Cost Explorer read showed 1–11 Nov at $46.11, of which about $21 (tax included) was two volumes attached to nothing (the 600 GB old root left from Quote 47 and a 30 GB May root) plus two old snapshots. Full record and REJECT list: `daily-universe-scope-expansion-2026-05-27.md` §0 Quote 52.
@@ -47,7 +91,7 @@ Owner, 2026-11-11: tapped "Raise Nov to $90 only (Recommended)" and "Delete all 
 | | Before (Quote 37) | After (Quote 52) |
 |---|---|---|
 | November 2026 line (`NOVEMBER_2026_KILL_USD`, code clamp + native `limit_amount`) | $75 | **$90**, November 2026 (UTC month) only |
-| `STANDING_BUDGET_KILL_USD` | $75 from 1 November | **$75 from 1 December 2026** onward (code clamp by itself; native `limit_amount` back to "75" in a follow-up on or after 1 December; `budget_ceiling_lockstep_guard.rs` fails the build from 1 December while it still reads 90) |
+| `STANDING_BUDGET_KILL_USD` | $75 from 1 November | **$75 from 1 December 2026** onward (code clamp by itself; native `limit_amount` back to "75" in a follow-up on or after 1 December; `budget_ceiling_lockstep_guard.rs` fails the build from 1 December while it still reads 90) *(⚠ SUPERSEDED the same day by Quote 54 above: the standing line is $62 from 1 December, and the native `limit_amount` moves to "62", not "75".)* |
 | Leftover volumes and snapshots | billed | deleted by the owner in the console; no repository role gets a volume or snapshot delete permission |
 
 ## OPERATOR RULING 2026-10-28 — October 2026 only: stop at $185 (supersedes "October 2026 stays capped at $170" below)
@@ -57,7 +101,21 @@ Owner, 2026-10-28: tapped "Raise Oct to $185 (Recommended)" after the Budgets AP
 | | Before (Quote 37) | After (Quote 45) |
 |---|---|---|
 | October 2026 line (`OCTOBER_2026_KILL_USD`, four lockstep sites) | $170 | **$185**, October 2026 only |
-| `STANDING_BUDGET_KILL_USD` | $75 from 1 November | **$75 from 1 November** (unchanged) |
+| `STANDING_BUDGET_KILL_USD` | $75 from 1 November | **$75 from 1 November** (unchanged) *(⚠ superseded: $90 for November 2026 by Quote 52, $62 from 1 December 2026 by Quote 54)* |
+
+## COST NOTE 2026-11-11 — Quote 53: fewer alarms, fewer shipped metrics, no CloudWatch dashboard, raw frames to Glacier Instant Retrieval ($75 stop unchanged)
+
+Owner, 2026-11-11: ticked "Cut alarms 93 → ~30 (Recommended)", "Trim CloudWatch metrics (Recommended)", "Cheaper S3 class for old raw frames (Recommended)" and "Delete the CloudWatch dashboard"; kept the $75 stop. Full record and REJECT list: `daily-universe-scope-expansion-2026-05-27.md` §0 Quote 53. Per-alarm rows and the estimate: `docs/audits/2026-11-alarm-review.md`.
+
+| | Before | After |
+|---|---|---|
+| CloudWatch alarms (prod) | 119 | 82 (the KEPT list in Quote 53 does not allow ~30) |
+| EMF names shipped | 109 + 1 class series | 46 |
+| CWAgent host metrics | disk, memory, CPU | disk |
+| CloudWatch dashboard | 1 (the "dashboard kept" of Quote 37) | 0 |
+| `raw-frames/` after 30 days | Deep Archive | Glacier Instant Retrieval |
+
+Estimate (Assumed, never measured): about $11–14 a month less before tax. **Risk:** Glacier Instant Retrieval costs more per GB than the Deep Archive class it replaces for `raw-frames/` (about $0.50 a month more per month of raw frames kept, Assumed); it buys reads at once instead of a 12-hour restore. Read the December bill.
 
 ## OPERATOR RULING 2026-10-21 (latest) — stop at $75, GST included, from 1 November (supersedes the $85 and $100 lines below)
 
@@ -65,7 +123,7 @@ Owner, 2026-10-21 (verbatim, typos preserved): "so that the max alogn with 18 pe
 
 | | Before (Quote 36) | After (Quote 37) |
 |---|---|---|
-| `STANDING_BUDGET_KILL_USD` (the guard Lambda's line, in code) | $85 from 1 November | **$75 from 1 November 2026**, GST included; October 2026 stays capped at $170 |
+| `STANDING_BUDGET_KILL_USD` (the guard Lambda's line, in code) | $85 from 1 November | **$75 from 1 November 2026**, GST included; October 2026 stays capped at $170 *(⚠ superseded: $90 for November 2026 by Quote 52, $62 from 1 December 2026 by Quote 54)* |
 | Four lockstep sites (terraform `limit_amount` = native 100% stop) | $170 until 1 November, then $85 | $170 until 1 November, then **$75** (a follow-up change on or after that date) |
 
 ## OPERATOR RULING 2026-10-21 (later) — stop at $85 from 1 November (supersedes the $100 line below)

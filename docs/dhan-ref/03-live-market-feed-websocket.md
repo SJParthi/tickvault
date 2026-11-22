@@ -490,6 +490,8 @@ pub struct DisconnectPacket {
    ```
    > **WARNING**: This differs from Historical REST API timestamps, which ARE standard UTC epoch. See 08-annexure Section 12 for the distinction.
 
+   > **⚠ CHANGED BY DHAN 2026-11-20 (Verified, Dhan support ticket #6684672, 21 Nov 2026):** "the Live LTT timestamp format has been changed from IST-based epoch to UTC-based epoch effective 20th November 2026", implemented before the market opened on 20 Nov, and "UTC-based epoch is now the permanent format for all Live Market Feed timestamps". So for frames received from 2026-11-20 00:00 IST, LTT is standard UTC epoch and IST = raw + 19,800 s; frames received before that are IST epoch as written above. tickvault adds the 19,800 s once, in the core dispatcher, by WAL receipt (`websocket-connection-scope-lock.md` §"2026-11-21"). Every "IST epoch seconds" label in the packet tables of this file applies to receipts before 2026-11-20 only. The text above is kept as Dhan's original documentation.
+
 2. **Byte ordering is Little Endian** — all multi-byte fields (uint16, uint32, float32) must be read as LE. In Rust: `f32::from_le_bytes()`, `u32::from_le_bytes()`, etc.
 
 3. **Byte indexing in docs is 1-based** — Dhan docs use 1-based byte positions. In code (0-based arrays), subtract 1. E.g., "bytes 9-12" in docs = `buffer[8..12]` in code.
@@ -597,6 +599,7 @@ Expected:
   - security_id = 1333
   - ltp = parsed float32 LE
   - ltt = parsed uint32 LE (IST epoch seconds — do NOT add +5:30; subtract 19800 for UTC)
+  - ⚠ 2026-11-20: from a receipt of 2026-11-20 00:00 IST on, `ltt` is UTC epoch (Dhan ticket #6684672); expect raw + 19,800 for IST. See Section 10 note 1.
 ```
 
 ### Test: Subscribe 100+ instruments

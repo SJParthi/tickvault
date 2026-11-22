@@ -1,0 +1,5 @@
+signal_id,security_id,segment,symbol,recipe,version,side,qty,candle_end,decision_ts,limit_paise,fill_qty,avg_paise,model_paise,recheck_qty,recheck_avg_paise,gap_ticks,remainder,outcome,verdict
+1,40001,NSE_FNO,RELIANCE-Nov2026-1401-CE,orb_5s,3,BUY,500,2026-11-12 10:00:00.000000,2026-11-12 10:00:00.002000,11000,500,10105,10105,500,10105,0,0,filled,match
+2,40002,NSE_FNO,RELIANCE-Nov2026-1402-CE,orb_5s,3,BUY,500,2026-11-12 10:00:00.000000,2026-11-12 10:00:00.002000,11000,250,10110,10110,250,10110,0,250,partial_cancelled,match
+3,40003,NSE_FNO,RELIANCE-Nov2026-1403-CE,orb_5s,3,BUY,500,2026-11-12 10:00:00.000000,2026-11-12 10:00:00.002000,11000,0,,,,,,500,skipped:late_price,not_priced
+4,40004,NSE_FNO,RELIANCE-Nov2026-1404-CE,orb_5s,3,BUY,500,2026-11-12 10:00:00.000000,2026-11-12 10:00:00.002000,11000,0,,,,,,500,rejected,not_priced

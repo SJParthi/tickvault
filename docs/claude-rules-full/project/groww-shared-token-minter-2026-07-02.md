@@ -66,7 +66,7 @@ Any such PR MUST be rejected in review even if the operator approves verbally �
 
 | Ratchet | Pins |
 |---|---|
-| `crates/common/tests/groww_no_mint_guard.rs` (6 tests) | No mint endpoint / mint fn / credential fetch / credential type in any `crates/*/src`; no credential param paths; sidecar reads `GROWW_SSM_TOKEN_PARAM` + `WithDecryption=True`, never mints, carries the 60s floor + 600s alert marker; smoke script mint-free; requirements pins boto3 not the TOTP lib; `fetch_groww_access_token` exists and its module has no `put_parameter` |
+| `crates/common/tests/groww_no_mint_guard.rs` (6 tests) | No mint endpoint / mint fn / credential fetch / credential type in any `crates/*/src`; no credential param paths; sidecar reads `GROWW_SSM_TOKEN_PARAM` + `WithDecryption=True`, never mints, carries the 60s floor + 600s alert marker; smoke script mint-free; requirements pins boto3 not the TOTP lib; `fetch_groww_access_token` exists and its module has no `put_parameter` (⚠ CORRECTED 2026-11-15: `groww_no_mint_guard.rs` is not in the tree (deleted with the Groww feed, 2026-08-21), so none of its tests runs and this pin is NOT ENFORCED; `dhan_token_publish_guard.rs::secret_manager_stays_read_only` is the only live read-only pin) |
 | `crates/common/tests/groww_ssm_seed_script_wiring.rs` (5 tests) | Seed script writes NO groww param, documents the minter ownership, carries no Groww credential env vars; the Rust reader targets the access-token param only |
 | `crates/app/src/groww_sidecar_supervisor.rs` unit tests | Supervisor injects `GROWW_SSM_TOKEN_PARAM`, never `GROWW_API_KEY`/`GROWW_TOTP_SECRET`; requirements-fingerprint re-provisioning gate |
 | `crates/core/src/feed/groww/auth.rs` unit tests | `validate_groww_token_shape` (empty/placeholder/short/JWT + no-value-echo) |
@@ -140,7 +140,7 @@ Unresolved; §8.4 probes it.
 |---|---|---|---|
 | 1 | **IAM hard-stop** — tickvault's reader role (`groww-token-minter-reader-tickvault`) is scoped to `ssm:GetParameter` on the **access-token param ONLY** + `kms:Decrypt`. The `groww/api-key` + `groww/totp-secret` params are **Lambda-only read** (§1). | **Runtime AccessDenied**, not a code gap — perfect TOTP code would still fail. | terraform/IAM grant: add the 2 credential params to tickvault's reader policy. |
 | 2 | **This file's own §1/§3** — verbatim: *"NEVER mint a Groww access token from TickVault code, in any environment, ever."* | Governance | THIS §8 is that override, with the §8.0 dated quotes. |
-| 3 | **6 build-failing tests** — `crates/common/tests/groww_no_mint_guard.rs` bans *"any Groww TOTP computation"*, the `obtain_groww_access_token` / `fetch_groww_credentials` / `GrowwCredentials` surface, credential param paths, and `put_parameter` in `secret_manager.rs` (`:129`). | Ratchet | Re-bless in the SAME PR as the code, with this §8 cited as authority. The `secret_manager.rs` read-only pin should be KEPT (put the mint in its own module). |
+| 3 | **6 build-failing tests** — `crates/common/tests/groww_no_mint_guard.rs` bans *"any Groww TOTP computation"*, the `obtain_groww_access_token` / `fetch_groww_credentials` / `GrowwCredentials` surface, credential param paths, and `put_parameter` in `secret_manager.rs` (`:129`). | Ratchet | Re-bless in the SAME PR as the code, with this §8 cited as authority. The `secret_manager.rs` read-only pin should be KEPT (put the mint in its own module). (⚠ CORRECTED 2026-11-15: `groww_no_mint_guard.rs` is not in the tree (deleted with the Groww feed, 2026-08-21), so none of its tests runs and this pin is NOT ENFORCED; `dhan_token_publish_guard.rs::secret_manager_stays_read_only` is the only live read-only pin) |
 | 4 | **Deleted code** — the Groww mint path existed pre-2026-07-02. | Recovery | Restore from git history (pre-`dd7eaa5e^` lineage), then re-harden. |
 
 ### §8.4 THE GATING PROBE — Groww one-active-token semantics (UNKNOWN, must run FIRST)
@@ -179,7 +179,7 @@ recorded HERE, **no Groww mint code may ship** (the §8.5 REJECT rows bind).
 - Grants tickvault read on the Groww credential params without the §8.4 verdict
   (the IAM grant is the point of no return — it makes an accidental mint possible).
 - Puts the mint's SSM write (if any) into `secret_manager.rs` — that module's
-  read-only pin (`groww_no_mint_guard.rs:129`) STAYS; use a separate module.
+  read-only pin (`groww_no_mint_guard.rs:129`) STAYS; use a separate module. (⚠ CORRECTED 2026-11-15: `groww_no_mint_guard.rs` is not in the tree (deleted with the Groww feed, 2026-08-21), so none of its tests runs and this pin is NOT ENFORCED; `dhan_token_publish_guard.rs::secret_manager_stays_read_only` is the only live read-only pin.)
 - Weakens the Groww mint's TOTP/credential hygiene below the Dhan bar: credentials
   read FRESH from SSM per mint, held only as `Secret<String>`, NEVER logged, never in
   a URL, never written to a local `.env`/keychain.
@@ -218,7 +218,7 @@ Any such PR MUST be rejected in review even if the operator approves verbally �
 ### §8.8 Trigger / auto-load
 
 The §7 trigger list covers this section. Additionally reinforced on any session
-editing `crates/common/tests/groww_no_mint_guard.rs`, `crates/core/src/auth/totp_generator.rs`,
+editing `crates/common/tests/groww_no_mint_guard.rs`, `crates/core/src/auth/totp_generator.rs`, (⚠ CORRECTED 2026-11-15: `groww_no_mint_guard.rs` is not in the tree, deleted with the Groww feed on 2026-08-21, so this trigger can never fire.)
 `deploy/aws/terraform/*groww*`, or any file containing `key_type`, `token/api/access`,
 `obtain_groww_access_token`, or `GrowwCredentials`.
 
@@ -271,7 +271,7 @@ ZERO consumers repo-wide. This section wires the intent that was already recorde
 | Aspect | Locked value |
 |---|---|
 | Write site | `crates/core/src/auth/dhan_token_publisher.rs` — the ONLY SSM write in the auth tree |
-| Read-only pin PRESERVED | `secret_manager.rs` stays `put_parameter`-free (`groww_no_mint_guard.rs:129` + the new `dhan_token_publish_guard.rs::secret_manager_stays_read_only`) |
+| Read-only pin PRESERVED | `secret_manager.rs` stays `put_parameter`-free (`groww_no_mint_guard.rs:129` + the new `dhan_token_publish_guard.rs::secret_manager_stays_read_only`; ⚠ CORRECTED 2026-11-15: `groww_no_mint_guard.rs` is not in the tree (deleted with the Groww feed, 2026-08-21), so none of its tests runs and this pin is NOT ENFORCED; `dhan_token_publish_guard.rs::secret_manager_stays_read_only` is the only live read-only pin) |
 | Trigger | after EVERY successful mint AND renewal, paired 1:1 with the existing crash-cache save |
 | Execution | **spawned, never awaited** — a slow/hanging SSM call can never delay a mint or stall the Step-6 boot deadline |
 | Failure policy | **fail-soft**: no panic, no retry loop, coded `error!` + `tv_dhan_token_publish_total{outcome}`; tickvault's own auth is unaffected (token is in memory) |

@@ -107,8 +107,36 @@ fn every_did_it_run_alarm_is_gated_and_ships_disarmed() {
     let gate = code_only(GATE);
     let list = gate_alarm_names_list(&gate);
 
+    let review = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/audits/2026-11-alarm-review.md"),
+    )
+    .expect("the Quote 53 alarm review must be readable"); // APPROVED: test
     for (src, resource) in DID_IT_RUN_ALARMS {
         let code = code_only(src);
+        // 2026-11-11: operator Quote 53 removed two of the three did-it-run
+        // alarms (rows in docs/audits/2026-11-alarm-review.md); the review KEPT
+        // boot_heartbeat_gate_not_invoked, which every check below covers. A removed one needs its
+        // REMOVE row and no leftover gate reference; if one comes back, every
+        // check below applies to it again unchanged.
+        let header = format!("resource \"aws_cloudwatch_metric_alarm\" \"{resource}\"");
+        if !code.contains(&header) {
+            let row = format!("`tv-<env>-{}`", resource.replace('_', "-"));
+            assert!(
+                review
+                    .lines()
+                    .any(|l| l.contains("| REMOVE |") && l.contains(&row)),
+                "`{resource}` is gone without a REMOVE row for {row} in the Quote 53 \
+                 alarm review"
+            );
+            assert!(
+                !list.contains(&format!(
+                    "aws_cloudwatch_metric_alarm.{resource}.alarm_name"
+                )),
+                "`{resource}` is removed but still named in the gate's ALARM_NAMES"
+            );
+            continue;
+        }
         let block = alarm_block(&code, resource);
 
         // Precondition: if a future edit makes one of these notBreaching, this

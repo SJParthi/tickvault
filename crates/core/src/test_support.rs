@@ -34,6 +34,23 @@ pub fn has_aws_credentials() -> bool {
     false
 }
 
+/// Keeps a second `tracing` dispatcher registered for the life of the test
+/// process. Call it before installing a scoped (thread-local) subscriber
+/// whose captured lines a test asserts on.
+///
+/// Why: while exactly one dispatcher is registered, `tracing-core` (0.1.36)
+/// works out a NEW callsite's interest from the default of whichever thread
+/// reaches it first. A test thread with no subscriber caches it as `never`,
+/// and the capturing thread's subscriber then never sees that line (measured
+/// 7 failures in 12,000 runs of two 808 tests). With this anchor alive there
+/// are always at least two dispatchers, so every callsite takes the path that
+/// asks all of them. The anchor is a `NoSubscriber`: it is not a global
+/// default, records nothing and never sees an event.
+pub(crate) fn keep_callsite_interest_shared() {
+    static ANCHOR: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+    ANCHOR.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -570,6 +587,57 @@ mod tests {
         assert!(
             !real_ssm_tests_enabled(),
             "neither opt-in nor credentials must NOT enable real-SSM tests"
+        );
+    }
+
+    // Regression: 2026-11-14 (nightly flake, two 808 tests in
+    // `pool_supervisor/cov_part1_tests.rs`, 7 failures in 12,000 runs).
+    // A thread with no subscriber reaches a callsite first while this
+    // thread's scoped subscriber is the only registered dispatcher: without
+    // the anchor `tracing-core` caches the callsite as `never` and the line
+    // is lost. Run alone (`--exact`) this fails every time without the anchor.
+    #[test]
+    fn test_keep_callsite_interest_shared_lets_a_scoped_subscriber_see_a_line_a_bare_thread_reached_first()
+     {
+        #[derive(Clone, Default)]
+        struct Buf(std::sync::Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if let Ok(mut g) = self.0.lock() {
+                    g.extend_from_slice(bytes);
+                }
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        // One callsite, reached first by a thread with no subscriber.
+        fn emit() {
+            tracing::warn!("anchor probe line");
+        }
+
+        keep_callsite_interest_shared();
+        let buf = Buf::default();
+        let writer = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            std::thread::spawn(emit)
+                .join()
+                .expect("the bare thread emits and exits");
+            emit();
+        });
+        let logs = buf
+            .0
+            .lock()
+            .map(|g| String::from_utf8_lossy(&g).into_owned())
+            .unwrap_or_default();
+        assert!(
+            logs.contains("anchor probe line"),
+            "the scoped subscriber missed the line: {logs:?}"
         );
     }
 }

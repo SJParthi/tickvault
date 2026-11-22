@@ -112,6 +112,10 @@ name = "order_gate"
 harness = false
 
 [[bench]]
+name = "live_fill"
+harness = false
+
+[[bench]]
 name = "feed_drain"
 harness = false
 
@@ -130,7 +134,7 @@ name = "backup_dedup"
 harness = false
 
 [package.metadata.cargo-machete]
-ignored = ["chrono-tz", "clap", "signal-hook"]
+ignored = ["clap", "signal-hook"]
 
 # Explicit name so the documented invocation works. Cargo derives a bin name
 # from the FILE name, giving `tv_guarantees`, while this binary's own docs --
@@ -139,3 +143,9 @@ ignored = ["chrono-tz", "clap", "signal-hook"]
 [[bin]]
 name = "tv-guarantees"
 path = "src/bin/tv_guarantees.rs"
+
+# Plan item LF-8 (2026-11-12): the offline live-fill replay. Paper only, never
+# on the live path; see `src/live_fill/replay/mod.rs`.
+[[bin]]
+name = "tv-live-fill-replay"
+path = "src/bin/tv_live_fill_replay.rs"

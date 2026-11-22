@@ -800,20 +800,13 @@ async fn run_disk_pressure_loop(
                 last_aside_for_depth_only = last_stood_aside && aside_for_depth_only;
                 last_in_session_aside = (in_session && matches!(pass, PressurePass::StoodAside))
                     .then_some((window_key, depth_allowed));
-                // PR DP review M1: a refunded pass (gated progress, or an
-                // in-session stand-aside at 90%+) that did not lower the volume five
+                // PR DP review M1: a refunded pass at 90%+ (gated progress, or an
+                // in-session stand-aside) that did not lower the volume five
                 // times in a row escalates the episode as an ungated one would.
-                let stalled = match pass {
-                    PressurePass::GatedProgress(_) => gated_stall.observe_gated_pass(used),
-                    PressurePass::StoodAside if in_session && emergency => {
-                        gated_stall.observe_gated_pass(used)
-                    }
-                    PressurePass::Dropped(_) => {
-                        gated_stall.reset();
-                        false
-                    }
-                    PressurePass::NotRun | PressurePass::StoodAside => false,
-                };
+                // Below 90% a gated pass that freed a partition is progress
+                // (audit 2026-11-15, live-2): see the helper.
+                let stalled =
+                    gated_stall_after_pass(&mut gated_stall, pass, in_session, emergency, used);
                 let dropped = match pass {
                     PressurePass::Dropped(n) | PressurePass::GatedProgress(n) => Some(n),
                     PressurePass::NotRun | PressurePass::StoodAside => None,
@@ -1003,6 +996,36 @@ pub const fn refund_off_session_progress(pass: PressurePass, off_session: bool) 
     match pass {
         PressurePass::Dropped(n) if off_session && n > 0 => PressurePass::GatedProgress(n),
         other => other,
+    }
+}
+
+/// Feeds one pass into the gated-stall tracker; returns `true` once the
+/// tracker says the episode has stalled. O(1).
+///
+/// Audit 2026-11-15 (live-2): below [`PRESSURE_EMERGENCY_USED_PCT`] (90%) a
+/// gated pass that freed a partition is progress and resets the stall.
+/// Before, five one-partition in-session passes that did not move the
+/// whole-number used% paged STORAGE-GAP-05 (12 Nov at 75%, 13 Nov at 72%),
+/// while the same episode freed 18 partitions right after the close.
+/// At 90% and above a gated pass still counts toward the stall, as PR DP
+/// review M1 asked: one partition a pass that does not lower the volume is
+/// not keeping up, and the episode must be able to escalate. An in-session
+/// stand-aside at 90%+ counts too. (`GatedProgress` always carries n > 0.)
+fn gated_stall_after_pass(
+    tracker: &mut GatedStallTracker,
+    pass: PressurePass,
+    in_session: bool,
+    emergency: bool,
+    used: u8,
+) -> bool {
+    match pass {
+        PressurePass::GatedProgress(_) if emergency => tracker.observe_gated_pass(used),
+        PressurePass::StoodAside if in_session && emergency => tracker.observe_gated_pass(used),
+        PressurePass::Dropped(_) | PressurePass::GatedProgress(_) => {
+            tracker.reset();
+            false
+        }
+        PressurePass::NotRun | PressurePass::StoodAside => false,
     }
 }
 
@@ -1390,6 +1413,92 @@ mod tests {
         assert_eq!(ep.passes_used, 0, "gated passes are refunded");
         assert_eq!(ep.last_pass_dropped, Some(1));
         assert!(!ep.escalated);
+    }
+
+    // Regression: audit 2026-11-15 (live-2) — five one-partition in-session
+    // passes at a flat whole-number used% paged STORAGE-GAP-05 (12 Nov at
+    // 75%, 13 Nov at 72%) although each pass freed a partition. Below 90% such
+    // a pass is progress; at 90%+ it still counts toward the stall (PR DP
+    // review M1), so a disk filling faster than one partition a pass pages.
+    #[test]
+    fn test_regression_live2_gated_stall_after_pass_counts_progress_only_at_emergency() {
+        use tickvault_storage::disk_pressure::{GATED_STALL_PASSES, GatedStallTracker};
+        let cfg = cfg();
+        // The two live cases (72%, 75% = high water) and the top of the band.
+        for used in [
+            72_u8,
+            cfg.pressure_high_water_pct,
+            PRESSURE_EMERGENCY_USED_PCT - 1,
+        ] {
+            let emergency = used >= PRESSURE_EMERGENCY_USED_PCT;
+            assert!(!emergency, "used {used}");
+            let probe = PressureProbe::used(used);
+            let mut tracker = GatedStallTracker::default();
+            let mut state = PressureState::default();
+            for poll in 0..20_u64 {
+                let action = decide_pressure_action(probe, &state, &cfg, poll * 60);
+                if !matches!(
+                    action,
+                    PressureAction::StartEpisode | PressureAction::ContinuePass
+                ) {
+                    break;
+                }
+                let pass = PressurePass::GatedProgress(1);
+                let stalled = gated_stall_after_pass(&mut tracker, pass, true, emergency, used);
+                assert!(
+                    !stalled,
+                    "used {used} poll {poll}: a pass that freed a partition is progress"
+                );
+                fold_pressure_pass(&mut state, action, poll * 60, pass);
+            }
+            if let Some(ep) = state.episode {
+                assert!(!ep.gated_stalled, "used {used}");
+            }
+        }
+        // At 90%+ the M1 escalation stays: five flat one-partition passes
+        // stall the episode, in session or not.
+        let used = PRESSURE_EMERGENCY_USED_PCT.saturating_add(2);
+        for in_session in [true, false] {
+            let mut tracker = GatedStallTracker::default();
+            let mut stalled = false;
+            for _ in 0..=GATED_STALL_PASSES {
+                stalled = gated_stall_after_pass(
+                    &mut tracker,
+                    PressurePass::GatedProgress(1),
+                    in_session,
+                    true,
+                    used,
+                );
+            }
+            assert!(
+                stalled,
+                "in_session {in_session}: 90%+ gated progress at a flat used% stalls"
+            );
+        }
+        // A pass that freed nothing still counts: five emergency stand-asides
+        // at a flat used% stall the episode, as PR DP review M1 asked.
+        let mut tracker = GatedStallTracker::default();
+        let mut stalled = false;
+        for _ in 0..=GATED_STALL_PASSES {
+            stalled =
+                gated_stall_after_pass(&mut tracker, PressurePass::StoodAside, true, true, used);
+        }
+        assert!(stalled, "stand-asides that free nothing still stall");
+        // A drop resets it; a pass that never ran leaves it alone.
+        assert!(!gated_stall_after_pass(
+            &mut tracker,
+            PressurePass::Dropped(3),
+            true,
+            true,
+            used
+        ));
+        assert!(!gated_stall_after_pass(
+            &mut tracker,
+            PressurePass::NotRun,
+            true,
+            true,
+            used
+        ));
     }
 
     fn test_questdb() -> QuestDbConfig {

@@ -26,7 +26,6 @@ tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
-chrono-tz = { workspace = true }
 metrics = { workspace = true }
 questdb-rs = { workspace = true }
 reqwest = { workspace = true }
@@ -99,4 +98,4 @@ name = "depth_row_append"
 harness = false
 
 [package.metadata.cargo-machete]
-ignored = ["chrono-tz", "metrics", "questdb-rs", "serde", "serde_json", "thiserror"]
+ignored = ["metrics", "questdb-rs", "serde", "serde_json", "thiserror"]

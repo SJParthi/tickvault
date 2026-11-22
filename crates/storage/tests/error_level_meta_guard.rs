@@ -63,6 +63,16 @@ const FAILURE_WORDS: &[&str] = &["fail", "could not", "cannot", "couldn't", "not
 const REVIEWED_WARN_SITES: &[(&str, &str, &str)] = &[
     // ---- app ----
     (
+        "crates/app/src/brutex_export_boot.rs",
+        "brutex daily export attempt failed",
+        "one attempt of a retried export (15/30/60-minute backoff); nothing is deleted or overwritten and no DONE is written, so Brutex never reads a partial day; the day's final give-up and a sealed-incomplete day are both coded error! lines (owner Quote 60)",
+    ),
+    (
+        "crates/app/src/clock_offset_page.rs",
+        "the saved episode latch could not be read or written",
+        "a small state file that only stops a second page for the same clock-offset episode after a restart; the poller and the offset row carry on, at worst one extra page, no market data is lost",
+    ),
+    (
         "crates/app/src/depth_book_since.rs",
         "the start instant could not be saved",
         "the instant still applies to this process; a later boot records a later one, so replayed frames go to market_depth (plan item 49e step 3 honest limit); no market data is lost",
@@ -239,6 +249,21 @@ const REVIEWED_WARN_SITES: &[(&str, &str, &str)] = &[
     ),
     // ---- storage ----
     (
+        "crates/storage/src/tick_spill_replay.rs",
+        "could not be moved to their own held file",
+        "B1 review 4 (2026-11-13): a retry, not a loss; the spill file is kept intact, nothing from the chunk is posted or advanced past, and the next round tries the move again",
+    ),
+    (
+        "crates/storage/src/ws_frame_spill/replay_retry.rs",
+        "replay read-failure book could not be written",
+        "B1 review 2 (2026-11-13): a lost count, not lost data; the in-memory count still bounds this process, so a missing book only means more replay retries (keeps more), never a dropped frame",
+    ),
+    (
+        "crates/storage/src/ilp_table_gate.rs",
+        "a live writer is not posting: its table has not been created",
+        "B1 (2026-11-13): a hold, not a loss, logged once per process; each held batch takes the writer's existing rescue (spill file or WAL deferral), whose own per-batch line carries the error code, and replays once the DDL re-run keys the table",
+    ),
+    (
         "crates/storage/src/fresh_start_reset.rs",
         "its first-boot marker could not be read",
         "2026-10-29: a READ, not a write: nothing is persisted or lost. Coded TICK-SPILL-01 (source market_data_floor_no_marker), once per boot; the boot keeps any floor file an earlier boot wrote, and without one the replays bring back more rows (never fewer)",
@@ -272,6 +297,11 @@ const REVIEWED_WARN_SITES: &[(&str, &str, &str)] = &[
         "crates/storage/src/wal_applied_watermark.rs",
         "unapplied ranges could not be persisted",
         "2026-10-20 (plan item PR W): coded WS-SPILL-01, latched once per episode, counted on the same persist-failed counter durability-sync-failing pages on; the watermark file then names no sidecar generation, so the next boot reads the ranges as whole buckets or, when they do not fit, as an unbounded overflow (replay more, never less)",
+    ),
+    (
+        "crates/storage/src/wal_backlog_trend.rs",
+        "wal backlog record could not be saved",
+        "2026-11-11 (noise lock 2.20): coded WS-SPILL-01; a failed save makes this start (and every later start that cannot save) page its replay-limit lines as ERROR, so the failure is already paged there and error! here would page twice; no market data is lost, the record only decides whether those lines are quiet",
     ),
     (
         "crates/storage/src/wal_clock_step.rs",

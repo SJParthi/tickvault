@@ -87,7 +87,7 @@ tracing-appender = "=0.2.5"
 # jsonwebtoken removed 2026-06-10 (operator-approved dead-pin cleanup): zero
 # consumers anywhere in the repo — the Dhan JWT is handled as an opaque
 # Secret<String>, never decoded locally.
-arc-swap = "=1.9.3"
+arc-swap = "=1.9.5"
 totp-rs = { version = "=6.0.0", features = ["otpauth"] }
 
 # ---- Section 6: Trading Domain — OMS & Risk ----
@@ -107,12 +107,11 @@ tower = { version = "=0.5.3", features = ["full"] }
 tower-http = { version = "=0.7.1", features = ["cors", "trace", "compression-gzip", "fs"] }
 
 # ---- Section 9: Configuration ----
-toml = "=1.1.8"
+toml = "=1.2.1"
 figment = { version = "=0.10.19", features = ["toml", "env"] }
 
 # ---- Section 10: Date & Time ----
 chrono = { version = "=0.4.45", features = ["serde"] }
-chrono-tz = "=0.10.4"
 
 # ---- Section 11: Serialization & Errors ----
 serde = { version = "=1.0.229", features = ["derive"] }
@@ -145,7 +144,7 @@ sha2 = "=0.11.1"
 # the spill/rescue free-space probe. Same version, no new package; the edge
 # from tickvault-storage is new and is flagged for the owner in that change.
 libc = "=0.2.191"
-notify = "=8.2.1"
+notify = "=8.2.2"
 # signal-hook-tokio removed in S11 — dead dep with zero references across
 # crates/ and fuzz/. signal-hook itself is kept because crates/app/Cargo.toml
 # declares it with { workspace = true } (via machete ignore list) for a
@@ -179,7 +178,7 @@ aws-lc-rs = "=1.19.0"
 # RUSTSEC advisories on the AWS chain without an upstream SDK release.
 aws-config = { version = "=1.13.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio", "credentials-process", "sso"] }
 aws-sdk-sns = { version = "=1.121.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
-aws-sdk-ssm = { version = "=1.133.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
+aws-sdk-ssm = { version = "=1.134.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 # 2026-10-31: coordinated AWS family repair for RUSTSEC-2026-0253.
 # S3 1.157.0 requires patched lru ^0.18.2. All nine config/service pins
 # move together because older pre-1.0 Smithy requirements cannot share
@@ -190,7 +189,7 @@ aws-sdk-ssm = { version = "=1.133.0", default-features = false, features = ["beh
 aws-sdk-s3 = { version = "=1.157.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 # EC2 and CloudWatch share the same reviewed SDK/Smithy generation.
 # They remain Rust Lambda/control-plane dependencies, with modern HTTPS.
-aws-sdk-ec2 = { version = "=1.274.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
+aws-sdk-ec2 = { version = "=1.275.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 aws-sdk-cloudwatch = { version = "=1.140.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 # 2026-10-22 (plan item 63, operator Quote 37; owner approved the new
 # dependency on the decision card "Approve (Recommended)"): the free AWS
@@ -200,6 +199,16 @@ aws-sdk-cloudwatch = { version = "=1.140.0", default-features = false, features 
 # same change. The current pin participates in the coordinated 2026-10-31
 # SDK family repair; the approved DescribeBudget scope is unchanged.
 aws-sdk-budgets = { version = "=1.130.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
+# 2026-11-11 (noise lock §2.18, owner card "Yes, daily waste check
+# (Recommended)"): the daily AWS waste check makes ONE Cost Explorer
+# `GetCostAndUsage` per run (month-to-date, grouped by service) for the
+# "top 5 costs this month" context line the owner asked for ($0.01 a call,
+# about $0.30 a month). Re-adds the crate removed 2026-10-22 (plan item 63)
+# for that single call only; the guard, digest and console keep reading the
+# free Budgets API. 1.138.0 is the release whose Smithy/runtime requirements
+# equal aws-sdk-budgets 1.130.0's exactly, so the lock gains this one crate
+# and moves nothing else. Same feature shape as every other AWS SDK pin.
+aws-sdk-costexplorer = { version = "=1.138.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 # The console front Lambda invokes the back relay through Lambda Invoke.
 # Preserve its existing features while upgrading the shared SDK family.
 aws-sdk-lambda = { version = "=1.156.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
@@ -216,7 +225,7 @@ lambda_runtime = "=1.5.0"
 # S3 upload. NOT a new supply-chain root — flate2 1.1.9 was ALREADY resolved
 # in Cargo.lock (transitive via tower-http compression-gzip); this promotes
 # it to a direct pin — the aws-lc-rs promotion precedent above.
-flate2 = "=1.1.10"
+flate2 = "=1.1.11"
 
 # ---- Section 11c: Regex (tickvault-logs-mcp grep_codebase) ----
 # 2026-07-18 (rust-only phase 2c): the Rust port of the tickvault-logs MCP
@@ -239,19 +248,19 @@ regex = "=1.13.1"
 # Flagged in the PR body for operator visibility.
 base64 = "=0.22.1"
 percent-encoding = "=2.3.2"
-form_urlencoded = "=1.2.2"
+form_urlencoded = "=1.2.3"
 
 # ---- Section 16: CLI ----
 
 # ---- Section 17: Unique IDs ----
-uuid = { version = "=1.29.0", features = ["v4", "serde"] }
+uuid = { version = "=1.29.2", features = ["v4", "serde"] }
 
 # ---- Section 18: Telegram Alerts ----
 
 # ---- Section 13: Dev/Test Dependencies ----
 criterion = { version = "=0.8.2", features = ["html_reports"] }
 proptest = "=1.12.0"
-loom = "=0.7.2"
+loom = "=0.7.3"
 dhat = "=0.3.3"
 
 # Build Profiles

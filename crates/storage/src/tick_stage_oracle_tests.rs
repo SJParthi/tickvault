@@ -37,7 +37,7 @@ struct LegacyAppender {
     out_of_window: OutOfWindowCounters,
     last_capture_seq: i64,
     flush_counters: TickFlushCounters,
-    aux_counters: [metrics::Counter; 6],
+    aux_counters: [metrics::Counter; AuxPacketKind::ALL.len()],
     aux_rows_appended: u64,
     quote_rows_appended: u64,
 }
@@ -307,6 +307,11 @@ fn price() -> impl Strategy<Value = f32> {
         Just(0.0),
         Just(-0.0),
         Just(f32::MIN_POSITIVE),
+        // Speed fix 6: subnormals and the extremes reach the raw stage too.
+        Just(f32::from_bits(1)),
+        Just(-f32::from_bits(0x007f_ffff)),
+        Just(f32::MAX),
+        Just(f32::MIN),
         any::<f32>(),
         (0.05_f32..200_000.0),
         (1_u32..4_000_000).prop_map(|p| p as f32 * 0.05),
@@ -459,16 +464,126 @@ fn new_state(w: &TickWriter) -> Snapshot {
     )
 }
 
+/// The drain-side counters whose deltas the oracle compares per append
+/// (speed fix 6: every refusal and counter must be counted at staging time,
+/// exactly as the old append path did).
+const WATCHED_COUNTERS: [&str; 7] = [
+    "tv_tick_rows_refused_total",
+    "tv_tick_optional_price_dropped_total",
+    TICK_NONFINITE_COLUMNS_COUNTER,
+    "tv_ticks_dropped_total",
+    "tv_tick_volume_saturated_total",
+    TICK_OUT_OF_WINDOW_COUNTER,
+    crate::feed_aux_persistence::FEED_AUX_ROWS_COUNTER,
+];
+
+/// A recorder that keeps every counter, scoped with
+/// `metrics::with_local_recorder` (never a global install).
+#[derive(Default)]
+struct CountingRecorder {
+    counters:
+        std::sync::Mutex<std::collections::BTreeMap<String, Arc<std::sync::atomic::AtomicU64>>>,
+}
+
+impl CountingRecorder {
+    /// The watched counters, keyed `name{labels}`.
+    fn watched(&self) -> std::collections::BTreeMap<String, u64> {
+        let Ok(map) = self.counters.lock() else {
+            return std::collections::BTreeMap::new();
+        };
+        map.iter()
+            .filter(|(k, _)| {
+                WATCHED_COUNTERS
+                    .iter()
+                    .any(|w| k.starts_with(&format!("{w}{{")))
+            })
+            .map(|(k, v)| (k.clone(), v.load(std::sync::atomic::Ordering::Relaxed)))
+            .filter(|(_, v)| *v > 0)
+            .collect()
+    }
+}
+
+impl metrics::Recorder for CountingRecorder {
+    fn describe_counter(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+    fn describe_gauge(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+    fn describe_histogram(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+    fn register_counter(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Counter {
+        let mut labels: Vec<String> = key
+            .labels()
+            .map(|l| format!("{}={}", l.key(), l.value()))
+            .collect();
+        labels.sort();
+        let name = format!("{}{{{}}}", key.name(), labels.join(","));
+        let Ok(mut map) = self.counters.lock() else {
+            return metrics::Counter::noop();
+        };
+        metrics::Counter::from_arc(Arc::clone(map.entry(name).or_default()))
+    }
+    fn register_gauge(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+        metrics::Gauge::noop()
+    }
+    fn register_histogram(
+        &self,
+        _: &metrics::Key,
+        _: &metrics::Metadata<'_>,
+    ) -> metrics::Histogram {
+        metrics::Histogram::noop()
+    }
+}
+
+/// `after - before` per watched counter (a counter that did not move is left out).
+fn counter_delta(
+    before: &std::collections::BTreeMap<String, u64>,
+    after: &std::collections::BTreeMap<String, u64>,
+) -> std::collections::BTreeMap<String, u64> {
+    after
+        .iter()
+        .map(|(k, v)| {
+            (
+                k.clone(),
+                v.saturating_sub(before.get(k).copied().unwrap_or(0)),
+            )
+        })
+        .filter(|(_, d)| *d > 0)
+        .collect()
+}
+
 /// One case: the oracle and the staging writer, step by step.
 fn run_case(encoder: TickIlpEncoder, ops: &[Op]) -> Result<(), TestCaseError> {
     let _g = TEST_PUBLISH_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     publish_candle_contract_labels(CandleContractLabels::default());
-    let mut legacy = LegacyAppender::new(Feed::Dhan, encoder);
-    let (mut w, sink, rx) = TickWriter::for_test_with_encoder(Feed::Dhan, encoder)
-        .with_spill_dir_for_test(std::env::temp_dir().join("tv-pf4-oracle"))
-        .split_for_offload();
+    // Speed fix 6: each side records its own counters, so every append's
+    // refusal and counter deltas can be compared (handles resolved at
+    // construction land in the same recorder).
+    let rec_legacy = CountingRecorder::default();
+    let rec_new = CountingRecorder::default();
+    let mut legacy =
+        metrics::with_local_recorder(&rec_legacy, || LegacyAppender::new(Feed::Dhan, encoder));
+    let (mut w, sink, rx) = metrics::with_local_recorder(&rec_new, || {
+        TickWriter::for_test_with_encoder(Feed::Dhan, encoder)
+            .with_spill_dir_for_test(std::env::temp_dir().join("tv-pf4-oracle"))
+            .split_for_offload()
+    });
     drop(sink);
     let mut legacy_batches = Vec::new();
     let mut new_batches = Vec::new();
@@ -478,20 +593,48 @@ fn run_case(encoder: TickIlpEncoder, ops: &[Op]) -> Result<(), TestCaseError> {
     for op in ops {
         match op {
             Op::Tick(t, s) => {
-                let a = legacy.append_tick_with_seq(t, *s).is_ok();
-                let b = w.append_tick_with_seq(t, *s).is_ok();
+                let (l0, n0) = (rec_legacy.watched(), rec_new.watched());
+                let a = metrics::with_local_recorder(&rec_legacy, || {
+                    legacy.append_tick_with_seq(t, *s).is_ok()
+                });
+                let b = metrics::with_local_recorder(&rec_new, || {
+                    w.append_tick_with_seq(t, *s).is_ok()
+                });
                 prop_assert_eq!(a, b, "append result");
+                prop_assert_eq!(
+                    counter_delta(&l0, &rec_legacy.watched()),
+                    counter_delta(&n0, &rec_new.watched()),
+                    "tick counter deltas"
+                );
             }
             Op::Quote(t, s) => {
-                let a = legacy.append_tick_quote_with_seq(t, *s).is_ok();
-                let b = w.append_tick_quote_with_seq(t, *s).is_ok();
+                let (l0, n0) = (rec_legacy.watched(), rec_new.watched());
+                let a = metrics::with_local_recorder(&rec_legacy, || {
+                    legacy.append_tick_quote_with_seq(t, *s).is_ok()
+                });
+                let b = metrics::with_local_recorder(&rec_new, || {
+                    w.append_tick_quote_with_seq(t, *s).is_ok()
+                });
                 prop_assert_eq!(a, b, "quote append result");
+                prop_assert_eq!(
+                    counter_delta(&l0, &rec_legacy.watched()),
+                    counter_delta(&n0, &rec_new.watched()),
+                    "quote counter deltas"
+                );
             }
             Op::Aux(k, id, seg, r, s, v) => {
                 if let Some(row) = aux_row(*k, *id, *seg, *r, *s, *v) {
-                    let a = legacy.append_aux(&row).is_ok();
-                    let b = w.append_aux(&row).is_ok();
+                    let (l0, n0) = (rec_legacy.watched(), rec_new.watched());
+                    let a = metrics::with_local_recorder(&rec_legacy, || {
+                        legacy.append_aux(&row).is_ok()
+                    });
+                    let b = metrics::with_local_recorder(&rec_new, || w.append_aux(&row).is_ok());
                     prop_assert_eq!(a, b, "aux append result");
+                    prop_assert_eq!(
+                        counter_delta(&l0, &rec_legacy.watched()),
+                        counter_delta(&n0, &rec_new.watched()),
+                        "aux counter deltas"
+                    );
                 }
             }
             Op::Mark => {

@@ -266,20 +266,8 @@ resource "aws_lambda_permission" "questdb_console_apigw" {
 }
 
 # Per-Lambda error alarm (mirrors the operator-control alarm pattern).
-resource "aws_cloudwatch_metric_alarm" "questdb_console_front_errors" {
-  count               = var.enable_questdb_console ? 1 : 0
-  alarm_name          = "tv-${var.environment}-questdb-console-front-errors"
-  comparison_operator = "GreaterThanThreshold"
-  evaluation_periods  = 1
-  metric_name         = "Errors"
-  namespace           = "AWS/Lambda"
-  period              = 300
-  statistic           = "Sum"
-  threshold           = 0
-  alarm_description   = "questdb-console front Lambda erroring — the console may be failing"
-  dimensions          = { FunctionName = aws_lambda_function.questdb_console_front[0].function_name }
-  treat_missing_data  = "notBreaching"
-}
+# alarm "questdb_console_front_errors" REMOVED 2026-11-11 (operator Quote 53, alarm review
+# docs/audits/2026-11-alarm-review.md). The comments above are kept as history.
 
 output "questdb_console_url" {
   value       = var.enable_questdb_console ? aws_apigatewayv2_stage.questdb_console[0].invoke_url : null
@@ -296,17 +284,5 @@ output "questdb_console_url" {
 # rather than quietly changed here — the console is an operator convenience
 # surface, not the trading path, and giving one half a pager while the other
 # stays silent would be a worse inconsistency than the one being fixed.
-resource "aws_cloudwatch_metric_alarm" "questdb_console_proxy_errors" {
-  count               = var.enable_questdb_console ? 1 : 0
-  alarm_name          = "tv-${var.environment}-questdb-console-proxy-errors"
-  comparison_operator = "GreaterThanThreshold"
-  evaluation_periods  = 1
-  metric_name         = "Errors"
-  namespace           = "AWS/Lambda"
-  period              = 300
-  statistic           = "Sum"
-  threshold           = 0
-  alarm_description   = "questdb-console PROXY Lambda erroring — the console may be failing. The front half has its own alarm; this one covers the half that actually reaches QuestDB."
-  dimensions          = { FunctionName = aws_lambda_function.questdb_console_proxy[0].function_name }
-  treat_missing_data  = "notBreaching"
-}
+# alarm "questdb_console_proxy_errors" REMOVED 2026-11-11 (operator Quote 53, alarm review
+# docs/audits/2026-11-alarm-review.md). The comments above are kept as history.

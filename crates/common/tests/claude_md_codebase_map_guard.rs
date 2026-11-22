@@ -281,3 +281,98 @@ fn archive_quiesce_and_snapshot_gate_rows_name_what_the_code_does() {
          registered the archiver refuses at once (ArchiveQuiesce::hold_writers)"
     );
 }
+
+/// Byte offsets in `text` where a dollar amount was eaten by shell expansion.
+///
+/// A double-quoted shell string turns `$0.05` into the shell's own name (or
+/// `-e` when run through `bash -c`), so the text reads `-e.05`. This finds a
+/// `-e.` that starts a word and is followed by a digit. Prose and command
+/// lines in CLAUDE.md never write a real `-e.5`; only the mangle does.
+fn shell_mangled_amounts(text: &str) -> Vec<usize> {
+    let bytes = text.as_bytes();
+    let mut hits = Vec::new();
+    let mut from = 0;
+    while let Some(rel) = text[from..].find("-e.") {
+        let at = from.saturating_add(rel);
+        let starts_word = at == 0 || matches!(bytes[at - 1], b' ' | b'(' | b'\t');
+        let digit_after = bytes
+            .get(at.saturating_add(3))
+            .is_some_and(u8::is_ascii_digit);
+        if starts_word && digit_after {
+            hits.push(at);
+        }
+        from = at.saturating_add(3);
+    }
+    hits
+}
+
+/// B3 review, 2026-11-13: the `hot_path_telemetry` row's cost note was
+/// written through a double-quoted shell string and read `(Assumed under
+/// -e.05 a month)`, so nobody could tell the price of the new stage. This
+/// fails on any such mangle anywhere in CLAUDE.md.
+#[test]
+fn claude_md_carries_no_shell_mangled_dollar_amount() {
+    let root = repo_root();
+    let claude_md = std::fs::read_to_string(root.join("CLAUDE.md"))
+        .unwrap_or_else(|e| panic!("cannot read CLAUDE.md: {e}"));
+    let hits = shell_mangled_amounts(&claude_md);
+    let lines: Vec<usize> = hits
+        .iter()
+        .map(|&at| claude_md[..at].matches('\n').count().saturating_add(1))
+        .collect();
+    assert!(
+        hits.is_empty(),
+        "CLAUDE.md lines {lines:?} carry a dollar amount eaten by shell \
+         expansion (`-e.<digits>`). Rewrite it as `$<amount>` with an editor \
+         or a single-quoted heredoc, never a double-quoted shell string."
+    );
+
+    let telemetry_row =
+        table_row_starting_with(&claude_md, "| `crates/storage/src/hot_path_telemetry.rs::");
+    assert!(
+        telemetry_row.contains("(Assumed under $0.05 a month)"),
+        "the hot_path_telemetry row must state the drain_frame_post cost as \
+         `(Assumed under $0.05 a month)`"
+    );
+}
+
+/// 2026-11-14 review: the Quote 60 cost note in `aws-budget.md` (auto-loaded
+/// every session) read "about -e.05 to -e.15 a trading day" for the one
+/// Assumed number the owner is told to measure. CLAUDE.md alone was scanned;
+/// this scans every auto-loaded project rule file too.
+#[test]
+fn rule_files_carry_no_shell_mangled_dollar_amount() {
+    let dir = repo_root().join(".claude/rules/project");
+    let mut bad = Vec::new();
+    let entries =
+        std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("cannot list {}: {e}", dir.display()));
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("md") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        for at in shell_mangled_amounts(&text) {
+            let line = text[..at].matches('\n').count().saturating_add(1);
+            bad.push(format!("{}:{line}", path.display()));
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "dollar amounts eaten by shell expansion (`-e.<digits>`): {bad:?}. Rewrite \
+         each as `$<amount>` with an editor or a single-quoted heredoc."
+    );
+}
+
+#[test]
+fn shell_mangle_scanner_finds_the_planted_case_and_skips_real_flags() {
+    assert_eq!(
+        shell_mangled_amounts("(Assumed under -e.05 a month)").len(),
+        1
+    );
+    assert_eq!(shell_mangled_amounts("costs -e.5 now").len(), 1);
+    assert!(shell_mangled_amounts("run grep -e.foo here").is_empty());
+    assert!(shell_mangled_amounts("under $0.05 a month").is_empty());
+    assert!(shell_mangled_amounts("tile-e.5").is_empty());
+}

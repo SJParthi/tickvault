@@ -57,13 +57,12 @@ migration (#O1/#O2/#O3) — the 2026-07-06 zero-page incident is why this list
 now exists (`deploy/aws/terraform/error-code-alarms.tf`).
 
 Filtered+alarmed codes (each = one `error_code_alerts` map entry):
-**WS-GAP-03/universe-collapse (added 2026-08-22** — the universe-collapse arm ONLY, matched by a three-condition pattern including `$.source = "fell_back_to_indices"`; the bare code has ~50 connection-state emit sites and filtering on it alone would page on ordinary reconnect churn. Closes the gap where a fall back from ~24,600 instruments to 4 reported nothing: the 4 indices keep ticking, so the no-ticks alarm stays green. See `dhan-rest-only-noise-lock-2026-07-14.md` §2.3d**), DH-901, DH-906 (term-match tripwire — no coded emit site
-exists yet), AUTH-GAP-04 (the Groww stall-storm entry left this list
+**WS-GAP-03/universe-collapse (added 2026-08-22** — the universe-collapse arm ONLY, matched by a three-condition pattern including `$.source = "fell_back_to_indices"`; the bare code has ~50 connection-state emit sites and filtering on it alone would page on ordinary reconnect churn. Closes the gap where a fall back from ~24,600 instruments to 4 reported nothing: the 4 indices keep ticking, so the no-ticks alarm stays green. See `dhan-rest-only-noise-lock-2026-07-14.md` §2.3d**), DH-901, the order-error tripwire [REMOVED 2026-11-11 by the operator Quote 53 alarm review, `docs/audits/2026-11-alarm-review.md`; its code is named here no longer so this list stays the paging list], AUTH-GAP-04 (the Groww stall-storm entry left this list
 2026-07-15 — its only ERROR-level emit site, the deleted sidecar stall
 watchdog, died with the Groww live feed; see "Retired paging entries" below),
 (the WAL re-injection-abort entry left this list 2026-07-17 — its only
 emit site, the un-consumed `wal_reinject.rs` helper, was deleted in the
-dead live-WS sweep stage 1; see "Retired paging entries" below), PROC-01, **RESOURCE-02 (added 2026-09-02** — the process's own resident-memory early warning, the one signal meant to fire BEFORE the OOM killer; it was log-sink-only and, with no memory directive on the systemd unit, its 80% line was measured against MemTotal (~31 GiB) and was unreachable. Paired with the same-day `MemoryHigh=15G` throttle + `OOMScoreAdjust=-900` on the unit; plain coded filter, `ok_recovery = true` because the monitor re-emits while RSS stays over the line. Dated row: `dhan-rest-only-noise-lock-2026-07-14.md` §2.3p**),
+dead live-WS sweep stage 1; see "Retired paging entries" below), PROC-01, **the resident-memory early-warning entry [REMOVED 2026-11-11 by the operator Quote 53 alarm review, `docs/audits/2026-11-alarm-review.md`; its code is named here no longer so this list stays the paging list] (added 2026-09-02** — the process's own resident-memory early warning, the one signal meant to fire BEFORE the OOM killer; it was log-sink-only and, with no memory directive on the systemd unit, its 80% line was measured against MemTotal (~31 GiB) and was unreachable. Paired with the same-day `MemoryHigh=15G` throttle + `OOMScoreAdjust=-900` on the unit; plain coded filter, `ok_recovery = true` because the monitor re-emits while RSS stays over the line. Dated row: `dhan-rest-only-noise-lock-2026-07-14.md` §2.3p**),
 **AGGREGATOR-DROP-01 (added 2026-07-09** — the
 audit found the Severity::Critical sealed-candle-drop code, the ONLY
 silent-data-loss path for sealed candles, paged nobody; it also gains a
@@ -71,7 +70,7 @@ redundant counter-side pager on `tv_seal_writer_drain_total{kind="dropped"}`
 — `tv-<env>-seal-writer-dropped`, `seal-drop-alarm.tf`, with the dropped
 series pre-registered at 0 post-recorder-install in main.rs per the
 feed-stall round-5 first-sample-baseline lesson; lockstep ratchet
-`crates/app/tests/seal_drop_paging_wiring_guard.rs`**)**, **WAL-SUSPEND-01
+`crates/app/tests/seal_drop_paging_wiring_guard.rs`**)**, **the WAL-suspension log entry [REMOVED 2026-11-11 by the operator Quote 53 alarm review, `docs/audits/2026-11-alarm-review.md`; its code is named here no longer so this list stays the paging list]
 (added 2026-07-10, W2 PR#6** — audit follow-up row 10: a WAL-suspended
 QuestDB table (post disk-full / apply error) keeps ACKing ILP rows while
 they silently stop becoming visible/applied, previously with ZERO signal;
@@ -143,7 +142,7 @@ the alarm review under operator Quote 37, noise-lock §2.14 and
 `docs/audits/2026-10-alarm-review.md`: the swap runs only on depth sockets,
 which are switched off since 2026-10-21, so the filter could not match; its
 code is named here no longer so this list stays the paging list).
-and **SCOREBOARD-01 (added 2026-09-02** — authority
+and **the daily-rollup entry [REMOVED 2026-11-11 by the operator Quote 53 alarm review, `docs/audits/2026-11-alarm-review.md`; its code is named here no longer so this list stays the paging list] (added 2026-09-02** — authority
 `dhan-rest-only-noise-lock-2026-07-14.md` §2.3q, operator reaffirmation that
 day. A daily rollup that fails to write loses the WHOLE per-connection day
 summary — the table you read to answer "which connection misbehaved
@@ -176,7 +175,17 @@ authority `dhan-rest-only-noise-lock-2026-07-14.md` §2.8: in session, a tokio
 runtime or the frame drain made no progress for 2 s, or one hot-path step
 took 2 s; written by the telemetry thread, edge-triggered per signal, at most
 one line a minute. `ok_recovery = false`: a stall that ended is not a
-repair**)**.
+repair**)**, and **CLOCK-SKEW-01 (added 2026-11-12** — owner-approved,
+authority `dhan-rest-only-noise-lock-2026-07-14.md` §2.22, Quote 57: chrony's
+clock offset over 1 ms for 5 consecutive minute samples inside 09:00–15:40 IST;
+written by the clock-skew poller, once per episode; a failed sample is a `warn!`
+with this code and does not match the filter. `ok_recovery = false`: the rule
+forbids a recovery page**)**, and **DHAN-FEED-TIME-01 (added 2026-11-21** —
+owner cards 2026-11-20, authority `dhan-rest-only-noise-lock-2026-07-14.md`
+§2.24: the live feed's trade times still look wrong after the Dhan trade-time
+correction, or no candle for 10 minutes while prices arrive, inside the
+session; at most once per cause per IST day, latch saved off the drain, the day
+auto-held. `ok_recovery = false`: the rule forbids a recovery page**)**.
 **Everything else
 is log-sink-only** unless it has its own metric alarm (app-alarms.tf) or a
 typed `NotificationEvent`. Counter-side (non-errcode) pager added
@@ -540,7 +549,7 @@ summary file and drives the above flow.
       `chaos_ws_frame_spill_saturation.rs` (Phase 11.2 backpressure sim),
       `chaos_valkey_kill.rs` (Phase 11.3 Valkey kill-test). The CloudWatch
       alarm equivalents land alongside the prod CloudWatch migration.
-- [x] **Phase 12.1** — ratcheted per-crate line-coverage floors (72.6–99.4, target 100%; floors only move up) set in
+- [x] **Phase 12.1** — ratcheted per-crate line-coverage floors (86.4–99.4 on the test-inclusive gate figure since 2026-11-13, plus production-only `[production]` floors; target 100%; floors only move up) set in
       `quality/crate-coverage-thresholds.toml`, enforced by
       `scripts/coverage-gate.sh` in CI
 - [x] **Phase 12.5** — O(1) hot-path ratchet: DHAT zero-alloc tests +

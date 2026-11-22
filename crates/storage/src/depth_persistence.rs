@@ -578,10 +578,10 @@ pub fn market_depth_book_ensure_statements() -> Vec<String> {
 /// One row of QuestDB's `table_columns(..)` answer: what the boot needs to
 /// know about a column before it asks for the `market_depth_book` DEDUP key.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct TableColumn {
-    name: String,
-    ty: String,
-    designated: bool,
+pub(crate) struct TableColumn {
+    pub(crate) name: String,
+    pub(crate) ty: String,
+    pub(crate) designated: bool,
 }
 
 /// Why an existing `market_depth_book` cannot take its DEDUP key (live audit
@@ -991,7 +991,7 @@ async fn self_heal_empty_market_depth_book(
 /// column NAME (`column`, `type`, `designated`), so an added or reordered
 /// result column does not break it. `None` for anything it cannot read (an
 /// error body, a missing column): the check then refuses nothing.
-fn parse_table_columns_answer(body: &str) -> Option<Vec<TableColumn>> {
+pub(crate) fn parse_table_columns_answer(body: &str) -> Option<Vec<TableColumn>> {
     let answer: serde_json::Value = serde_json::from_str(body).ok()?;
     let header = answer.get("columns")?.as_array()?;
     let index_of = |wanted: &str| {
@@ -1262,6 +1262,70 @@ pub struct DepthBookRow<'a> {
     pub ts_nanos: i64,
 }
 
+/// Both sides of one packet's book, for [`DepthWriter::append_book_pair`]
+/// (speed fix 5, 2026-11-17): the identity columns once, then the bid and
+/// the ask slices. It stands for the two [`DepthBookRow`]s (bid first) that
+/// share every identity column.
+#[derive(Debug, Clone, Copy)]
+pub struct DepthBookPair<'a> {
+    /// Dhan SecurityId.
+    pub security_id: i64,
+    /// Exchange segment wire label.
+    pub segment: &'static str,
+    /// `d5`, `d20` or `d200`.
+    pub depth_kind: &'static str,
+    /// Bid level prices, best first.
+    pub bid_prices: &'a [f64],
+    /// Bid level quantities, same order.
+    pub bid_quantities: &'a [f64],
+    /// Orders resting at each bid level, same order.
+    pub bid_orders: &'a [f64],
+    /// Ask level prices, best first.
+    pub ask_prices: &'a [f64],
+    /// Ask level quantities, same order.
+    pub ask_quantities: &'a [f64],
+    /// Orders resting at each ask level, same order.
+    pub ask_orders: &'a [f64],
+    /// Intra-second tiebreaker; see the module docs.
+    pub capture_seq: i64,
+    /// Designated timestamp — arrival time in IST, as `market_depth`.
+    pub ts_nanos: i64,
+}
+
+impl<'a> DepthBookPair<'a> {
+    /// The single row of one side (`DEPTH_SIDE_BID` or anything else for
+    /// the ask). O(1), borrows only.
+    fn side(&self, side: &'static str) -> DepthBookRow<'a> {
+        let (prices, quantities, orders) = if side == DEPTH_SIDE_BID {
+            (self.bid_prices, self.bid_quantities, self.bid_orders)
+        } else {
+            (self.ask_prices, self.ask_quantities, self.ask_orders)
+        };
+        DepthBookRow {
+            security_id: self.security_id,
+            segment: self.segment,
+            depth_kind: self.depth_kind,
+            side,
+            prices,
+            quantities,
+            orders,
+            capture_seq: self.capture_seq,
+            ts_nanos: self.ts_nanos,
+        }
+    }
+}
+
+// `append_book_pair` reuses the bid line's length for an ask line with the
+// same level count: the side label is the only text that differs.
+const _: () = assert!(DEPTH_SIDE_BID.len() == DEPTH_SIDE_ASK.len());
+
+/// Whether a book row's three slices are equal in length and at most
+/// [`MAX_DEPTH_BOOK_LEVELS`]: the shape `append_book_row` accepts. O(1).
+fn book_row_shape_is_valid(row: &DepthBookRow<'_>) -> bool {
+    let levels = row.prices.len();
+    levels <= MAX_DEPTH_BOOK_LEVELS && row.quantities.len() == levels && row.orders.len() == levels
+}
+
 /// The framed-spill record version for a buffer's protocol.
 ///
 /// A v2 buffer is binary and holds `\n` bytes inside its doubles and arrays,
@@ -1405,6 +1469,12 @@ async fn run_depth_ddl(questdb_config: &QuestDbConfig, table: &str, statements: 
         }
     };
     let mut every_statement_accepted = true;
+    // B1 review: the gates need only the key-bearing statements (see
+    // `ilp_table_gate::ddl_is_key_bearing`); the table is marked keyed below
+    // when those were all accepted, whatever the column self-heals answered.
+    let mut key_statements_accepted = true;
+    // B1 review 2: a key statement QuestDB answered with a refusal.
+    let mut key_refused_by_server = false;
     for ddl in statements {
         match client
             .get(&base_url)
@@ -1429,6 +1499,8 @@ async fn run_depth_ddl(questdb_config: &QuestDbConfig, table: &str, statements: 
                      missing, which makes the two depth pools overwrite each other"
                 );
                 every_statement_accepted = false;
+                key_statements_accepted &= !crate::ilp_table_gate::ddl_is_key_bearing(ddl);
+                key_refused_by_server |= crate::ilp_table_gate::ddl_is_key_bearing(ddl);
             }
             Err(err) => {
                 metrics::counter!("tv_depth_persist_errors_total", "stage" => "ensure_ddl")
@@ -1442,8 +1514,23 @@ async fn run_depth_ddl(questdb_config: &QuestDbConfig, table: &str, statements: 
                     "depth table DDL request failed"
                 );
                 every_statement_accepted = false;
+                key_statements_accepted &= !crate::ilp_table_gate::ddl_is_key_bearing(ddl);
             }
         }
+    }
+    if key_statements_accepted
+        && let Some(gated) = crate::ilp_table_gate::GatedTable::from_measurement(table.as_bytes())
+    {
+        crate::ilp_table_gate::mark_table_keyed(gated);
+    }
+    // B1 review 2: name a `market_depth` QuestDB created itself (it can never
+    // be keyed). `market_depth_book` has its own shape probe (PR DP-5).
+    if !key_statements_accepted && key_refused_by_server && table == MARKET_DEPTH_TABLE {
+        crate::ilp_table_gate::diagnose_refused_key(
+            questdb_config,
+            crate::ilp_table_gate::GatedTable::MarketDepth,
+        )
+        .await;
     }
     every_statement_accepted
 }
@@ -2120,6 +2207,16 @@ pub struct DepthWriter {
     /// PF-4b: the return lane's sender, kept so the rescue split can hand a
     /// clone to the rescue thread.
     spare_staged_tx: Option<std::sync::mpsc::SyncSender<crate::depth_stage::DepthStagedBatch>>,
+    /// PR AA-G (finding 17 review, 2026-11-11): the archive quiesce lock the
+    /// SYNCHRONOUS arm of [`Self::stage_pin_after_cut`] holds around its
+    /// commit. `None` everywhere but the after-close depth pass, whose
+    /// commits land in old depth hours an archiver may be copying and
+    /// dropping; set by [`Self::hold_archive_quiesce_on_pin_cut`].
+    pin_cut_quiesce: Option<&'static crate::archive_quiesce::ArchiveQuiesce>,
+    /// B1 (2026-11-13): whether a batch may be posted now, given its table.
+    /// Always [`crate::ilp_table_gate::live_tables_writable`] outside this
+    /// module's tests. One call per flush, never per row.
+    table_gate: fn(&[crate::ilp_table_gate::GatedTable]) -> bool,
 }
 
 /// A unique temp spill directory, so a test writer never touches
@@ -2324,6 +2421,8 @@ impl DepthWriter {
                     book_label: None,
                     spare_staged: None,
                     spare_staged_tx: None,
+                    pin_cut_quiesce: None,
+                    table_gate: crate::ilp_table_gate::live_tables_writable,
                 }
             }
             Err(err) => {
@@ -2360,6 +2459,8 @@ impl DepthWriter {
                     book_label: None,
                     spare_staged: None,
                     spare_staged_tx: None,
+                    pin_cut_quiesce: None,
+                    table_gate: crate::ilp_table_gate::live_tables_writable,
                 }
             }
         }
@@ -2402,7 +2503,39 @@ impl DepthWriter {
             book_label: None,
             spare_staged: None,
             spare_staged_tx: None,
+            pin_cut_quiesce: None,
+            table_gate: crate::ilp_table_gate::live_tables_writable,
         }
+    }
+
+    /// The gated table this writer's layout posts into (B1). O(1).
+    #[must_use]
+    pub const fn gated_tables(&self) -> &'static [crate::ilp_table_gate::GatedTable] {
+        match self.layout {
+            DepthLayout::Levels => &[crate::ilp_table_gate::GatedTable::MarketDepth],
+            DepthLayout::Book => &[crate::ilp_table_gate::GatedTable::MarketDepthBook],
+        }
+    }
+
+    /// Whether this writer may post now: its table is keyed in this process,
+    /// or the live gate was never armed (B1). One call per flush on the live
+    /// path; the after-close pass also reads it once a round, so a shut gate
+    /// carries its buckets instead of spilling the same rows every round (B1
+    /// review). O(1).
+    #[must_use]
+    pub fn table_keyed(&self) -> bool {
+        (self.table_gate)(self.gated_tables())
+    }
+
+    /// Test-only: replaces the live table gate (B1).
+    #[cfg(test)]
+    #[must_use]
+    fn with_table_gate_for_test(
+        mut self,
+        gate: fn(&[crate::ilp_table_gate::GatedTable]) -> bool,
+    ) -> Self {
+        self.table_gate = gate;
+        self
     }
 
     /// Test constructor for an array-row writer: disconnected, its buffer
@@ -2456,6 +2589,27 @@ impl DepthWriter {
     fn with_wal_defer_check_for_test(mut self, check: fn(u64, u64, bool) -> bool) -> Self {
         self.wal_defer_check = check;
         self
+    }
+
+    /// PR AA-G (finding 17 review, 2026-11-11): makes the synchronous commit
+    /// a pin cut makes inside [`Self::append_book_row`] hold the shared side
+    /// of the PROCESS archive quiesce lock, the same lock the after-close
+    /// depth pass holds around each of its flushes. Only that pass calls this
+    /// (its writer is synchronous and its rows go into old depth hours); a
+    /// live or offloaded writer never does. The lock is taken with
+    /// `blocking_read`, so the writer must run on a plain OS thread. O(1).
+    pub fn hold_archive_quiesce_on_pin_cut(&mut self) {
+        self.pin_cut_quiesce = Some(crate::archive_quiesce::process_archive_quiesce());
+    }
+
+    /// [`Self::hold_archive_quiesce_on_pin_cut`] with a private lock, so a
+    /// test can hold its exclusive side without stalling every other test.
+    #[cfg(test)]
+    fn hold_archive_quiesce_on_pin_cut_with(
+        &mut self,
+        quiesce: &'static crate::archive_quiesce::ArchiveQuiesce,
+    ) {
+        self.pin_cut_quiesce = Some(quiesce);
     }
 
     /// Rows appended but not yet flushed.
@@ -2704,26 +2858,67 @@ impl DepthWriter {
         // name is resolved once per instrument run exactly as before, but the
         // cache records the name TABLE (as a pin in the batch) instead of the
         // name, so the encoder later reads the same name the old line held.
-        let hit = matches!(
-            &self.book_label,
-            Some((id, seg, _, _)) if *id == row.security_id && *seg == row.segment
-        );
-        if !hit {
-            let labels = crate::candle_contract_labels::candle_contract_labels();
-            let name_len = labels
-                .get(&(row.security_id, row.segment))
-                .map(|n| crate::depth_stage::escaped_symbol_len(n));
-            let pin = match self.staged.try_pin(labels) {
-                Ok(pin) => pin,
-                Err(labels) => self.stage_pin_after_cut(labels),
-            };
-            self.book_label = Some((row.security_id, row.segment, pin, name_len));
-        }
-        let (pin, name_len) = match &self.book_label {
-            Some((_, _, pin, name_len)) => (*pin, *name_len),
-            None => (0, None),
-        };
+        let (pin, name_len) = self.resolve_book_label(row.security_id, row.segment);
         let text_len = crate::depth_stage::book_line_len(self.feed, row, levels, name_len);
+        self.stage_book_side(row, pin, text_len);
+        self.note_pending_seq(row.capture_seq);
+        Ok(())
+    }
+
+    /// The run's `(pin, name length)` for `(security_id, segment)`: the
+    /// cached run on a hit (two compares), else the name resolved once.
+    ///
+    /// Speed fix 5 (2026-11-17): on a miss the table load is skipped while
+    /// no name table was published since the batch's last pin was loaded
+    /// (one acquire load and one compare,
+    /// `DepthStagedBatch::current_pin_at_generation`): the name is read from
+    /// that pinned table, which is the table a fresh load would return, so
+    /// the pin, the name and every byte are unchanged. O(1) plus one hash
+    /// probe and one name scan on a miss.
+    #[inline]
+    fn resolve_book_label(
+        &mut self,
+        security_id: i64,
+        segment: &'static str,
+    ) -> (u8, Option<usize>) {
+        if let Some((id, seg, pin, name_len)) = &self.book_label
+            && *id == security_id
+            && *seg == segment
+        {
+            return (*pin, *name_len);
+        }
+        let generation = crate::candle_contract_labels::candle_contract_labels_generation();
+        let (pin, name_len) = match self.staged.current_pin_at_generation(generation) {
+            Some(pin) => {
+                let name_len = self
+                    .staged
+                    .labels(pin)
+                    .get(&(security_id, segment))
+                    .map(|n| crate::depth_stage::escaped_symbol_len(n));
+                (pin, name_len)
+            }
+            None => {
+                // Read the generation BEFORE the load: a publish bumps to odd,
+                // stores, then bumps to even, so the loaded table is at least
+                // that generation's, and an odd one is never kept (`try_pin_at_generation`).
+                let labels = crate::candle_contract_labels::candle_contract_labels();
+                let name_len = labels
+                    .get(&(security_id, segment))
+                    .map(|n| crate::depth_stage::escaped_symbol_len(n));
+                let pin = match self.staged.try_pin_at_generation(labels, generation) {
+                    Ok(pin) => pin,
+                    Err(labels) => self.stage_pin_after_cut(labels),
+                };
+                (pin, name_len)
+            }
+        };
+        self.book_label = Some((security_id, segment, pin, name_len));
+        (pin, name_len)
+    }
+
+    /// Stages one checked side and counts it in `pending`. O(levels).
+    #[inline]
+    fn stage_book_side(&mut self, row: &DepthBookRow<'_>, pin: u8, text_len: usize) {
         if self.staged.push(row, pin, text_len) {
             // Past the pre-size: one reallocation on the drain, counted.
             self.flush_counters.stage_grow.increment(1);
@@ -2732,9 +2927,55 @@ impl DepthWriter {
         // flush, rescue and loss counter reads the same whichever table is
         // written. A side with no levels still counts one, so a buffered row
         // is never invisible to `pending`.
-        self.pending = self.pending.saturating_add(levels.max(1));
-        self.note_pending_seq(row.capture_seq);
-        Ok(())
+        self.pending = self.pending.saturating_add(row.prices.len().max(1));
+    }
+
+    /// Appends BOTH sides of one packet's book (speed fix 5, 2026-11-17):
+    /// what [`Self::append_book_row`] does for the bid row and then for the
+    /// ask row, with the work the two rows share done once (the window gate,
+    /// the layout check, the run's name lookup, the line length when both
+    /// sides carry the same number of levels, the pending range).
+    ///
+    /// Same rows in the same order, same bytes, same refusals and counts as
+    /// the two single appends; a pair the shared path cannot take whole (a
+    /// level writer, a malformed side) goes through the two single appends.
+    /// Returns the bid result, then the ask result. O(levels), no
+    /// allocation.
+    pub fn append_book_pair(&mut self, pair: &DepthBookPair<'_>) -> (Result<()>, Result<()>) {
+        let bid = pair.side(DEPTH_SIDE_BID);
+        let ask = pair.side(DEPTH_SIDE_ASK);
+        let bid_levels = bid.prices.len();
+        let ask_levels = ask.prices.len();
+        if self.layout != DepthLayout::Book
+            || !book_row_shape_is_valid(&bid)
+            || !book_row_shape_is_valid(&ask)
+        {
+            // Cold: the single appends refuse, count and mark exactly as
+            // they always have.
+            return (self.append_book_row(&bid), self.append_book_row(&ask));
+        }
+        if let Some(reason) = depth_arrival_window_refusal(pair.ts_nanos) {
+            // Counted per LEVEL per side, as two single appends count.
+            for levels in [bid_levels, ask_levels] {
+                let levels = u64::try_from(levels).unwrap_or(u64::MAX);
+                self.out_of_window.note_n(reason, levels.max(1));
+            }
+            return (Ok(()), Ok(()));
+        }
+        let (pin, name_len) = self.resolve_book_label(pair.security_id, pair.segment);
+        let bid_len = crate::depth_stage::book_line_len(self.feed, &bid, bid_levels, name_len);
+        // The side label is the only per-side text and both labels have the
+        // same length (asserted at compile time), so equal level counts give
+        // equal line lengths.
+        let ask_len = if ask_levels == bid_levels {
+            bid_len
+        } else {
+            crate::depth_stage::book_line_len(self.feed, &ask, ask_levels, name_len)
+        };
+        self.stage_book_side(&bid, pin, bid_len);
+        self.stage_book_side(&ask, pin, ask_len);
+        self.note_pending_seq(pair.capture_seq);
+        (Ok(()), Ok(()))
     }
 
     /// A ninth contract-name table arrived inside one staged batch (PF-4b,
@@ -2765,6 +3006,16 @@ impl DepthWriter {
             }
         } else {
             // The synchronous arm: sends, or rescues the rows on failure.
+            // PR AA-G (finding 17 review, 2026-11-11): this commit is made
+            // INSIDE an append, so the after-close pass's per-flush lock does
+            // not cover it; the pass's writer holds the archive quiesce lock
+            // here itself, so no commit of the pass lands while an archiver
+            // copies and drops an old depth hour. The guard borrows a
+            // `'static` lock, not `self`. Never nested: the pass appends
+            // outside its own flush lock.
+            let _quiesce = self
+                .pin_cut_quiesce
+                .map(crate::archive_quiesce::ArchiveQuiesce::shared_blocking);
             let _sent_or_rescued = self.flush().is_ok();
         }
         self.pending_unbacked |= unbacked;
@@ -3004,7 +3255,14 @@ impl DepthWriter {
         {
             self.staged = spare;
         }
-        self.staged.reserve_presize();
+        // 2026-11-16: count the fresh reserve (no spare, or a smaller one).
+        if self.staged.reserve_presize() {
+            self.flush_counters.stage_presize_fresh.increment(1);
+            self.flush_counters.stage_presize_fresh_count = self
+                .flush_counters
+                .stage_presize_fresh_count
+                .saturating_add(1);
+        }
     }
 
     /// PF-4b: the name table the running instrument's cached name came
@@ -3310,6 +3568,8 @@ impl DepthWriter {
             staged_return: Some(staged_tx.clone()), // APPROVED: channel sender cloned once per process at the offload split
             scratch: Buffer::new(DepthLayout::Book.protocol()),
             counters: DepthSinkCounters::new(self.feed),
+            table_gate: self.table_gate,
+            gate_tables: self.gated_tables(),
         };
         self.offload = Some(tx);
         self.spare_buffers = Some(spare_rx);
@@ -3715,6 +3975,13 @@ impl DepthWriter {
                 self.buffer.clear();
                 return Ok(());
             }
+        }
+        // B1 (2026-11-13): never post into a table this process has not
+        // keyed; the rows take the rescue (WAL deferral or the spill).
+        if self.sender.is_some() && !self.table_keyed() {
+            crate::ilp_table_gate::note_live_batch_held("market_depth");
+            let dropped = self.discard_pending();
+            anyhow::bail!("market_depth: table not keyed yet; {dropped} row(s) rescued");
         }
         let Some(sender) = self.sender.as_mut() else {
             let rescued_before = self.rescued;
@@ -4461,6 +4728,10 @@ pub struct DepthWriterSink {
     scratch: Buffer,
     /// Rescue-arm counter handles, resolved once at the split (item 44g).
     counters: DepthSinkCounters,
+    /// The producer's live table gate and its layout's table, copied at the
+    /// split (B1).
+    table_gate: fn(&[crate::ilp_table_gate::GatedTable]) -> bool,
+    gate_tables: &'static [crate::ilp_table_gate::GatedTable],
 }
 
 /// Flush-path counter handles for the depth PRODUCER half, resolved once per
@@ -4494,6 +4765,14 @@ struct DepthFlushCounters {
     stage_grow: metrics::Counter,
     /// PF-4b: a ninth name table cut a staged batch early (local only).
     stage_pin_cut: metrics::Counter,
+    /// Hand-offs that found no staged spare waiting (or a smaller one) and
+    /// reserved and touched a fresh pre-sized batch on the drain
+    /// (2026-11-16, `tv_depth_stage_presize_fresh_total`, local `/metrics`
+    /// only). One relaxed add on that branch only.
+    stage_presize_fresh: metrics::Counter,
+    /// The same count kept on the writer, so a test can read it without a
+    /// recorder.
+    stage_presize_fresh_count: u64,
 }
 
 impl DepthFlushCounters {
@@ -4524,6 +4803,13 @@ impl DepthFlushCounters {
             rows_dropped: metrics::counter!("tv_depth_rows_dropped_total", "feed" => feed),
             stage_grow: metrics::counter!("tv_depth_stage_grow_total", "feed" => feed),
             stage_pin_cut: metrics::counter!("tv_depth_stage_pin_cut_total", "feed" => feed),
+            // 2026-11-16: registered at 0 when the writer is built (boot).
+            stage_presize_fresh: {
+                let c = metrics::counter!("tv_depth_stage_presize_fresh_total", "feed" => feed);
+                c.increment(0);
+                c
+            },
+            stage_presize_fresh_count: 0,
         }
     }
 }
@@ -4678,6 +4964,13 @@ impl DepthWriterSink {
 
     fn write_inner(&mut self, batch: &mut DepthFlushBatch) -> usize {
         if batch.rows == 0 {
+            return 0;
+        }
+        // B1 (2026-11-13): never post into a table this process has not keyed
+        // (QuestDB would create it in a shape that can never take the key).
+        if self.sender.is_some() && !(self.table_gate)(self.gate_tables) {
+            crate::ilp_table_gate::note_live_batch_held("market_depth");
+            self.rescue(batch, "table not keyed yet (boot DDL refused)");
             return 0;
         }
         let Some(sender) = self.sender.as_mut() else {
@@ -6520,6 +6813,74 @@ mod tests {
             min_seq: 0,
             max_seq: 0,
             unbacked: false,
+        }
+    }
+
+    /// B1 review: `table_keyed` reads the gate for this writer's OWN table
+    /// (level rows: `market_depth`; book rows: `market_depth_book`).
+    #[test]
+    fn test_table_keyed_reads_the_gate_for_the_writers_own_table() {
+        let only_book: fn(&[crate::ilp_table_gate::GatedTable]) -> bool =
+            |t| t == [crate::ilp_table_gate::GatedTable::MarketDepthBook];
+        let levels = DepthWriter::for_test(Feed::Dhan).with_table_gate_for_test(only_book);
+        assert!(!levels.table_keyed());
+        let book = DepthWriter::for_test_book(Feed::Dhan).with_table_gate_for_test(only_book);
+        assert!(book.table_keyed());
+        let shut = DepthWriter::for_test_book(Feed::Dhan).with_table_gate_for_test(|_| false);
+        assert!(!shut.table_keyed());
+    }
+
+    /// Regression, B1 (2026-11-13): with `market_depth` not keyed, the live
+    /// depth writer thread must NOT post (QuestDB would create the table in a
+    /// shape that can never take the DEDUP key); the batch is rescued to the
+    /// spill. The open-gate half proves the server would have been reached.
+    #[test]
+    fn test_regression_depth_sink_never_posts_into_an_unkeyed_table() {
+        use std::io::{Read, Write};
+        for (gate_open, expect_hits) in [(false, 0_usize), (true, 1)] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            let port = listener.local_addr().expect("addr").port();
+            let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let seen = std::sync::Arc::clone(&hits);
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { continue };
+                    seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let mut buf = [0u8; 65_536];
+                    let _ = stream.read(&mut buf);
+                    let _ =
+                        stream.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n");
+                }
+            });
+            let cfg = QuestDbConfig {
+                host: "127.0.0.1".to_string(),
+                http_port: port,
+                pg_port: 1,
+                ilp_port: 1,
+            };
+            let gate: fn(&[crate::ilp_table_gate::GatedTable]) -> bool =
+                if gate_open { |_| true } else { |_| false };
+            let w = DepthWriter::new(&cfg, Feed::Dhan).with_table_gate_for_test(gate);
+            let (mut w, mut sink, rx) = w.split_for_offload();
+            let dir = temp_depth_spill_dir();
+            sink.spill_dir = dir.clone();
+            sink.spill_min_free_headroom = 0;
+            w.append_row(&row()).expect("append");
+            w.flush().expect("hand off");
+            let mut batch = rx.try_recv().expect("batch queued");
+            let landed = sink.write(&mut batch);
+            assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), expect_hits);
+            if gate_open {
+                assert_eq!(landed, 1, "an open gate posts");
+            } else {
+                assert_eq!(landed, 0, "a shut gate lands nothing");
+                let spilled = std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0);
+                assert!(
+                    spilled >= 1,
+                    "the rows are rescued to the spill, not dropped"
+                );
+            }
+            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 
@@ -8759,10 +9120,18 @@ mod tests {
                     .expect("lane has room");
             }
             let handed = w.staged.as_ptr_for_test();
+            let fresh_before = w.flush_counters.stage_presize_fresh_count;
             w.append_book_row(&book_row(&p[..5], &q[..5], &o[..5], 1))
                 .expect("append");
             w.flush().expect("hand off");
             let case = format!("spare {spare:?}");
+            // 2026-11-16: the fresh-reserve count moves only when no spare of
+            // the pre-size was waiting.
+            assert_eq!(
+                w.flush_counters.stage_presize_fresh_count - fresh_before,
+                u64::from(!kept),
+                "{case}: fresh reserve counted only without a pre-sized spare"
+            );
             assert!(w.staged.is_empty(), "{case}");
             assert_ne!(w.staged.as_ptr_for_test(), handed, "{case}: a new batch");
             let (rows, values) = w.staged.capacities_for_test();

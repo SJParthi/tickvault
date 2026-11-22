@@ -493,13 +493,13 @@ scan_prod_code 'DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL.*twohundreddepth' \
 # security_id ALONE silently drops one of the two — leading to missing
 # WebSocket subscriptions, wrong tick enrichment, and silent data loss.
 #
-# Every HashSet<u32> / HashSet<SecurityId> / HashMap<u32, _> / HashMap<SecurityId, _>
+# Every HashSet<u32|u64|SecurityId> / HashMap<u32|u64|SecurityId, _> (u64 = SecurityId)
 # in instrument-handling paths must either:
 #  (a) use the composite key (u32, ExchangeSegment) / (SecurityId, ExchangeSegment), OR
 #  (b) carry a `// APPROVED: single-segment context — <reason>` comment
 #      proving every value belongs to one known segment.
 #
-# Scope: paths where cross-segment instruments can appear.
+# Scope: paths where cross-segment instruments can appear (app + storage since 2026-11-15).
 scan_instrument_paths() {
   local pattern="$1"
   local description="$2"
@@ -507,7 +507,7 @@ scan_instrument_paths() {
   local instrument_files
 
   instrument_files=$(echo "$files" | grep -E \
-    '^crates/(common|core|trading)/src/(instrument|pipeline|websocket|greeks)/|^crates/common/src/instrument_registry\.rs$' \
+    '^crates/(common|core|trading)/src/(instrument|pipeline|websocket|greeks)/|^crates/common/src/instrument_registry\.rs$|^crates/(app|storage)/src/' \
     || true)
   if [ -z "$instrument_files" ]; then
     return
@@ -516,16 +516,16 @@ scan_instrument_paths() {
   scan_prod_code "$pattern" "$description" "$instrument_files"
 }
 
-# Ban single-key collections on u32 / SecurityId — the exact bug class from
+# Ban single-key collections on u32 / u64 / SecurityId — the exact bug class from
 # Parthiban's 2026-04-17 live finding (NIFTY IDX_I id=13 dropped).
-scan_instrument_paths 'HashSet<u32>' \
-  'I-P1-11: HashSet<u32> — use HashSet<(u32, ExchangeSegment)> or add // APPROVED: comment' \
+scan_instrument_paths 'HashSet<u[36][24]>' \
+  'I-P1-11: HashSet<u32/u64> — use HashSet<(id, ExchangeSegment)> or add // APPROVED: comment' \
   "$STAGED_FILES"
 scan_instrument_paths 'HashSet<SecurityId>' \
   'I-P1-11: HashSet<SecurityId> — use HashSet<(SecurityId, ExchangeSegment)> or add // APPROVED: comment' \
   "$STAGED_FILES"
-scan_instrument_paths 'HashMap<u32,' \
-  'I-P1-11: HashMap<u32, _> — use HashMap<(u32, ExchangeSegment), _> or add // APPROVED: comment' \
+scan_instrument_paths 'HashMap<u[36][24],' \
+  'I-P1-11: HashMap<u32/u64, _> — use HashMap<(id, ExchangeSegment), _> or add // APPROVED: comment' \
   "$STAGED_FILES"
 scan_instrument_paths 'HashMap<SecurityId,' \
   'I-P1-11: HashMap<SecurityId, _> — use HashMap<(SecurityId, ExchangeSegment), _> or add // APPROVED: comment' \

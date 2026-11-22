@@ -123,7 +123,13 @@ fn dashboard_charts_gauge() -> bool {
     // The quoted form is what CloudWatch actually renders; a prose mention in
     // a `#` comment is not a line on a chart. This mirrors the matching rule
     // in `dashboard_live_lane_visibility_guard`.
-    read("deploy/aws/terraform/dashboard.tf").contains(&format!("\"{GAUGE}\""))
+    //
+    // 2026-11-11: operator Quote 53 deleted the CloudWatch dashboard
+    // (`deploy/aws/terraform/dashboard.tf`). An absent file charts nothing;
+    // if a dashboard comes back under a fresh quote, this check applies to it
+    // again unchanged.
+    let path = repo_root().join("deploy/aws/terraform/dashboard.tf");
+    path.exists() && read("deploy/aws/terraform/dashboard.tf").contains(&format!("\"{GAUGE}\""))
 }
 
 /// The whole rule, as a pure function so every branch is testable without

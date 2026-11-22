@@ -1407,3 +1407,103 @@ first compacted the script to 34,627 bytes; the follow-up fix that stops a
 reply for an older filter from rendering under a newer one (a generation stamp
 on each reply) brings it to **34,696**, still under the 34,714 this section
 approved. No line, tag or handler change.
+
+## §0.19. 2026-11-11 — ONE-OFF workflow for the Quote 56 disk delete (owner-approved)
+
+**Operator words (verbatim, typos included):** "swhat i cnat or i wont do
+anythign dude i aske dyou makle it evrythign as entirleya utomated full
+yauotmed dude okay? is aid ful lauiyamtio ndude okay?" and "i aske dyou to
+dleete it dude okay? doe veyrhtign from your side dude okay?", then the
+decision card "One-off, these 4 only (Recommended)" (recorded as Quote 56 in
+`daily-universe-scope-expansion-2026-05-27.md`).
+
+**What is authorized:** one workflow, `.github/workflows/disk-delete-2026-11-11.yml`,
+dispatch-only, with TWO `run:` lines (build, then run; budget row in
+`crates/common/tests/shell_budget_guard.rs`), the build before any AWS credentials exist, then the Rust tool
+`tv-disk-delete-2026-11-11` (`crates/app/src/disk_delete_2026_11_11.rs`). All
+logic is in Rust: the four ids are constants, a volume is deleted only when it
+is `available` and unattached, `dry` proves the permission and deletes nothing,
+`apply` deletes then verifies, and the tool refuses after 2026-11-14 00:00 UTC.
+No SSM shell, no shell on the box.
+
+**Removal:** the workflow, its budget row, the tool and the role are deleted
+in the first PR after the run (or after 2026-11-14 IST, whichever comes first).
+This exception then ends.
+
+**REJECT:** reusing this exception for any other workflow or payload; raising
+the row's ceiling; adding a schedule or push trigger; any delete beyond the
+four Quote 56 ids; keeping the workflow after the run.
+
+**ENDED 2026-11-11.** The workflow ran twice that evening: `dry` (run 43068890684) and `apply` (run 43069827741), both OK; all four ids were deleted and verified gone. The workflow, its budget row, the Rust tool and the role are deleted in the follow-up PR, so this exception authorizes nothing further.
+
+## §0.20. 2026-11-17 — the operator portal remembers its key for 30 days (owner-approved)
+
+The owner, 2026-11-17 (verbatim, typos preserved): "why the fuck whenevr i
+click tickvault opertaor portal from tleegram why the fuck it si askign em the
+access key ... form telegram when we click the lin kit shdou len evr evr fuckigna
+sk em the key", then the card "Remember 30 days (Recommended)": "Paste once per
+device; Telegram links open straight in for 30 days, then it asks once again. A
+'Lock' button still forgets it at once. The key still never goes inside a link."
+
+Cause: since audit L4 (2026-10-04) the portal kept the key per TAB
+(`sessionStorage`), so every link opened from Telegram (a new tab) asked again,
+while the lock screen still said "saved on THIS device only". The page now
+keeps the key in this browser's `localStorage` under `tv_key` with an expiry
+30 days after it was pasted; an expired or unreadable record is removed; Lock
+removes it; a 401 (wrong or rotated key) locks. The server answers 503, not
+401, when it cannot read its own secret, so a read failure never makes the
+browser forget a correct key. The key never goes into a link or a message
+(audit PR36a, 2026-09-27, unchanged).
+
+Measured by the guard after implementation: this portal's JS_BYTE_BUDGET row
+moves **34,696 → 35,000 UTF-8 bytes** (+304). JavaScript lines stay within the
+unchanged 350-line ceiling; one script tag; inline handler occurrences
+unchanged at 21.
+
+Scope is this key-remembering change only. REJECT: putting the key in any link
+or message; remembering it longer than 30 days without a fresh dated quote;
+removing Lock; reading a `tv_token` copy an older build left; any other budget
+increase under this section.
+
+## §0.21. 2026-11-21 — one-off server step for the 2026-11-20 day repair (owner-approved)
+
+The owner, 2026-11-21, on a decision card in the session that built the
+repair. Asked: *"The 20 Nov repair has to run on the server, which needs one
+small one-off server command plus a button in GitHub (deleted after the run,
+as for the October rebuild). Approve that?"*, the owner tapped **"Approve,
+one-off (Recommended)"**, whose text read: *"One short server command that
+only starts the Rust repair program, and a GitHub button that runs: check,
+repair, verify. Both deleted after the run."* The repair itself is authorized
+by daily-universe Quote 63 (2026-11-20); this section covers only the shell it
+needs, in the shape of §0.13 and §0.14.
+
+What it allows, and only this:
+- A Rust runner `tv-day-repair-2026-11-20` sends ONE SSM element per mode
+  (`dry`, `apply`, `verify`), built from one literal in
+  `crates/app/src/day_repair_ssm.rs` of at most 6 lines, which fetches
+  `deploys/<sha>/tickvault` from the cold bucket and `exec`s its Rust
+  `day-repair <mode> <sha>` subcommand. The element's lines and bytes are
+  pinned in `crates/common/tests/shell_budget_guard.rs` when written.
+- A dispatch-only workflow `.github/workflows/day-repair-2026-11-20.yml` with
+  at most 2 `run:` lines (build, then run), no schedule and no push trigger.
+- No new role: the box and workflow use their existing permissions; nothing
+  gains an S3 delete.
+- Refused 08:00–16:30 IST on a trading day, while a deploy run is queued or
+  running, and after 2026-11-30 IST.
+- The runner, the element, the workflow and their guard rows are deleted by
+  the first PR after a passed verify (`RETIRED_ONE_OFF_PATHS`), then §0.21 is
+  ENDED.
+
+REJECT: reusing the element or the workflow for anything else; adding shell
+beyond the one literal; raising its line or byte ceiling; a schedule or push
+trigger; any S3 delete; running before the code has merged with All Green;
+keeping any of it after the run.
+
+**ENDED 2026-11-22.** The repair ran on commit 2c975d5 (merged with All
+Green as #2281): `dry` (run 45004379797), `apply` (run 45004826979) and
+`verify` (run 45007320978), all OK. The verify gate checked 58,373,077
+removed packets: 0 missing by number, 0 repeat-kind rows not rebuilt, and it
+wrote `.done`, releasing 2026-11-20. The runner, `day_repair_ssm.rs`, the
+workflow and their budget rows were deleted in the next PR, and their paths
+joined `RETIRED_ONE_OFF_PATHS`. The box subcommand `tickvault day-repair`
+stays as the record of what ran; it sends no shell.

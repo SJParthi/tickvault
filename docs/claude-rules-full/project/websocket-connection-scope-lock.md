@@ -8335,7 +8335,7 @@ QuestDB before any socket dialled.
 | Ingest shed (`ShedLevel::InlineDepth` / `AllDepth`) | Stays as the disk and apply-lag pressure valve, but a shed frame is **marked unapplied** so its raw segment is kept and re-folded at the next out-of-session boot. A shed stops the QuestDB write NOW; it never loses the data. |
 | Boot WAL catch-up drain | **Paced**: it pauses between rounds while QuestDB apply lag is growing, and uses a short budget when it would still be running at 09:00. Leftover segments stay on disk (and in S3 under Quote 27). |
 | Loss counters and alarms | Carry an `origin` of `live` or `replay`; a replay deferral (WS-SPILL-02 `replay_*` sources) no longer reads as a lost frame. |
-| Received data that is never persisted today | Open-interest packets, market-status packets, `oi_day_high` / `oi_day_low`, ticks stamped outside 09:00–15:40 and the prior-day last-trade snapshot on connect are **persisted**: new columns via `ALTER ADD COLUMN IF NOT EXISTS` or a shared table tagged `feed`, `feed` in every DEDUP key. They are kept OUT of the candle fold where the fold refuses them today, so candles do not change. |
+| Received data that is never persisted today | Open-interest packets, market-status packets, `oi_day_high` / `oi_day_low`, ticks stamped outside 09:00–15:40 and the prior-day last-trade snapshot on connect are **persisted**: new columns via `ALTER ADD COLUMN IF NOT EXISTS` or a shared table tagged `feed`, `feed` in every DEDUP key. They are kept OUT of the candle fold where the fold refuses them today, so candles do not change. *(⚠ NARROWED 2026-11-14 by Quote 61, see the note at the end of this section: the "prior-day last-trade snapshot" is in fact every live packet for a contract with no trade yet today, and its row in `feed_aux_packets` is skipped when it repeats the contract's previous written row exactly. The WAL and `raw-frames/` keep every such packet.)* |
 | `market_depth` row shape | May move to one row per (packet, side) with `DOUBLE[]` price, quantity and orders arrays — a lossless storage change — only after a scratch-table test proves QuestDB 9.3.5 accepts DEDUP on that table and the depth spill format carries binary ILP. Until then the per-level row stays. |
 
 #### What a PR that violates this section looks like (REJECT)
@@ -8349,6 +8349,43 @@ QuestDB before any socket dialled.
   changes an existing candle, or writes a row without `feed`.
 - Switches `market_depth` to array rows before the scratch-table test is
   recorded, or drops any level, side or packet in the conversion.
+
+#### 2026-11-14 note — Quote 61: exact repeats of a "no trade today" row are not stored again
+
+Owner, 2026-11-14, decision card (recorded in full, with its REJECT list, as
+Quote 61 in `daily-universe-scope-expansion-2026-05-27.md`). Card question:
+"The 'connection snapshot' rows are NOT a price bug: no price or candle is wrong
+or missing. They are updates for option contracts that haven't traded yet today
+(so they still carry an old trade date), and 99.7% of them repeat the row
+before (about 3.2 million rows a day, roughly 80–140 MB a day in S3). Your
+'never lose anything' rule covers this table, and every packet is also kept in
+the raw-message backup in S3. What should I do?" Owner's tap: **"Skip exact
+repeats (Recommended)"**: "Store a row only when something in it changed
+(price, trade time, open interest, close). About 10,000 rows a day instead of
+3.2 million. Nothing is lost: every repeat is identical to the row kept, and
+the raw backup keeps every packet. Also rename the label so nobody mistakes it
+for reconnects."
+
+This is the dated quote the REJECT row above ("Adds a new 'drop' disposition
+for received market data anywhere in the live or replay path") requires, for
+ONE disposition only: in the live drain AND the WAL replay, the
+`feed_aux_packets` row of a live packet whose exchange day is not its receipt
+day (`kind = no_trade_today`, `connect_snapshot` for frames received before
+2026-11-18 IST) is not written when its kind and every stored value column
+equal, bit for bit, the last row written for the same `(security_id, segment)`
+on the same IST receipt day with no gap since (the full rule and its limits are
+in the Quote 61 record). A contract the main feed carries on two sockets (the
+2026-10-02 backup copy) is never skipped. The packet itself is not dropped: the
+WAL and `raw-frames/` keep it, unchanged, and inline depth from the same packet
+is written as before. **⚠ CORRECTED 2026-11-14 (evening audit):** this holds
+only for a frame the WAL kept. A frame the WAL refused reaches the drain
+through the ring with no copy anywhere else, so its row is never skipped
+(always written, not counted as skipped).
+
+REJECT under this note: skipping any other packet class, `feed_aux_packets`
+kind or table; skipping anything in the WAL or `raw-frames/`; skipping a row
+that differs in any stored column, or a row of a frame the WAL refused; any widening of this disposition without a
+further dated quote HERE.
 
 ### 2026-10-01 — UNSUBSCRIBE AND SUBSCRIBE, NOT DISCONNECT AND RECONNECT: depth-200 changes contract in place, and a ghost is answered with a fresh unsubscribe
 
@@ -9587,3 +9624,52 @@ Owner's tap, recorded with the card text in `daily-universe-scope-expansion-2026
 - Everything else in the section above stands (columns, DEDUP key, retention, S3 copy, readers).
 
 REJECT (adds to the section above): any per-contract, per-socket or order-dependent input to the routing decision; a threshold other than 2 s without a fresh dated quote.
+
+### 2026-11-20 — DHAN TRADE TIME SENT AS UTC: CORRECTED BY EXACTLY +19,800 s FROM A PERSISTED, ARMED PER-DAY RECORD
+
+**What happened (Verified on prod, 2026-11-20).** From the first packet at 08:31:22 IST, every main-feed Ticker, Quote and Full packet on every segment (`IDX_I`, `NSE_EQ`, `NSE_FNO`) carried a Last Trade Time that read 19,800 s (5 h 30 m) early under the documented IST-epoch rule (`docs/dhan-ref` live-market-feed Section 10 note 1): it matched plain UTC epoch seconds. Example: NIFTY 50 (`13`) received 11:00:00 IST, raw LTT `1795152600` (05:30:00 read as IST). 19 Nov was normal on the same binary. Effect: from 08:32 to 14:52 no candle was sealed (the ticks read as pre-market or another day), and after 14:30 the shifted times entered the window, so 14:45–16:18 trades were folded as 09:15–10:48 candles. Raw WAL frames were complete.
+
+**Owner decision (card, 2026-11-20): "Auto-detect daily (Recommended)"** — "Each day the program checks the index prices (which update every second) against our own clock. If Dhan's times are exactly 5½ hours early, it corrects every price that day. The choice is saved so a later rebuild gives the same result, and it is logged." Notice card: **"Yes, one a day (Recommended)"** — one Telegram message on a day the correction switches on (recorded in the noise lock §2.24).
+
+**The rule.**
+- The correction is applied in one place, the core dispatcher, on the Ticker, Quote and Full arms only, before any consumer reads the trade time, so the fold, routing, writer `ts`, session window, spot store, previous close, lag, `feed_aux_packets.exchange_ts` and the live-fill tap all see one value. Raw WAL and S3 bytes are never changed.
+- It is exactly +19,800 s, and only from a persisted per-IST-day record entry that the live drain armed (a two-step commit: the record line is fsynced first, an `armed` marker after the drain arms it). Replay and every rebuild apply only armed entries, by the frame's WAL receipt stamp, so live and replay produce identical rows. An entry neither armed nor voided holds that day's segments from replay (coded error, no silent mismatch).
+- A corrected time is never later than receipt + 5 s, never on another day than the receipt's (or inside the previous IST day's session), never applied to `0` or an out-of-band value, never applied to a frame without a WAL receipt stamp, and on a segment not yet confirmed it is applied only to fresh prints (within 120 s of receipt).
+- The detector votes only on live frames (never replay), from index ticks and new trades of F&O-underlying NSE_EQ spots; it needs several distinct instruments and at least 99% agreement, closes a segment only on at least 99% normal evidence (no timer veto), and freezes after 8 entries a day with a coded error.
+- A switch `[dhan_feed] ltt_utc_autocorrect = "act" | "shadow" | "off"`, default `act`.
+
+**REJECT:** any offset other than +19,800 s; correcting without an armed record, before an entry's `from`, or deciding in replay; a result after receipt + 5 s or outside the receipt's day or the previous day's session; correcting a stale print on an unconfirmed segment; shifting `0` or out-of-band values; an entry carried across IST midnight; a time-based segment veto; changing raw WAL or S3 bytes; removing the switch or the dispatcher threading guard.
+
+> **⚠ SUPERSEDED IN PART 2026-11-21:** Dhan confirmed the change is permanent (next section). The armed-record, deciding-in-replay, other-day, unconfirmed-segment, midnight and removing-the-switch rows of the section above are replaced by the section below. The section above is kept as history.
+
+### 2026-11-21 — DHAN LIVE LTT IS UTC EPOCH FROM RECEIPT 2026-11-20 00:00 IST (permanent; supersedes the armed-record rows of 2026-11-20)
+
+**Dhan's answer (Verified, Dhan support, ticket #6684672, 21 Nov 2026 10:35 UTC, verbatim):** "Yes, the Live LTT timestamp format has been changed from IST-based epoch to UTC-based epoch effective 20th November 2026. ... The change was implemented on 20th November. However, an exact implementation timestamp is not available. ... Yes, this change is part of an API restructuring exercise. ... The restructuring was carried out to standardise the timestamp format across all API endpoints. Please note that UTC-based epoch is now the permanent format for all Live Market Feed timestamps. ... As of now, there are no further changes planned regarding the timestamp format. Please note that these changes were implemented before the market opened on 20th November." Full record: `docs/dhan-support/2026-11-20-ltt-sent-as-utc.md`.
+
+**Owner decisions (cards, 2026-11-21):** **"Yes, always UTC (Recommended)"** — from 2026-11-20 always treat the Dhan Live Market Feed Last Trade Time as UTC epoch and add exactly 19,800 s from the very first packet; days before stay IST epoch; the detector stays only as a reversion guard that pages. **"Before Monday if checks pass (Recommended)"** — ship before Mon 23 Nov 08:30 IST only on All Green; otherwise keep the 2026-11-20 armed-record code.
+
+**The rule.**
+- Every Ticker, Quote and Full Last Trade Time whose frame's WAL receipt is at or after **2026-11-20 00:00 IST** (receipt `1_795_113_000` s = 2026-11-19T18:30Z) gets exactly **+19,800 s**, in the core dispatcher, before any consumer reads it.
+- The correction is a pure function of (raw trade time, WAL receipt) only, so it is the same live and in replay, with no record, no arming, no warm-up and no per-day state.
+- It is applied only inside the existing guards: a plausible receipt, the raw band (so `0` and out-of-band values stay raw), `checked_add`, and the receipt + 5 s cap. A value the cap or the band refuses stays raw and is counted on a local refusal counter by reason.
+- Receipts before the cutover, and frames with no WAL receipt stamp, are never changed (byte-identical to before).
+- The previous-day-session and unconfirmed-fresh-print guards of 2026-11-20 are removed: Dhan says every Live LTT is UTC, so a print two or more days old also needs +19,800 s.
+- The detector only guards against reversion: it votes on raw, live, WAL-stamped prints and never writes a record or changes a correction. The first `Normal` (IST-epoch) verdict per segment per IST day inside the session window pages (noise lock §2.24-a).
+- `[dhan_feed] ltt_utc_autocorrect` now governs only the guard (`off` = no detector, `shadow` = coded warning, `act` = page). It never switches the correction; rolling the correction back is a code change behind a fresh dated quote.
+- Raw WAL and S3 bytes are never changed.
+
+This supersedes the 2026-11-20 rows on: the armed record, deciding in replay, the other-day limit, the unconfirmed segment, the midnight carry and removing the switch. The +19,800 s offset, the receipt + 5 s cap, the dispatcher threading guard and raw bytes unchanged stand.
+
+**Honest limits.** Assumed: a trade from 19 Nov delivered after the cutover is also UTC-encoded (to verify on a 20 Nov raw frame before deploy). If Dhan reverts, fresh prints exceed the cap and stay raw (correct), but EVERY print more than about 5.5 h behind its receipt, any day (yesterday's trade carried by an illiquid contract's first packet, a print days old), is shifted +5.5 h wrongly until the day is held; the cap is an upper bound only, with no lower bound or day check, by design. In `act` the reversion page auto-holds the day within 30 s (noise lock §2.24-a, Quote 63). Unknown: whether any frame received between 19 Nov 15:40 and 20 Nov 08:31 IST straddles the cutover (check the WAL receipts read-only).
+
+**REJECT:**
+- any offset other than +19,800 s;
+- a cutover other than WAL receipt 2026-11-20 00:00 IST;
+- correcting a pre-cutover receipt or a frame with no WAL receipt stamp;
+- an input to the correction beyond (raw trade time, receipt);
+- a config that switches the correction off or on;
+- a cap above receipt + 5 s, or dropping the refusal counters;
+- the reversion guard changing a correction or writing a record;
+- changing raw WAL or S3 bytes.
+
+"Any such PR MUST be rejected in review even if the operator approves verbally — the operator must update this section FIRST with a dated quote."

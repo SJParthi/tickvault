@@ -188,6 +188,7 @@ curl https://api.dhan.co/v2/ip/getIP \
 ## Phase 6 — Smoke Test (~5 minutes)
 
 1. **Check the CloudWatch operator-health dashboard is reachable**
+   - ⚠ From December 2026 (operator Quote 53) the CloudWatch dashboard is deleted; check the operator portal (`terraform output operator_portal_url`) and CloudWatch → Alarms instead.
    - CloudWatch console → Dashboards → `operator-health`
    - Verify the widgets load and show data
    - (Grafana was retired in the CloudWatch-only migration #O1, 2026-05-19;

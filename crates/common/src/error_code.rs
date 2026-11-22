@@ -183,21 +183,54 @@ pub enum ErrorCode {
     /// ticks. Edge-triggered, at most one line a minute; pages (noise-lock
     /// §2.8, owner-approved 2026-10-02).
     HotPathStall01,
-    /// BOOT-04: the durable frame log (WAL) could not be opened at boot, so
-    /// boot HALTS (fail-closed): running without it would let frames be lost
-    /// silently under back-pressure. Log-only; the box not coming up is what
-    /// the start watchdog notices.
-    Boot04WalInitFailed,
-    /// PROC-02: the process panicked. Logged by the panic hook with the
-    /// location, the payload and how the WAL drain went, just before the
-    /// default hook runs. Log-only; the restart is what systemd and the
-    /// liveness alarm notice.
-    Proc02Panic,
-    /// API-SERVER-01: the HTTP API server stopped with an error. `/health`,
-    /// `/api/feeds` and the MCP read endpoints are unreachable until a
-    /// restart; the feed and candles keep running. Log-only.
-    ApiServer01Stopped,
-    /// TICK-SPILL-01 — a rescued tick-spill file was PERMANENTLY refused by
+    /// CLOCK-SKEW-01: chrony's clock offset was over 1 ms for 5 consecutive
+    /// minute samples inside 09:00–15:40 IST. Signal and order times taken
+    /// from this clock may be off by that much. Edge-triggered once per
+    /// episode, no recovery line; pages (noise-lock §2.22, Quote 57,
+    /// owner-approved 2026-11-12). A failed sample is a `warn!` with this code
+    /// and never pages.
+    ClockSkew01OffsetOverOneMs,
+    /// NET-RTT-01: the once-per-session TCP + TLS handshake check to the Dhan
+    /// hosts could not resolve, connect or finish a handshake, or its rows
+    /// could not be written. Log-only, never pages: a failed handshake
+    /// attempt is a `warn!` (and a row in `network_rtt_session` with
+    /// `ok = false`); a failed row write, or a table that could not be
+    /// ensured after one retry (`stage = "ensure_failed"`), is an `error!`
+    /// with no CloudWatch filter.
+    NetRtt01HandshakeCheckFailed,
+    /// DHAN-FEED-TIME-01: the live main feed's trade times look wrong AFTER
+    /// the trade-time correction, inside the session (09:15–15:30 IST or the
+    /// published Muhurat window). Cause A: in two 30 s scans in a row at least
+    /// 20 index ticks and at least half carried a time outside the session or
+    /// more than 5 minutes from receipt. Cause B: 10 minutes of main-feed
+    /// frames with no candle sealed. At most once per cause per IST day; the
+    /// day is auto-held from the archive and the export; pages (noise-lock
+    /// §2.24, owner cards 2026-11-20).
+    DhanFeedTime01TradeTimesWrong,
+    /// DHAN-LTT-01: the Dhan trade-time correction armed or closed (Dhan sent
+    /// trade times 5 h 30 min early, scope lock 2026-11-20), or in shadow mode
+    /// would have. A `warn!`, never pages (noise-lock §2.24 REJECT "paging the
+    /// correction's own coded warnings").
+    DhanLtt01CorrectionChanged,
+    /// DHAN-LTT-02: the trade-time correction record could not be written, a
+    /// started change was never confirmed (that day is held from replay), the
+    /// detector froze after 8 changes in a day, or a WAL replay stopped at a
+    /// held day. Log-only, never pages.
+    DhanLtt02RecordUnsettled,
+    /// LIVE-FILL-01: the daily live paper fill calibration report (plan item
+    /// LF-7) could not read its rows, re-price an order, write its files,
+    /// copy them to the cold bucket, write its daily marker or its database
+    /// row, or read a day truncated at its row cap. Field `stage` names the
+    /// step. Log-only, never pages: the local files are kept and the next
+    /// run retries the copy.
+    LiveFill01ReportFailed,
+    /// LIVE-FILL-02: the daily calibration report re-priced a paper fill from
+    /// the stored 1 s candles and the chain's price differs (worse or better
+    /// than the worst case), or a stored row says the fill was worse than the
+    /// model. One line per order, at most 50 a report, then one total.
+    /// Log-only, never pages (noise lock: no new page without a dated row).
+    LiveFill02FillOutsideWorstCase,
+    /// TICK-SPILL-01) — a rescued tick-spill file was PERMANENTLY refused by
     /// QuestDB and has been quarantined so the rest of the backlog can drain.
     ///
     /// The spill tier exists so a failed ILP flush costs disk instead of data.
@@ -1183,9 +1216,13 @@ impl ErrorCode {
             Self::HotPath03ReaderPinNotApplied => "HOT-PATH-03",
             Self::HotPath04TelemetryNotStarted => "HOT-PATH-04",
             Self::HotPathStall01 => "HOT-PATH-STALL-01",
-            Self::Boot04WalInitFailed => "BOOT-04",
-            Self::Proc02Panic => "PROC-02",
-            Self::ApiServer01Stopped => "API-SERVER-01",
+            Self::ClockSkew01OffsetOverOneMs => "CLOCK-SKEW-01",
+            Self::NetRtt01HandshakeCheckFailed => "NET-RTT-01",
+            Self::DhanFeedTime01TradeTimesWrong => "DHAN-FEED-TIME-01",
+            Self::DhanLtt01CorrectionChanged => "DHAN-LTT-01",
+            Self::DhanLtt02RecordUnsettled => "DHAN-LTT-02",
+            Self::LiveFill01ReportFailed => "LIVE-FILL-01",
+            Self::LiveFill02FillOutsideWorstCase => "LIVE-FILL-02",
             Self::TickSpill01FileQuarantined => "TICK-SPILL-01",
             Self::DrainHold01NotWritten => "DRAIN-HOLD-01",
             // PR #5 (2026-05-19): PHASE2-01 / PHASE2-02 retired.
@@ -1476,14 +1513,18 @@ impl ErrorCode {
             // this process; this failure alone does not establish capture loss.
             Self::HotPath04TelemetryNotStarted => Severity::Medium,
             Self::HotPathStall01 => Severity::High,
-            // BOOT-04 halts boot, PROC-02 is a crash, API-SERVER-01 leaves the
-            // feed running. High, not Critical: each is already seen by another
-            // signal (start watchdog, liveness alarm, /health), and Critical
-            // would demand a new page (critical_errcode_alarm_coverage_guard).
-            // The triage rules escalate all three; none is auto-actioned.
-            Self::Boot04WalInitFailed | Self::Proc02Panic | Self::ApiServer01Stopped => {
-                Severity::High
-            }
+            // CLOCK-SKEW-01 pages (noise-lock §2.22): signal and order times
+            // read from a clock off by more than 1 ms for five minutes.
+            Self::ClockSkew01OffsetOverOneMs => Severity::High,
+            // NET-RTT-01: a measurement row is missing or failed; log-only.
+            Self::NetRtt01HandshakeCheckFailed => Severity::Low,
+            Self::DhanFeedTime01TradeTimesWrong => Severity::High,
+            Self::DhanLtt01CorrectionChanged => Severity::Low,
+            Self::DhanLtt02RecordUnsettled => Severity::Medium,
+            // LIVE-FILL-01: a step of the daily report failed; files kept, log-only.
+            Self::LiveFill01ReportFailed => Severity::Medium,
+            // LIVE-FILL-02: a paper fill outside the re-priced worst case; log-only.
+            Self::LiveFill02FillOutsideWorstCase => Severity::High,
             // TF-VERIFY-01/02 (operator 2026-07-13) — the daily
             // timeframe-consistency verifier found a TF-vs-1m divergence /
             // ran degraded. High: operator eyes required on every occurrence
@@ -1671,8 +1712,14 @@ impl ErrorCode {
             | Self::PrevOi01CacheEmptyAtBoot
             | Self::PrevClose04CacheEmptyAtBoot => "docs/error-runbooks/wave-1-error-codes.md",
             Self::HotPathStall01 => "docs/error-runbooks/hot-path-stall-error-codes.md",
-            Self::Boot04WalInitFailed | Self::Proc02Panic | Self::ApiServer01Stopped => {
-                "docs/error-runbooks/process-lifecycle-error-codes.md"
+            Self::DhanFeedTime01TradeTimesWrong
+            | Self::DhanLtt01CorrectionChanged
+            | Self::DhanLtt02RecordUnsettled => "docs/error-runbooks/dhan-feed-time-error-codes.md",
+            Self::ClockSkew01OffsetOverOneMs | Self::NetRtt01HandshakeCheckFailed => {
+                "docs/error-runbooks/clock-offset-and-network-rtt-error-codes.md"
+            }
+            Self::LiveFill01ReportFailed | Self::LiveFill02FillOutsideWorstCase => {
+                "docs/error-runbooks/live-fill-report-error-codes.md"
             }
             Self::WsSpill01WriterRespawn | Self::WsSpill02FrameDropped => {
                 "docs/error-runbooks/ws-frame-spill-error-codes.md"
@@ -1898,6 +1945,10 @@ impl ErrorCode {
                 // operator judges (restart, apply lag or a real loss); the
                 // TF-VERIFY-01 precedent.
                 | Self::TickConserve01DailyMismatch
+                // DHAN-FEED-TIME-01 (2026-11-20): whether the feed's times are
+                // wrong is an operator verdict (the day is auto-held for the
+                // manual repair); no auto action may rerun or release it.
+                | Self::DhanFeedTime01TradeTimesWrong
                 // EXPIRY-SCOPE-01 (2026-10-28): a scope verdict the operator
                 // judges (selector bug, stale file, vendor relisting).
                 | Self::ExpiryScope01OffExpiry
@@ -1979,9 +2030,13 @@ impl ErrorCode {
             Self::HotPath03ReaderPinNotApplied,
             Self::HotPath04TelemetryNotStarted,
             Self::HotPathStall01,
-            Self::Boot04WalInitFailed,
-            Self::Proc02Panic,
-            Self::ApiServer01Stopped,
+            Self::ClockSkew01OffsetOverOneMs,
+            Self::NetRtt01HandshakeCheckFailed,
+            Self::DhanFeedTime01TradeTimesWrong,
+            Self::DhanLtt01CorrectionChanged,
+            Self::DhanLtt02RecordUnsettled,
+            Self::LiveFill01ReportFailed,
+            Self::LiveFill02FillOutsideWorstCase,
             Self::TickSpill01FileQuarantined,
             Self::DrainHold01NotWritten,
             // PR #5 (2026-05-19): Phase201DispatchFailed + Phase202EmitGuardDropped retired.
@@ -2522,6 +2577,8 @@ mod tests {
                 || s.starts_with("CADENCE-")
                 // The revived Dhan feed's live-vs-REST ground-truth check
                 || s.starts_with("DHAN-LIVE-XVERIFY-")
+                || s.starts_with("DHAN-FEED-TIME-")
+                || s.starts_with("DHAN-LTT-")
                 // 2026-08-25: the tick spill tier's replay path — a rescued
                 // file QuestDB will never accept, set aside so the rest of
                 // the backlog can drain.
@@ -2535,7 +2592,14 @@ mod tests {
                 // trading pipeline's broadcast lag.
                 || s.starts_with("API-SERVER-")
                 || s.starts_with("TICK-GAP-")
-                || s.starts_with("PIPELINE-LAG-");
+                || s.starts_with("PIPELINE-LAG-")
+                // Plan item LF-6a (2026-11-12): the clock-offset page and
+                // the session handshake timing check.
+                || s.starts_with("CLOCK-SKEW-")
+                || s.starts_with("NET-RTT-")
+                // Plan item LF-7 (2026-11-12): the daily live paper fill
+                // calibration report.
+                || s.starts_with("LIVE-FILL-");
             assert!(has_known_prefix, "unexpected code prefix: {s}");
         }
     }

@@ -1574,10 +1574,13 @@ fn console_embedded_shell_never_grows() {
 /// no bin by either tool's name, so a deleted SSM sender cannot come back
 /// unbudgeted. Re-adding one needs a fresh dated quote in the rust-only lock.
 const RETIRED_ONE_OFF_PATHS: &[&str] = &[
+    ".github/workflows/day-repair-2026-11-20.yml",
     ".github/workflows/rebuild-2026-10-22.yml",
     ".github/workflows/wipe-2026-10-31.yml",
     "crates/app/src/bin/rebuild_2026_10_22.rs",
+    "crates/app/src/bin/tv_day_repair_2026_11_20.rs",
     "crates/app/src/bin/wipe_2026_10_31.rs",
+    "crates/app/src/day_repair_ssm.rs",
     "crates/app/src/rebuild_2026_10_22.rs",
     "crates/app/src/rebuild_box.rs",
     "crates/app/src/rebuild_ssm.rs",
@@ -1599,11 +1602,15 @@ fn retired_one_off_tools_stay_deleted() {
     assert!(
         present.is_empty(),
         "deleted one-off rebuild/wipe files are back: {present:?}. Rust-only \
-         lock §0.13/§0.14 removed them after the 2026-10-28 runs; re-adding \
+         lock §0.13/§0.14/§0.21 removed them after their runs; re-adding \
          needs a fresh dated quote there first."
     );
     let cargo = read_text("crates/app/Cargo.toml").expect("crates/app/Cargo.toml must exist");
-    for bin in ["tv-rebuild-2026-10-22", "tv-wipe-2026-10-31"] {
+    for bin in [
+        "tv-day-repair-2026-11-20",
+        "tv-rebuild-2026-10-22",
+        "tv-wipe-2026-10-31",
+    ] {
         assert!(
             !cargo.contains(bin),
             "crates/app/Cargo.toml declares the deleted `{bin}` bin again"
@@ -1611,6 +1618,7 @@ fn retired_one_off_tools_stay_deleted() {
     }
     let lib = read_text("crates/app/src/lib.rs").expect("crates/app/src/lib.rs must exist");
     for module in [
+        "day_repair_ssm",
         "rebuild_2026_10_22",
         "rebuild_box",
         "rebuild_ssm",

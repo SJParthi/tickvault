@@ -340,7 +340,7 @@ classifier is total (`_ => Indeterminate`, proptest-pinned never-panic).
 > `rest_leg_*` SCOREBOARD-01 degrade stages named below, the
 > `tv_rest_leg_close_to_data_p99_ms` gauge (LOCAL `/metrics` only — it was
 > never CloudWatch-shipped, so no alarm or EMF selector entry is owed), and
-> the ratchet `crates/app/tests/rest_leg_digest_wiring_guard.rs` (3 tests),
+> the ratchet `crates/app/tests/rest_leg_digest_wiring_guard.rs` (⚠ CORRECTED 2026-11-15: that guard was deleted 2026-09-17 with the REST-leg digest; NOT ENFORCED) (3 tests),
 > whose entire subject was this wiring.
 >
 > **⚠ A precision correction while retiring it**, because
@@ -404,7 +404,7 @@ read-failure footnote (the ensure-DDL belongs to the legs, not the
 scorecard); the Dhan option-chain line stays "not measured yet" until the
 Dhan forensics follow-up lands (its per-fire histogram is not
 day-drainable). Ratchets:
-`crates/app/tests/rest_leg_digest_wiring_guard.rs` (3 tests) + the
+`crates/app/tests/rest_leg_digest_wiring_guard.rs` (⚠ CORRECTED 2026-11-15: that guard was deleted 2026-09-17 with the REST-leg digest; NOT ENFORCED) (3 tests) + the
 aggregation/render unit suites in `feed_scoreboard_boot.rs` / `events.rs`.
 
 **2026-07-14 update — Dhan forensics rows are LIVE (GAP-11):** the Dhan

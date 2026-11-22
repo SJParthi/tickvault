@@ -274,6 +274,27 @@ uncoded `warn!` until 2026-10-01.
   book is REST outside the allowed classes. That reconcile is plan item
   PR42c and needs an owner decision.
 
+### 2026-11-12 note — the paper order event log (plan item LF-5)
+
+`crates/storage/src/live_order_events_persistence.rs` also logs AUDIT-06,
+always with `table = "live_order_events"`. Stages: `ensure_client_build` /
+`ensure_ddl` (the table's boot DDL), `append` (a row refused before the
+buffer because a price, quantity, charge, identity or timestamp column is
+negative, or an ILP append error) and `flush` (rows discarded after a failed
+flush AND a refused disk-tier write). A failed flush normally goes to
+`data/spill/audit/live_order_events/` and is replayed, like `order_audit`.
+
+- **Counters (local `/metrics` only):** `tv_live_order_events_rows_total{event}`,
+  `tv_live_order_events_rows_refused_total{column}`,
+  `tv_live_order_events_rows_discarded_total`,
+  `tv_live_order_events_persist_errors_total{stage}`. The disk tier's
+  generic `tv_audit_spill_*{table="live_order_events"}` counters and the
+  chain counter source `live_order_events_spill_lost` are shared with the
+  other audit tables.
+- **DO:** a `column` refusal is a bug in the paper chain that built the row
+  (a negative money or quantity value); the row is not written. A discard
+  means the rows are gone; record the window.
+
 ## STORAGE-GAP-03 — audit-table write failure (any table)
 
 **Trigger:** any audit-table writer hit an unrecoverable error after the
@@ -411,42 +432,65 @@ QuestDB partition to S3 and the upload failed. Idempotency-key
 
 **Source:** `crates/storage/src/s3_archive.rs` (Wave 2 Item 9.4)
 
-### Raw WAL segments (added 2026-10-01, plan item 45e)
+**`source = "brutex_daily_export"` (owner Quote 60, 2026-11-14).** The daily
+Brutex export gave up on a day (3 attempts with a 15/30/60-minute backoff;
+from 20:45 IST the session day is retried as a catch-up day, without a hold)
+and wrote no `DONE`, so Brutex sees the day as not exported. Nothing was
+deleted or overwritten. Log-only: no CloudWatch filter matches STORAGE-GAP-04,
+and the export adds no page. Each failed attempt is a coded `warn!` with the
+same code and the reason (recount mismatch while rows still landed, the
+scratch volume under 2 GiB free, S3 unreachable, a content-addressed key
+already holding other bytes).
+1. Look in S3: `questdb-partitions/_daily/<D>/` lists every attempt's
+   `manifest-<n>.json`; a `DONE` there means the day is sealed after all.
+2. A later poll or process retries the day as a catch-up day: a past day
+   runs once nothing delays it, and anyway (sealed `complete = false`,
+   the manifest naming what was pending) once it is 2 days old, so a
+   weekend never hides it. A day that still leaves the 7-day window with no
+   `DONE` logs `source = "brutex_daily_export_left_window"` (below).
+3. Turn it off with `[partition_retention] brutex_export_enabled = false`
+   (the archiver keeps sorting only against an existing object, or one it
+   cannot rule out, and only outside 08:30-15:40 IST, so it still reuses
+   what the export placed; amend records continue for every day that already
+   has a `DONE`).
 
-The same code covers the raw-frame uploader,
-`crates/storage/src/wal_raw_upload.rs`, which copies every closed WAL
-segment to `s3://tv-<env>-cold/raw-frames/<IST date>/<segment>.<raw bytes>.gz`
-(the raw length is in the key, so a segment that grew after an upload is
-stored again under a new key). Each object carries the raw SHA-256 and length
-as metadata (`x-amz-meta-raw-sha256`, `x-amz-meta-raw-bytes`); a restore
-checks the decompressed bytes against them. Three `source` values:
+**`source = "brutex_daily_export_left_window"`.** A session day left the
+7-day catch-up window with no `DONE`. Logged ONCE PER PROCESS for every
+session day up to a week past the window (from 2026-11-14 on), so each boot
+and evening-drain restart of that week logs it again (about 7 to 28 identical
+lines for one missed day). Brutex never gets that day from the export; its
+partitions still reach S3 through the archive and appear as amend records.
+Log-only: until a noise-lock row adds a page, the app logs (or Brutex finding
+no `DONE`) are the only way the owner learns of a missed export.
 
-- `raw_frames_upload`: a HEAD, PUT or read-back verify failed, or the segment
-  could not be read or compressed locally. Nothing was marked. An S3 failure
-  ends the pass; a local failure skips that segment and the pass moves on.
-  The next pass (within a minute) retries.
-- `raw_frames_conflict`: the key already holds a DIFFERENT object. It is never
-  overwritten, so that segment stays on disk until someone compares the two.
-  Logged once per process; later passes skip the segment quietly and copy
-  the others.
-- `raw_frames_uploader_disabled`: at boot, no explicit environment
-  (`TV_ENVIRONMENT` / `ENVIRONMENT`) was set, so no uploader runs and the WAL
-  prunes delete without a copy. Expected only on a dev machine; on the
-  production box it means the systemd unit lost `TV_ENVIRONMENT=prod`.
+**`source = "brutex_daily_export_incomplete"`.** The day was sealed with
+`complete = false`; the manifest's `incomplete_reasons` name what was still
+pending. On the session day the manifest also names, per arrival-time
+table, the hours left out because they could still take rows
+(`open_from_ist`, `open_partitions_left_out`; not a reason, `complete` is
+unchanged) and, per object, whether its rows are sorted
+(`ordered_by_dedup_key`). The possible reasons: `wal_not_applied:<t>` including `partition_archive_audit`,
+`spill_pending:<t>`, `wal_backlog:<n>` or `wal_backlog_unreadable` (frames
+shed during the session that no replay reached tonight),
+`deferred_depth_marks_floor_blocked`, `contract_names_repair_failed`,
+`contract_names_repair_pending` (a forced catch-up day after the session
+day's midnight, before a repair run reached it), a hard gate on a forced
+catch-up day,
+`archived_copy_unconfirmed:<t>/<p>`, or `no_ticks_captured` on a forced
+catch-up day. DONE is final; later copies appear only as amend records
+`_daily/<D>/amend-*.json` (every verified archiver copy of an export-table
+partition gets one, a reuse included). Log-only, like the line above.
 
-**Why it matters:** the WAL cleanup deletes a segment only after its upload
-is verified (operator Quotes 27 + 28, 2026-09-29). While uploads fail,
-segments pile up on disk; the cleanup logs `wal_prune_refused_no_copy`
-(WS-SPILL-01) and the disk alarms page if the volume fills.
-
-**Triage:**
-1. `curl -s localhost:<metrics port>/metrics | grep -E 'tv_wal_raw_upload_total|tv_wal_raw_upload_pending_segments|tv_wal_prune_refused_no_copy_total'`
-   gives uploads by outcome, the backlog, and refusals.
-2. Credentials and reachability as above; the instance role already has
-   `s3:GetObject` / `s3:PutObject` on the whole cold bucket.
-3. For a conflict, compare the object (`aws s3api head-object --checksum-mode ENABLED`)
-   with the local segment's marker in `data/ws_wal/uploaded/`. Do not delete
-   either copy by hand.
+**Stopped, not failed.** An attempt stops (not counted, nothing sealed)
+when the window would close before the next partition could finish (30
+minutes before 08:30 IST on a session day) or when the scratch volume is
+under the after-close depth pass's floor or the disk-pressure line
+(`pressure_high_water_pct`, whichever is larger) plus the partition's size (retried
+15 minutes later, so the export never pushes the disk toward the 5% line
+where pinned WAL segments are deleted, and never holds the quiesce lock a
+pressure archive pass needs).
+Source: `crates/storage/src/partition_archive/daily_export.rs`,
+`crates/app/src/brutex_export_boot.rs`.
 
 ## STORAGE-GAP-05 — disk pressure could not be relieved
 

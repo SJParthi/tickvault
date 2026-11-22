@@ -286,6 +286,11 @@ output "boot_heartbeat_alarm_name" {
 # to. The ratchet added alongside makes that omission fail the build.
 # ---------------------------------------------------------------------------
 
+# KEPT by the operator Quote 53 alarm review (2026-11-11, docs/audits/2026-11-alarm-review.md):
+# this gate arms the KEPT boot-heartbeat-missing page, which ships disarmed;
+# without this alarm and its did-it-run sibling below, a failing or dropped
+# gate leaves that page off with nothing to say so (the deploy-provenance-blind
+# reasoning, applied to a live-lane page).
 resource "aws_cloudwatch_metric_alarm" "boot_heartbeat_gate_errors" {
   alarm_name          = "tv-${var.environment}-boot-heartbeat-gate-errors"
   alarm_description   = "The BOOT-HEARTBEAT GATE itself FAILED. It arms the boot alarm in the morning and disarms it at 09:20 IST when the market-hours window takes over. A failure leaves the gate STUCK in whichever state it was in: armed all night (false pages) or disarmed all morning (the boot alarm silently covers nothing). Triage: read the Lambda log group, then check the boot alarm's actions_enabled state directly."
@@ -331,6 +336,7 @@ resource "aws_cloudwatch_metric_alarm" "boot_heartbeat_gate_errors" {
 # worth seeing in the console and is not worth a second page.
 # ---------------------------------------------------------------------------
 
+# KEPT by the operator Quote 53 alarm review (2026-11-11): see the Errors alarm above.
 resource "aws_cloudwatch_metric_alarm" "boot_heartbeat_gate_not_invoked" {
   alarm_name          = "tv-${var.environment}-boot-heartbeat-gate-not-invoked"
   alarm_description   = "The boot-window gate did NOT RUN in the last 24h - its EventBridge schedule was dropped or disabled (the 2026-07-02 scheduler-drop class). This gate ARMS and DISARMS the boot alarm around the morning window; while it is not running the boot alarm is stuck in whichever state it was last left, so a dead app either pages nobody all morning or pages every night, and its Errors alarm cannot see this (no invocation = no error)."

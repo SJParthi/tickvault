@@ -345,29 +345,8 @@ output "binary_sha_stale_alarm_name" {
 # to. The ratchet added alongside makes that omission fail the build.
 # ---------------------------------------------------------------------------
 
-resource "aws_cloudwatch_metric_alarm" "deploy_watchdog_errors" {
-  alarm_name          = "tv-${var.environment}-deploy-watchdog-errors"
-  alarm_description   = "The DEPLOY WATCHDOG itself FAILED - the check that catches a box booted on a STALE BINARY (the 2026-07-09 incident class). While it is broken a stale-binary boot is unreported, so the box can run all day on code nobody shipped. Triage: read the Lambda log group."
-  comparison_operator = "GreaterThanOrEqualToThreshold"
-  evaluation_periods  = 1
-  metric_name         = "Errors"
-  namespace           = "AWS/Lambda"
-  period              = 300
-  statistic           = "Sum"
-  threshold           = 1
-  treat_missing_data  = "notBreaching"
-  dimensions = {
-    FunctionName = aws_lambda_function.deploy_watchdog.function_name
-  }
-  alarm_actions = [aws_sns_topic.tv_alerts.arn]
-  # NO ok_actions (the round-14 precedent): these run on a schedule, so the
-  # post-ALARM auto-OK only means the single Errors datapoint AGED OUT of the
-  # lookback — never that anything was fixed. The telegram-webhook Lambda
-  # forwards every OK as a green "recovered" page, so a symmetric ok_actions
-  # here would produce a Rule-11 false recovery per failure episode. The real
-  # recovery signal is the NEXT scheduled run succeeding.
-  ok_actions = []
-}
+# alarm "deploy_watchdog_errors" REMOVED 2026-11-11 (operator Quote 53, alarm review
+# docs/audits/2026-11-alarm-review.md). The comments above are kept as history.
 
 
 # ---------------------------------------------------------------------------
@@ -386,32 +365,8 @@ resource "aws_cloudwatch_metric_alarm" "deploy_watchdog_errors" {
 # worth seeing in the console and is not worth a second page.
 # ---------------------------------------------------------------------------
 
-resource "aws_cloudwatch_metric_alarm" "deploy_watchdog_not_invoked" {
-  alarm_name          = "tv-${var.environment}-deploy-watchdog-not-invoked"
-  alarm_description   = "The deploy watchdog did NOT RUN in the last 24h - its EventBridge schedule was dropped or disabled (the 2026-07-02 scheduler-drop class). This is the check that catches a box booted on a STALE BINARY (the 2026-07-09 incident); while it is not running a stale deploy trades all day looking perfectly healthy. Its Errors alarm cannot see this (no invocation = no error)."
-  comparison_operator = "LessThanThreshold"
-  evaluation_periods  = 1
-  metric_name         = "Invocations"
-  namespace           = "AWS/Lambda"
-  period              = 86400
-  statistic           = "Sum"
-  threshold           = 1
-  # breaching: a missing Invocations datapoint IS the condition being detected.
-  treat_missing_data = "breaching"
-  dimensions = {
-    FunctionName = aws_lambda_function.deploy_watchdog.function_name
-  }
-  # GATED (2026-09-01): ships DISARMED. The market-hours gate Lambda
-  # (market-hours-liveness-alarm.tf ALARM_NAMES) enables actions at 09:20 IST
-  # Mon-Fri and disables them at 15:35 IST. Without this the alarm pages every
-  # Saturday and Sunday: the watched Lambda is on a MON-FRI cron, so its
-  # Invocations datapoint is legitimately ABSENT at the weekend and
-  # treat_missing_data = breaching turns that absence into an ALARM. The gate
-  # cannot disarm an alarm that ships armed, so this line is half of the fix.
-  actions_enabled = false
-  alarm_actions   = [aws_sns_topic.tv_alerts.arn]
-  ok_actions      = []
-}
+# alarm "deploy_watchdog_not_invoked" REMOVED 2026-11-11 (operator Quote 53, alarm review
+# docs/audits/2026-11-alarm-review.md). The comments above are kept as history.
 
 # ---------------------------------------------------------------------------
 # DEPLOY-PROVENANCE BLIND — the watchdog is running but publishing nothing

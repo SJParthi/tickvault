@@ -648,7 +648,7 @@ where
 #[must_use]
 // TEST-EXEMPT: a OnceLock around claim_planned_boot_at (unit-tested: test_regression_claim_*); its placement before the boot replay is pinned by the_lane_and_main_are_wired_to_the_evening_drain.
 pub fn claim_planned_boot() -> bool {
-    BOOT_CLAIM
+    let planned = BOOT_CLAIM
         .get_or_init(|| {
             claim_planned_boot_at(
                 Path::new(EVENING_DRAIN_STATE_PATH),
@@ -657,7 +657,12 @@ pub fn claim_planned_boot() -> bool {
                 store_state_locked,
             )
         })
-        .is_some()
+        .is_some();
+    // 2026-11-11 (noise lock §2.17 note): the STAGE-C replay runs before the
+    // catch-up raises the frame cap, so the verdict is recorded where the
+    // replay's deferral line can read it.
+    tickvault_storage::wal_replay_frame_cap::note_planned_evening_drain_claim(planned);
+    planned
 }
 
 /// The catch-up allowance for this boot: the verdict [`claim_planned_boot`]
@@ -1093,9 +1098,62 @@ mod tests {
             matches!((claim, wal_lock), (Some(c), Some(w)) if c < w),
             "claim at {claim:?} must precede the WAL lock at {wal_lock:?}"
         );
+        // 2026-11-11 (noise lock §2.20): the backlog trend is judged after the
+        // WAL lock and before the boot replay reads anything, so the count is
+        // taken at the same point on every start. Paired behaviour tests in
+        // storage: `test_judge_at_boot_in_first_start_then_shrink_then_unchanged`.
+        let judge = main.find("tickvault_storage::wal_backlog_trend::judge_at_boot(&ws_wal_path)");
+        let replay =
+            main.find("tickvault_storage::ws_frame_spill::replay_all_fenced(&ws_wal_path)");
+        assert!(
+            matches!((wal_lock, judge, replay), (Some(w), Some(j), Some(r)) if w < j && j < r),
+            "lock {wal_lock:?} < judge {judge:?} < replay {replay:?}"
+        );
+        // 2026-11-11 (noise lock §2.17 note, §2.20): the catch-up's once-per-boot
+        // deferral line reports through the verdict-aware reporter (paired
+        // behaviour tests in storage:
+        // `test_regression_report_catchup_replay_deferred_warns_only_on_the_planned_boot`,
+        // `test_regression_rs_0833_morning_start_with_a_shrinking_backlog_does_not_page`).
+        let call = lane
+            .find("tickvault_storage::wal_replay_frame_cap::report_catchup_replay_deferred(")
+            .expect("the catch-up deferral goes through the reporter");
+        assert!(
+            lane[call..call + 200].contains(
+                "tickvault_storage::wal_replay_frame_cap::replay_limit_verdict_this_boot()"
+            ),
+            "with the process verdict (planned restart or shrinking backlog)"
+        );
+        assert!(
+            !lane.contains("source = \"replay_deferred\""),
+            "the line is not logged inline any more"
+        );
         let hold = include_str!("drain_hold.rs");
         assert!(hold.contains("crate::evening_drain::request_self_restart()"));
         assert!(hold.contains("crate::evening_drain::state_for_give_up("));
         assert!(hold.contains("crate::evening_drain::crossverify_settled("));
+    }
+
+    // Regression: 2026-11-11 — noise lock §2.17 note. Every planned
+    // evening-drain restart paged twice (2026-11-09) on the replay deferral
+    // lines. The claim records its verdict for the STAGE-C replay (which runs
+    // before the catch-up raises the cap), and the catch-up's once-per-boot
+    // deferral line reports through the planned-aware reporter. Bite: drop
+    // the note, or log the line inline again.
+    #[test]
+    fn test_claim_planned_boot_records_the_verdict_for_the_replay_deferral_lines() {
+        let src = include_str!("evening_drain.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
+        let claim = prod
+            .find("pub fn claim_planned_boot() -> bool {")
+            .expect("the claim");
+        let body_end = prod[claim..]
+            .find("\n\u{7d}\n")
+            .map_or(prod.len(), |i| claim + i);
+        assert!(
+            prod[claim..body_end].contains(
+                "tickvault_storage::wal_replay_frame_cap::note_planned_evening_drain_claim(planned);"
+            ),
+            "the claim records its verdict"
+        );
     }
 }

@@ -145,7 +145,16 @@ fn measure(
     frames: &[CapturedFrame],
     kind: DepthFeedKind,
 ) -> (u64, u64, u64) {
-    let mut depth = DepthIngest::for_test();
+    measure_with(DepthIngest::for_test(), warm, frames, kind)
+}
+
+/// [`measure`] on a given sink (the array-row book sink, for one).
+fn measure_with(
+    mut depth: DepthIngest,
+    warm: &[CapturedFrame],
+    frames: &[CapturedFrame],
+    kind: DepthFeedKind,
+) -> (u64, u64, u64) {
     let c = counters();
     for f in warm {
         let _ = drain_depth_frame(&mut depth, f, RECEIPT_NANOS, kind, c);
@@ -183,6 +192,41 @@ fn depth20_drain_does_not_allocate_per_packet() {
          levels) allocated {blocks} blocks ({bytes} bytes); the budget is \
          {MAX_BLOCKS} blocks. Bytes grow with rows by design; blocks must not. \
          Find the allocation, do NOT raise the ceiling.",
+        FRAMES * 4
+    );
+}
+
+/// Speed fix 5 review (2026-11-17): the depth-20 socket drain with
+/// `[depth_storage] array_rows` ON, so each packet is one `market_depth_book`
+/// row written through `append_book_slots`. Until this test that path had
+/// no DHAT gate (the inline Full-packet book, which used to share it, now
+/// goes through `DepthWriter::append_book_pair`). 1,500 frames stay under
+/// the staged batch's pre-size (6,000 rows, 360,000 values), so the claim
+/// is "below the pre-size, nothing allocated per packet".
+#[test]
+fn depth20_book_drain_does_not_allocate_per_packet() {
+    let _serial = DHAT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    const FRAMES: u64 = 1_500;
+    let warm: Vec<CapturedFrame> = (0..4).map(|n| depth20_frame(n, n)).collect();
+    let frames: Vec<CapturedFrame> = (0..FRAMES).map(|n| depth20_frame(1_000 + n, n)).collect();
+    let (blocks, bytes, rows) = measure_with(
+        DepthIngest::for_test_book(0),
+        &warm,
+        &frames,
+        DepthFeedKind::Twenty,
+    );
+    assert_eq!(
+        rows,
+        FRAMES * 4 * 20,
+        "the book drain stored {rows} levels for {FRAMES} frames of 4 x 20 levels; \
+         the frames are being refused and the budget below would measure an \
+         empty walk"
+    );
+    assert!(
+        blocks <= MAX_BLOCKS,
+        "PER-PACKET ALLOCATION ON THE DEPTH-20 BOOK DRAIN.\n\n{} packets ({rows} \
+         levels) allocated {blocks} blocks ({bytes} bytes); the budget is \
+         {MAX_BLOCKS} blocks. Find the allocation, do NOT raise the ceiling.",
         FRAMES * 4
     );
 }

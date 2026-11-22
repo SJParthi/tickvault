@@ -118,18 +118,51 @@ impl OrderRateLimiter {
 /// the per-second GCRA still paces it. Recorded rather than hidden: this is a
 /// deliberate trade, not an oversight.
 ///
-/// # Windows roll; they are not calendar-aligned
+/// # The minute and hour windows roll; the day window is the IST date
 ///
-/// Each window starts at the first request after the previous one expired, so
-/// the daily tier is "7,000 in any rolling 24h", which is never MORE permissive
-/// than the broker's calendar day. For a regulatory ceiling, conservative in
-/// the right direction is the only acceptable rounding error.
+/// A minute or hour window starts at the first request after the previous
+/// one expired. The DAY window is the IST calendar date (00:00 to 24:00 IST)
+/// since 2026-11-13 (audit B2 follow-up): the broker counts its 7,000 per
+/// calendar day, and a rolling 24 h window can admit up to 14,000 inside one
+/// broker day (7,000 just before the window rolls at, say, 23:00 and 7,000
+/// just after). Earlier text here called the rolling window "never MORE
+/// permissive than the broker's calendar day", which was false. Nothing
+/// clears the day tier at an arbitrary instant (the 16:00 IST OMS daily reset
+/// did, for one build, which let a full day's ceiling be spent twice inside
+/// one IST date). The day window only ever moves forward: a wall clock that
+/// steps back across midnight keeps the newer date's count.
+///
+/// # Per IST date WITHIN ONE PROCESS (honest limit, B2 review 2026-11-13)
+///
+/// The counts live in memory only. `OrderManagementSystem::new` builds a
+/// fresh budget with every tier at 0, so a crash restart, a deploy or the
+/// evening-drain planned restart starts a new 7,000 (and new minute and hour
+/// windows) inside the same IST date. Orders sent by the earlier process are
+/// not counted. Not reachable today: `dry_run` is hardcoded on, so nothing
+/// reaches the broker. Keeping the day count across restarts (for example,
+/// rebuilt at boot from the day's `order_audit` rows) is a follow-up recorded
+/// in the audit plan, and must land before live orders are switched on.
 #[derive(Debug, Clone, Copy)]
 struct TierWindow {
     limit: u32,
     window_secs: u64,
     used: u32,
     window_start_secs: u64,
+    /// `true` only for the day tier: the window is the IST calendar date.
+    ist_calendar_day: bool,
+}
+
+/// Seconds from UTC to IST, as the unsigned offset the day window uses.
+const IST_OFFSET_SECS: u64 = tickvault_common::constants::IST_UTC_OFFSET_SECONDS_I64.unsigned_abs();
+
+/// The epoch second at which the IST calendar date holding `now_secs`
+/// started (00:00 IST). O(1). Saturates at 0 for the first partial IST day
+/// after the epoch, which no real clock reads.
+const fn ist_day_start_secs(now_secs: u64) -> u64 {
+    let ist_day = now_secs.saturating_add(IST_OFFSET_SECS) / 86_400;
+    ist_day
+        .saturating_mul(86_400)
+        .saturating_sub(IST_OFFSET_SECS)
 }
 
 impl TierWindow {
@@ -139,13 +172,31 @@ impl TierWindow {
             window_secs,
             used: 0,
             window_start_secs: 0,
+            ist_calendar_day: false,
+        }
+    }
+
+    /// The day tier: one window per IST calendar date.
+    const fn ist_day(limit: u32) -> Self {
+        Self {
+            limit,
+            window_secs: 86_400,
+            used: 0,
+            window_start_secs: 0,
+            ist_calendar_day: true,
         }
     }
 
     /// Rolls the window forward if it has expired, then reports whether one
     /// more request fits. Does NOT consume — see [`Self::consume`].
     fn would_admit(&mut self, now_secs: u64) -> bool {
-        if now_secs.saturating_sub(self.window_start_secs) >= self.window_secs {
+        if self.ist_calendar_day {
+            let start = ist_day_start_secs(now_secs);
+            if start > self.window_start_secs {
+                self.window_start_secs = start;
+                self.used = 0;
+            }
+        } else if now_secs.saturating_sub(self.window_start_secs) >= self.window_secs {
             self.window_start_secs = now_secs;
             self.used = 0;
         }
@@ -156,9 +207,11 @@ impl TierWindow {
         self.used = self.used.saturating_add(1);
     }
 
-    const fn reset(&mut self) {
-        self.used = 0;
-        self.window_start_secs = 0;
+    /// Undoes one [`Self::consume`]. Never rolls the window, so called right
+    /// after the consume it takes back (same `&mut` borrow, no other request
+    /// in between) it restores the exact count.
+    const fn give_back(&mut self) {
+        self.used = self.used.saturating_sub(1);
     }
 }
 
@@ -192,7 +245,7 @@ impl OrderBudget {
         Self {
             minute: TierWindow::new(Self::MAX_PER_MINUTE, 60),
             hour: TierWindow::new(Self::MAX_PER_HOUR, 3_600),
-            day: TierWindow::new(Self::MAX_PER_DAY, 86_400),
+            day: TierWindow::ist_day(Self::MAX_PER_DAY),
         }
     }
 
@@ -258,11 +311,19 @@ impl OrderBudget {
         Ok(())
     }
 
-    /// Clears every tier. Called from the OMS daily reset.
-    pub const fn reset_daily(&mut self) {
-        self.minute.reset();
-        self.hour.reset();
-        self.day.reset();
+    /// Gives back the one order the last successful [`Self::try_consume`]
+    /// counted, on every tier, when a later local gate refused that order and
+    /// nothing reached the broker (B2 review, 2026-11-13). Without it a
+    /// refused order still spent budget: retries during a halt could spend
+    /// the hour tier, and after the halt was cleared every place, modify and
+    /// cancel was refused until the hour rolled.
+    ///
+    /// Call it only for an order this process admitted and did not send, and
+    /// only before any other `try_consume` on this budget. O(1), saturating.
+    pub const fn give_back(&mut self) {
+        self.minute.give_back();
+        self.hour.give_back();
+        self.day.give_back();
     }
 
     /// Orders consumed in the current day window — for the operator surface.
@@ -420,18 +481,109 @@ mod tests {
         );
     }
 
+    /// 2026-11-13, 15:59:00 IST as epoch seconds (10:29:00 UTC).
+    const NOV13_1559_IST: u64 = 1_794_565_740;
+
+    /// Audit B2 follow-up (2026-11-13): the day tier is the IST calendar
+    /// date. A day's ceiling spent before 16:00 IST stays spent for the rest
+    /// of that IST date, and opens again at 00:00 IST the next date.
     #[test]
-    fn the_daily_reset_clears_every_tier() {
+    fn the_day_tier_is_the_ist_calendar_date() {
+        let mut budget = OrderBudget::new();
+        // From 00:30 IST, spread so the minute and hour tiers never bind.
+        let mut now = ist_day_start_secs(NOV13_1559_IST) + 1_800;
+        for i in 0..OrderBudget::MAX_PER_DAY {
+            if i > 0 && i % 200 == 0 {
+                now += 60;
+            }
+            if i > 0 && i % 1_000 == 0 {
+                now += 3_600;
+            }
+            budget.try_consume(now).expect("day room");
+        }
+        assert!(now < NOV13_1559_IST, "all spent before 15:59 IST");
+        // 16:01 IST, same date: refused by the day tier.
+        assert!(matches!(
+            budget.try_consume(NOV13_1559_IST + 120),
+            Err(OmsError::OrderBudgetExhausted { tier: "day", .. })
+        ));
+        // 23:59:59 IST, same date: still refused.
+        let next_midnight = ist_day_start_secs(NOV13_1559_IST) + 86_400;
+        assert!(matches!(
+            budget.try_consume(next_midnight - 1),
+            Err(OmsError::OrderBudgetExhausted { tier: "day", .. })
+        ));
+        // 00:00 IST the next date: admitted.
+        budget
+            .try_consume(next_midnight)
+            .expect("a new IST date opens a new day window");
+        assert_eq!(budget.used_today(), 1);
+    }
+
+    /// The IST day starts at 18:30 UTC of the previous UTC date.
+    #[test]
+    fn ist_day_start_is_ist_midnight() {
+        // 2026-11-13 00:00 IST = 2026-11-12 18:30 UTC = 1_794_508_200.
+        assert_eq!(ist_day_start_secs(NOV13_1559_IST), 1_794_508_200);
+        assert_eq!(ist_day_start_secs(1_794_508_200), 1_794_508_200);
+        assert_eq!(ist_day_start_secs(1_794_508_199), 1_794_508_200 - 86_400);
+    }
+
+    /// B2 review (2026-11-13): `give_back` undoes exactly one consume on
+    /// every tier, so a full minute that gave one back admits one more.
+    #[test]
+    fn give_back_undoes_one_consume_on_every_tier() {
         let mut budget = OrderBudget::new();
         for _ in 0..OrderBudget::MAX_PER_MINUTE {
             budget.try_consume(1_000).expect("fills the minute");
         }
         assert!(budget.try_consume(1_000).is_err());
-        budget.reset_daily();
+        budget.give_back();
+        assert_eq!(budget.used_today(), OrderBudget::MAX_PER_MINUTE - 1);
         budget
             .try_consume(1_000)
-            .expect("the daily reset reopens every tier");
+            .expect("the given-back slot is free");
+        assert!(budget.try_consume(1_000).is_err(), "and only that one");
+        // Saturating: giving back on an empty budget stays at 0.
+        let mut empty = OrderBudget::new();
+        empty.give_back();
+        assert_eq!(empty.used_today(), 0);
+    }
+
+    /// A wall clock stepping back across IST midnight never reopens the
+    /// newer date's spent ceiling.
+    #[test]
+    fn a_backward_clock_step_never_reopens_the_day() {
+        let mut budget = OrderBudget::new();
+        let midnight = ist_day_start_secs(NOV13_1559_IST);
+        budget.try_consume(midnight + 10).expect("first");
         assert_eq!(budget.used_today(), 1);
+        budget.try_consume(midnight - 10).expect("second");
+        assert_eq!(budget.used_today(), 2, "the newer date keeps its count");
+    }
+
+    /// B2 review round 5 (2026-11-13): a clock that steps forward past IST
+    /// midnight and back counts on the newer date, the step back neither
+    /// resets it nor adds to the old date. Fails under the old rolling
+    /// window (the window started at 23:59:00 IST had not run 24 h, so the
+    /// count kept climbing across the true midnight: 2, then 3) and under a
+    /// calendar roll on `!=` (the step back reset the newer date to 1).
+    #[test]
+    fn a_backward_step_after_ist_midnight_counts_on_the_newer_date() {
+        let mut budget = OrderBudget::new();
+        let next_midnight = ist_day_start_secs(NOV13_1559_IST) + 86_400;
+        budget
+            .try_consume(next_midnight - 60)
+            .expect("23:59:00 IST");
+        assert_eq!(budget.used_today(), 1);
+        budget
+            .try_consume(next_midnight + 30)
+            .expect("00:00:30 IST the next date");
+        assert_eq!(budget.used_today(), 1, "the new IST date starts at 1");
+        budget
+            .try_consume(next_midnight - 30)
+            .expect("stepped back to 23:59:30 IST");
+        assert_eq!(budget.used_today(), 2, "counted on the newer date");
     }
 
     #[test]

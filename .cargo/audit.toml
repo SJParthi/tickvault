@@ -39,7 +39,12 @@
 # the same way: quinn-proto 0.11.15 -> 0.11.18, plus rand_pcg 0.10.2 (new
 # dependency of 0.11.18) and two existing crates on getrandom 0.4.2's edge
 # list. No other package version changed; no ignore added.
-ignore = []
+# 2026-11-17: RUSTSEC-2026-0543 (chrono) and RUSTSEC-2026-0555 (chrono-tz)
+# mark both UNMAINTAINED (no vulnerability, no fixed version). Owner card
+# 2026-11-17 "Allow now, replace later"; mirrored in deny.toml with reasons.
+# 2026-11-18: chrono-tz removed from the tree, so RUSTSEC-2026-0555 is no
+# longer ignored.
+ignore = ["RUSTSEC-2026-0543"]
 
 [output]
 quiet = false

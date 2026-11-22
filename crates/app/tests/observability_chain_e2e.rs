@@ -47,6 +47,16 @@ use tickvault_core::notification::summary_writer::{
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::SubscriberExt;
 
+/// Keeps a second, inert `tracing` dispatcher registered for the whole test
+/// process. While a scoped subscriber is the only registered dispatcher,
+/// tracing-core caches a callsite as `never` when a thread with no
+/// subscriber reaches it first, and the scoped subscriber then misses the
+/// line. Call before installing the scoped subscriber.
+fn keep_callsite_interest_shared() {
+    static ANCHOR: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+    ANCHOR.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+}
+
 fn fresh_tmp_dir(label: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "tv-e2e-{}-{}-{}",
@@ -89,6 +99,7 @@ fn error_with_code_field_survives_jsonl_roundtrip() {
     let subscriber = tracing_subscriber::registry().with(layer);
 
     // 3. Emit a known event inside this subscriber's scope.
+    keep_callsite_interest_shared();
     tracing::subscriber::with_default(subscriber, || {
         tracing::error!(
             code = ErrorCode::InstrumentP1CrossSegmentCollision.code_str(),
@@ -161,6 +172,7 @@ fn summary_writer_groups_duplicate_jsonl_events_end_to_end() {
     let subscriber = tracing_subscriber::registry().with(layer);
 
     // Emit three duplicate events + one distinct.
+    keep_callsite_interest_shared();
     tracing::subscriber::with_default(subscriber, || {
         for _ in 0..3 {
             tracing::error!(
@@ -235,6 +247,7 @@ fn summary_file_novel_section_lists_single_occurrence_events() {
 
     let subscriber = tracing_subscriber::registry().with(layer);
 
+    keep_callsite_interest_shared();
     tracing::subscriber::with_default(subscriber, || {
         tracing::error!(
             code = ErrorCode::AuthGapTokenExpiry.code_str(),

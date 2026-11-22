@@ -774,21 +774,21 @@ async fn async_main() -> Result<()> {
     // -----------------------------------------------------------------------
     // Step 0.5: `tickvault holiday-gate` (audit D6c; was deploy/aws/holiday-gate.sh)
     // -----------------------------------------------------------------------
-    // Run by tickvault-holiday-gate.service before the app. Asks the same
-    // calendar as `--check-trading-day` and, on a definitive holiday, stamps
-    // the stop marker, pages and stops the instance. After the provider
-    // install because its IMDS and AWS clients use TLS.
+    // Run by tickvault-holiday-gate.service before the app: same calendar as `--check-trading-day`;
+    // on a definitive holiday it stamps the stop marker, pages, stops the instance (TLS: IMDS/AWS).
     let cli_args: Vec<String> = std::env::args().collect();
     if tickvault_app::holiday_gate::is_invocation(&cli_args) {
         let code = tickvault_app::holiday_gate::run(holiday_gate_calendar_day).await;
         std::process::exit(code);
     }
-    // `tickvault ensure-questdb` (audit D6d; was scripts/ensure-questdb.sh):
-    // tickvault.service's ExecStartPre and the console's restart actions bring
-    // the QuestDB container up. After the provider install for its SSM client.
+    // `tickvault ensure-questdb` (D6d): ExecStartPre / console restarts bring QuestDB up (SSM, TLS).
+    // `tickvault day-repair`: the one-off repair of 2026-11-20 (Quote 63, rust-only §0.21).
     if tickvault_app::ensure_questdb::is_invocation(&cli_args) {
         let code = tickvault_app::ensure_questdb::run().await;
         std::process::exit(code);
+    }
+    if tickvault_app::day_repair::is_invocation(&cli_args) {
+        std::process::exit(tickvault_app::day_repair::run_cli(&cli_args).await);
     }
 
     // -----------------------------------------------------------------------
@@ -1293,8 +1293,9 @@ async fn async_main() -> Result<()> {
             std::process::exit(1);
         }
     };
-    // K4 (2026-10-26): the previous process's last receipt, read after the
-    // claim and before this process can append (boot crash-gap row).
+    // §2.20 + K4: backlog vs the last start, then the last receipt, before any append.
+    tickvault_storage::ltt_correction::install_at_boot_from(&config); // scope lock 2026-11-20
+    let _backlog_trend = tickvault_storage::wal_backlog_trend::judge_at_boot(&ws_wal_path);
     let previous_process_last_receipt =
         tickvault_storage::wal_last_receipt::newest_receipt_nanos_on_disk(&ws_wal_path);
 
@@ -2297,6 +2298,7 @@ async fn async_main() -> Result<()> {
     // PR W review round 6: the WAL boot fold ran before this subscriber
     // existed; write what it recorded (and any failed fold persist) now.
     let _boot_fold_logged = tickvault_storage::wal_unapplied_ranges::log_boot_fold_summary();
+    tickvault_storage::ltt_correction::log_boot_summary(); // scope lock 2026-11-20
 
     // Start telemetry after metrics and tracing, before the watched live tasks.
     // 2026-10-30: the per-minute latency proof tables, writer before publisher.
@@ -3854,15 +3856,14 @@ async fn async_main() -> Result<()> {
             // Plan item 49e step 3: absent section = off (market_depth rows).
             depth_storage: config.depth_storage,
             tick_storage: config.tick_storage, // ITEM DT: absent section = library encoder
-            // A second copy of the top contracts on another main-feed socket
-            // (scope lock 2026-10-02). 0 turns it off.
+            // Backup copy on another main-feed socket (scope lock 2026-10-02); 0 = off.
             main_feed_backup_top_n: config.dhan_universe.backup_top_n,
             subscribe_reconcile_auto_resubscribe: config
                 .dhan_universe
                 .subscribe_reconcile_auto_resubscribe,
-            // Frame-silence fast paths (scope lock 2026-10-10): shadow by
-            // default, so they count would-redials before anything acts.
+            // Frame-silence fast paths (scope lock 2026-10-10): shadow by default.
             frame_silence_fast_path: config.dhan_universe.frame_silence_fast_path,
+            ltt_utc_autocorrect: config.dhan_feed.ltt_utc_autocorrect, // scope lock 2026-11-20
             dhan_enabled: config.feeds.dhan_enabled,
             instance_lock_held: std::sync::Arc::clone(&dhan_instance_lock_held),
             // Frames a previous session captured but died before folding. The
@@ -3885,8 +3886,7 @@ async fn async_main() -> Result<()> {
             depth_20_instruments: Vec::new(),
             depth_200_instruments: Vec::new(),
             questdb: config.questdb.clone(),
-            // So the lane can report whether it is ACTUALLY running, instead of
-            // the console reading a flag nothing ever set (2026-08-14).
+            // So the lane reports whether it is ACTUALLY running (2026-08-14).
             feed_runtime: std::sync::Arc::clone(&feed_runtime),
             // And so a DEAD lane can report dead (2026-08-18). The drain
             // records rows flushed to QuestDB, which is what lets the Dhan
@@ -3974,8 +3974,7 @@ async fn async_main() -> Result<()> {
             &main_feed_instruments,
         )
     });
-    // K4 (2026-10-26): daily ticks conservation check (15:45 IST) and the
-    // boot downtime row. Own task; only with the Dhan lane, the one writer.
+    // K4 (2026-10-26): 15:45 IST ticks conservation check + boot downtime row; Dhan lane only.
     let _tick_conservation = config.feeds.dhan_enabled.then(|| {
         tickvault_app::tick_conservation::spawn_tick_conservation(
             config.questdb.clone(),
@@ -3984,14 +3983,15 @@ async fn async_main() -> Result<()> {
             previous_process_last_receipt,
         )
     });
-    // 2026-10-28: the daily expiry-scope check (15:50 IST), own task.
+    // LF-6a handshake timing (09:25 IST); expiry-scope check (15:50); LF-7 fill report. Own tasks.
+    let _network_rtt = tickvault_app::network_rtt::spawn_network_rtt_session(&config);
     let _expiry_scope = config.feeds.dhan_enabled.then(|| {
         tickvault_app::expiry_scope_check::spawn_expiry_scope_check(
             config.questdb.clone(),
             std::sync::Arc::clone(&trading_calendar),
         )
     });
-
+    tickvault_app::live_fill_report::start(&config, &trading_calendar, process_start_ist_nanos);
     // =======================================================================
     // Boot completion signals (deploy-hang fix 2026-07-13; unconditional +
     // non-blocking since PR-C2).
@@ -4753,9 +4753,8 @@ async fn build_shared_infra(
             return Err(anyhow::anyhow!(reason));
         }
     };
-    // Wave 3-B Item 11: opt-in Telegram bucket-coalescer (defaults to `true`).
-    // 2026-07-07 UX overhaul: digest window from config; the drain loop
-    // also owns the episode stability ticker (green-close promotion).
+    // Wave 3-B Item 11: Telegram bucket-coalescer (default true); 2026-07-07: digest window
+    // from config, and the drain loop owns the episode stability ticker (green-close).
     let notifier = if config.features.telegram_bucket_coalescer {
         NotificationService::enable_coalescer(
             notifier,
@@ -4929,10 +4928,10 @@ async fn build_shared_infra(
     // loop (coded error on exhaustion); boot continues either way — a missing
     // key is a degraded session, a halted boot is a dark one.
     //
-    // Audit PR31a (2026-09-27): when the bounded loop gives up, keep
-    // re-running the ensure in the background for this session. A
-    // `DEDUP ENABLE` re-run is what repairs a ticks or depth table ILP
-    // auto-created without its key.
+    // PR31a: on give-up, re-run the ensure in the background. B1: the live
+    // writers post only into keyed tables (the loop arms that gate), since
+    // no re-run can key a table ILP auto-created; rows wait in spill/WAL
+    // until the re-run keys the table.
     if !tickvault_app::candle_ddl_boot::run_live_table_ddl_at_boot(&config.questdb).await {
         drop(tickvault_app::candle_ddl_boot::spawn_ensure_until_keyed(
             config.questdb.clone(),
@@ -4946,9 +4945,9 @@ async fn build_shared_infra(
     // §12.15). The three tables — `dhan_rest_1m_tape` and its two audit
     // siblings — were retained with every row through the 2026-09-16 removal;
     // their writer is back, so their DDL is back. Awaited inline so the
-    // tables exist before the first 15:41 run can write to them. The helper
-    // logs its own failures; boot continues, and the run's flush error then
-    // reports a missing table.
+    // tables exist before the first 15:41 run can write to them. On refusal
+    // (logged) the writer refuses to post and each run re-runs this ensure
+    // first (B1), so ILP never auto-creates an un-keyable table.
     tickvault_storage::dhan_live_crossverify_persistence::ensure_dhan_live_crossverify_tables(
         &config.questdb,
     )

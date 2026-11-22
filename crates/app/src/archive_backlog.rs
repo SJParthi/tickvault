@@ -14,7 +14,8 @@
 //!
 //! Only when ALL of these are true ([`backlog_holds`]):
 //! - the reading is fresh: measured under [`ARCHIVE_BACKLOG_FRESH_SECS`] ago,
-//!   or a daily pass is running and started under
+//!   or a daily pass is running and started, or last dropped a partition
+//!   (`partition_archive::last_archive_drop_unix`), under
 //!   [`ARCHIVE_BACKLOG_RUNNING_MAX_SECS`] ago (a long pass does not let the
 //!   reading go stale while it is still dropping);
 //! - the bytes are above 0;
@@ -49,9 +50,15 @@
 //!
 //! It never holds past 07:30 IST: the drain hold's own window and expiry
 //! end there, and the daily leg stops passing then, so the reading goes
-//! stale. A stuck backlog (no bytes freed for an hour) releases through the
-//! drain hold's stall rule. No page, no alarm, no EMF name: the gauge
-//! [`ARCHIVE_BACKLOG_GAUGE`] is local `/metrics` only.
+//! stale. A stuck backlog releases through the drain hold's stall rule: no
+//! partition dropped and nothing else moving for an hour. ⚠ CHANGED
+//! 2026-11-09 (PR AA-G, finding 10): this read "no bytes freed for an hour"
+//! while the rule only saw the reading at the END of each pass, so a long
+//! pass that kept dropping was judged stalled; an accepted DROP
+//! (`partition_archive::archive_drops_total`) now counts as progress, and a
+//! running pass stays fresh while it dropped one in the last two hours.
+//! No page, no alarm, no EMF name: the gauge [`ARCHIVE_BACKLOG_GAUGE`] is
+//! local `/metrics` only.
 //!
 //! # Cost
 //!
@@ -70,7 +77,10 @@ pub const ARCHIVE_BACKLOG_FRESH_SECS: i64 = 900;
 
 /// While a daily pass runs, its start keeps the last reading fresh for at
 /// most this long, so a pass that never returns cannot hold the box all
-/// night through this alone.
+/// night through this alone. ⚠ CHANGED 2026-11-09 (PR AA-G, finding 10): its
+/// latest accepted DROP restarts this, so the bound reads "running and no
+/// partition dropped for two hours"; the 07:30 IST end of the hold is
+/// unchanged.
 pub const ARCHIVE_BACKLOG_RUNNING_MAX_SECS: i64 = 7_200;
 
 /// The bytes of a provisional reading: the first pass of a process is
@@ -195,23 +205,42 @@ pub fn register_archive_backlog_gauge() {
 /// does not hold it (absent, stale, 0 bytes, or free space at or above the
 /// target). See the module docs. Pure, O(1).
 #[must_use]
-pub fn backlog_holds(reading: Option<BacklogReading>, now_unix: i64) -> Option<u64> {
+pub fn backlog_holds(
+    reading: Option<BacklogReading>,
+    last_drop_unix: Option<i64>,
+    now_unix: i64,
+) -> Option<u64> {
     let reading = reading?;
     let age_ok = |since: i64, max: i64| {
         let age = now_unix.saturating_sub(since);
         age < max && age > -ARCHIVE_BACKLOG_CLOCK_SKEW_SECS
     };
     let fresh = age_ok(reading.at_unix, ARCHIVE_BACKLOG_FRESH_SECS)
-        || reading
-            .pass_running_since
-            .is_some_and(|since| age_ok(since, ARCHIVE_BACKLOG_RUNNING_MAX_SECS));
+        || reading.pass_running_since.is_some_and(|since| {
+            // PR AA-G (finding 10): a running pass also stays fresh from its
+            // latest accepted DROP; a drop from before its start never counts.
+            // ⚠ CHANGED 2026-11-11 (review): a drop stamped ahead of the clock
+            // (recorded during a forward wall-clock step, then the clock
+            // stepped back) is read as now, so a pass still dropping is not
+            // judged stale for the size of the step; the next drop replaces
+            // the stamp (`partition_archive` stores the latest, not the max).
+            age_ok(since, ARCHIVE_BACKLOG_RUNNING_MAX_SECS)
+                || last_drop_unix
+                    .map(|at| at.min(now_unix))
+                    .filter(|at| *at >= since)
+                    .is_some_and(|at| age_ok(at, ARCHIVE_BACKLOG_RUNNING_MAX_SECS))
+        });
     (fresh && reading.bytes > 0 && reading.below_target).then_some(reading.bytes)
 }
 
 /// [`backlog_holds`] over [`ARCHIVE_BACKLOG`] at `now_unix`. O(1).
 #[must_use]
 pub fn held_backlog_bytes(now_unix: i64) -> Option<u64> {
-    backlog_holds(ARCHIVE_BACKLOG.reading(), now_unix)
+    backlog_holds(
+        ARCHIVE_BACKLOG.reading(),
+        tickvault_storage::partition_archive::last_archive_drop_unix(),
+        now_unix,
+    )
 }
 
 #[cfg(test)]
@@ -229,12 +258,17 @@ mod tests {
         }
     }
 
+    /// [`backlog_holds`] with no drop recorded.
+    fn holds(reading: Option<BacklogReading>, now_unix: i64) -> Option<u64> {
+        backlog_holds(reading, None, now_unix)
+    }
+
     #[test]
     fn test_hold_released_when_backlog_stale_or_zero_or_target_met() {
         // Fresh, above 0, below the target: holds with its bytes.
-        assert_eq!(backlog_holds(Some(reading(5, true, NOW)), NOW), Some(5));
+        assert_eq!(holds(Some(reading(5, true, NOW)), NOW), Some(5));
         assert_eq!(
-            backlog_holds(
+            holds(
                 Some(reading(5, true, NOW - ARCHIVE_BACKLOG_FRESH_SECS + 1)),
                 NOW
             ),
@@ -242,27 +276,21 @@ mod tests {
         );
         // Stale.
         assert_eq!(
-            backlog_holds(
+            holds(
                 Some(reading(5, true, NOW - ARCHIVE_BACKLOG_FRESH_SECS)),
                 NOW
             ),
             None
         );
         // Zero bytes.
-        assert_eq!(backlog_holds(Some(reading(0, true, NOW)), NOW), None);
+        assert_eq!(holds(Some(reading(0, true, NOW)), NOW), None);
         // Target met.
-        assert_eq!(backlog_holds(Some(reading(5, false, NOW)), NOW), None);
+        assert_eq!(holds(Some(reading(5, false, NOW)), NOW), None);
         // Nothing published (the switch is off, or no pass measured).
-        assert_eq!(backlog_holds(None, NOW), None);
+        assert_eq!(holds(None, NOW), None);
         // A reading far ahead of the clock does not count.
-        assert_eq!(
-            backlog_holds(Some(reading(5, true, NOW + 3_600)), NOW),
-            None
-        );
-        assert_eq!(
-            backlog_holds(Some(reading(5, true, NOW + 30)), NOW),
-            Some(5)
-        );
+        assert_eq!(holds(Some(reading(5, true, NOW + 3_600)), NOW), None);
+        assert_eq!(holds(Some(reading(5, true, NOW + 30)), NOW), Some(5));
     }
 
     #[test]
@@ -272,11 +300,104 @@ mod tests {
             pass_running_since: Some(since),
             ..reading(9, true, old)
         };
-        assert_eq!(backlog_holds(Some(running(NOW - 600)), NOW), Some(9));
+        assert_eq!(holds(Some(running(NOW - 600)), NOW), Some(9));
         assert_eq!(
-            backlog_holds(Some(running(NOW - ARCHIVE_BACKLOG_RUNNING_MAX_SECS)), NOW),
+            holds(Some(running(NOW - ARCHIVE_BACKLOG_RUNNING_MAX_SECS)), NOW),
             None,
             "a pass that never returns stops holding"
+        );
+    }
+
+    /// PR AA-G (finding 10): a pass still dropping partitions past two hours
+    /// keeps its reading fresh; one that stopped dropping, or a drop from
+    /// before the pass started, does not.
+    #[test]
+    fn test_regression_running_pass_that_keeps_dropping_stays_fresh_past_two_hours() {
+        let old = NOW - 2 * ARCHIVE_BACKLOG_FRESH_SECS;
+        let since = NOW - 3 * 3_600;
+        let running = BacklogReading {
+            pass_running_since: Some(since),
+            ..reading(9, true, old)
+        };
+        assert_eq!(
+            holds(Some(running), NOW),
+            None,
+            "no drop: stale after two hours"
+        );
+        assert_eq!(
+            backlog_holds(Some(running), Some(NOW - 600), NOW),
+            Some(9),
+            "a drop ten minutes ago keeps it fresh"
+        );
+        assert_eq!(
+            backlog_holds(
+                Some(running),
+                Some(NOW - ARCHIVE_BACKLOG_RUNNING_MAX_SECS),
+                NOW
+            ),
+            None,
+            "no drop for two hours: stale"
+        );
+        assert_eq!(
+            backlog_holds(Some(running), Some(since - 1), NOW),
+            None,
+            "a drop before the pass started never counts"
+        );
+        // 2026-11-11 review: the case above is already refused by age alone.
+        // This one is not: a pass start a little ahead of the clock (a step
+        // back) with a recent drop from before it; only the start filter
+        // refuses it.
+        let started_ahead = BacklogReading {
+            pass_running_since: Some(NOW + 120),
+            ..running
+        };
+        assert_eq!(
+            backlog_holds(Some(started_ahead), Some(NOW - 60), NOW),
+            None,
+            "a drop from before the pass started never counts"
+        );
+        let at_target = BacklogReading {
+            below_target: false,
+            ..running
+        };
+        assert_eq!(
+            backlog_holds(Some(at_target), Some(NOW - 60), NOW),
+            None,
+            "free space at the target: nothing holds, whatever the drops say"
+        );
+        let between = BacklogReading {
+            pass_running_since: None,
+            ..running
+        };
+        assert_eq!(
+            backlog_holds(Some(between), Some(NOW - 60), NOW),
+            None,
+            "a drop never refreshes an old reading between passes"
+        );
+    }
+
+    // Regression: 2026-11-11 — PR AA-G review. A drop stamped during a
+    // forward wall-clock step sat ahead of the clock once it stepped back,
+    // and the age check refused it, so a long pass still dropping read stale.
+    #[test]
+    fn test_regression_backlog_holds_reads_a_future_drop_stamp_as_now() {
+        let running = BacklogReading {
+            pass_running_since: Some(NOW - 3 * 3_600),
+            ..reading(9, true, NOW - 2 * ARCHIVE_BACKLOG_FRESH_SECS)
+        };
+        assert_eq!(
+            backlog_holds(Some(running), Some(NOW + 600), NOW),
+            Some(9),
+            "a drop stamped ten minutes ahead still keeps the running pass fresh"
+        );
+        let between = BacklogReading {
+            pass_running_since: None,
+            ..running
+        };
+        assert_eq!(
+            backlog_holds(Some(between), Some(NOW + 600), NOW),
+            None,
+            "it never refreshes a reading between passes"
         );
     }
 
@@ -317,23 +438,23 @@ mod tests {
         let cell = ArchiveBacklog::new();
         cell.note_pass_started(NOW, true);
         assert_eq!(
-            backlog_holds(cell.reading(), NOW + 600),
+            holds(cell.reading(), NOW + 600),
             Some(PROVISIONAL_BACKLOG_BYTES),
             "the first pass, below the target, holds the box while it runs"
         );
         assert_eq!(
-            backlog_holds(cell.reading(), NOW + ARCHIVE_BACKLOG_RUNNING_MAX_SECS),
+            holds(cell.reading(), NOW + ARCHIVE_BACKLOG_RUNNING_MAX_SECS),
             None,
             "bounded like any running pass"
         );
         // The pass's result replaces the provisional reading.
         cell.publish(Some(3), true, NOW + 900);
-        assert_eq!(backlog_holds(cell.reading(), NOW + 900), Some(3));
+        assert_eq!(holds(cell.reading(), NOW + 900), Some(3));
 
         // Free space at or above the target before the pass: nothing holds.
         let above = ArchiveBacklog::new();
         above.note_pass_started(NOW, false);
-        assert_eq!(backlog_holds(above.reading(), NOW + 600), None);
+        assert_eq!(holds(above.reading(), NOW + 600), None);
     }
 
     #[test]

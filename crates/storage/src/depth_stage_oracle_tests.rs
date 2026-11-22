@@ -145,7 +145,9 @@ fn publish(seed: u64) {
     publish_candle_contract_labels(labels);
 }
 
-/// Appends one generated side (or bid/ask pair) to both writers.
+/// Appends one generated side (or bid/ask pair) to both writers. A
+/// five-level pair goes through `append_book_pair` half the time (speed fix
+/// 5), so every oracle stream also proves the pair append's bytes.
 fn append_both(seed: u64, counter: &mut i64, w: &mut DepthWriter, legacy: &mut LegacyBook) {
     let mut rng = Rng(seed | 1);
     let kind = match rng.below(12) {
@@ -168,10 +170,12 @@ fn append_both(seed: u64, counter: &mut i64, w: &mut DepthWriter, legacy: &mut L
     } else {
         &[DEPTH_SIDE_ASK]
     };
-    let mut prices = [0.0_f64; MAX_DEPTH_BOOK_LEVELS + 1];
-    let mut quantities = [0.0_f64; MAX_DEPTH_BOOK_LEVELS + 1];
-    let mut orders = [0.0_f64; MAX_DEPTH_BOOK_LEVELS + 1];
-    for side in sides {
+    // [side][value]; one set per side so a pair can borrow both at once.
+    let mut prices = [[0.0_f64; MAX_DEPTH_BOOK_LEVELS + 1]; 2];
+    let mut quantities = [[0.0_f64; MAX_DEPTH_BOOK_LEVELS + 1]; 2];
+    let mut orders = [[0.0_f64; MAX_DEPTH_BOOK_LEVELS + 1]; 2];
+    let mut lens = [(0_usize, 0_usize); 2];
+    for (s, _side) in sides.iter().enumerate() {
         let n = match kind {
             DEPTH_KIND_5 => {
                 if rng.below(10) == 0 {
@@ -189,27 +193,51 @@ fn append_both(seed: u64, counter: &mut i64, w: &mut DepthWriter, legacy: &mut L
         };
         let nq = if rng.below(30) == 0 { n + 1 } else { n };
         for i in 0..=MAX_DEPTH_BOOK_LEVELS {
-            prices[i] = f64::from_bits(rng.next());
-            quantities[i] = (rng.below(10_000)) as f64;
-            orders[i] = if rng.below(9) == 0 {
+            prices[s][i] = f64::from_bits(rng.next());
+            quantities[s][i] = (rng.below(10_000)) as f64;
+            orders[s][i] = if rng.below(9) == 0 {
                 f64::NAN
             } else {
                 rng.below(50) as f64
             };
         }
-        let row = DepthBookRow {
+        lens[s] = (n, nq.min(MAX_DEPTH_BOOK_LEVELS + 1));
+    }
+    let row = |s: usize, side: &'static str| DepthBookRow {
+        security_id: id,
+        segment,
+        depth_kind: kind,
+        side,
+        prices: &prices[s][..lens[s].0],
+        quantities: &quantities[s][..lens[s].1],
+        orders: &orders[s][..lens[s].0],
+        capture_seq: seq,
+        ts_nanos: ts,
+    };
+    if sides.len() == 2 && rng.below(2) == 0 {
+        let (bid, ask) = (row(0, DEPTH_SIDE_BID), row(1, DEPTH_SIDE_ASK));
+        let pair = DepthBookPair {
             security_id: id,
             segment,
             depth_kind: kind,
-            side,
-            prices: &prices[..n],
-            quantities: &quantities[..nq.min(MAX_DEPTH_BOOK_LEVELS + 1)],
-            orders: &orders[..n],
+            bid_prices: bid.prices,
+            bid_quantities: bid.quantities,
+            bid_orders: bid.orders,
+            ask_prices: ask.prices,
+            ask_quantities: ask.quantities,
+            ask_orders: ask.orders,
             capture_seq: seq,
             ts_nanos: ts,
         };
-        let _ = w.append_book_row(&row);
-        legacy.append(&row);
+        let _ = w.append_book_pair(&pair);
+        legacy.append(&bid);
+        legacy.append(&ask);
+        return;
+    }
+    for (s, side) in sides.iter().enumerate() {
+        let r = row(s, side);
+        let _ = w.append_book_row(&r);
+        legacy.append(&r);
     }
 }
 
@@ -878,4 +906,504 @@ fn test_writer_sink_scratch_shrinks_back_after_a_batch_above_the_presize() {
     assert!(sink.scratch.capacity() >= DEPTH_BOOK_ROW_BUFFER_PRESIZE_BYTES);
     assert!(sink.scratch.capacity() <= DEPTH_BOOK_ROW_BUFFER_PRESIZE_BYTES * 2);
     let _ = std::fs::remove_dir_all(&spill);
+}
+
+// Regression: 2026-11-11 — PR AA-G review (finding 17). On the after-close
+// pass's SYNCHRONOUS writer a ninth name table inside one batch commits the
+// batch from inside `append_book_row` (`stage_pin_after_cut`), outside the
+// pass's per-flush archive quiesce lock. With
+// `hold_archive_quiesce_on_pin_cut` set, that commit waits while an archiver
+// holds the exclusive side, and runs as soon as it lets go.
+#[test]
+fn test_hold_archive_quiesce_on_pin_cut_holds_the_in_append_commit() {
+    let _g = TEST_PUBLISH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let quiesce: &'static crate::archive_quiesce::ArchiveQuiesce =
+        Box::leak(Box::new(crate::archive_quiesce::ArchiveQuiesce::new()));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("runtime");
+    let archiver = runtime
+        .block_on(quiesce.hold_writers(std::time::Duration::from_secs(5)))
+        .expect("the archiver takes the exclusive side");
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<i64>();
+    let writer = std::thread::spawn(move || {
+        let mut w = DepthWriter::for_test_book(Feed::Dhan);
+        w.hold_archive_quiesce_on_pin_cut_with(quiesce);
+        let prices = [100.0];
+        for t in 0..crate::depth_stage::DEPTH_STAGE_LABEL_PINS as i64 + 1 {
+            let mut labels = CandleContractLabels::default();
+            labels.insert((ID_BASE + t, "NSE_FNO"), Arc::from("N"));
+            publish_candle_contract_labels(labels);
+            let row = DepthBookRow {
+                security_id: ID_BASE + t,
+                segment: "NSE_FNO",
+                depth_kind: DEPTH_KIND_5,
+                side: DEPTH_SIDE_ASK,
+                prices: &prices,
+                quantities: &prices,
+                orders: &prices,
+                capture_seq: 100 + t,
+                ts_nanos: SESSION_TS_NANOS,
+            };
+            let _ = w.append_book_row(&row);
+            let _ = done_tx.send(t);
+        }
+    });
+    let pins = crate::depth_stage::DEPTH_STAGE_LABEL_PINS as i64;
+    for t in 0..pins {
+        assert_eq!(
+            done_rx.recv_timeout(std::time::Duration::from_secs(30)),
+            Ok(t),
+            "appends that stage only never wait for the archiver"
+        );
+    }
+    assert!(
+        done_rx
+            .recv_timeout(std::time::Duration::from_millis(300))
+            .is_err(),
+        "the ninth table's in-append commit waits while the archiver holds the lock"
+    );
+    drop(archiver);
+    assert_eq!(
+        done_rx.recv_timeout(std::time::Duration::from_secs(30)),
+        Ok(pins),
+        "it commits as soon as the archiver lets go"
+    );
+    writer.join().expect("writer thread");
+    publish_candle_contract_labels(CandleContractLabels::default());
+}
+
+/// The production setter points the pin cut at the PROCESS lock (the one the
+/// archiver and the after-close pass's flushes use).
+#[test]
+fn test_hold_archive_quiesce_on_pin_cut_uses_the_process_lock() {
+    let mut w = DepthWriter::for_test_book(Feed::Dhan);
+    assert!(w.pin_cut_quiesce.is_none(), "off by default");
+    w.hold_archive_quiesce_on_pin_cut();
+    assert!(
+        w.pin_cut_quiesce
+            .is_some_and(|q| std::ptr::eq(q, crate::archive_quiesce::process_archive_quiesce())),
+        "the process lock"
+    );
+}
+
+// ---- Speed fix 5 (2026-11-17): the pair append and the generation pin ----
+
+/// One step of the pair-versus-singles stream.
+#[derive(Debug, Clone)]
+enum PairOp {
+    Append(u64),
+    Publish(u64),
+    Flush,
+    Discard,
+    MarkUnbacked,
+}
+
+fn pair_op_strategy() -> impl Strategy<Value = PairOp> {
+    prop_oneof![
+        12 => any::<u64>().prop_map(PairOp::Append),
+        4 => any::<u64>().prop_map(PairOp::Publish),
+        2 => Just(PairOp::Flush),
+        1 => Just(PairOp::Discard),
+        1 => Just(PairOp::MarkUnbacked),
+    ]
+}
+
+/// The values of one generated pair: identity, then per side
+/// `(prices, quantities, orders)` lengths and values.
+struct PairCase {
+    id: i64,
+    segment: &'static str,
+    kind: &'static str,
+    seq: i64,
+    ts: i64,
+    values: [[[f64; MAX_DEPTH_BOOK_LEVELS + 1]; 3]; 2],
+    lens: [[usize; 3]; 2],
+}
+
+impl PairCase {
+    fn new(seed: u64, counter: &mut i64) -> Self {
+        let mut rng = Rng(seed | 1);
+        let kind = if rng.below(6) == 0 {
+            DEPTH_KIND_20
+        } else {
+            DEPTH_KIND_5
+        };
+        let id = ID_BASE + rng.below(IDS as u64) as i64;
+        let segment = SEGMENTS[(id % 3) as usize];
+        *counter += 1 + rng.below(2) as i64;
+        let seq = if rng.below(15) == 0 { 0 } else { *counter };
+        let ts = match rng.below(12) {
+            0 => SESSION_TS_NANOS - 3 * 3_600 * 1_000_000_000,
+            1 => -5,
+            _ => SESSION_TS_NANOS + rng.below(1_000_000_000) as i64,
+        };
+        let base = if kind == DEPTH_KIND_5 { 5 } else { 20 };
+        let mut values = [[[0.0_f64; MAX_DEPTH_BOOK_LEVELS + 1]; 3]; 2];
+        let mut lens = [[0_usize; 3]; 2];
+        for side in 0..2 {
+            let n = match rng.below(12) {
+                0 => rng.below(5) as usize,
+                1 => MAX_DEPTH_BOOK_LEVELS + 1,
+                _ => base,
+            };
+            lens[side] = [n; 3];
+            // A malformed side now and then: one slice a level longer.
+            if rng.below(20) == 0 {
+                lens[side][1 + rng.below(2) as usize] = (n + 1).min(MAX_DEPTH_BOOK_LEVELS + 1);
+            }
+            for column in &mut values[side] {
+                for v in column.iter_mut() {
+                    *v = match rng.below(15) {
+                        0 => f64::NAN,
+                        1 => f64::from_bits(rng.next()),
+                        _ => rng.below(100_000) as f64 / 20.0,
+                    };
+                }
+            }
+        }
+        Self {
+            id,
+            segment,
+            kind,
+            seq,
+            ts,
+            values,
+            lens,
+        }
+    }
+
+    fn row(&self, side: usize) -> DepthBookRow<'_> {
+        DepthBookRow {
+            security_id: self.id,
+            segment: self.segment,
+            depth_kind: self.kind,
+            side: if side == 0 {
+                DEPTH_SIDE_BID
+            } else {
+                DEPTH_SIDE_ASK
+            },
+            prices: &self.values[side][0][..self.lens[side][0]],
+            quantities: &self.values[side][1][..self.lens[side][1]],
+            orders: &self.values[side][2][..self.lens[side][2]],
+            capture_seq: self.seq,
+            ts_nanos: self.ts,
+        }
+    }
+
+    fn pair(&self) -> DepthBookPair<'_> {
+        let (bid, ask) = (self.row(0), self.row(1));
+        DepthBookPair {
+            security_id: self.id,
+            segment: self.segment,
+            depth_kind: self.kind,
+            bid_prices: bid.prices,
+            bid_quantities: bid.quantities,
+            bid_orders: bid.orders,
+            ask_prices: ask.prices,
+            ask_quantities: ask.quantities,
+            ask_orders: ask.orders,
+            capture_seq: self.seq,
+            ts_nanos: self.ts,
+        }
+    }
+}
+
+/// What a writer shows after a step: pending levels, pending text bytes,
+/// the encoded pending rows, the unbacked mark and the cached run.
+fn writer_state(w: &DepthWriter) -> (usize, usize, Vec<u8>, bool, Option<(i64, &'static str)>) {
+    (
+        w.pending(),
+        w.pending_bytes(),
+        w.pending_ilp_bytes(),
+        w.pending_unbacked,
+        w.book_label.map(|(id, seg, _, _)| (id, seg)),
+    )
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 256, ..ProptestConfig::default() })]
+
+    /// Speed fix 5: `append_book_pair` is the bid single append then the ask
+    /// single append, step for step: the same results, the same pending
+    /// levels and text bytes, the same staged rows, the same batches handed
+    /// off, across random name publishes (a ninth table included), flushes,
+    /// rescues, malformed sides and out-of-window rows.
+    #[test]
+    fn proptest_fix5_append_book_pair_equals_two_single_appends(
+        ops in proptest::collection::vec(pair_op_strategy(), 1..200)
+    ) {
+        let _g = TEST_PUBLISH_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        publish_candle_contract_labels(CandleContractLabels::default());
+        let spill_a = temp_dir("pair-a");
+        let spill_b = temp_dir("pair-b");
+        let make = |spill: PathBuf| {
+            let (mut w, sink, rx) = DepthWriter::for_test_book(Feed::Dhan)
+                .with_spill_dir_for_test(spill)
+                .with_wal_defer_check_for_test(|_, _, _| false)
+                .split_for_offload();
+            drop(sink);
+            let (rescue_sink, rescue_rx) = w.split_rescue_offload();
+            drop(rescue_sink);
+            (w, rx, rescue_rx)
+        };
+        let (mut pair_w, pair_rx, pair_rescue) = make(spill_a.clone());
+        let (mut single_w, single_rx, single_rescue) = make(spill_b.clone());
+        let mut counter = 10_000_i64;
+        let drain = |rx: &std::sync::mpsc::Receiver<DepthFlushBatch>,
+                     rescue: &std::sync::mpsc::Receiver<DepthRescueBatch>| {
+            let mut out = Vec::new();
+            let mut rows = 0_usize;
+            while let Ok(b) = rx.try_recv() {
+                out.extend_from_slice(&flush_batch_bytes(&b));
+                rows += b.rows;
+            }
+            while let Ok(b) = rescue.try_recv() {
+                out.extend_from_slice(&rescue_batch_bytes(&b));
+                rows += b.rows;
+                release_floor(b);
+            }
+            (out, rows)
+        };
+        for op in &ops {
+            match op {
+                PairOp::Append(seed) => {
+                    let case = PairCase::new(*seed, &mut counter);
+                    let (a_bid, a_ask) = pair_w.append_book_pair(&case.pair());
+                    let b_bid = single_w.append_book_row(&case.row(0));
+                    let b_ask = single_w.append_book_row(&case.row(1));
+                    prop_assert_eq!(a_bid.is_ok(), b_bid.is_ok());
+                    prop_assert_eq!(a_ask.is_ok(), b_ask.is_ok());
+                }
+                PairOp::Publish(seed) => publish(*seed),
+                PairOp::Flush => {
+                    let a = pair_w.flush().is_ok();
+                    let b = single_w.flush().is_ok();
+                    prop_assert_eq!(a, b);
+                }
+                PairOp::Discard => {
+                    prop_assert_eq!(pair_w.discard_pending(), single_w.discard_pending());
+                }
+                PairOp::MarkUnbacked => {
+                    pair_w.mark_pending_unbacked();
+                    single_w.mark_pending_unbacked();
+                }
+            }
+            prop_assert_eq!(writer_state(&pair_w), writer_state(&single_w), "after {:?}", op);
+            prop_assert_eq!(
+                drain(&pair_rx, &pair_rescue),
+                drain(&single_rx, &single_rescue),
+                "handed-off batches differ after {:?}",
+                op
+            );
+        }
+        pair_w.close_offload();
+        single_w.close_offload();
+        let _ = pair_w.discard_pending();
+        let _ = single_w.discard_pending();
+        prop_assert_eq!(
+            drain(&pair_rx, &pair_rescue),
+            drain(&single_rx, &single_rescue)
+        );
+        drop(pair_rescue);
+        drop(single_rescue);
+        pair_w.close_rescue_offload();
+        single_w.close_rescue_offload();
+        prop_assert_eq!(read_v2_spill_dir(&spill_a), read_v2_spill_dir(&spill_b));
+        let _ = std::fs::remove_dir_all(&spill_a);
+        let _ = std::fs::remove_dir_all(&spill_b);
+        publish_candle_contract_labels(CandleContractLabels::default());
+    }
+
+    /// Speed fix 5: a name-publish-heavy stream (a ninth table inside one
+    /// batch is common) through the staged writer, half of its five-level
+    /// pairs by `append_book_pair`, still writes the legacy append's bytes.
+    #[test]
+    fn proptest_fix5_publish_heavy_stream_equals_the_legacy_append(
+        ops in proptest::collection::vec(
+            prop_oneof![
+                10 => any::<u64>().prop_map(Op::Append),
+                6 => any::<u64>().prop_map(Op::Publish),
+                1 => Just(Op::Flush),
+                1 => Just(Op::Discard),
+                1 => Just(Op::MarkUnbacked),
+            ],
+            1..200,
+        )
+    ) {
+        let _g = TEST_PUBLISH_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (got, got_levels, want, want_levels) = run(&ops, true);
+        prop_assert_eq!(got_levels, want_levels);
+        prop_assert!(got == want, "staged bytes differ from the legacy append");
+    }
+}
+
+/// A level writer refuses both sides of a pair, exactly as it refuses two
+/// single appends.
+#[test]
+fn test_append_book_pair_on_a_level_writer_refuses_both_sides() {
+    let _g = TEST_PUBLISH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut counter = 1_i64;
+    let mut seed = 3_u64;
+    let case = loop {
+        let c = PairCase::new(seed, &mut counter);
+        if c.ts >= SESSION_TS_NANOS && c.lens == [[5; 3]; 2] && c.seq > 0 {
+            break c;
+        }
+        seed += 2;
+    };
+    let mut w = DepthWriter::for_test(Feed::Dhan);
+    let (bid, ask) = w.append_book_pair(&case.pair());
+    assert!(bid.is_err() && ask.is_err());
+    assert_eq!(w.pending(), 0);
+}
+
+/// A pair whose sides carry different level counts writes each line at its
+/// own length (the shared length is taken only for equal counts).
+#[test]
+fn test_append_book_pair_with_unequal_sides_writes_each_line_at_its_own_length() {
+    let _g = TEST_PUBLISH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut named = CandleContractLabels::default();
+    named.insert((ID_BASE, "NSE_FNO"), Arc::from("NIFTY-X"));
+    publish_candle_contract_labels(named);
+    let bid = [100.0, 99.5, 99.0];
+    let ask = [100.5];
+    let pair = DepthBookPair {
+        security_id: ID_BASE,
+        segment: "NSE_FNO",
+        depth_kind: DEPTH_KIND_5,
+        bid_prices: &bid,
+        bid_quantities: &bid,
+        bid_orders: &bid,
+        ask_prices: &ask,
+        ask_quantities: &ask,
+        ask_orders: &ask,
+        capture_seq: 77,
+        ts_nanos: SESSION_TS_NANOS,
+    };
+    let mut w = DepthWriter::for_test_book(Feed::Dhan);
+    let (b, a) = w.append_book_pair(&pair);
+    assert!(b.is_ok() && a.is_ok());
+    let mut legacy = LegacyBook::new();
+    legacy.append(&pair.side(DEPTH_SIDE_BID));
+    legacy.append(&pair.side(DEPTH_SIDE_ASK));
+    assert_eq!(w.pending_ilp_bytes(), legacy.buffer.as_bytes());
+    assert_eq!(w.pending_bytes(), legacy.buffer.len());
+    assert_eq!(w.pending(), 4);
+    publish_candle_contract_labels(CandleContractLabels::default());
+}
+
+/// A ninth name table arriving on a pair's run cuts the batch early and
+/// loses no byte (the pair twin of
+/// `test_ninth_name_table_cuts_the_batch_and_keeps_every_byte`).
+#[test]
+fn test_fix5_ninth_name_table_through_append_book_pair_keeps_every_byte() {
+    let _g = TEST_PUBLISH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (mut w, sink, rx) = DepthWriter::for_test_book(Feed::Dhan).split_for_offload();
+    drop(sink);
+    let mut legacy = LegacyBook::new();
+    let bid = [100.0, 99.95, 99.9, 99.85, 99.8];
+    let ask = [100.05, 100.1, 100.15, 100.2, 100.25];
+    let mut got = Vec::new();
+    for t in 0..20_i64 {
+        let mut labels = CandleContractLabels::default();
+        labels.insert(
+            (ID_BASE + t, "NSE_FNO"),
+            Arc::from(format!("N{t}").as_str()),
+        );
+        publish_candle_contract_labels(labels);
+        let pair = DepthBookPair {
+            security_id: ID_BASE + t,
+            segment: "NSE_FNO",
+            depth_kind: DEPTH_KIND_5,
+            bid_prices: &bid,
+            bid_quantities: &bid,
+            bid_orders: &bid,
+            ask_prices: &ask,
+            ask_quantities: &ask,
+            ask_orders: &ask,
+            capture_seq: 100 + t,
+            ts_nanos: SESSION_TS_NANOS,
+        };
+        let (b, a) = w.append_book_pair(&pair);
+        assert!(b.is_ok() && a.is_ok());
+        legacy.append(&pair.side(DEPTH_SIDE_BID));
+        legacy.append(&pair.side(DEPTH_SIDE_ASK));
+        assert!(w.staged.pin_count() <= crate::depth_stage::DEPTH_STAGE_LABEL_PINS);
+        while let Ok(b) = rx.try_recv() {
+            got.extend_from_slice(&flush_batch_bytes(&b));
+        }
+    }
+    got.extend_from_slice(&w.pending_ilp_bytes());
+    publish_candle_contract_labels(CandleContractLabels::default());
+    let text = String::from_utf8_lossy(&got);
+    assert!(text.contains("contract=N19"), "{text}");
+    assert_eq!(got, legacy.buffer.as_bytes());
+}
+
+/// Between publishes, a run change resolves its name from the batch's
+/// pinned table (no table load) and still writes the name a fresh load
+/// would give; after a publish the new table's name is used.
+#[test]
+fn test_fix5_run_change_without_a_publish_reads_the_pinned_table() {
+    let _g = TEST_PUBLISH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut first = CandleContractLabels::default();
+    for i in 0..3 {
+        first.insert(
+            (ID_BASE + i, "NSE_FNO"),
+            Arc::from(format!("A{i}").as_str()),
+        );
+    }
+    publish_candle_contract_labels(first);
+    let mut w = DepthWriter::for_test_book(Feed::Dhan);
+    let mut legacy = LegacyBook::new();
+    let p = [1.0];
+    let row = |id: i64, seq: i64| DepthBookRow {
+        security_id: id,
+        segment: "NSE_FNO",
+        depth_kind: DEPTH_KIND_5,
+        side: DEPTH_SIDE_BID,
+        prices: &p,
+        quantities: &p,
+        orders: &p,
+        capture_seq: seq,
+        ts_nanos: SESSION_TS_NANOS,
+    };
+    for (i, id) in [0, 1, 2, 0, 1].iter().enumerate() {
+        let r = row(ID_BASE + id, 10 + i as i64);
+        w.append_book_row(&r).expect("append");
+        legacy.append(&r);
+    }
+    let g = crate::candle_contract_labels::candle_contract_labels_generation();
+    assert_eq!(w.staged.current_pin_at_generation(g), Some(0));
+    let mut second = CandleContractLabels::default();
+    second.insert((ID_BASE + 2, "NSE_FNO"), Arc::from("B2"));
+    publish_candle_contract_labels(second);
+    for (i, id) in [2, 0].iter().enumerate() {
+        let r = row(ID_BASE + id, 20 + i as i64);
+        w.append_book_row(&r).expect("append");
+        legacy.append(&r);
+    }
+    assert_eq!(w.staged.pin_count(), 2, "the publish pinned a second table");
+    let got = w.pending_ilp_bytes();
+    publish_candle_contract_labels(CandleContractLabels::default());
+    let text = String::from_utf8_lossy(&got);
+    assert_eq!(text.matches("contract=A").count(), 5, "{text}");
+    assert_eq!(text.matches("contract=B2").count(), 1, "{text}");
+    assert_eq!(got, legacy.buffer.as_bytes());
 }

@@ -197,6 +197,11 @@ pub struct ApplicationConfig {
     /// opts in.
     #[serde(default)]
     pub dhan_universe: DhanUniverseConfig,
+    /// `[dhan_feed]` — how the live main feed reads Dhan's Last Trade Time
+    /// (scope lock 2026-11-20, "DHAN TRADE TIME SENT AS UTC"). Absent
+    /// section ⇒ the default `act`.
+    #[serde(default)]
+    pub dhan_feed: DhanFeedConfig,
     /// `[dhan_margin_gate]` — 🔷 DHAN pre-trade margin gate (operator
     /// directive 2026-07-14, relayed via the coordinator session — the
     /// Funds & Margin surface runs as its own dedicated build; umbrella
@@ -235,6 +240,148 @@ pub struct ApplicationConfig {
     /// the portal fall back to the slower box path.
     #[serde(default)]
     pub operator_movers: OperatorMoversConfig,
+    /// `[live_fill]` — the live PAPER fill chain (plan item LF-6b): live ticks
+    /// → strategy candles → the approved brutex strategy engine → a paper
+    /// order on the dry-run OMS with the worst-case fill. Absent section ⇒
+    /// OFF. Even when on, the chain idles until an approved brutex strategy
+    /// crate exists (`live_fill::select_engine` returns `None` today).
+    #[serde(default)]
+    pub live_fill: LiveFillConfig,
+}
+
+/// `[live_fill]` — the live paper fill chain (plan item LF-6b, owner rules of
+/// 2026-11-12: a late price skips the order, a partial fill's remainder is
+/// cancelled, 60 s fill window, worst-case fill priced per second). PAPER
+/// ONLY: the chain sends to the dry-run OMS and never to a broker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub struct LiveFillConfig {
+    /// Master switch. Default OFF. Needs `[order_runtime] enabled`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Ticks the drain may queue for the chain thread before the tap drops
+    /// (counted). Range 1,024..=1,048,576.
+    #[serde(default = "default_live_fill_tap_capacity")]
+    pub tap_capacity: usize,
+    /// How long after a candle's end the chain waits for its final price
+    /// before deciding, ms. Range 100..=10,000.
+    #[serde(default = "default_live_fill_wait_ms")]
+    pub wait_ms: u64,
+    /// The same wait for the first candle of each size that opens at 09:15:00,
+    /// ms. Range `wait_ms..=30,000`.
+    #[serde(default = "default_live_fill_open_wait_ms")]
+    pub open_wait_ms: u64,
+    /// Marketable-limit band, basis points. Range 1..=9,999.
+    #[serde(default = "default_live_fill_band_bps")]
+    pub band_bps: u32,
+    /// Our share of a second's traded volume in the worst-case fill, basis
+    /// points. Range 1..=10,000.
+    #[serde(default = "default_live_fill_participation_bps")]
+    pub participation_bps: u32,
+    /// The fill window, seconds after the decision (owner rule: 60). The rest
+    /// is cancelled. Range 1..=600.
+    #[serde(default = "default_live_fill_max_fill_seconds")]
+    pub max_fill_seconds: u32,
+    /// Bounded event and paper-command channel capacity. Range 64..=65,536.
+    #[serde(default = "default_live_fill_event_channel_capacity")]
+    pub event_channel_capacity: usize,
+}
+
+const fn default_live_fill_tap_capacity() -> usize {
+    65_536
+}
+const fn default_live_fill_wait_ms() -> u64 {
+    1_000
+}
+const fn default_live_fill_open_wait_ms() -> u64 {
+    1_000
+}
+const fn default_live_fill_band_bps() -> u32 {
+    1_000
+}
+const fn default_live_fill_participation_bps() -> u32 {
+    2_500
+}
+/// The highest `[live_fill] max_fill_seconds` the config accepts. The daily
+/// report (`live_fill_report`) bounds a stored value by the same figure, so a
+/// hand-edited row cannot size an allocation past it.
+pub const LIVE_FILL_MAX_FILL_SECONDS_CEILING: u32 = 600;
+
+const fn default_live_fill_max_fill_seconds() -> u32 {
+    60
+}
+const fn default_live_fill_event_channel_capacity() -> usize {
+    4_096
+}
+
+impl Default for LiveFillConfig {
+    /// Matches the serde field defaults: an empty `[live_fill]` section and an
+    /// absent one read the same.
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            tap_capacity: default_live_fill_tap_capacity(),
+            wait_ms: default_live_fill_wait_ms(),
+            open_wait_ms: default_live_fill_open_wait_ms(),
+            band_bps: default_live_fill_band_bps(),
+            participation_bps: default_live_fill_participation_bps(),
+            max_fill_seconds: default_live_fill_max_fill_seconds(),
+            event_channel_capacity: default_live_fill_event_channel_capacity(),
+        }
+    }
+}
+
+impl LiveFillConfig {
+    /// Bounds check, run at boot whether or not the chain is enabled (a bad
+    /// value is refused before anyone turns it on). O(1).
+    ///
+    /// # Errors
+    /// The first field out of range, named.
+    pub fn validate(&self) -> Result<()> {
+        if !(1_024..=1_048_576).contains(&self.tap_capacity) {
+            bail!(
+                "live_fill.tap_capacity ({}) must be in [1024, 1048576]",
+                self.tap_capacity
+            );
+        }
+        if !(100..=10_000).contains(&self.wait_ms) {
+            bail!(
+                "live_fill.wait_ms ({}) must be in [100, 10000]",
+                self.wait_ms
+            );
+        }
+        if self.open_wait_ms < self.wait_ms || self.open_wait_ms > 30_000 {
+            bail!(
+                "live_fill.open_wait_ms ({}) must be in [wait_ms ({}), 30000]",
+                self.open_wait_ms,
+                self.wait_ms
+            );
+        }
+        if !(1..=9_999).contains(&self.band_bps) {
+            bail!(
+                "live_fill.band_bps ({}) must be in [1, 9999]",
+                self.band_bps
+            );
+        }
+        if !(1..=10_000).contains(&self.participation_bps) {
+            bail!(
+                "live_fill.participation_bps ({}) must be in [1, 10000]",
+                self.participation_bps
+            );
+        }
+        if !(1..=LIVE_FILL_MAX_FILL_SECONDS_CEILING).contains(&self.max_fill_seconds) {
+            bail!(
+                "live_fill.max_fill_seconds ({}) must be in [1, {LIVE_FILL_MAX_FILL_SECONDS_CEILING}]",
+                self.max_fill_seconds
+            );
+        }
+        if !(64..=65_536).contains(&self.event_channel_capacity) {
+            bail!(
+                "live_fill.event_channel_capacity ({}) must be in [64, 65536]",
+                self.event_channel_capacity
+            );
+        }
+        Ok(())
+    }
 }
 
 /// `[operator_movers]` — the movers universe publisher (plan PR MV).
@@ -453,6 +600,13 @@ pub struct OrderRuntimeConfig {
     /// Validation range: [256, 65536].
     #[serde(default = "default_order_runtime_mark_channel_capacity")]
     pub mark_channel_capacity: usize,
+    /// Connect-only TLS pre-warm of the order REST host at 09:14 IST on
+    /// trading days (owner card 2026-11-13, `no-rest-except-live-feed`
+    /// §12.16). Sends no HTTP request; keeps the TLS session ticket for the
+    /// first order. Default OFF; never a substitute for the OMS `dry_run`
+    /// hardcode.
+    #[serde(default)]
+    pub prewarm_order_connection: bool,
 }
 
 fn default_order_runtime_paper_fill() -> bool {
@@ -482,6 +636,7 @@ impl Default for OrderRuntimeConfig {
             self_test: default_order_runtime_self_test(),
             reconcile_interval_secs: default_order_runtime_reconcile_interval_secs(),
             mark_channel_capacity: default_order_runtime_mark_channel_capacity(),
+            prewarm_order_connection: false,
         }
     }
 }
@@ -1420,6 +1575,51 @@ impl FrameSilenceFastPath {
             Self::Act => "act",
         }
     }
+}
+
+/// What the Dhan trade-time REVERSION GUARD does (`[dhan_feed]
+/// ltt_utc_autocorrect`).
+///
+/// ⚠ CHANGED 2026-11-21 (scope lock "DHAN LIVE LTT IS UTC EPOCH FROM RECEIPT
+/// 2026-11-20 00:00 IST"; Dhan ticket #6684672): from WAL receipt 2026-11-20
+/// 00:00 IST every Dhan Last Trade Time gets exactly +19,800 s, ALWAYS, in the
+/// core dispatcher. No value of this switch turns that correction off or on
+/// (a config that switches the correction is a scope-lock REJECT); rolling it
+/// back is a code change behind a fresh dated quote. The switch governs only
+/// the guard that watches for Dhan going back to IST epoch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LttUtcAutocorrect {
+    /// No reversion guard. The +19,800 s correction is still applied.
+    Off,
+    /// The guard runs and logs a coded warning on a reversion; no page, no
+    /// hold. The correction is still applied.
+    Shadow,
+    /// The guard pages `DHAN-FEED-TIME-01` on a reversion and the day is
+    /// auto-held (daily-universe Quote 63). The default. The correction is
+    /// applied as in every mode.
+    #[default]
+    Act,
+}
+
+impl LttUtcAutocorrect {
+    /// The config spelling, for logs.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Shadow => "shadow",
+            Self::Act => "act",
+        }
+    }
+}
+
+/// `[dhan_feed]` config (scope lock 2026-11-20).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+pub struct DhanFeedConfig {
+    /// `"act"` (default), `"shadow"` or `"off"`.
+    #[serde(default)]
+    pub ltt_utc_autocorrect: LttUtcAutocorrect,
 }
 
 const fn default_main_feed_backup_top_n() -> usize {
@@ -2366,6 +2566,29 @@ pub struct PartitionRetentionConfig {
     /// be copied to S3 and dropped (step 6). Never past 07:30 IST.
     #[serde(default = "default_archive_switch_on")]
     pub drain_hold_counts_archive: bool,
+    /// The daily Brutex export (owner Quote 60, 2026-11-14): after the
+    /// close, day D's tick, quote, aux, depth and candle partitions are
+    /// written to their canonical archive keys (create-only, rows ordered by
+    /// the DEDUP key), then a manifest and a `DONE` marker under
+    /// `questdb-partitions/_daily/<D>/`, and the archiver's amend records
+    /// for copies a manifest may not name. `false` turns those off; the
+    /// archiver's DEDUP-key ordering does not follow the switch (it sorts only
+    /// against an existing canonical object, outside the trading-day window).
+    /// Never deletes or overwrites.
+    #[serde(default)]
+    pub brutex_export_enabled: bool,
+    /// IST days (`YYYY-MM-DD`) HELD out of the archiver (day, hour and
+    /// pressure passes, for `ticks`, `tick_quotes`, `feed_aux_packets` and
+    /// `candles_*`), the Brutex export (forced and last-chance runs too) and
+    /// the cross-check past-day catch-up, until a verified repair writes
+    /// `data/state/day-repair/<day>.done` (daily-universe Quote 63,
+    /// 2026-11-20). Empty by default; `config/base.toml` lists 2026-11-20.
+    /// Never set `archive_enabled = false` to hold a day: that path drops
+    /// partitions without a copy. An entry that is not a date does not stop
+    /// the boot (that would stop the live capture): it holds EVERY day, with
+    /// one coded error per process, until fixed.
+    #[serde(default)]
+    pub held_days: Vec<String>,
     /// Internal marker: this config drives a DISK-PRESSURE archive pass.
     ///
     /// NOT a config knob. `#[serde(skip)]` means no TOML can set it and an
@@ -2423,6 +2646,8 @@ impl Default for PartitionRetentionConfig {
             daily_free_target_fallback_session_bytes:
                 default_daily_free_target_fallback_session_bytes(),
             drain_hold_counts_archive: true,
+            brutex_export_enabled: false,
+            held_days: Vec::new(),
             under_disk_pressure: false,
         }
     }
@@ -3066,6 +3291,11 @@ impl ApplicationConfig {
         parse_time("trading.market_open_time", &self.trading.market_open_time)?;
         parse_time("trading.market_close_time", &self.trading.market_close_time)?;
         parse_time("trading.order_cutoff_time", &self.trading.order_cutoff_time)?;
+        // Daily-universe Quote 63 (2026-11-20): a `held_days` entry that is not
+        // a date is NOT refused here (refusing would stop the live capture).
+        // The storage crate's held days then hold EVERY day, with one coded
+        // error per process, until the config is fixed
+        // (`tickvault_storage::held_days::held_days_config_unreadable`).
         parse_time(
             "trading.data_collection_start",
             &self.trading.data_collection_start,
@@ -3381,6 +3611,7 @@ impl ApplicationConfig {
         // bounds always; freeze-limit + review-date sanity when enabled —
         // rejected at boot, BEFORE the trading pipeline spawns.
         self.exit_orders.validate()?;
+        self.live_fill.validate()?;
 
         // 2026-07-16 REST-era candle derivation: the boot catch-up window
         // must be a sane 1..=370-day envelope — rejected at boot, BEFORE
@@ -4171,12 +4402,14 @@ mod tests {
             order_update_events: OrderUpdateEventsConfig::default(),
             order_leg_pnl: OrderLegPnlConfig::default(),
             dhan_universe: DhanUniverseConfig::default(),
+            dhan_feed: DhanFeedConfig::default(),
             dhan_margin_gate: DhanMarginGateConfig::default(),
             exit_orders: ExitOrdersConfig::default(),
             raw_frame_archive: RawFrameArchiveConfig::default(),
             memory_watchdog: MemoryWatchdogConfig::default(),
             task_heartbeat: TaskHeartbeatConfig::default(),
             operator_movers: OperatorMoversConfig::default(),
+            live_fill: LiveFillConfig::default(),
         }
     }
 
@@ -5062,6 +5295,29 @@ mod tests {
     // `test_default_valkey_password_is_empty_string` DELETED in #O4
     // (2026-05-24) along with the `default_valkey_password` helper.
 
+    /// Daily-universe Quote 63 (2026-11-20): `held_days` defaults empty,
+    /// parses a list, and validation never refuses an entry (a bad one would
+    /// stop the live capture; the storage crate holds every day instead).
+    #[test]
+    fn test_partition_retention_held_days_default_parse_and_validate() {
+        let from_toml: PartitionRetentionConfig =
+            toml::from_str("").expect("empty section must parse via defaults");
+        assert!(from_toml.held_days.is_empty());
+        assert!(PartitionRetentionConfig::default().held_days.is_empty());
+        let set: PartitionRetentionConfig =
+            toml::from_str("held_days = [\"2026-11-20\"]\n").expect("held_days parses");
+        assert_eq!(set.held_days, vec!["2026-11-20".to_string()]);
+
+        let mut config = make_valid_config();
+        config.partition_retention.held_days = vec!["2026-11-20".to_string()];
+        assert!(config.validate().is_ok());
+        config.partition_retention.held_days = vec!["2026-13-40".to_string()];
+        assert!(
+            config.validate().is_ok(),
+            "a bad held_days entry must not stop the boot"
+        );
+    }
+
     #[test]
     fn test_validate_url_empty_rest_api_base_url_rejected() {
         // Covers the `bail!("{name} must not be empty")` branch inside
@@ -5436,6 +5692,57 @@ mod tests {
     }
 
     #[test]
+    fn test_ltt_utc_autocorrect_defaults_to_act_and_parses_every_spelling() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            dhan_feed: DhanFeedConfig,
+        }
+        // Absent section and absent key: the scope lock 2026-11-20 default.
+        let absent: Wrapper = Figment::new()
+            .merge(Toml::string("[questdb]\nhost = \"x\"\n"))
+            .extract()
+            .expect("absent [dhan_feed] must default");
+        assert_eq!(absent.dhan_feed.ltt_utc_autocorrect, LttUtcAutocorrect::Act);
+        assert_eq!(LttUtcAutocorrect::default(), LttUtcAutocorrect::Act);
+        for (spelling, want) in [
+            ("off", LttUtcAutocorrect::Off),
+            ("shadow", LttUtcAutocorrect::Shadow),
+            ("act", LttUtcAutocorrect::Act),
+        ] {
+            let parsed: Wrapper = Figment::new()
+                .merge(Toml::string(&format!(
+                    "[dhan_feed]\nltt_utc_autocorrect = \"{spelling}\"\n"
+                )))
+                .extract()
+                .expect("a documented spelling parses");
+            assert_eq!(parsed.dhan_feed.ltt_utc_autocorrect, want);
+            assert_eq!(want.as_str(), spelling);
+        }
+        let typo: Result<Wrapper, _> = Figment::new()
+            .merge(Toml::string("[dhan_feed]\nltt_utc_autocorrect = \"on\"\n"))
+            .extract();
+        assert!(typo.is_err(), "an unknown mode must be refused");
+    }
+
+    #[test]
+    fn test_base_toml_ships_ltt_utc_autocorrect_act() {
+        let base = include_str!("../../../config/base.toml");
+        let section = base
+            .split("\n[dhan_feed]")
+            .nth(1)
+            .expect("base.toml carries [dhan_feed]");
+        let section = section.split("\n[").next().unwrap_or(section);
+        assert!(
+            section.contains("ltt_utc_autocorrect = \"act\""),
+            "base.toml must ship the Dhan trade-time correction in act mode"
+        );
+    }
+
+    #[test]
     fn test_depth200_silent_swap_resubscribe_secs_defaults_to_90_and_is_bounded() {
         assert_eq!(
             DhanUniverseConfig::default().depth200_silent_swap_resubscribe_secs,
@@ -5716,11 +6023,159 @@ mod tests {
         assert!(on.tf_consistency.enabled);
     }
 
+    /// LF-6b: `[live_fill]` defaults OFF; an absent and an empty section read
+    /// the same; `validate` refuses every out-of-range field and accepts the
+    /// defaults.
+    #[test]
+    fn test_live_fill_config_defaults_off_and_validate_bounds() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+
+        let d = LiveFillConfig::default();
+        assert!(!d.enabled, "live_fill must default OFF");
+        assert_eq!(d.tap_capacity, 65_536);
+        assert_eq!(d.wait_ms, 1_000);
+        assert_eq!(d.open_wait_ms, 1_000);
+        assert_eq!(d.max_fill_seconds, 60);
+        assert!(d.validate().is_ok());
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            live_fill: LiveFillConfig,
+        }
+        let missing: Wrapper = Figment::new()
+            .merge(Toml::string("[other]\nx = 1\n"))
+            .extract()
+            .expect("missing section defaults");
+        let empty: Wrapper = Figment::new()
+            .merge(Toml::string("[live_fill]\n"))
+            .extract()
+            .expect("empty section defaults");
+        assert_eq!(missing.live_fill, d);
+        assert_eq!(empty.live_fill, d);
+
+        let bad = [
+            LiveFillConfig {
+                tap_capacity: 1_023,
+                ..d
+            },
+            LiveFillConfig {
+                tap_capacity: 1_048_577,
+                ..d
+            },
+            LiveFillConfig { wait_ms: 99, ..d },
+            LiveFillConfig {
+                wait_ms: 10_001,
+                open_wait_ms: 10_001,
+                ..d
+            },
+            LiveFillConfig {
+                open_wait_ms: 999,
+                ..d
+            },
+            LiveFillConfig {
+                open_wait_ms: 30_001,
+                ..d
+            },
+            LiveFillConfig { band_bps: 0, ..d },
+            LiveFillConfig {
+                band_bps: 10_000,
+                ..d
+            },
+            LiveFillConfig {
+                participation_bps: 0,
+                ..d
+            },
+            LiveFillConfig {
+                participation_bps: 10_001,
+                ..d
+            },
+            LiveFillConfig {
+                max_fill_seconds: 0,
+                ..d
+            },
+            LiveFillConfig {
+                max_fill_seconds: 601,
+                ..d
+            },
+            LiveFillConfig {
+                event_channel_capacity: 63,
+                ..d
+            },
+            LiveFillConfig {
+                event_channel_capacity: 65_537,
+                ..d
+            },
+        ];
+        for b in bad {
+            assert!(b.validate().is_err(), "{b:?} must be refused");
+        }
+        let edges = [
+            LiveFillConfig {
+                tap_capacity: 1_024,
+                wait_ms: 100,
+                open_wait_ms: 100,
+                ..d
+            },
+            LiveFillConfig {
+                band_bps: 9_999,
+                participation_bps: 10_000,
+                max_fill_seconds: 600,
+                ..d
+            },
+            LiveFillConfig {
+                event_channel_capacity: 64,
+                open_wait_ms: 30_000,
+                ..d
+            },
+        ];
+        for e in edges {
+            assert!(e.validate().is_ok(), "{e:?} is inside the bounds");
+        }
+    }
+
     /// Order runtime (2026-07-14, cluster A): the `[order_runtime]` section
     /// is FAIL-SAFE default OFF — an absent section, an empty section, and
     /// an older TOML all deserialize to disabled with the pinned field
     /// defaults (paper_fill/self_test ON, 300s reconcile, 8192 marks);
     /// explicit values round-trip.
+    /// The order-host TLS pre-warm (no-rest rule §12.16) is OFF by default:
+    /// the `Default` impl, an `[order_runtime]` section without the key, and
+    /// the tracked `config/base.toml` all read false.
+    #[test]
+    fn test_order_runtime_prewarm_defaults_off() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+
+        assert!(!OrderRuntimeConfig::default().prewarm_order_connection);
+        #[derive(Deserialize)]
+        struct Wrapper {
+            order_runtime: OrderRuntimeConfig,
+        }
+        let absent: Wrapper = Figment::new()
+            .merge(Toml::string("[order_runtime]\nenabled = true\n"))
+            .extract()
+            .expect("a section without the key must parse");
+        assert!(!absent.order_runtime.prewarm_order_connection);
+        let set: Wrapper = Figment::new()
+            .merge(Toml::string(
+                "[order_runtime]\nprewarm_order_connection = true\n",
+            ))
+            .extract()
+            .expect("an explicit key must parse");
+        assert!(set.order_runtime.prewarm_order_connection);
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/base.toml");
+        let tracked: Wrapper = Figment::new()
+            .merge(Toml::file(base))
+            .extract()
+            .expect("config/base.toml must carry [order_runtime]");
+        assert!(
+            !tracked.order_runtime.prewarm_order_connection,
+            "config/base.toml must keep the order pre-warm OFF (no-rest rule §12.16)"
+        );
+    }
+
     #[test]
     fn test_order_runtime_config_defaults_off() {
         use figment::Figment;

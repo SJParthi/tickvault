@@ -192,6 +192,17 @@ pub struct DayWork {
     /// (nothing left, target met, a stale reading, or the switch off). See
     /// `archive_backlog::backlog_holds`.
     pub archive_backlog_bytes: Option<u64>,
+    /// Today's daily Brutex export is due and not sealed or given up, or an
+    /// export runs (owner Quote 60). Holds the box (`is_done`), and the
+    /// one-hour stall rule does not release it (the export waits for its
+    /// gates on purpose; bounded by its 20:45 horizon). Never the evening
+    /// WAL restart.
+    pub brutex_export_pending: bool,
+    /// A Brutex export is running right now. Only this holds the evening
+    /// WAL restart back (2026-11-14 review): a restart never cuts an export,
+    /// and a DUE export never makes the restart wait, so the day's shed
+    /// frames are replayed BEFORE the day is sealed, not after.
+    pub brutex_export_running: bool,
 }
 
 impl DayWork {
@@ -199,7 +210,9 @@ impl DayWork {
     /// not done, the direction that keeps the box up. O(1).
     #[must_use]
     pub fn is_done(&self) -> bool {
-        self.data_in_database() && self.archive_backlog_bytes.is_none()
+        self.data_in_database()
+            && self.archive_backlog_bytes.is_none()
+            && !self.brutex_export_pending
     }
 
     /// [`Self::is_done`] without the archive copy work: the day's data is in
@@ -222,6 +235,17 @@ impl DayWork {
             && self.suspended == Some(0)
             && !self.sink_suspect
             && !self.wal_holding
+    }
+
+    /// What the evening WAL restart reads as "the day's other work is done":
+    /// the day's data is in the database AND no Brutex export is RUNNING
+    /// (owner Quote 60), so the restart never cuts an export. A due export
+    /// waiting for its gates does not hold the restart: the export waits for
+    /// the replay instead (2026-11-14 review). O(1).
+    #[must_use]
+    // TEST-EXEMPT: covered by test_evening_step_waits_only_while_an_export_runs
+    pub fn evening_work_done(&self) -> bool {
+        self.data_in_database() && !self.brutex_export_running
     }
 
     /// Whether the skipped-depth buckets stop holding the box: every pass
@@ -291,6 +315,13 @@ impl DayWork {
                 )
             } else {
                 String::new()
+            }
+            + if self.brutex_export_running {
+                " brutex_export=running"
+            } else if self.brutex_export_pending {
+                " brutex_export=pending"
+            } else {
+                ""
             }
     }
 }
@@ -431,6 +462,8 @@ pub fn measure_day_work(today_ist: chrono::NaiveDate) -> DayWork {
         archive_backlog_bytes: crate::archive_backlog::held_backlog_bytes(
             chrono::Utc::now().timestamp(),
         ),
+        brutex_export_pending: crate::brutex_export_boot::export_pending(),
+        brutex_export_running: crate::brutex_export_boot::export_running(),
     }
 }
 
@@ -463,6 +496,9 @@ pub struct ProgressTracker {
     anchor: [u64; 6],
     /// Pass rows written as of the last reading.
     pass_rows: u64,
+    /// Archive partitions dropped (after a verified copy) as of the last
+    /// reading (PR AA-G, finding 10).
+    archive_drops: u64,
     /// When progress was last seen; `None` before the first reading.
     last_progress_unix: Option<i64>,
 }
@@ -475,6 +511,29 @@ impl ProgressTracker {
     /// falling counts (3,000 → 600 after a pass), while one that only swings
     /// up and down around a level does not. Unknown parts never count.
     pub fn observe(&mut self, work: &DayWork, pass_rows: u64, now_unix: i64) -> bool {
+        let archive_drops = self.archive_drops;
+        self.observe_with_archive(work, pass_rows, archive_drops, now_unix)
+    }
+
+    /// [`Self::observe`] that also counts an archive partition DROPPED since
+    /// the last reading (`archive_drops` is
+    /// `partition_archive::archive_drops_total`) as progress, only while the
+    /// archive backlog holds the box (`work.archive_backlog_bytes` is
+    /// `Some`), and never re-anchors on it (PR AA-G, finding 10; both limits
+    /// added 2026-11-11 after review). The archive backlog reading moves only at
+    /// the END of a pass, so a pass longer than an hour that kept freeing
+    /// disk was judged stalled; and a reading that rose (new hours past the
+    /// floor) and then fell, still above its old level, never counted. Only
+    /// an accepted DROP counts: an upload or a verify can repeat every pass
+    /// with nothing freed, so a truly stuck backlog still releases after
+    /// [`DRAIN_HOLD_STALL_SECS`]. O(1).
+    pub fn observe_with_archive(
+        &mut self,
+        work: &DayWork,
+        pass_rows: u64,
+        archive_drops: u64,
+        now_unix: i64,
+    ) -> bool {
         let parts = [
             u64::try_from(work.deferred_marks).unwrap_or(u64::MAX),
             u64::try_from(work.spill_files).unwrap_or(u64::MAX),
@@ -487,11 +546,20 @@ impl ProgressTracker {
         let Some(last) = self.last_progress_unix else {
             self.anchor = parts;
             self.pass_rows = pass_rows;
+            self.archive_drops = archive_drops;
             self.last_progress_unix = Some(now_unix);
             return false;
         };
         let wrote = pass_rows > self.pass_rows;
+        // ⚠ CHANGED 2026-11-11 (PR AA-G review): a drop counts only while
+        // the archive backlog is part of the hold. Every leg's drops raise
+        // the counter (routine retention included), so before, an unrelated
+        // drop kept a stuck spill or deferred-mark hold alive, and re-held a
+        // box the stall rule had released. The count is still taken, so a
+        // later drop is measured from here.
+        let dropped = work.archive_backlog_bytes.is_some() && archive_drops > self.archive_drops;
         self.pass_rows = pass_rows;
+        self.archive_drops = archive_drops;
         let fell = self
             .anchor
             .iter()
@@ -499,6 +567,12 @@ impl ProgressTracker {
             .any(|(anchor, part)| part < *anchor);
         if wrote || fell {
             self.anchor = parts;
+        }
+        if wrote || fell || dropped {
+            // ⚠ CHANGED 2026-11-11 (PR AA-G review): a drop alone moves the
+            // clock but not the anchor; re-anchoring on it set a swinging
+            // part's level at its high point, so its next ordinary dip read
+            // as progress and restarted the hour.
             self.last_progress_unix = Some(now_unix);
             return false;
         }
@@ -543,6 +617,88 @@ impl HoldState {
     }
 }
 
+/// Whether a stall releases the hold: never while the Brutex export is due
+/// or running (2026-11-14 review). The session day waits for its gates
+/// until 18:00 on purpose, with nothing moving; releasing at the one-hour
+/// stall would stop the box before the export ever ran. Bounded: the export
+/// is "due" only until its 20:45 horizon, and nothing holds past 07:30.
+/// Pure, O(1).
+#[must_use]
+pub fn stall_releases_hold(stalled: bool, work: &DayWork) -> bool {
+    stalled && !work.brutex_export_pending
+}
+
+/// Whether the evening WAL drain will still replay tonight: it holds the box
+/// (a restart is planned or waited for) and frames are waiting. Read by the
+/// Brutex export (owner Quote 60), which seals the session day only after
+/// that replay. Published once a minute by the supervisor; `false` outside
+/// the hold window. O(1).
+static EVENING_REPLAY_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// [`EVENING_REPLAY_PENDING`]'s value for one evaluation. Pure, O(1).
+///
+/// `stalled` is the stall rule's verdict this minute
+/// ([`stall_releases_hold`]). A stalled evening makes no restart (the
+/// supervisor's `restart_now` needs `!stalled`), so no replay comes tonight
+/// and the flag is `false` (2026-11-15 audit, fix2252-1: a `Wait` caused by
+/// stuck other work kept the flag `true` while the stall rule released the
+/// box, so a forced Brutex day waited for a replay that never came).
+#[must_use]
+pub fn evening_replay_value(
+    step: crate::evening_drain::EveningStep,
+    wal_backlog: Option<u64>,
+    stalled: bool,
+) -> bool {
+    !stalled && step.holds() && wal_backlog.is_some_and(|n| n > 0)
+}
+
+/// Set once the supervisor has stored [`EVENING_REPLAY_PENDING`] in this
+/// process (2026-11-14 evening audit). Before that the flag's `false` is
+/// only its start value, not a verdict.
+static EVENING_REPLAY_PUBLISHED: AtomicBool = AtomicBool::new(false);
+
+/// Whether a WAL replay will still write old rows (2026-11-14 evening
+/// audit): the supervisor's `published_value` once it has `published`; on
+/// the planned evening restart (`planned_boot`) a replay is pending until
+/// then (the export loop starts before the supervisor's first verdict, and
+/// that boot exists to replay); and always while a replay is running in this
+/// process (`replay_running`: the boot refold or the catch-up drain, which
+/// can run on a boot the evening step no longer holds for). Pure, O(1).
+#[must_use]
+pub fn replay_pending_from(
+    published_value: bool,
+    published: bool,
+    planned_boot: bool,
+    replay_running: bool,
+) -> bool {
+    replay_running || published_value || (!published && planned_boot)
+}
+
+/// Whether a WAL replay will still write old rows: one runs in this process,
+/// or tonight's evening WAL drain still has one to make (owner Quote 60,
+/// 2026-11-14 review and evening audit). Read by the Brutex export. Four
+/// atomic loads, O(1).
+#[must_use]
+// TEST-EXEMPT: loads of the flags; the decision is test_replay_pending_from_holds_until_the_first_publish_on_a_planned_boot and test_evening_replay_value_needs_a_holding_step_and_a_backlog
+pub fn evening_replay_pending() -> bool {
+    let published = EVENING_REPLAY_PUBLISHED.load(Ordering::Acquire);
+    replay_pending_from(
+        EVENING_REPLAY_PENDING.load(Ordering::Relaxed),
+        published,
+        tickvault_storage::wal_replay_frame_cap::planned_evening_drain_boot(),
+        tickvault_storage::archive_quiesce::old_hour_replay_registered(),
+    )
+}
+
+/// The work count the drain hold's stall rule watches: rows the after-close
+/// depth pass wrote plus objects the Brutex export placed (owner Quote 60), so
+/// a running export is progress. Pure, O(1).
+#[must_use]
+// TEST-EXEMPT: covered by test_export_objects_count_as_drain_progress
+pub fn drain_progress_count(pass_rows: u64, export_objects: u64) -> u64 {
+    pass_rows.saturating_add(export_objects)
+}
+
 /// Spawns the drain-hold supervisor for `environment`. Runs for the life of
 /// the process; outside 15:40–07:30 IST it only sleeps.
 // TEST-EXEMPT: an endless loop over the SSM client; its decisions are HoldState::step, hold_value and hold_until_unix, all unit-tested.
@@ -561,6 +717,8 @@ pub fn spawn_drain_hold_supervisor(environment: String) -> tokio::task::JoinHand
             if !in_hold_window(secs_ist) {
                 state = HoldState::default();
                 progress = ProgressTracker::default();
+                EVENING_REPLAY_PENDING.store(false, Ordering::Relaxed);
+                EVENING_REPLAY_PUBLISHED.store(true, Ordering::Release);
                 // Past the hold window's end plus the stop lag, tonight is over.
                 if secs_ist >= DRAIN_HOLD_CEILING_SECS_IST + HELD_STOP_LAG_SECS {
                     HELD_TONIGHT.store(false, Ordering::Release);
@@ -633,7 +791,8 @@ pub fn spawn_drain_hold_supervisor(environment: String) -> tokio::task::JoinHand
                 Some(evening) if on_aws => crate::evening_drain::evening_step(
                     &evening,
                     evening_day,
-                    work.data_in_database(),
+                    // Owner Quote 60: the restart waits for the export.
+                    work.evening_work_done(),
                     crate::evening_drain::crossverify_settled(xverify_marker, secs_ist),
                     work.wal_backlog,
                     now_unix,
@@ -664,8 +823,29 @@ pub fn spawn_drain_hold_supervisor(environment: String) -> tokio::task::JoinHand
             #[allow(clippy::cast_precision_loss)] // APPROVED: a bucket count, far below 2^53
             let floor_blocked = work.floor_blocked_buckets() as f64;
             metrics::gauge!(FLOOR_BLOCKED_BUCKETS_GAUGE).set(floor_blocked);
-            let pass_rows = crate::dhan_feed_stack::deferred_depth_pass::pass_rows_written_total();
-            let stalled = progress.observe(&work, pass_rows, now_unix);
+            // An object the Brutex export placed is progress too (Quote 60).
+            let pass_rows = drain_progress_count(
+                crate::dhan_feed_stack::deferred_depth_pass::pass_rows_written_total(),
+                tickvault_storage::partition_archive::daily_export::objects_placed_total(),
+            );
+            // A due or running Brutex export is never released by the stall
+            // rule (2026-11-14 review).
+            let stalled = stall_releases_hold(
+                progress.observe_with_archive(
+                    &work,
+                    pass_rows,
+                    tickvault_storage::partition_archive::archive_drops_total(),
+                    now_unix,
+                ),
+                &work,
+            );
+            // Published after the stall verdict (2026-11-15 audit,
+            // fix2252-1): a stalled evening makes no restart, so no replay.
+            EVENING_REPLAY_PENDING.store(
+                evening_replay_value(evening_step, work.wal_backlog, stalled),
+                Ordering::Relaxed,
+            );
+            EVENING_REPLAY_PUBLISHED.store(true, Ordering::Release);
             let done = work.is_done();
             let restart_now =
                 evening_step == crate::evening_drain::EveningStep::Restart && !stalled;
@@ -844,6 +1024,183 @@ mod tests {
             suspended: Some(0),
             ..DayWork::default()
         }
+    }
+
+    /// Owner Quote 60: a due Brutex export holds the box.
+    #[test]
+    fn test_brutex_export_pending_keeps_day_not_done() {
+        assert!(done_work().is_done());
+        let work = DayWork {
+            brutex_export_pending: true,
+            ..done_work()
+        };
+        assert!(!work.is_done());
+        assert!(work.left_text().ends_with(" brutex_export=pending"));
+        assert!(!done_work().left_text().contains("brutex"));
+    }
+
+    /// ... but never the evening WAL restart, which waits for it instead.
+    #[test]
+    fn test_brutex_export_pending_does_not_block_data_in_database() {
+        let work = DayWork {
+            brutex_export_pending: true,
+            ..done_work()
+        };
+        assert!(work.data_in_database());
+    }
+
+    /// Regression (2026-11-14 review, HIGH): the evening restart waits only
+    /// while an export RUNS (a restart never cuts one); an export that is
+    /// merely due no longer makes it wait, so the day's shed frames are
+    /// replayed before the export seals the day, not after.
+    #[test]
+    fn test_evening_step_waits_only_while_an_export_runs() {
+        let pending = DayWork {
+            brutex_export_pending: true,
+            ..done_work()
+        };
+        let running = DayWork {
+            brutex_export_pending: true,
+            brutex_export_running: true,
+            ..done_work()
+        };
+        assert!(done_work().evening_work_done());
+        assert!(
+            pending.evening_work_done(),
+            "a due export never holds the restart"
+        );
+        assert!(!running.evening_work_done());
+        assert!(running.left_text().ends_with(" brutex_export=running"));
+        let state = crate::evening_drain::EveningState::default();
+        let evening = 17 * 3600;
+        let step = |done: bool| {
+            crate::evening_drain::evening_step(&state, 1, done, true, Some(9), 1_000_000, evening)
+        };
+        assert_eq!(
+            step(running.evening_work_done()),
+            crate::evening_drain::EveningStep::Wait
+        );
+        assert_ne!(
+            step(pending.evening_work_done()),
+            crate::evening_drain::EveningStep::Wait,
+            "the restart may go while the export only waits"
+        );
+    }
+
+    /// Regression (2026-11-14 review, MEDIUM): the one-hour stall rule never
+    /// releases the hold while the export is due or running.
+    #[test]
+    fn test_stall_releases_hold_never_for_a_due_export() {
+        let pending = DayWork {
+            brutex_export_pending: true,
+            ..done_work()
+        };
+        assert!(stall_releases_hold(true, &done_work()));
+        assert!(!stall_releases_hold(true, &pending));
+        assert!(!stall_releases_hold(false, &done_work()));
+    }
+
+    /// Regression (2026-11-14 review, HIGH): the export reads a pending
+    /// evening replay only while a holding step has frames to replay.
+    #[test]
+    fn test_evening_replay_value_needs_a_holding_step_and_a_backlog() {
+        use crate::evening_drain::EveningStep;
+        assert!(evening_replay_value(EveningStep::Wait, Some(3), false));
+        assert!(evening_replay_value(EveningStep::Restart, Some(1), false));
+        assert!(!evening_replay_value(EveningStep::Wait, Some(0), false));
+        assert!(!evening_replay_value(EveningStep::Wait, None, false));
+        assert!(!evening_replay_value(EveningStep::Idle, Some(3), false));
+        assert!(!evening_replay_value(EveningStep::GaveUp, Some(3), false));
+    }
+
+    /// Regression (2026-11-15 audit, fix2252-1, MEDIUM): an evening that
+    /// waits on stuck other work (`other_done` false) and has stalled makes
+    /// no restart, so the published flag reads "no replay" and a forced
+    /// Brutex day that is not at its last chance runs. Before, the flag stayed
+    /// `true` on every `Wait`, the stall rule released the box, and the day
+    /// was never tried that night.
+    #[test]
+    fn test_evening_replay_value_is_false_when_the_evening_stalled() {
+        use crate::brutex_export_boot as bx;
+        use crate::evening_drain::EveningStep;
+        let state = crate::evening_drain::EveningState::default();
+        let step = crate::evening_drain::evening_step(
+            &state,
+            739_000,
+            false,
+            true,
+            Some(30),
+            1_800_000_000,
+            19 * 3_600,
+        );
+        assert_eq!(
+            step,
+            EveningStep::Wait,
+            "stuck other work: the evening waits"
+        );
+        assert!(
+            evening_replay_value(step, Some(30), false),
+            "not stalled yet: the restart may still come"
+        );
+        let stalled = stall_releases_hold(true, &done_work());
+        let pending = evening_replay_value(step, Some(30), stalled);
+        assert!(!pending, "stalled: no restart, so no replay tonight");
+        let gates = bx::Gates {
+            seal_applied: None,
+            candles_final: None,
+            repair: None,
+            repair_running: false,
+            arrival_hours_open: None,
+            wal_backlog: Some(30),
+            evening_replay_pending: pending,
+            depth_pass_floor_blocked: false,
+        };
+        let reasons = bx::compose_reasons(Vec::new(), gates);
+        // A forced day four days back, not at its last chance.
+        let blocked = bx::blocks_even_forced(&reasons, false, false);
+        assert!(!blocked, "reasons {reasons:?} must not hold the forced day");
+        let st = bx::DayState::default();
+        assert_eq!(
+            bx::past_day_step(st, 0, bx::ready(&reasons), true, blocked),
+            bx::DayStep::Run
+        );
+    }
+
+    /// Regression (2026-11-14 evening audit, MEDIUM): the flag starts
+    /// `false` in a new process and the Brutex export loop starts before the
+    /// supervisor's first verdict. On the planned evening restart that start
+    /// value no longer reads as "no replay"; a replay running in this
+    /// process always reads as pending, whatever was published; once the
+    /// supervisor has published, its verdict stands.
+    #[test]
+    fn test_replay_pending_from_holds_until_the_first_publish_on_a_planned_boot() {
+        // value, published, planned boot, replay running
+        assert!(replay_pending_from(false, false, true, false));
+        assert!(!replay_pending_from(false, true, true, false));
+        assert!(replay_pending_from(true, true, true, false));
+        assert!(!replay_pending_from(false, false, false, false));
+        assert!(replay_pending_from(false, true, false, true));
+        assert!(replay_pending_from(false, false, false, true));
+        // The wiring (every store marked published; the loads) is pinned by
+        // `chaos_combined_evening_drain.rs`, which reads this file's source.
+    }
+
+    /// Owner Quote 60: an object the export placed moves the stall clock.
+    #[test]
+    fn test_export_objects_count_as_drain_progress() {
+        assert!(drain_progress_count(5, 1) > drain_progress_count(5, 0));
+        assert_eq!(drain_progress_count(u64::MAX, 1), u64::MAX);
+    }
+
+    /// `measure_day_work` reads the export scheduler's pending flag.
+    #[test]
+    fn test_measure_day_work_reads_the_export_pending_flag() {
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 10, 29).expect("date");
+        crate::brutex_export_boot::set_export_pending_for_test(true);
+        let pending = measure_day_work(day).brutex_export_pending;
+        crate::brutex_export_boot::set_export_pending_for_test(false);
+        assert!(pending);
+        assert!(!measure_day_work(day).brutex_export_pending);
     }
 
     // Regression: 2026-11-05 (PR DP-4) — the after-close pass stopped ~700
@@ -1091,6 +1448,165 @@ mod tests {
         assert!(tracker.observe(&holding(400), 0, t0 + 2 * DRAIN_HOLD_STALL_SECS - 1));
     }
 
+    // Regression: 2026-11-09 — PR AA-G (finding 10). The backlog reading
+    // moves only at the end of a pass, so a pass that kept dropping
+    // partitions for over an hour was judged stalled and the box released
+    // with copy work left.
+    #[test]
+    fn test_regression_archive_drop_mid_pass_is_progress() {
+        let work = DayWork {
+            archive_backlog_bytes: Some(900),
+            ..done_work()
+        };
+        let mut tracker = ProgressTracker::default();
+        let t0 = 1_000_000;
+        assert!(!tracker.observe_with_archive(&work, 0, 0, t0));
+        let t1 = t0 + 3_500;
+        assert!(!tracker.observe_with_archive(&work, 0, 1, t1), "a drop");
+        assert!(
+            !tracker.observe_with_archive(&work, 0, 1, t0 + DRAIN_HOLD_STALL_SECS),
+            "an hour after the first reading, but a drop since"
+        );
+        assert!(!tracker.observe_with_archive(&work, 0, 1, t1 + DRAIN_HOLD_STALL_SECS - 1));
+        assert!(
+            tracker.observe_with_archive(&work, 0, 1, t1 + DRAIN_HOLD_STALL_SECS),
+            "an hour with no drop and nothing else moving"
+        );
+    }
+
+    // Regression: 2026-11-09 — PR AA-G (finding 10). A reading that rose
+    // (new hours past the floor) and then fell, still above its old level,
+    // never counted, while the archiver was dropping partitions.
+    #[test]
+    fn test_regression_backlog_rise_then_drops_is_progress() {
+        let holding = |bytes: u64| DayWork {
+            archive_backlog_bytes: Some(bytes),
+            ..done_work()
+        };
+        let mut tracker = ProgressTracker::default();
+        let t0 = 1_000_000;
+        assert!(!tracker.observe_with_archive(&holding(400), 0, 10, t0));
+        assert!(!tracker.observe_with_archive(&holding(900), 0, 12, t0 + 1_800));
+        assert!(!tracker.observe_with_archive(&holding(600), 0, 15, t0 + DRAIN_HOLD_STALL_SECS));
+        // The old rule (no drop count) stalls on the same readings.
+        let mut old = ProgressTracker::default();
+        assert!(!old.observe(&holding(400), 0, t0));
+        assert!(!old.observe(&holding(900), 0, t0 + 1_800));
+        assert!(old.observe(&holding(600), 0, t0 + DRAIN_HOLD_STALL_SECS));
+    }
+
+    /// PR AA-G (finding 10): a backlog with no drop and no part falling
+    /// (every pass re-verifies a partition it cannot drop) still releases
+    /// after exactly an hour.
+    #[test]
+    fn test_observe_with_archive_stuck_backlog_without_drops_still_releases_after_an_hour() {
+        let work = DayWork {
+            archive_backlog_bytes: Some(900),
+            ..done_work()
+        };
+        let mut tracker = ProgressTracker::default();
+        let t0 = 1_000_000;
+        assert!(!tracker.observe_with_archive(&work, 0, 7, t0));
+        for step in 1..DRAIN_HOLD_STALL_SECS / 60 {
+            assert!(!tracker.observe_with_archive(&work, 0, 7, t0 + step * 60));
+        }
+        assert!(tracker.observe_with_archive(&work, 0, 7, t0 + DRAIN_HOLD_STALL_SECS));
+    }
+
+    // Regression: 2026-11-11 — PR AA-G review. Every leg's drops raise the
+    // counter (routine retention too), so an unrelated drop kept a stuck
+    // spill hold alive while the archive backlog was not holding at all.
+    #[test]
+    fn test_regression_drop_counts_only_while_the_archive_backlog_holds() {
+        let stuck = DayWork {
+            spill_files: 3,
+            archive_backlog_bytes: None,
+            ..done_work()
+        };
+        let mut tracker = ProgressTracker::default();
+        let t0 = 1_000_000;
+        assert!(!tracker.observe_with_archive(&stuck, 0, 0, t0));
+        let mut drops = 0;
+        for minute in 1..DRAIN_HOLD_STALL_SECS / 60 {
+            drops += 1;
+            assert!(!tracker.observe_with_archive(&stuck, 0, drops, t0 + minute * 60));
+        }
+        assert!(
+            tracker.observe_with_archive(&stuck, 0, drops + 1, t0 + DRAIN_HOLD_STALL_SECS),
+            "an hour with nothing that holds moving: stalled, whatever other tables dropped"
+        );
+    }
+
+    // Regression: 2026-11-11 — PR AA-G review. A drop re-anchored every part
+    // at its current level, so a drop taken while the apply lag swung high
+    // made its next ordinary dip read as progress and restarted the hour.
+    #[test]
+    fn test_regression_drop_does_not_reanchor_a_swinging_part() {
+        let at = |lag: u64| DayWork {
+            archive_backlog_bytes: Some(900),
+            apply_lag: Some(lag),
+            ..done_work()
+        };
+        let mut tracker = ProgressTracker::default();
+        let t0 = 1_000_000;
+        assert!(!tracker.observe_with_archive(&at(40), 0, 0, t0));
+        assert!(
+            !tracker.observe_with_archive(&at(600), 0, 1, t0 + 60),
+            "a drop"
+        );
+        let mut now = t0 + 60;
+        let mut high = false;
+        while now + 60 < t0 + 60 + DRAIN_HOLD_STALL_SECS {
+            now += 60;
+            high = !high;
+            assert!(!tracker.observe_with_archive(&at(if high { 600 } else { 40 }), 0, 1, now));
+        }
+        assert!(
+            tracker.observe_with_archive(&at(40), 0, 1, t0 + 60 + DRAIN_HOLD_STALL_SECS),
+            "exactly an hour after the last drop, the swings never counted"
+        );
+    }
+
+    proptest::proptest! {
+        /// PR AA-G (finding 10): never stalled within an hour of a drop (or of
+        /// the first reading); always stalled an hour after the last drop when
+        /// nothing else moved.
+        #[test]
+        fn proptest_observe_with_archive_stalls_exactly_an_hour_after_the_last_drop(
+            steps in proptest::collection::vec(
+                (1i64..1_200, proptest::bool::ANY, proptest::bool::ANY),
+                1..80,
+            ),
+        ) {
+            // 2026-11-11 review: the apply lag swings around its first level
+            // (never below it), which must never count as progress, drops or
+            // not; before, a drop at a high point re-anchored it there.
+            let work_at = |high: bool| DayWork {
+                archive_backlog_bytes: Some(900),
+                apply_lag: Some(if high { 600 } else { 40 }),
+                ..done_work()
+            };
+            let mut tracker = ProgressTracker::default();
+            let mut now = 1_000_000_i64;
+            let mut drops = 0_u64;
+            let mut last_progress = now;
+            proptest::prop_assert!(!tracker.observe_with_archive(&work_at(false), 0, drops, now));
+            for (gap, dropped, high) in steps {
+                now += gap;
+                if dropped {
+                    drops += 1;
+                }
+                let stalled = tracker.observe_with_archive(&work_at(high), 0, drops, now);
+                if dropped {
+                    last_progress = now;
+                    proptest::prop_assert!(!stalled);
+                } else {
+                    proptest::prop_assert_eq!(stalled, now - last_progress >= DRAIN_HOLD_STALL_SECS);
+                }
+            }
+        }
+    }
+
     /// PR AA finding 5: the first daily pass of a process starts on an empty
     /// backlog cell. With every other part done, the day still reads not done
     /// while that pass runs below the free-space target.
@@ -1100,7 +1616,11 @@ mod tests {
         let t0 = 1_800_000_000;
         cell.note_pass_started(t0, true);
         let work = DayWork {
-            archive_backlog_bytes: crate::archive_backlog::backlog_holds(cell.reading(), t0 + 600),
+            archive_backlog_bytes: crate::archive_backlog::backlog_holds(
+                cell.reading(),
+                None,
+                t0 + 600,
+            ),
             ..done_work()
         };
         assert!(

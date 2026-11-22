@@ -602,9 +602,20 @@ mod tests {
         );
     }
 
+    /// Keeps a second, inert `tracing` dispatcher registered for the whole test
+    /// process. While a scoped subscriber is the only registered dispatcher,
+    /// tracing-core caches a callsite as `never` when a thread with no
+    /// subscriber reaches it first, and the scoped subscriber then misses the
+    /// line. Call before installing the scoped subscriber.
+    fn keep_callsite_interest_shared() {
+        static ANCHOR: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+        ANCHOR.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+    }
+
     fn captured(emit: impl FnOnce()) -> Vec<String> {
         let capture = capture::Capture::default();
         let lines = std::sync::Arc::clone(&capture.0);
+        keep_callsite_interest_shared();
         tracing::subscriber::with_default(capture, emit);
         lines.lock().map(|l| l.clone()).unwrap_or_default()
     }

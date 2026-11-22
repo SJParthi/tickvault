@@ -30,7 +30,8 @@
 //!     publishes           LONG,       -- one-second windows folded into the row
 //!     strict_version      LONG,       -- 1 = disjoint raw threshold counts; historical null
 //!     strict_samples      LONG,       -- same raw-window denominator; independent of fine samples
-//!     strict_samples_at_or_above_1000ns LONG -- equality at 1,000 violates; null = unknown
+//!     strict_samples_at_or_above_1000ns LONG, -- equality at 1,000 violates; null = unknown
+//!     mean_ns             LONG        -- exact mean of the stage's samples, rounded; null = no samples
 //! ) timestamp(ts) PARTITION BY DAY
 //!   DEDUP UPSERT KEYS(ts, stage, feed);
 //! ```
@@ -77,11 +78,34 @@
 //!   last, partial minute is not written at exit.
 //! * **The first row of a process** also holds every sample recorded before
 //!   the publisher's first read (boot).
+//! * **`mean_ns` is exact, not a bucket bound (⚠ CHANGED 2026-11-16).** The
+//!   percentiles are log2 bucket edges, so a small move across an edge reads
+//!   as a 2x change (`drain_main_tick` p50 2,048 vs 4,096 ns on 16 Nov).
+//!   `mean_ns` is the minute's sample SUM divided by its sample count,
+//!   rounded to the nearest nanosecond, from the stage's own running sum
+//!   (the same one `tv_hot_path_stage_ns_sum` carries). Each one-second
+//!   window adds the sum's difference beside the buckets' difference, so a
+//!   weighted stage (`drain_main_tick`, `weight` ticks of one frame's
+//!   per-tick average) divides `nanos × weight` by `weight` and reads the
+//!   true per-tick mean. The count is the stage's log2 sample total, also for
+//!   `receipt_to_fold`, whose `samples` column comes from the fine histogram.
+//!   Limit: the sum is read just after the buckets, so a sample recorded
+//!   between the two reads can sit in one window's sum and the next window's
+//!   count; within a minute these cancel, so only the samples racing the
+//!   reads at the minute's two edges can move it. Added by
+//!   `ALTER ADD COLUMN IF NOT EXISTS`, outside the DEDUP key; rows written
+//!   before 2026-11-16 read NULL.
 //!
 //! ## Cost
 //!
-//! 8 rows a minute (one per stage, `ALL_STAGES`), ~3,900 rows a day at the
-//! box's ~8 hours. QuestDB only;
+//! 9 rows a minute (one per stage, `ALL_STAGES`; 8 until B3 added
+//! `drain_frame_post` on 2026-11-13), ~4,300 rows a day at the box's ~8
+//! hours. ⚠ CHANGED 2026-11-16: 14 rows a minute (the five `drain_arm_*`
+//! stages, one per non-frame arm of the frame drain), ~6,700 rows a day.
+//! ⚠ CHANGED 2026-11-17: 15 rows a minute (`drain_inline_depth`, the inline
+//! depth of a sample of about 1 in 64 Full packets; its `samples` column counts
+//! the sampled packets only), ~7,200 rows a day.
+//! QuestDB only;
 //! nothing goes to `/metrics` except one drop counter.
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -158,6 +182,8 @@ pub const HOT_PATH_LATENCY_MINUTE_COLUMNS: &[(&str, &str)] = &[
     ("strict_version", "LONG"),
     ("strict_samples", "LONG"),
     ("strict_samples_at_or_above_1000ns", "LONG"),
+    // 2026-11-16: the exact mean (sum / samples); outside the DEDUP key.
+    ("mean_ns", "LONG"),
 ];
 
 /// Whether `samples_over_1024ns` means anything for `stage` (PR DP-6). The
@@ -203,6 +229,10 @@ pub struct LatencyMinuteRow {
     pub strict_samples: Option<i64>,
     /// Raw-stage samples at or above 1,000 ns in that same window.
     pub strict_samples_at_or_above_1000ns: Option<i64>,
+    /// The minute's exact mean sample, ns, rounded to the nearest (2026-11-16):
+    /// the stage's sample sum over its log2 sample count. `None` (NULL) when
+    /// the minute holds no sample ([`mean_nanos`]).
+    pub mean_ns: Option<u64>,
 }
 
 impl LatencyMinuteRow {
@@ -249,6 +279,18 @@ fn sum(window: &[u64]) -> u64 {
     window.iter().fold(0u64, |acc, n| acc.saturating_add(*n))
 }
 
+/// `sum / count` rounded to the nearest nanosecond (half up), or `None`
+/// for an empty count (2026-11-16, the `mean_ns` column). u128 so the
+/// rounding add cannot overflow. Pure, O(1), no allocation.
+#[must_use]
+pub fn mean_nanos(sum_nanos: u64, count: u64) -> Option<u64> {
+    if count == 0 {
+        return None;
+    }
+    let mean = (u128::from(sum_nanos) + u128::from(count) / 2) / u128::from(count);
+    Some(u64::try_from(mean).unwrap_or(u64::MAX))
+}
+
 fn add_into(into: &mut [u64], from: &[u64]) {
     for (a, b) in into.iter_mut().zip(from.iter()) {
         *a = a.saturating_add(*b);
@@ -263,6 +305,8 @@ pub struct MinuteAccumulator {
     publishes: u64,
     buckets: [[u64; STAGE_BUCKETS]; STAGES_PER_MINUTE],
     max: [u64; STAGES_PER_MINUTE],
+    /// Per stage, the minute's sample sum, ns (2026-11-16, `mean_ns`).
+    sum_nanos: [u64; STAGES_PER_MINUTE],
     fine: [u64; FINE_BUCKETS],
     strict: [Option<StrictSampleCounts>; STAGES_PER_MINUTE],
 }
@@ -282,6 +326,7 @@ impl MinuteAccumulator {
             publishes: 0,
             buckets: [[0; STAGE_BUCKETS]; STAGES_PER_MINUTE],
             max: [0; STAGES_PER_MINUTE],
+            sum_nanos: [0; STAGES_PER_MINUTE],
             fine: [0; FINE_BUCKETS],
             strict: [Some(StrictSampleCounts {
                 samples: 0,
@@ -325,6 +370,7 @@ impl MinuteAccumulator {
         for (into, from) in self.max.iter_mut().zip(second.stage_max_nanos.iter()) {
             *into = (*into).max(*from);
         }
+        add_into(&mut self.sum_nanos, &second.stage_sum_nanos);
         add_into(&mut self.fine, &second.receipt_to_fold_fine);
         for (into, from) in self.strict.iter_mut().zip(second.stage_strict.iter()) {
             *into = into.and_then(|counts| from.and_then(|next| counts.checked_add(next)));
@@ -383,6 +429,10 @@ impl MinuteAccumulator {
         };
         let [p50, p99, p999] = bounds;
         let strict = self.strict[i].and_then(StrictSampleCounts::ilp_counts);
+        // The stage's own log2 count, also for `receipt_to_fold` (whose
+        // `samples` is the fine histogram's): the sum and these buckets come
+        // from the same stage record, the fine histogram from another one.
+        let mean_ns = mean_nanos(self.sum_nanos[i], sum(buckets));
         LatencyMinuteRow {
             minute_ist_nanos: minute,
             stage,
@@ -398,6 +448,7 @@ impl MinuteAccumulator {
             strict_version: strict.map(|_| STRICT_MEASUREMENT_VERSION),
             strict_samples: strict.map(|(n, _)| n),
             strict_samples_at_or_above_1000ns: strict.map(|(_, n)| n),
+            mean_ns,
         }
     }
 }
@@ -689,6 +740,13 @@ impl HotPathLatencyMinuteWriter {
         }
     }
 
+    /// Whether the boot ensure has confirmed every proof table keyed.
+    /// One Acquire load; writer thread only.
+    #[must_use]
+    pub fn is_keyed(&self) -> bool {
+        self.readiness.keyed.load(Ordering::Acquire)
+    }
+
     /// Rows appended but not yet flushed.
     #[must_use]
     // TEST-EXEMPT: accessor, exercised by the append tests below.
@@ -697,7 +755,9 @@ impl HotPathLatencyMinuteWriter {
     }
 
     /// Appends one row. Cold path: one per stage a minute (`ALL_STAGES`, eight
-    /// since PR DP-6), on the writer thread.
+    /// since PR DP-6, nine since B3 added `drain_frame_post`, 14 since the
+    /// `drain_arm_*` stages on 2026-11-16, 15 since `drain_inline_depth` on
+    /// 2026-11-17), on the writer thread.
     ///
     /// # Errors
     /// Propagates ILP buffer errors.
@@ -737,6 +797,11 @@ impl HotPathLatencyMinuteWriter {
                 .context("strict_samples_at_or_above_1000ns")?,
             // Never write a version with a missing/invalid count, or saturate
             // the two counts independently into a different percentile.
+            None => row,
+        };
+        // 2026-11-16: NULL (left out) when the minute held no sample.
+        let row = match r.mean_ns {
+            Some(n) => row.column_i64("mean_ns", to_i64(n)).context("mean_ns")?,
             None => row,
         };
         // PR DP-6: NULL (left out) where the count is 100% by construction.
@@ -968,11 +1033,36 @@ fn spawn_writer_into(
     Ok(thread)
 }
 
+/// How long after the writer starts a "tables not yet keyed" refusal stays
+/// quiet: the ensure task's own quiet window (`ENSURE_ATTEMPTS` tries,
+/// `retry_interval` apart). 2026-11-18: the first flush at the first minute
+/// change after every boot or deploy (08:31:00 IST, 8 times 14 to 18 Nov) was
+/// refused because QuestDB was still starting, and logged a STORAGE-GAP-03
+/// ERROR that recovered 30 s later. The rows are retained and the overflow
+/// policy runs exactly as before; only the log waits. A send failure, or tables
+/// still not keyed after the window, logs as before.
+fn boot_quiet_window(retry_interval: std::time::Duration) -> std::time::Duration {
+    retry_interval.saturating_mul(ENSURE_ATTEMPTS)
+}
+
+/// True when a failed flush is only the boot-time "not yet keyed" refusal
+/// inside the quiet window. Pure, so the rule is unit-tested.
+fn quiet_boot_refusal(
+    flush_failed: bool,
+    keyed: bool,
+    since_start: std::time::Duration,
+    quiet_window: std::time::Duration,
+) -> bool {
+    flush_failed && !keyed && since_start < quiet_window
+}
+
 fn run_writer(
     rx: crossbeam_channel::Receiver<ProofMessage>,
     mut writer: HotPathLatencyMinuteWriter,
     retry_interval: std::time::Duration,
 ) -> HotPathLatencyMinuteWriter {
+    let started = std::time::Instant::now();
+    let quiet_window = boot_quiet_window(retry_interval);
     let mut episode = FlushEpisode::default();
     let mut append_episode = FlushEpisode::default();
     loop {
@@ -998,6 +1088,14 @@ fn run_writer(
         }
         // Also retries when readiness changes after the last producer item.
         let result = writer.flush();
+        if quiet_boot_refusal(
+            result.is_err(),
+            writer.is_keyed(),
+            started.elapsed(),
+            quiet_window,
+        ) {
+            continue;
+        }
         match (episode.step(result.is_ok()), &result) {
             (Some(true), Err(err)) => error!(
                 code = ErrorCode::StorageGap03AuditWriteFailed.code_str(),
@@ -1033,6 +1131,7 @@ mod tests {
         let i = stage as usize;
         w.stage_buckets[i][bucket_index(nanos)] += n;
         w.stage_max_nanos[i] = nanos;
+        w.stage_sum_nanos[i] = nanos.saturating_mul(n);
         if stage == Stage::ReceiptToFold {
             w.receipt_to_fold_fine[fine_bucket_index(nanos)] += n;
         }
@@ -1304,6 +1403,70 @@ mod tests {
         assert!(!over_1024ns_is_meaningful(Stage::ReceiptToFold));
     }
 
+    // Regression: 2026-11-16: the drain's non-frame arms were timed
+    // nowhere, so a 2.8 ms ring wait could not be named. Each arm stage gets
+    // its own row every minute, with its samples and maximum.
+    #[test]
+    fn test_regression_every_minute_has_one_row_per_drain_arm_stage() {
+        use crate::hot_path_telemetry::DRAIN_ARM_STAGES;
+        for (n, stage) in DRAIN_ARM_STAGES.into_iter().enumerate() {
+            let mut acc = MinuteAccumulator::new();
+            let mut w = window_with(stage, 2_000, 120);
+            w.stage_buckets[stage as usize][bucket_index(2_800_000)] += 1;
+            w.stage_max_nanos[stage as usize] = 2_800_000;
+            let _ = acc.absorb(minute(0), &w);
+            let rows = acc.rows().expect("rows");
+            assert_eq!(rows.len(), ALL_STAGES.len());
+            let row = row_of(&rows, stage);
+            assert_eq!(row.samples, 121, "stage #{n} {}", stage.as_str());
+            assert_eq!(row.max_ns, 2_800_000);
+            assert!(row.stage.as_str().starts_with("drain_arm_"));
+        }
+    }
+
+    // Regression: 2026-11-13 (B3): the frame arm's post-fold hand-offs were
+    // in no stage, so no minute row could show them. Every minute now has a
+    // `drain_frame_post` row whose over-1,024 ns count is kept (most frames
+    // trip no hand-off, so the count separates the hand-off tail).
+    #[test]
+    fn test_regression_b3_every_minute_has_a_drain_frame_post_row() {
+        let mut acc = MinuteAccumulator::new();
+        let mut w = window_with(Stage::DrainFramePost, 200, 990);
+        w.stage_buckets[Stage::DrainFramePost as usize][bucket_index(600_000)] += 10;
+        w.stage_max_nanos[Stage::DrainFramePost as usize] = 600_000;
+        let _ = acc.absorb(minute(0), &w);
+        let rows = acc.rows().expect("rows");
+        assert_eq!(rows.len(), ALL_STAGES.len());
+        let post = row_of(&rows, Stage::DrainFramePost);
+        assert_eq!(post.stage.as_str(), "drain_frame_post");
+        assert_eq!(post.samples, 1_000);
+        assert_eq!(post.samples_over_1024ns, Some(10));
+        assert_eq!(post.max_ns, 600_000);
+        assert!(over_1024ns_is_meaningful(Stage::DrainFramePost));
+    }
+
+    // 2026-11-17 (plan ITEM DT "PR 0, measure first"): every minute has a
+    // `drain_inline_depth` row (the sampled inline depth of Full packets)
+    // whose over-1,024 ns count is kept: a packet's depth append is expected
+    // well under 1 µs, so the count separates the slow ones.
+    #[test]
+    fn test_every_minute_has_a_drain_inline_depth_row() {
+        let mut acc = MinuteAccumulator::new();
+        let mut w = window_with(Stage::DrainInlineDepth, 500, 150);
+        w.stage_buckets[Stage::DrainInlineDepth as usize][bucket_index(4_000)] += 6;
+        w.stage_max_nanos[Stage::DrainInlineDepth as usize] = 4_000;
+        let _ = acc.absorb(minute(0), &w);
+        let rows = acc.rows().expect("rows");
+        assert_eq!(rows.len(), ALL_STAGES.len());
+        assert_eq!(STAGES_PER_MINUTE, 15);
+        let depth = row_of(&rows, Stage::DrainInlineDepth);
+        assert_eq!(depth.stage.as_str(), "drain_inline_depth");
+        assert_eq!(depth.samples, 156);
+        assert_eq!(depth.samples_over_1024ns, Some(6));
+        assert_eq!(depth.max_ns, 4_000);
+        assert!(over_1024ns_is_meaningful(Stage::DrainInlineDepth));
+    }
+
     /// The max is the largest per-second max, per stage.
     #[test]
     fn test_max_is_the_largest_second_max_per_stage() {
@@ -1422,6 +1585,7 @@ mod tests {
             "max_ns=700i",
             "samples_over_1024ns=0i",
             "publishes=1i",
+            "mean_ns=700i",
         ] {
             assert!(drain.contains(col), "{col} in {drain}");
         }
@@ -1439,6 +1603,7 @@ mod tests {
             .expect("empty row");
         assert!(empty.contains("samples=0i"));
         assert!(!empty.contains("p99_ns"), "a null percentile is omitted");
+        assert!(!empty.contains("mean_ns"), "an empty minute's mean is NULL");
         assert!(w.flush().is_err(), "no sender: flush reports the failure");
     }
 
@@ -1611,6 +1776,68 @@ mod tests {
         assert_eq!(w.pending(), 2 * (STAGES_PER_MINUTE + 1));
     }
 
+    /// 2026-11-16: `mean_ns` is the exact mean, where the percentiles are
+    /// bucket edges. Samples at 1,500 and 1,600 ns all sit in the bucket
+    /// ending at 2,048 ns, so p50/p99 read 2,048 while the mean is 1,550.
+    #[test]
+    fn test_mean_ns_is_the_exact_minute_mean_not_a_bucket_edge() {
+        let mut acc = MinuteAccumulator::new();
+        let _ = acc.absorb(minute(0), &window_with(Stage::DrainMainFrame, 1_500, 10));
+        let _ = acc.absorb(
+            minute(0) + 1,
+            &window_with(Stage::DrainMainFrame, 1_600, 10),
+        );
+        let rows = acc
+            .absorb(minute(1), &SecondWindow::empty())
+            .expect("closed");
+        let r = row_of(&rows, Stage::DrainMainFrame);
+        assert_eq!(r.samples, 20);
+        assert_eq!((r.p50_ns, r.p99_ns), (Some(2_048), Some(2_048)));
+        assert_eq!(r.mean_ns, Some(1_550));
+        // A stage that recorded nothing has no mean, never a fast 0.
+        assert_eq!(row_of(&rows, Stage::SocketToWal).mean_ns, None);
+    }
+
+    /// 2026-11-16: the weighted `drain_main_tick` stage, end to end from the
+    /// recording call to the minute row. A frame of 4 ticks at 900 ns each
+    /// and a frame of 1 tick at 2,500 ns are 5 ticks averaging 1,220 ns.
+    /// Uses a local stage record through the real window difference, not
+    /// the process-wide statics other tests share.
+    #[test]
+    fn test_weighted_drain_main_tick_mean_is_the_per_tick_mean() {
+        use crate::hot_path_telemetry::test_support::weighted_window;
+        let second = weighted_window(Stage::DrainMainTick, &[(900, 4), (2_500, 1)]);
+        let mut acc = MinuteAccumulator::new();
+        let _ = acc.absorb(minute(0), &second);
+        let r = row_of(&acc.rows().expect("rows"), Stage::DrainMainTick);
+        assert_eq!(r.samples, 5);
+        assert_eq!(r.mean_ns, Some(1_220));
+    }
+
+    /// `receipt_to_fold` takes its percentiles and `samples` from the fine
+    /// histogram but its mean from the stage's own sum and log2 count.
+    #[test]
+    fn test_receipt_to_fold_mean_uses_the_stage_sum_and_log2_count() {
+        let mut w = window_with(Stage::ReceiptToFold, 3_000, 2);
+        // The fine histogram is read separately and can disagree.
+        w.receipt_to_fold_fine[fine_bucket_index(3_000)] += 5;
+        let mut acc = MinuteAccumulator::new();
+        let _ = acc.absorb(minute(0), &w);
+        let r = row_of(&acc.rows().expect("rows"), Stage::ReceiptToFold);
+        assert_eq!(r.samples, 7, "samples is the fine count");
+        assert_eq!(r.mean_ns, Some(3_000));
+    }
+
+    #[test]
+    fn test_mean_nanos_rounds_to_nearest_and_is_none_when_empty() {
+        assert_eq!(mean_nanos(0, 0), None);
+        assert_eq!(mean_nanos(5, 0), None);
+        assert_eq!(mean_nanos(10, 4), Some(3)); // 2.5 rounds up
+        assert_eq!(mean_nanos(9, 4), Some(2)); // 2.25 rounds down
+        assert_eq!(mean_nanos(u64::MAX, 1), Some(u64::MAX));
+        assert_eq!(mean_nanos(u64::MAX, u64::MAX), Some(1));
+    }
+
     #[test]
     fn test_to_i64_saturates() {
         assert_eq!(to_i64(5), 5);
@@ -1623,6 +1850,48 @@ mod tests {
         let ist = wall_ist_nanos_now();
         let diff = ist - utc - IST_UTC_OFFSET_NANOS;
         assert!(diff.abs() < 5_000_000_000, "within 5 s: {diff}");
+    }
+
+    /// 2026-11-18: the boot-time "not yet keyed" refusal is quiet only while
+    /// the tables are unkeyed AND inside the ensure task's own quiet window;
+    /// a keyed send failure, or a refusal past the window, still logs.
+    #[test]
+    fn test_quiet_boot_refusal_only_while_unkeyed_inside_the_window() {
+        use std::time::Duration;
+        let window = boot_quiet_window(ENSURE_RETRY_INTERVAL);
+        assert_eq!(window, Duration::from_secs(300), "10 tries x 30 s");
+        let early = Duration::from_secs(30);
+        let late = Duration::from_secs(301);
+        // Boot refusal inside the window: quiet.
+        assert!(quiet_boot_refusal(true, false, early, window));
+        // Same refusal past the window: logs.
+        assert!(!quiet_boot_refusal(true, false, late, window));
+        assert!(!quiet_boot_refusal(true, false, window, window));
+        // Keyed tables and a failed send: a real failure, logs at once.
+        assert!(!quiet_boot_refusal(true, true, early, window));
+        // A success is never "quiet": it must reach the recovery log.
+        assert!(!quiet_boot_refusal(false, false, early, window));
+        assert!(!quiet_boot_refusal(false, true, early, window));
+    }
+
+    #[test]
+    fn test_boot_quiet_window_saturates_and_scales_with_the_retry_interval() {
+        use std::time::Duration;
+        assert_eq!(
+            boot_quiet_window(Duration::from_millis(5)),
+            Duration::from_millis(50)
+        );
+        assert_eq!(boot_quiet_window(Duration::MAX), Duration::MAX);
+    }
+
+    #[test]
+    fn test_is_keyed_reads_the_readiness_gate() {
+        let w = HotPathLatencyMinuteWriter::for_test();
+        assert!(!w.is_keyed(), "a fresh writer starts closed");
+        w.readiness.keyed.store(true, Ordering::Release);
+        assert!(w.is_keyed());
+        w.readiness.keyed.store(false, Ordering::Release);
+        assert!(!w.is_keyed());
     }
 }
 

@@ -203,9 +203,57 @@ pub fn nanos_in_any_open_window(ist_nanos: i64, muhurat_active: bool) -> bool {
 ///
 /// Off a Muhurat day the flag is `false` and this is exactly
 /// [`nanos_in_session_window`].
+///
+/// B1 review (2026-11-13): the Muhurat flag is the one of the ROW's own IST
+/// date ([`row_day_had_muhurat`]), not the process's. A Muhurat evening row
+/// replayed by a later process (the next boot's WAL refold or catch-up) read
+/// the replaying process's flag (false) and was refused although the writer
+/// had accepted it on its own day. Live on a Muhurat day both answers agree.
 #[must_use]
 pub fn row_is_in_an_open_window(ist_nanos: i64) -> bool {
-    nanos_in_any_open_window(ist_nanos, crate::muhurat::current())
+    open_on_row_day(ist_nanos, nanos_in_any_open_window, row_day_had_muhurat)
+}
+
+/// Days from 0001-01-01 (day 1 of the common era) to 1970-01-01.
+const UNIX_EPOCH_DAYS_FROM_CE: i32 = 719_163;
+
+/// The IST calendar date of an IST epoch-nanosecond stamp (the stamp counts
+/// IST wall time from the epoch, so its whole days ARE the IST date). `None`
+/// for a negative stamp. O(1), no allocation.
+fn row_date_ist(ist_nanos: i64) -> Option<chrono::NaiveDate> {
+    if ist_nanos < 0 {
+        return None;
+    }
+    let days = (ist_nanos / NANOS_PER_SECOND) / i64::from(SECONDS_PER_DAY);
+    let days = i32::try_from(days)
+        .ok()?
+        .checked_add(UNIX_EPOCH_DAYS_FROM_CE)?;
+    chrono::NaiveDate::from_num_days_from_ce_opt(days)
+}
+
+/// Whether the IST date of the row stamped `ist_nanos` had a Muhurat session:
+/// the installed trading calendar's answer for THAT date, else (no calendar
+/// installed, or a negative stamp) the process flag ([`crate::muhurat::current`]),
+/// the old behaviour (B1 review, 2026-11-13). O(1): a date conversion and one
+/// hash probe, no allocation; the window functions below call it only for a
+/// row outside the regular session, so a session tick never pays it.
+#[must_use]
+pub fn row_day_had_muhurat(ist_nanos: i64) -> bool {
+    row_date_ist(ist_nanos)
+        .and_then(crate::market_hours::installed_calendar_says_muhurat)
+        .unwrap_or_else(crate::muhurat::current)
+}
+
+/// `open(ist_nanos, muhurat)` with `muhurat` the row day's flag, asked only
+/// when the regular window alone says no (every `open` here only widens with
+/// the flag, so this equals `open(ist_nanos, muhurat_on(ist_nanos))`). Pure
+/// apart from `muhurat_on`. O(1).
+fn open_on_row_day(
+    ist_nanos: i64,
+    open: fn(i64, bool) -> bool,
+    muhurat_on: impl Fn(i64) -> bool,
+) -> bool {
+    open(ist_nanos, false) || (open(ist_nanos, true) && muhurat_on(ist_nanos))
 }
 
 /// True when an ARRIVAL-clocked stamp falls inside an open window, allowing a
@@ -272,7 +320,12 @@ pub fn nanos_in_any_open_window_with_arrival_grace(ist_nanos: i64, muhurat_activ
 /// admits genuinely out-of-session events.
 #[must_use]
 pub fn arrival_row_is_in_an_open_window(ist_nanos: i64) -> bool {
-    nanos_in_any_open_window_with_arrival_grace(ist_nanos, crate::muhurat::current())
+    // B1 review: the row day's Muhurat flag (see `row_is_in_an_open_window`).
+    open_on_row_day(
+        ist_nanos,
+        nanos_in_any_open_window_with_arrival_grace,
+        row_day_had_muhurat,
+    )
 }
 /// The window verdict for a row carrying a designated timestamp and an
 /// OPTIONAL receipt timestamp, both IST epoch nanoseconds.
@@ -290,12 +343,31 @@ pub fn arrival_row_is_in_an_open_window(ist_nanos: i64) -> bool {
 /// afterwards — `received_at` is NULL in the table — so the operator can tighten
 /// this to a refusal later without losing the ability to find them.
 #[must_use]
+///
+/// B1 review (2026-11-13): each stamp is judged with the Muhurat flag of its
+/// own IST date ([`row_day_had_muhurat`]), so a replay on a later day keeps a
+/// Muhurat evening tick in `ticks` instead of moving it to `feed_aux_packets`.
 pub fn verdict(ts_ist_nanos: i64, received_at_ist_nanos: Option<i64>) -> WindowVerdict {
-    verdict_in(
-        ts_ist_nanos,
-        received_at_ist_nanos,
-        crate::muhurat::current(),
-    )
+    verdict_by_row_day(ts_ist_nanos, received_at_ist_nanos, row_day_had_muhurat)
+}
+
+/// [`verdict`] with the per-date Muhurat answer injected. Pure apart from
+/// `muhurat_on`; on a single date it equals [`verdict_in`] with that date's
+/// flag. O(1).
+fn verdict_by_row_day(
+    ts_ist_nanos: i64,
+    received_at_ist_nanos: Option<i64>,
+    muhurat_on: impl Fn(i64) -> bool,
+) -> WindowVerdict {
+    if !open_on_row_day(ts_ist_nanos, nanos_in_any_open_window, &muhurat_on) {
+        return WindowVerdict::TsOutOfWindow;
+    }
+    match received_at_ist_nanos {
+        Some(r) if !open_on_row_day(r, nanos_in_any_open_window, &muhurat_on) => {
+            WindowVerdict::ReceivedAtOutOfWindow
+        }
+        _ => WindowVerdict::InWindow,
+    }
 }
 
 /// The pure form of [`verdict`] — the Muhurat flag as a parameter, no global.
@@ -790,18 +862,80 @@ mod tests {
         // other test in this binary installed the `OnceLock` first, so instead
         // it asserts the property that actually matters and is order-blind:
         // the wrapper must not narrow, widen or otherwise differ from the pure
-        // form evaluated with the SAME flag.
-        let flag = crate::muhurat::current();
+        // form evaluated with the SAME flag. B1 review 2: that flag is now the
+        // row day's (`row_day_had_muhurat`), not the process's.
         for sod in [
             0_i64, 32_399, 32_400, 56_399, 56_400, 56_639, 56_640, 64_800, 86_399,
         ] {
             assert_eq!(
                 arrival_row_is_in_an_open_window(at(sod)),
-                nanos_in_any_open_window_with_arrival_grace(at(sod), flag),
+                nanos_in_any_open_window_with_arrival_grace(at(sod), row_day_had_muhurat(at(sod))),
                 "seconds-of-day {sod}: the wrapper disagreed with the pure form \
                  it delegates to, so a writer calling it gets a different window \
                  than the one this module's tests pin"
             );
         }
+    }
+
+    /// B1 review (2026-11-13): each stamp is judged with its OWN date's
+    /// Muhurat flag. Day 20,000 is a Muhurat day here, day 20,001 is not;
+    /// an 18:30 row of each is judged by its own day whatever the other.
+    #[test]
+    fn test_verdict_by_row_day_reads_each_stamps_own_date() {
+        let day_secs = i64::from(SECONDS_PER_DAY) * NANOS_PER_SECOND;
+        let muhurat_on = |n: i64| n / day_secs == 20_000;
+        let evening = 18 * 3600 + 30 * 60;
+        let muhurat_row = at(evening);
+        let ordinary_row = at(evening) + day_secs;
+        assert_eq!(
+            verdict_by_row_day(muhurat_row, Some(muhurat_row), muhurat_on),
+            WindowVerdict::InWindow
+        );
+        assert_eq!(
+            verdict_by_row_day(ordinary_row, Some(ordinary_row), muhurat_on),
+            WindowVerdict::TsOutOfWindow
+        );
+        // A Muhurat-day ts received the next evening: the receipt is judged
+        // on its own (ordinary) date.
+        assert_eq!(
+            verdict_by_row_day(muhurat_row, Some(ordinary_row), muhurat_on),
+            WindowVerdict::ReceivedAtOutOfWindow
+        );
+        // A session row never asks the calendar.
+        let never = |_: i64| -> bool { panic!("a session row must not ask") };
+        assert_eq!(
+            verdict_by_row_day(at(10 * 3600), None, never),
+            WindowVerdict::InWindow
+        );
+        assert!(open_on_row_day(
+            at(10 * 3600),
+            nanos_in_any_open_window,
+            never
+        ));
+        // The arrival-graced form widens the same way.
+        assert!(open_on_row_day(
+            muhurat_row,
+            nanos_in_any_open_window_with_arrival_grace,
+            muhurat_on
+        ));
+        assert!(!open_on_row_day(
+            ordinary_row,
+            nanos_in_any_open_window_with_arrival_grace,
+            muhurat_on
+        ));
+    }
+
+    /// The row date is the IST date of the stamp's whole days.
+    #[test]
+    fn test_row_date_ist_is_the_stamps_ist_day() {
+        let d = chrono::NaiveDate::from_ymd_opt(2026, 11, 8).expect("date");
+        let nanos = d
+            .and_hms_opt(18, 30, 0)
+            .map(|t| t.and_utc().timestamp())
+            .expect("time")
+            * NANOS_PER_SECOND;
+        assert_eq!(row_date_ist(nanos), Some(d));
+        assert_eq!(row_date_ist(0), chrono::NaiveDate::from_ymd_opt(1970, 1, 1));
+        assert_eq!(row_date_ist(-1), None);
     }
 }

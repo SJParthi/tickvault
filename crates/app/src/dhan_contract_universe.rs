@@ -1242,6 +1242,7 @@ pub(crate) const MIN_LEGS_FOR_A_REAL_EXPIRY: usize = 4;
 ///
 /// Returns `None` when no expiry qualifies. `usize` is the number skipped.
 fn nearest_expiry(contracts: &[Contract<'_>]) -> (Option<u32>, usize) {
+    // APPROVED: not an instrument key — the key is an expiry date YYYYMMDD.
     let mut legs: HashMap<u32, usize> = HashMap::new();
     for c in contracts {
         *legs.entry(c.expiry_ymd).or_insert(0) += 1;
@@ -2188,6 +2189,24 @@ pub fn contract_names_for_day(
     Some(labels)
 }
 
+/// [`contract_names_for_day`] for the day repair: both of the day's files
+/// must read (2026-11-21 review: a missing contract file would name spots
+/// only and leave every option row of the rebuilt day unnamed). O(rows).
+///
+/// # Errors
+/// The day's symbol map or contract file does not read.
+pub fn contract_names_for_day_strict(
+    date_ist: &str,
+) -> anyhow::Result<tickvault_storage::candle_contract_labels::CandleContractLabels> {
+    let symbols =
+        read_symbol_map(date_ist).map_err(|e| anyhow::anyhow!("symbol map for {date_ist}: {e}"))?;
+    let contracts = read_contract_artifact(date_ist)
+        .map_err(|e| anyhow::anyhow!("contract file for {date_ist}: {e}"))?;
+    let mut labels = spot_labels_from(&symbols);
+    labels.extend(option_labels_from(&contracts, day_key(date_ist)));
+    Ok(labels)
+}
+
 /// IST "now" as epoch nanoseconds — wall clock plus the fixed IST offset, the
 /// same convention the `ticks` designated timestamp is written in.
 fn ist_now_nanos() -> i64 {
@@ -2231,6 +2250,17 @@ pub fn spot_paise_by_symbol(
     out
 }
 
+/// Whether a failed read of today's contract artifact is the expected
+/// pre-rider kind (2026-11-15 audit, live-6): the file is MISSING (not found)
+/// at a time the rider has not built it yet (`absence_expected`). A file that
+/// exists but cannot be read or parsed is never expected. Pure, O(1).
+fn contract_artifact_error_is_expected(err: &anyhow::Error, absence_expected: bool) -> bool {
+    absence_expected
+        && err
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+}
+
 /// Loads today's contract universe: artifact from disk, prices from QuestDB.
 ///
 /// Returns an EMPTY selection on any failure, having said which one. An empty
@@ -2255,14 +2285,34 @@ pub async fn load_contract_universe(
     let contracts = match read_contract_artifact(date_ist) {
         Ok(c) => c,
         Err(err) => {
-            tracing::error!(
-                code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
-                %err,
-                date_ist,
-                path = %contract_artifact_path(date_ist).display(),
-                "contract universe: today's contract artifact is unreadable — the lane will \
-                 carry its spot universe only. No futures, no option contracts."
+            // Live-6 (2026-11-15): before the rider builds today's file (or on
+            // a non-trading day) a MISSING file is expected and logged at
+            // WARN, like the live universe's pre-rider line. Any other
+            // failure, or a boot at or after the rider hour, stays ERROR.
+            let absence_expected = crate::dhan_live_universe::day_artifact_absence_expected_at(
+                crate::dhan_feed_stack::ist_second_of_day_now(),
             );
+            if contract_artifact_error_is_expected(&err, absence_expected) {
+                tracing::warn!(
+                    code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+                    source = crate::dhan_live_universe::PRE_RIDER_BOOT_SOURCE,
+                    %err,
+                    date_ist,
+                    path = %contract_artifact_path(date_ist).display(),
+                    "contract universe: today's contract artifact does not exist yet \
+                     (non-trading day, or before the daily rider's build hour) — the lane \
+                     carries its spot universe until it does. Expected for this boot."
+                );
+            } else {
+                tracing::error!(
+                    code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+                    %err,
+                    date_ist,
+                    path = %contract_artifact_path(date_ist).display(),
+                    "contract universe: today's contract artifact is unreadable — the lane will \
+                     carry its spot universe only. No futures, no option contracts."
+                );
+            }
             // Bumped HERE rather than through `record_contract_verdict`: this
             // path returns a default selection, which carries none of the
             // information needed to classify what went wrong.
@@ -2620,6 +2670,29 @@ mod tests {
         );
     }
 
+    /// 2026-11-15 audit (live-6): an off-hours boot (00:26 IST, Saturday
+    /// 14:23) logged today's not-yet-built contract artifact as a coded ERROR
+    /// on every attach attempt. A missing file at a time the rider has not
+    /// built it is expected; a file that exists but fails to read or parse,
+    /// or any failure after the rider hour on a trading day, is not. Bites:
+    /// dropping the `NotFound` check passes the parse-error case.
+    #[test]
+    fn test_regression_contract_artifact_error_is_expected_only_for_a_missing_file() {
+        let missing =
+            read_contract_artifact_on_this_thread("1999-01-01").expect_err("no artifact for 1999");
+        assert!(super::contract_artifact_error_is_expected(&missing, true));
+        assert!(!super::contract_artifact_error_is_expected(&missing, false));
+        let unparsable =
+            anyhow::Error::from(serde_json::from_str::<Vec<u8>>("{").expect_err("bad json"));
+        assert!(!super::contract_artifact_error_is_expected(
+            &unparsable,
+            true
+        ));
+        let denied =
+            anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        assert!(!super::contract_artifact_error_is_expected(&denied, true));
+    }
+
     /// Regression (2026-10-28, HAVELLS-23Nov2026-1260-CE written with a NULL
     /// `contract`): the attach must publish the candle names from EVERY option
     /// row of the day's file, never from the 25,000-capped ranking table, or a
@@ -2827,6 +2900,11 @@ mod tests {
     /// only assertion that fails when the parse is re-run, and not re-running
     /// it is the entire point — the 2026-08-22 measurement puts this file at
     /// ~4,565 rows, parsed twice a minute before this cache existed.
+    #[test]
+    fn contract_names_for_day_strict_refuses_a_day_with_no_files() {
+        assert!(contract_names_for_day_strict("1999-01-01").is_err());
+    }
+
     #[test]
     fn read_symbol_map_shares_one_parse_across_reads() {
         let _g = CACHE_TEST_LOCK

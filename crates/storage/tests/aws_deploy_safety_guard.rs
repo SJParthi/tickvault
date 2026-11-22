@@ -285,11 +285,14 @@ fn deploy_ebs_default_is_150gb() {
     // trading box. The levers are the already-approved Quote 10 Elastic IP
     // release (-$3.60/mo) or an operator decision; a ceiling edit cannot help
     // because Quote 19 caps limit_amount at $150, already the live value.
+    // 2026-11-13 (audit B2): the ceiling is 150, the rebuilt root. Quote 51
+    // (2026-11-07) rules no bigger disk, so the default sits AT the ceiling
+    // again and a grow is a deliberate, quoted decision, not a drive-by.
     assert!(
-        vars.contains("var.ebs_gp3_size_gb >= 10 && var.ebs_gp3_size_gb <= 600"),
-        "the 10-600 GB validation range must stay — with the default AT the \
-         ceiling it is what makes a further grow a deliberate, quoted decision \
-         rather than a one-character edit."
+        vars.contains("var.ebs_gp3_size_gb >= 10 && var.ebs_gp3_size_gb <= 150"),
+        "the 10-150 GB validation range must stay (Quote 51: no bigger disk); \
+         with the default AT the ceiling it is what makes a further grow a \
+         deliberate, quoted decision rather than a one-character edit."
     );
     // Inverted pin, unchanged in spirit: gp3 grows online and can never
     // shrink, so over-provisioning is the irreversible mistake and pays for
@@ -308,6 +311,96 @@ fn deploy_ebs_default_is_150gb() {
          would add $9.12/mo against a forecast already above the $135 \
          STOP_EC2_INSTANCES action line. Grow it live if measured volume \
          demands it, with its own dated quote and a lever."
+    );
+}
+
+/// Audit B2 finding 11 (2026-11-13): the volume-grow workflow defaulted to
+/// 600 GB and accepted up to 600, so a dispatch meant to change only IOPS or
+/// throughput grew the 150 GB root by 450 GB (about +$41 a month, permanent:
+/// gp3 never shrinks). Quote 51 (2026-11-07) rules no bigger disk. The
+/// default must be the live 150 GB and the guard must refuse anything above
+/// it; IOPS and throughput stay changeable.
+#[test]
+fn grow_ebs_workflow_defaults_to_150_and_refuses_a_bigger_disk() {
+    let wf = read(".github/workflows/grow-ebs-volume.yml");
+    let squished = squish(&wf);
+    assert!(
+        squished.contains("target_size_gb: description:")
+            && squished.contains("required: true default: '150' target_iops:"),
+        "target_size_gb must default to '150' (the rebuilt root, Quotes 32/33)"
+    );
+    assert!(
+        !squished.contains("default: '600'"),
+        "a 600 GB default grows the disk 4x on a dispatch meant for IOPS"
+    );
+    assert!(
+        wf.contains("if [ \"$TARGET\" -gt 150 ]; then"),
+        "the size guard must refuse anything above 150 GB (Quote 51)"
+    );
+    assert!(
+        !wf.contains("-gt 600"),
+        "the old 600 GB ceiling must not come back without a dated owner quote"
+    );
+    // Audit B2 review: the two other grow routes stop at the same 150 GB, so
+    // the three cannot drift apart again (the script allowed 200 and the
+    // Terraform validation 600 after the workflow was lowered).
+    let script = read("scripts/aws-upgrade-instance.sh");
+    assert!(
+        script.contains("[ \"$EBS_SIZE\" -le 150 ]"),
+        "aws-upgrade-instance.sh --ebs-size must refuse anything above 150 GB"
+    );
+    assert!(
+        !script.contains("[ \"$EBS_SIZE\" -le 200 ]"),
+        "the script's old 200 GB ceiling must not come back"
+    );
+    let vars = read(VARIABLES_TF);
+    assert!(
+        vars.contains("var.ebs_gp3_size_gb <= 150"),
+        "the Terraform validation must stop at 150 GB too"
+    );
+    // Audit B2 follow-up (2026-11-13): IOPS and throughput are held at the
+    // quoted values on all three routes, like size. Quote 30 (2026-10-13)
+    // rejects IOPS above 3,000 without a fresh dated quote and Quotes 32/33
+    // (2026-10-21) set throughput to 125; the old 16000 / 1000 ceilings let
+    // one dispatch add about $100 a month at list price, past the $62 line.
+    assert!(wf.contains("if [ \"$WANT_IOPS\" -lt 3000 ] || [ \"$WANT_IOPS\" -gt 3000 ]; then"));
+    assert!(wf.contains("if [ \"$WANT_TP\" -lt 125 ] || [ \"$WANT_TP\" -gt 125 ]; then"));
+    for wide in ["-gt 16000", "-gt 1000 ]"] {
+        assert!(
+            !wf.contains(wide),
+            "workflow ceiling {wide} is above the quoted value"
+        );
+    }
+    assert!(script.contains("[ \"$EBS_IOPS\" -le 3000 ]"));
+    assert!(script.contains("[ \"$EBS_THROUGHPUT\" -le 125 ]"));
+    assert!(!script.contains("-le 16000"));
+    assert!(!script.contains("[ \"$EBS_THROUGHPUT\" -le 1000 ]"));
+    assert!(vars.contains("var.ebs_gp3_iops <= 3000"));
+    assert!(vars.contains("var.ebs_gp3_throughput <= 125"));
+}
+
+/// Audit B2 review (2026-11-13): the hard-stop guard's stopped-box budget
+/// hold must disable the daily-start rule BEFORE that rule fires. EventBridge
+/// gives no order between two rules firing in the same minute, so the guard
+/// runs at minute 50: its 02:50 UTC run (08:20 IST) comes ten minutes before
+/// the 03:00 UTC (08:30 IST) start. On minute 0 the two raced, and a start
+/// that won ran the box into the session until the next hourly breach stop.
+#[test]
+fn hard_stop_guard_runs_before_the_daily_start_in_the_same_hour() {
+    let guards = read("deploy/aws/terraform/budget-guards.tf");
+    let start = guards
+        .find("resource \"aws_cloudwatch_event_rule\" \"tv_hard_stop_guard\"")
+        .expect("hard-stop guard schedule rule");
+    let block = &guards[start..];
+    let end = block.find("\n}").expect("rule block end");
+    let block = &block[..end];
+    assert!(
+        block.contains("schedule_expression = \"cron(50 * * * ? *)\""),
+        "the hard-stop guard must run hourly at minute 50, before the 03:00 UTC daily start: {block}"
+    );
+    assert!(
+        read(MAIN_TF).contains("cron(0 3 ? * MON-FRI *)"),
+        "the daily start this ordering assumes is 03:00 UTC"
     );
 }
 

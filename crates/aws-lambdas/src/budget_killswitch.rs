@@ -120,7 +120,10 @@ pub fn format_alert_payload(
          \x20 1. Inspect AWS Cost Explorer for the runaway cost source.\n\
          \x20 2. Fix the underlying issue (rogue stress test, unintended\n\
          \x20    resource, exchange-rate spike, etc).\n\
-         \x20 3. Delete the budget-stop latch (/tickvault-guard/<env>/budget-stop-month),\n\
+         \x20 3. Delete the budget-stop latch:\n\
+         \x20    `aws ssm delete-parameter --name /tickvault-guard/<env>/budget-stop-month`,\n\
+         \x20    then turn the 8:30 AM start back on (the hourly guard keeps it off\n\
+         \x20    while the stop holds): `aws events enable-rule --name tv-<env>-daily-start`,\n\
          \x20    then restart via AWS Console or `aws ec2 start-instances`.\n\
          \x20 4. Charter aws-budget.md §6: EIP + EBS continue to accrue at\n\
          \x20    ~Rs 0.51/hour while stopped (vs Rs 1.90/hour running)."
@@ -378,6 +381,28 @@ mod tests {
     fn test_payload_renders_state_transition() {
         let out = format_alert_payload("i-cafe", &one_transition("i-cafe"), "ctx");
         assert!(out.message.contains("i-cafe: running -> stopping"));
+    }
+
+    /// Audit B2 review (2026-11-13): the hourly guard now keeps the 8:30 AM
+    /// start rule disabled while this month's stop holds, so deleting the
+    /// latch alone no longer brings the box back next morning. The page must
+    /// name both steps, latch first.
+    #[test]
+    fn test_regression_recovery_steps_name_the_latch_and_the_start_rule() {
+        let out = format_alert_payload("i-abc", &one_transition("i-abc"), "ctx");
+        let delete = out
+            .message
+            .find("aws ssm delete-parameter --name /tickvault-guard/<env>/budget-stop-month")
+            .expect("latch delete step");
+        let enable = out
+            .message
+            .find("aws events enable-rule --name tv-<env>-daily-start")
+            .expect("start rule step");
+        let restart = out
+            .message
+            .find("aws ec2 start-instances")
+            .expect("restart step");
+        assert!(delete < enable && enable < restart, "{}", out.message);
     }
 
     #[test]

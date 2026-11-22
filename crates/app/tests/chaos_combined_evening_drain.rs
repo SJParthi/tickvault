@@ -436,6 +436,14 @@ fn the_supervisor_model_matches_drain_hold_rs() {
         "evening_step == crate::evening_drain::EveningStep::Restart && !stalled",
         "let backlog = work.wal_backlog.unwrap_or(0);",
         "crate::evening_drain::state_for_restart(evening, day, backlog, now_unix)",
+        // Owner Quote 60 (2026-11-14 third review): the Brutex export's
+        // wiring in the supervisor. The restart waits only while an export
+        // RUNS; the export reads tonight's pending replay; a due export is
+        // never released by the stall rule; the day's work reads both flags.
+        "work.evening_work_done(),",
+        "let stalled = stall_releases_hold(",
+        "brutex_export_pending: crate::brutex_export_boot::export_pending(),",
+        "brutex_export_running: crate::brutex_export_boot::export_running(),",
     ] {
         assert!(
             src.contains(needle),
@@ -446,6 +454,40 @@ fn the_supervisor_model_matches_drain_hold_rs() {
     assert!(compact.contains(
         "crate::evening_drain::load_state_for_evening(evening_path,chrono::Utc::now().timestamp(),)"
     ), "the recovery model must use the real state path and current clock");
+    // Owner Quote 60: the evening replay's pending value is STORED where the
+    // Brutex export reads it (2026-11-14 third review), and only AFTER the
+    // stall verdict, which it reads (2026-11-15 audit, fix2252-1: a stalled
+    // evening makes no restart, so no replay comes).
+    let store_needle =
+        "EVENING_REPLAY_PENDING.store(evening_replay_value(evening_step,work.wal_backlog,stalled),";
+    let store_at = compact
+        .find(store_needle)
+        .expect("the supervisor must publish the pending evening replay with the stall verdict");
+    let stalled_at = compact
+        .find("letstalled=stall_releases_hold(")
+        .expect("the stall verdict");
+    assert!(
+        stalled_at < store_at,
+        "the pending replay is published after the stall verdict it reads"
+    );
+    // 2026-11-14 evening audit: every store is marked published right after
+    // it (inside and outside the hold window), and the export's read also
+    // counts a replay running now and the planned restart before the first
+    // publish. Behaviour: `test_replay_pending_from_holds_until_the_first_publish_on_a_planned_boot`.
+    let body = &src[..src.find("#[cfg(test)]").expect("tests")];
+    assert_eq!(
+        body.matches("EVENING_REPLAY_PENDING.store(").count(),
+        body.matches("EVENING_REPLAY_PUBLISHED.store(true, Ordering::Release);")
+            .count(),
+        "each store of the pending flag is followed by its published mark"
+    );
+    for needle in [
+        "tickvault_storage::wal_replay_frame_cap::planned_evening_drain_boot(),",
+        "tickvault_storage::archive_quiesce::old_hour_replay_registered(),",
+        "EVENING_REPLAY_PUBLISHED.load(Ordering::Acquire);",
+    ] {
+        assert!(body.contains(needle), "drain_hold.rs lost: {needle}");
+    }
     // The restart is asked only after the record landed.
     let fn_at = src
         .find("async fn request_evening_restart(")

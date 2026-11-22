@@ -20,6 +20,64 @@
 #
 # Measured baseline (2026-06-10, main @ a6fe35c4):
 #   common 99.57 | api 98.71 | trading 97.02 | storage 91.35 | core 90.38 | app 63.43
+#
+# WHAT THE GATE PERCENTAGE COUNTS (B3, 2026-11-13, stated plainly because a
+# reader of these numbers would otherwise take them for production coverage):
+#   scripts/coverage-gate.sh adds every file under crates/<name>/ to that
+#   crate, and llvm-cov counts the test code that lives INSIDE src (inline
+#   `#[cfg(test)] mod` blocks and the `*_tests.rs` files they load) as
+#   coverable lines. Test code runs almost entirely under the tests, so the
+#   [crates] floors below are on a TEST-INCLUSIVE figure that reads well above
+#   the share of production lines the tests reach. Measured on main c77d80d
+#   (CI run 43319207393, Coverage & Perf job 131536160036): app gate 86.93%
+#   against 72.84% production-only, with 51,159 test lines in app/src beside
+#   42,569 production lines.
+#   The [production] table at the end of this file is the second check: it
+#   floors the production-only per-line figure computed by
+#   crates/common/src/bin/coverage_prod_report.rs (test code = `tests.rs` /
+#   `*_tests.rs` files, files loaded by a top-level `#[cfg(test)] mod x;`,
+#   and top-level `#[cfg(test)] mod x { .. }` blocks). KNOWN LIMIT: a
+#   `#[cfg(test)]` module nested inside another module, and a top-level
+#   `#[cfg(test)]` fn, impl or use, still count as production there.
+#
+# B3 RATCHET (2026-11-13): the [crates] floors had not moved while the gate
+# figure rose (app sat 14.3 points above its floor, so a change could drop
+# that much coverage and stay green). Every floor below that the measurement
+# allows was raised to: the MINIMUM gate percentage across four consecutive
+# green main runs, rounded DOWN to one decimal, minus 0.3. The 0.3 margin
+# (the 2026-09-06 app note below used 0.32) covers only the run-to-run drift
+# measured across those runs (app 86.77 to 86.93, trading 97.42 to 97.48,
+# storage 94.06 to 94.10). A floor the formula would LOWER (api, common) is
+# left where it is: floors only move up.
+#   WHAT THE FOUR RUNS DID NOT SAMPLE (B3 review, 2026-11-13): all four ran
+#   on an IST weekday outside market hours (03:52 Fri, 21:40 Thu, 05:31 Thu,
+#   23:11 Wed). No weekend run and no in-session run was measured. The one
+#   coverage test whose covered lines followed the IST weekday,
+#   cov_xvs_expiry_spawn, now drives the task with a fixed clock (a weekday
+#   AND a weekend on every run,
+#   expiry_scope_check::spawn_expiry_scope_check_with_clock), so its run path
+#   is covered whatever day CI runs; cov_xvs_crossverify_spawn and
+#   cov_xvs_holiday_gate reach the same lines at any time of day (see their
+#   headers).
+#   THE TREE B3 IS BUILT ON (main 5db0eb2) WAS MEASURED (B3 review round 2,
+#   2026-11-13; an earlier version of this note said it was not): PR #2242's
+#   final CI run 43353487212 (Coverage & Perf job 131651116936, head
+#   1ac30cfb, pull_request merge ref onto c77d80d, 08:07 IST Fri). Its tree
+#   a33b0486 is the tree squash-merged as 5db0eb2 (checked with
+#   `git rev-parse 1ac30cfb^{tree} 5db0eb2^{tree}`). Gate % (summary) /
+#   production % per crate: api 98.76 / 97.02, app 87.09 / 73.83 (the gate
+#   step printed app 87.10), aws-lambdas 90.90 / 78.20, common 99.43 / 99.59,
+#   core 94.83 / 88.72, storage 94.07 / 88.19, tickvault-logs-mcp 92.31 /
+#   88.42, trading 97.48 / 95.55. Every value is at or above the four-run
+#   minimum, so this run leaves every floor below unchanged. app slack on
+#   this tree: 0.69 points on the gate floor (87.09 - 86.4) and 2.43 on the
+#   production floor (73.83 - 71.4). It is also an IST weekday outside
+#   market hours, so it adds no weekend or in-session sample.
+#   Runs (workflow CI, branch main, all success), gate % per crate:
+#     run 43319207393 job 131536160036 (c77d80d): api 98.76 app 86.93 aws-lambdas 90.88 common 99.44 core 94.84 storage 94.06 tickvault-logs-mcp 92.31 trading 97.48
+#     run 43255665898 job 131315794798 (3b5f073): api 98.75 app 86.79 aws-lambdas 90.88 common 99.43 core 94.83 storage 94.09 tickvault-logs-mcp 92.31 trading 97.48
+#     run 43124168055 job 130873340739 (7635547): api 98.76 app 86.85 aws-lambdas 90.90 common 99.43 core 94.84 storage 94.10 tickvault-logs-mcp 92.31 trading 97.42
+#     run 43070508690 job 130699618532 (10d5967): api 98.75 app 86.77 aws-lambdas 90.88 common 99.43 core 94.83 storage 94.08 tickvault-logs-mcp 92.31 trading 97.42
 # ======================================================================
 # Default threshold for any crate not explicitly listed
 default = 63.0
@@ -56,10 +114,13 @@ default = 63.0
 # and keep the 99.5 floor honest — is the better long-term move and is NOT
 # done here: it is unrelated to this PR's diff, and shipping it inside an
 # unrelated change is how ratchet floors stop meaning anything.
+# 2026-11-13 (B3): unchanged. The formula gives 99.1 (min 99.43), below 99.4.
 common  = 99.4
 # 2026-07-20: 90.2 -> 91.6 (up-only ratchet; CI Coverage & Perf measured min 91.98 across runs 29739772946 / 29745302463; PR #1694).
-core    = 91.6
-trading = 96.9
+# 2026-11-13 (B3): 91.6 -> 94.5 (min 94.83, 94.8 - 0.3).
+core    = 94.5
+# 2026-11-13 (B3): 96.9 -> 97.1 (min 97.42, 97.4 - 0.3).
+trading = 97.1
 # storage: 91.2 -> 90.1 (2026-07-17, stage-2 dead-WS sweep, PR #1631).
 # TRUTHFUL RE-BASELINE, not a ratchet bypass: the sweep deleted ~12K LoC of
 # heavily-unit-tested DEAD tick-chain code from crates/storage
@@ -72,7 +133,9 @@ trading = 96.9
 # measured 90.26 rounded down to one decimal (90.2) minus 0.1 = 90.1.
 # The deleted code no longer exists to cover; the ratchet (up-only) resumes
 # from this honest floor. Flagged in the PR #1631 body for coordinator review.
-storage = 90.1
+# 2026-11-13 (B3): 90.1 -> 93.7 (min 94.06, 94.0 - 0.3).
+storage = 93.7
+# 2026-11-13 (B3): unchanged. The formula gives 98.4 (min 98.75), below 98.6.
 api     = 98.6
 # 2026-07-20: 63.3 -> 68.3 (up-only ratchet; CI-measured min 68.66 across the same two runs; PR #1694).
 # 2026-09-06: 68.3 -> 72.6 (up-only ratchet). Two INDEPENDENT CI Coverage & Perf
@@ -94,7 +157,8 @@ api     = 98.6
 #       would leave 0.12 under the min; 72.6 leaves 0.32, inside that practice.
 # This closes 4.3 of the 4.62 points of silent-regression room the 68.3 floor
 # permitted — app was the outlier by 3x (next widest was aws-lambdas at 1.41).
-app     = 72.6
+# 2026-11-13 (B3): 72.6 -> 86.4 (min 86.77 over the four runs in the header, 86.7 - 0.3).
+app     = 86.4
 # aws-lambdas: NEW crate (2026-07-18, rust-only phase 2b-1 — the 4 AWS
 # Lambdas as Rust bins). MEASURED-then-ratcheted per the phase-2 design:
 # local `cargo llvm-cov -p tickvault-aws-lambdas` measured 64.92% lines
@@ -111,7 +175,8 @@ app     = 72.6
 # unexercisable without a live AWS account; every pure decision/formatting
 # fn is covered). Ratchet up-only: 66.06 → 66.0 − 0.1 = 65.9.
 # 2026-07-20: 65.9 -> 81.1 (first CI Coverage & Perf measurement, 81.40 on both runs, supersedes the 66.06 local baseline above; PR #1694).
-aws-lambdas = 81.1
+# 2026-11-13 (B3): 81.1 -> 90.5 (min 90.88, 90.8 - 0.3).
+aws-lambdas = 90.5
 # tickvault-logs-mcp: INITIAL floor (2026-07-18, rust-only phase 2c — the
 # new Rust MCP crate). Locally measured 85.83% line coverage (cargo
 # llvm-cov -p tickvault-logs-mcp, all targets — the parity integration
@@ -123,7 +188,8 @@ aws-lambdas = 81.1
 # one decimal minus 0.1) in a follow-up once the first post-merge CI
 # measurement lands.
 # 2026-07-20: 80.0 -> 87.3 (this IS the ratchet promised above - first CI measurement 87.64 on both runs; PR #1694).
-tickvault-logs-mcp = 87.3
+# 2026-11-13 (B3): 87.3 -> 92.0 (min 92.31, 92.3 - 0.3).
+tickvault-logs-mcp = 92.0
 
 # ----------------------------------------------------------------------
 # Per-FILE floors (2026-10-12, deep audit PROOF-12). Read by the Rust bin
@@ -145,3 +211,31 @@ tickvault-logs-mcp = 87.3
 # crates/app/src/dhan_live_crossverify.rs. Floors may only move up.
 # ----------------------------------------------------------------------
 [files]
+
+# ----------------------------------------------------------------------
+# Per-crate PRODUCTION-ONLY floors (B3, 2026-11-13). Read by the std-only
+# bin crates/common/src/bin/coverage_prod_report.rs, which CI builds with
+# one rustc call in the Coverage & Perf job ("Enforce production-only
+# coverage floors") and which exits 1 when a crate listed here is below its
+# floor on the production-only per-line figure, is missing from the report,
+# has no production lines, or has a floor that does not parse.
+# scripts/coverage-gate.sh skips this table (it reads [crates] only).
+#
+# Set by the same rule as [crates]: the minimum production-only percentage
+# across the four main runs listed in the header, rounded DOWN to one
+# decimal, minus 0.3. Production % per crate in those runs:
+#   43319207393: api 97.02 app 72.84 aws-lambdas 78.15 common 99.59 core 88.73 storage 88.14 tickvault-logs-mcp 88.42 trading 95.52
+#   43255665898: api 96.99 app 71.79 aws-lambdas 78.15 common 99.58 core 88.71 storage 88.19 tickvault-logs-mcp 88.42 trading 95.51
+#   43124168055: api 97.02 app 71.94 aws-lambdas 78.20 common 99.58 core 88.72 storage 88.28 tickvault-logs-mcp 88.42 trading 95.24
+#   43070508690: api 96.99 app 71.75 aws-lambdas 78.15 common 99.58 core 88.71 storage 88.23 tickvault-logs-mcp 88.42 trading 95.24
+# These floors may only move UP, like [crates]. 100% stays the target.
+# ----------------------------------------------------------------------
+[production]
+api = 96.6
+app = 71.4
+aws-lambdas = 77.8
+common = 99.2
+core = 88.4
+storage = 87.8
+tickvault-logs-mcp = 88.1
+trading = 94.9

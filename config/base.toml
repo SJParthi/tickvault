@@ -196,6 +196,16 @@ instrument_csv_fallback_url = "https://images.dhan.co/api-data/api-scrip-master.
 max_instruments_per_connection = 5000
 max_websocket_connections = 5
 
+# Scope lock 2026-11-21 ("DHAN LIVE LTT IS UTC EPOCH FROM RECEIPT 2026-11-20
+# 00:00 IST"; Dhan ticket #6684672): from that receipt Dhan sends every trade
+# time as UTC epoch and the app ALWAYS adds exactly +19,800 s. This switch does
+# NOT turn that correction off or on; it governs only the guard that watches
+# for Dhan going back to IST epoch: "act" pages DHAN-FEED-TIME-01 and holds the
+# day, "shadow" logs a coded warning only, "off" runs no guard. Rolling the
+# correction back is a code change behind a fresh dated quote.
+[dhan_feed]
+ltt_utc_autocorrect = "act"
+
 [questdb]
 host = "tv-questdb"
 http_port = 9000
@@ -479,6 +489,23 @@ daily_free_target_session_multiplier_pct = 150
 # 40 GiB, used until five sessions have been measured.
 daily_free_target_fallback_session_bytes = 42949672960
 drain_hold_counts_archive = true
+# Owner Quote 60 (2026-11-14): the daily Brutex export. After 15:45 IST each
+# trading day the tick, quote, aux, depth and candle partitions of the day go
+# to their canonical archive keys (create-only, ordered by the DEDUP key), then
+# questdb-partitions/_daily/<D>/manifest-<n>.json and DONE. Never deletes or
+# overwrites. false stops the export and its amend records; the archiver still
+# sorts only against an existing object and only outside 08:30-15:45 IST.
+brutex_export_enabled = true
+# Daily-universe Quote 63 (2026-11-20): Dhan sent trade times 5 h 30 min
+# early on 2026-11-20. A held day is kept out of the archiver (ticks,
+# tick_quotes, feed_aux_packets and candle tables; depth is not held), the
+# Brutex export and the cross-check catch-up until the repair writes
+# data/state/day-repair/<day>.done. After the .done the archiver still waits
+# for the export to seal the day (data/state/day-repair/<day>.exported, at most
+# 8 days), with or without this entry. A bad entry holds EVERY day (coded
+# error), it never stops the boot. Removing 2026-11-20 later (PR-6) also needs
+# crates/app/tests/held_day_paths_guard.rs changed, which pins this line.
+held_days = ["2026-11-20"]
 
 # [valkey] section DELETED in #O4 (2026-05-24). Valkey removed from
 # the runtime; the dual-instance lock moved to AWS SSM Parameter Store
@@ -982,6 +1009,28 @@ paper_fill = true
 self_test = true
 reconcile_interval_secs = 300
 mark_channel_capacity = 8192
+# Connect-only TLS pre-warm of the order host at 09:14 IST (owner card
+# 2026-11-13, no-rest rule §12.16): DNS + TCP + TLS handshake, then close.
+# No HTTP request, no order. OFF until real orders start.
+prewarm_order_connection = false
+
+# ===========================================================================
+# Live PAPER fill chain (plan item LF-6b, owner rules 2026-11-12). OFF.
+# Live ticks -> strategy candles -> the approved brutex strategy -> a paper
+# order on the dry-run OMS above, filled by the worst-case model over a
+# 60-second window (the rest is cancelled; a candle whose final price came
+# late skips its order). Needs [order_runtime] enabled. Even when on it idles
+# until an approved brutex strategy crate exists. Never sends to a broker.
+# ===========================================================================
+[live_fill]
+enabled = false
+tap_capacity = 65536
+wait_ms = 1000
+open_wait_ms = 1000
+band_bps = 1000
+participation_bps = 2500
+max_fill_seconds = 60
+event_channel_capacity = 4096
 
 # ===========================================================================
 # 🔷 DHAN order-update WS paper-mode push channel (operator directive

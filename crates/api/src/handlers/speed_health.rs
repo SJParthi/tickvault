@@ -409,6 +409,18 @@ pub(crate) const fn stage_label(stage: Stage) -> &'static str {
         Stage::ReceiptToFold => "Receipt to finishing one live main-feed frame",
         Stage::MetricsUpkeep => "Metrics housekeeping run (diagnostic)",
         Stage::DrainMainTick => "Processing one main-feed tick (average within its frame)",
+        Stage::DrainFramePost => "Work after a frame (hand-offs and upkeep)",
+        // 2026-11-16: one per non-frame arm of the frame drain; a queued
+        // frame waits for the whole arm.
+        Stage::DrainArmFlush => "Feed processor: 500 ms hand-off run (diagnostic)",
+        Stage::DrainArmCatchup => "Feed processor: 5 s candle sweep start (diagnostic)",
+        Stage::DrainArmSeed => "Feed processor: new-contract intake (diagnostic)",
+        Stage::DrainArmSilence => "Feed processor: 30 s silent-contract check (diagnostic)",
+        Stage::DrainArmIdle => "Feed processor: one idle-time step (diagnostic)",
+        // 2026-11-17: a sampled part of the frame stage, never added to it.
+        Stage::DrainInlineDepth => {
+            "Order-book part of one Full tick, about 1 in 64 sampled (diagnostic)"
+        }
     }
 }
 
@@ -486,8 +498,12 @@ fn speed_section(
     Section {
         title: "Operational stall budgets — since process start",
         note: "These colours compare p99 bucket bounds with broad stall budgets, not \
-               the strict one-microsecond target. Runtime delays and metrics upkeep are diagnostics. \
-               Receipt-to-fold overlaps earlier frame stages; durations must not be added. \
+               the strict one-microsecond target. Runtime delays, metrics upkeep and the feed processor's timer and idle runs are diagnostics. \
+               Receipt-to-fold overlaps earlier frame stages, and later frames' ring dwell \
+               and receipt-to-fold include the time an earlier frame spent in work after a \
+               frame (drain_frame_post); durations must not be added. \
+               The sampled order-book part of a Full tick (drain_inline_depth) is \
+               already inside the frame and tick stages. \
                The published 75-second maximum has no publication timestamp here. \
                Neither window is a session verdict."
             .to_string(),
@@ -517,7 +533,17 @@ fn strict_target_section(stages: &[StageFigures; ALL_STAGES.len()]) -> Section {
             Stage::DrainMainFrame => "main-feed frame; decode/fold/append combined",
             Stage::ReceiptToFold => "live main-feed frame; overlaps earlier stages; ring-refused frames excluded",
             Stage::DrainMainTick => "main-feed tick; the frame's decode/fold/append time over its ticks (per-tick average within each frame)",
+            Stage::DrainFramePost => "received frame, all endpoints; the frame arm's work after the fold (size-trigger and depth hand-offs, upkeep), plus a depth frame's own handling; not in this frame's other stages; later frames' ring_dwell and receipt_to_fold include the wait it causes; do not add them",
             Stage::MainRuntimeLag | Stage::ReaderRuntimeLag | Stage::MetricsUpkeep => return None,
+            // 2026-11-16: a drain arm is not a per-tick step; diagnostic only.
+            Stage::DrainArmFlush
+            | Stage::DrainArmCatchup
+            | Stage::DrainArmSeed
+            | Stage::DrainArmSilence
+            | Stage::DrainArmIdle => return None,
+            // 2026-11-17: a sampled sub-step already inside the frame stage;
+            // diagnostic only, never a strict verdict on its own.
+            Stage::DrainInlineDepth => return None,
         };
         let (bound, recorded_failure) = if stage_samples_valid(fig) {
             match stage_quantiles(&fig.buckets).map(|q| q.p99) {
@@ -2011,9 +2037,9 @@ mod tests {
         assert!(strict.note.contains("not Monday proof"));
         assert_eq!(
             strict.tiles.len(),
-            5,
+            6,
             "runtime timers and metrics upkeep are not frame stages; the \
-             per-tick drain stage (PR DP-6) is"
+             per-tick drain stage (PR DP-6) and the post-frame stage (B3) are"
         );
         let first = &strict.tiles[0];
         assert_eq!(first.status, Light::Grey);
@@ -2114,6 +2140,7 @@ mod tests {
                 stage_label(Stage::DrainMainFrame),
                 stage_label(Stage::ReceiptToFold),
                 stage_label(Stage::DrainMainTick),
+                stage_label(Stage::DrainFramePost),
             ],
         );
         assert!(strict.tiles.iter().all(|tile| tile.status == Light::Grey));
@@ -2132,6 +2159,50 @@ mod tests {
         let strict = strict_target_section(&inputs.stages);
         assert_eq!(strict.tiles[3].value, "LIFETIME FAIL · session UNKNOWN");
         assert_eq!(strict.tiles[3].status, Light::Red);
+    }
+
+    /// Regression: 2026-11-13 (B3 review round 3). The drain_frame_post tile
+    /// said "not in any other stage", but the time a post step holds the
+    /// drain is also in every later frame's ring dwell and receipt-to-fold,
+    /// so an operator adding the stages counted it twice or more. The tile
+    /// and the operational note now say so.
+    #[test]
+    fn test_regression_b3_drain_frame_post_text_warns_of_the_ring_dwell_overlap() {
+        let inputs = all_down_inputs(false);
+        let strict = strict_target_section(&inputs.stages);
+        let post = strict
+            .tiles
+            .iter()
+            .find(|tile| tile.label == stage_label(Stage::DrainFramePost))
+            .expect("the drain_frame_post strict tile");
+        assert!(!post.detail.contains("not in any other stage"));
+        assert!(post.detail.contains("ring_dwell"));
+        assert!(post.detail.contains("do not add them"));
+        let operational = speed_section(&inputs.stages, None);
+        assert!(operational.note.contains("ring dwell"));
+        assert!(operational.note.contains("drain_frame_post"));
+    }
+
+    /// 2026-11-17 (plan ITEM DT "PR 0, measure first"): the sampled inline
+    /// depth stage gets an operational tile labelled as sampled and
+    /// diagnostic, no strict-target tile, and the note says it is already
+    /// inside the frame and tick stages.
+    #[test]
+    fn test_drain_inline_depth_is_a_sampled_diagnostic_tile_only() {
+        let inputs = all_down_inputs(false);
+        let label = stage_label(Stage::DrainInlineDepth);
+        assert!(label.contains("1 in 64 sampled"));
+        assert!(label.contains("(diagnostic)"));
+        let operational = speed_section(&inputs.stages, None);
+        assert!(operational.tiles.iter().any(|tile| tile.label == label));
+        assert!(operational.note.contains("drain_inline_depth"));
+        assert!(
+            operational
+                .note
+                .contains("already inside the frame and tick stages")
+        );
+        let strict = strict_target_section(&inputs.stages);
+        assert!(strict.tiles.iter().all(|tile| tile.label != label));
     }
 
     #[test]

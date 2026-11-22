@@ -323,20 +323,8 @@ resource "aws_lambda_permission" "operator_control_apigw" {
 }
 
 # Per-Lambda error alarm → existing tv_alerts SNS (matches the killswitch pattern).
-resource "aws_cloudwatch_metric_alarm" "operator_control_errors" {
-  count               = var.enable_operator_control_lambda ? 1 : 0
-  alarm_name          = "tv-${var.environment}-operator-control-errors"
-  comparison_operator = "GreaterThanThreshold"
-  evaluation_periods  = 1
-  metric_name         = "Errors"
-  namespace           = "AWS/Lambda"
-  period              = 300
-  statistic           = "Sum"
-  threshold           = 0
-  alarm_description   = "operator-control Lambda erroring — control buttons may be failing"
-  dimensions          = { FunctionName = aws_lambda_function.operator_control[0].function_name }
-  treat_missing_data  = "notBreaching"
-}
+# alarm "operator_control_errors" REMOVED 2026-11-11 (operator Quote 53, alarm review
+# docs/audits/2026-11-alarm-review.md). The comments above are kept as history.
 
 output "operator_control_function_url" {
   value       = var.enable_operator_control_lambda ? aws_lambda_function_url.operator_control[0].function_url : null
