@@ -1498,3 +1498,12 @@ REJECT: reusing the element or the workflow for anything else; adding shell
 beyond the one literal; raising its line or byte ceiling; a schedule or push
 trigger; any S3 delete; running before the code has merged with All Green;
 keeping any of it after the run.
+
+**ENDED 2026-11-22.** The repair ran on commit 2c975d5 (merged with All
+Green as #2281): `dry` (run 45004379797), `apply` (run 45004826979) and
+`verify` (run 45007320978), all OK. The verify gate checked 58,373,077
+removed packets: 0 missing by number, 0 repeat-kind rows not rebuilt, and it
+wrote `.done`, releasing 2026-11-20. The runner, `day_repair_ssm.rs`, the
+workflow and their budget rows were deleted in the next PR, and their paths
+joined `RETIRED_ONE_OFF_PATHS`. The box subcommand `tickvault day-repair`
+stays as the record of what ran; it sends no shell.
