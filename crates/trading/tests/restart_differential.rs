@@ -18,6 +18,14 @@
 //! still open. Its old exit seal (`force_seal_all` at any hour) wrote those
 //! buckets truncated, and check 5 fails on it within a second.
 //!
+//! In about 3 of the other cases in 10 the market is in the session's last
+//! minutes (each instrument's last trade at 15:39:59) and both runs take the
+//! close seal (plan item PR23): every sweep from 15:44:05 also takes the
+//! session end plus the longest bucket (the app's close term, mirrored), and
+//! the run ends with a sweep at 15:44:05 or later and a crash with no
+//! day-close seal. `close_seal_cases_seal_buckets_the_usual_cutoff_leaves_open`
+//! pins that such a case seals buckets the usual cutoff leaves open.
+//!
 //! Every bar the restart writes is compared with the truth, and with what the
 //! previous process stored (a third run, live up to the crash):
 //!
@@ -120,6 +128,11 @@ struct Case {
     /// instant and withheld every bucket still open. Before, its exit seal
     /// wrote those truncated buckets as complete bars.
     clean_exit: bool,
+    /// Both runs end with the close seal (plan item PR23): once the wall
+    /// passes the session end plus the margin, one catch-up sweep to the end
+    /// plus the longest bucket, then a stop with no day-close seal (a crash
+    /// after the close seal). Only when `day_close` is off.
+    close_crash: bool,
 }
 
 fn event() -> impl Strategy<Value = Event> {
@@ -156,6 +169,7 @@ fn case() -> impl Strategy<Value = Case> {
         prop::bool::weighted(0.35),
         prop::bool::weighted(0.2),
         prop::bool::weighted(0.3),
+        prop::bool::weighted(0.3),
     )
         .prop_map(
             |(
@@ -168,6 +182,7 @@ fn case() -> impl Strategy<Value = Case> {
                 day_close,
                 near_wrap,
                 clean_exit,
+                close_crash,
             )| Case {
                 instruments,
                 crash_per_mille,
@@ -178,6 +193,7 @@ fn case() -> impl Strategy<Value = Case> {
                 day_close,
                 near_wrap,
                 clean_exit,
+                close_crash,
             },
         )
 }
@@ -234,7 +250,17 @@ fn packets(c: &Case) -> Vec<Packet> {
         } else {
             0
         };
-        let (mut trade, mut cumulative, mut price) = (START, base, 1_000.0f32);
+        // A close-seal case (PR23 review) puts each instrument's trades in
+        // the session's last minutes: its last trade is at 15:39:59, so the
+        // closing 1, 3, 5, 10, 15, 30 and 60 minute buckets all hold trades
+        // and only the close seal can seal them before a crash.
+        let first = if c.closes_with_the_close_seal() {
+            let total: u32 = events.iter().map(|e| u32::from(e.dt)).sum();
+            SESSION_END - 1 - total
+        } else {
+            START
+        };
+        let (mut trade, mut cumulative, mut price) = (first, base, 1_000.0f32);
         let (mut high, mut low, mut open, mut last_received) = (0f32, f32::MAX, 0f32, 0u64);
         for (k, e) in events.iter().enumerate() {
             trade += u32::from(e.dt);
@@ -323,24 +349,105 @@ fn aggregator() -> MultiTfAggregator {
     agg
 }
 
-/// The live catch-up sweep the app runs: `min(watermark, wall) - margin`.
-fn sweep(agg: &mut MultiTfAggregator, wall_secs: u32, out: &mut Written) {
-    let cutoff = agg.watermark_secs().min(wall_secs).saturating_sub(MARGIN);
+/// The live catch-up sweep the app runs: `min(watermark, wall) - margin`,
+/// and, when `close` (a close-seal case), the larger of that and the close
+/// term ([`close_term`]), as `LiveIngest::catch_up_cutoff` takes it.
+fn sweep(agg: &mut MultiTfAggregator, wall_secs: u32, close: bool, out: &mut Written) {
+    let watermark = agg.watermark_secs();
+    let mut cutoff = watermark.min(wall_secs).saturating_sub(MARGIN);
+    if close {
+        cutoff = cutoff.max(close_term(wall_secs, watermark));
+    }
     agg.catch_up_seal_all(cutoff, |_, sid, _, tf, bar| out.put(sid, tf, bar));
 }
 
-/// Ends a run: the day-close seal, or a final catch-up sweep to `end_cutoff`.
-fn finish(agg: &mut MultiTfAggregator, day_close: bool, end_cutoff: u32, out: &mut Written) {
-    if day_close {
-        agg.force_seal_all(|_, sid, _, tf, bar| out.put(sid, tf, bar));
+/// The session start (09:00 IST), where the fold starts admitting trades.
+const SESSION_START: u32 = DAY + 32_400;
+/// The session end (15:40 IST), where the fold stops admitting trades.
+const SESSION_END: u32 = DAY + 56_400;
+/// The close term's delay: the margin plus one 5 s sweep interval (the app's
+/// `close_seal::CLOSE_SEAL_DELAY_SECS`, 245 s).
+const CLOSE_DELAY: u32 = MARGIN + 5;
+
+/// The longest bucket the fold carries (the app's `LONGEST_BUCKET_SECS`).
+fn longest_bucket_secs() -> u32 {
+    TfIndex::ALL
+        .iter()
+        .map(|tf| tf.seconds_per_bucket())
+        .max()
+        .unwrap_or(0)
+}
+
+/// The app's close term (`close_seal::close_seal_cutoff` for a regular day):
+/// the session end plus the longest bucket once the wall is the delay past
+/// the end and a trade of the session was folded, else 0. The app crate
+/// depends on this one, so the rule is mirrored here; the app's own value is
+/// pinned by `close_seal.rs` and `close_seal_tests.rs`.
+fn close_term(wall_secs: u32, watermark: u32) -> u32 {
+    if SESSION_END + CLOSE_DELAY <= wall_secs && watermark >= SESSION_START {
+        SESSION_END + longest_bucket_secs()
     } else {
-        agg.catch_up_seal_all(end_cutoff, |_, sid, _, tf, bar| out.put(sid, tf, bar));
+        0
+    }
+}
+
+impl Case {
+    /// Both runs take the close term and end with a crash after the close
+    /// seal (no day-close seal).
+    fn closes_with_the_close_seal(&self) -> bool {
+        self.close_crash && !self.day_close
+    }
+}
+
+/// How a run ends.
+#[derive(Clone, Copy)]
+enum End {
+    /// The day-close seal (`force_seal_all`).
+    DayClose,
+    /// A final catch-up sweep to this cutoff.
+    CatchUp(u32),
+    /// The close seal (plan item PR23): every sweep takes the close term from
+    /// 15:44:05, and the run ends with one sweep at 15:44:05 (or the last
+    /// receipt, if later), then a crash (no day close).
+    CloseCrash,
+}
+
+impl End {
+    fn of(c: &Case, end_cutoff: u32) -> Self {
+        if c.day_close {
+            Self::DayClose
+        } else if c.close_crash {
+            Self::CloseCrash
+        } else {
+            Self::CatchUp(end_cutoff)
+        }
+    }
+
+    /// Sweeps take the close term.
+    fn close(self) -> bool {
+        matches!(self, Self::CloseCrash)
+    }
+}
+
+/// Ends a run whose last sweep was at `last_wall`.
+fn finish(agg: &mut MultiTfAggregator, end: End, last_wall: u32, out: &mut Written) {
+    match end {
+        End::DayClose => {
+            agg.force_seal_all(|_, sid, _, tf, bar| out.put(sid, tf, bar));
+        }
+        End::CatchUp(cutoff) => {
+            agg.catch_up_seal_all(cutoff, |_, sid, _, tf, bar| out.put(sid, tf, bar));
+        }
+        End::CloseCrash => {
+            sweep(agg, last_wall.max(SESSION_END + CLOSE_DELAY), true, out);
+        }
     }
 }
 
 /// Folds `packets` live from a capture start before the session.
 fn fold_live<'a>(
     packets: impl Iterator<Item = &'a Packet>,
+    close: bool,
     out: &mut Written,
 ) -> MultiTfAggregator {
     let mut agg = aggregator();
@@ -352,7 +459,7 @@ fn fold_live<'a>(
             None,
             |_, sid, _, tf, bar| out.put(sid, tf, bar),
         );
-        sweep(&mut agg, (p.received_ms / 1000) as u32, out);
+        sweep(&mut agg, (p.received_ms / 1000) as u32, close, out);
     }
     agg
 }
@@ -393,9 +500,16 @@ fn check(c: &Case) -> Result<(), TestCaseError> {
     };
     let end_cutoff = all.iter().map(|p| p.trade).max().unwrap_or(START) + 10_000;
 
+    let end = End::of(c, end_cutoff);
+    let close = end.close();
     let mut truth = Written::default();
-    let mut truth_agg = fold_live(all.iter(), &mut truth);
-    finish(&mut truth_agg, c.day_close, end_cutoff, &mut truth);
+    let mut truth_agg = fold_live(all.iter(), close, &mut truth);
+    finish(
+        &mut truth_agg,
+        end,
+        (last.received_ms / 1000) as u32,
+        &mut truth,
+    );
 
     let crash_ms = first.received_ms
         + (last.received_ms - first.received_ms) * u64::from(c.crash_per_mille) / 1000;
@@ -410,11 +524,12 @@ fn check(c: &Case) -> Result<(), TestCaseError> {
     let mut stored = Written::default();
     let mut previous = fold_live(
         all.iter().filter(|p| p.received_ms <= crash_ms),
+        close,
         &mut stored,
     );
     if c.clean_exit {
         // The lane's mid-session exit seal (audit PR31b-2).
-        sweep(&mut previous, crash_secs, &mut stored);
+        sweep(&mut previous, crash_secs, close, &mut stored);
         let _ = previous.withhold_open_buckets();
     }
 
@@ -450,7 +565,7 @@ fn check(c: &Case) -> Result<(), TestCaseError> {
     }
     agg.set_live_capture_start(capture_start);
     agg.finish_replay(gap, |_, sid, _, tf, bar| restart.put(sid, tf, bar));
-    sweep(&mut agg, capture_start, &mut restart);
+    sweep(&mut agg, capture_start, close, &mut restart);
 
     // `(receipt ms, order, packet)`: a subscribe re-send (order 0) arrives
     // at the listen instant, before anything else received then.
@@ -556,9 +671,12 @@ fn check(c: &Case) -> Result<(), TestCaseError> {
             None,
             |_, sid, _, tf, bar| restart.put(sid, tf, bar),
         );
-        sweep(&mut agg, (*received / 1000) as u32, &mut restart);
+        sweep(&mut agg, (*received / 1000) as u32, close, &mut restart);
     }
-    finish(&mut agg, c.day_close, end_cutoff, &mut restart);
+    let last_wall = live
+        .last()
+        .map_or(capture_start, |(received, _, _)| (*received / 1000) as u32);
+    finish(&mut agg, end, last_wall, &mut restart);
     // The first live receipt of ANY instrument confirms the capture start.
     let confirmed_start = live.first().map_or(capture_start, |(received, _, _)| {
         capture_start.max((*received / 1000) as u32)
@@ -618,7 +736,13 @@ fn check(c: &Case) -> Result<(), TestCaseError> {
                         && p.trade >= start
                         && p.trade < end
                         && p.received_ms > crash_ms
-                        && p.received_ms >= (u64::from(end) + u64::from(MARGIN)) * 1000
+                        && (p.received_ms >= (u64::from(end) + u64::from(MARGIN)) * 1000
+                            // A close-seal case: a trade received at or after the
+                            // close term started (15:44:05, more than 245 s after
+                            // any session trade) may find its bucket sealed by it,
+                            // in both runs; the same envelope as the margin above.
+                            || (close
+                                && p.received_ms >= u64::from(SESSION_END + CLOSE_DELAY) * 1000))
                 });
                 if beyond_margin {
                     continue;
@@ -713,4 +837,65 @@ proptest! {
     fn a_restart_never_writes_a_wrong_bar(c in case()) {
         check(&c)?;
     }
+}
+
+/// PR23 review (2026-11-22): a close-seal case is not vacuous. Its trades end
+/// at 15:39:59, so with the usual cutoff alone (`min(watermark, wall) -
+/// margin`) the closing buckets of every timeframe stay open at 15:44:05,
+/// and only the close term seals them. Before this, the close-seal arm put
+/// every trade near 09:16 and sealed exactly what the plain end did.
+#[test]
+fn close_seal_cases_seal_buckets_the_usual_cutoff_leaves_open() {
+    let events: Vec<Event> = (0..40)
+        .map(|_| Event {
+            dt: 7,
+            size: 5,
+            price_steps: 1,
+            lag_ms: 300,
+            resend_ms: None,
+            delivered: true,
+            out_of_order: false,
+        })
+        .collect();
+    let c = Case {
+        instruments: vec![events.clone(), events],
+        crash_per_mille: 500,
+        start_after_crash: 0,
+        listen_after_start: vec![0; 4],
+        unreadable: vec![99; 64],
+        resend_on_subscribe: vec![0; 4],
+        day_close: false,
+        near_wrap: false,
+        clean_exit: false,
+        close_crash: true,
+    };
+    assert!(c.closes_with_the_close_seal());
+    let all = packets(&c);
+    let last_trade = all.iter().map(|p| p.trade).max().unwrap_or(0);
+    assert_eq!(last_trade, SESSION_END - 1, "the last trade is 15:39:59");
+    let at_close = SESSION_END + CLOSE_DELAY;
+
+    let mut usual = Written::default();
+    let mut agg = fold_live(all.iter(), false, &mut usual);
+    sweep(&mut agg, at_close, false, &mut usual);
+    let mut closed = Written::default();
+    let mut agg = fold_live(all.iter(), true, &mut closed);
+    sweep(&mut agg, at_close, true, &mut closed);
+
+    for tf in TfIndex::ALL {
+        let key = (security_id(1), tf.as_ordinal(), tf.bucket_start(last_trade));
+        assert!(
+            !usual.last.contains_key(&key),
+            "{tf:?}: the usual cutoff already sealed the closing bucket"
+        );
+        assert!(
+            closed.last.contains_key(&key),
+            "{tf:?}: the close term must seal the closing bucket"
+        );
+    }
+    assert_eq!(
+        agg.force_seal_all(|_, _, _, _, _| {}),
+        0,
+        "nothing is left open after the close seal"
+    );
 }

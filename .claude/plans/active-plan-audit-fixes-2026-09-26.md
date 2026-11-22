@@ -784,11 +784,12 @@ PR25–PR27, PR18, PR19 and the decisions. One PR open at a time, as before.
     installs now bump the generation too (ratchet `every_token_install_bumps_the_renew_generation`).
     Not changed: the mid-session watchdog's `force_renewal()` (not an 807 path; sockets now
     re-dial instead of renewing if it replaces a fresh token).
-- [ ] **PR23 — the day's last candles are sealed at the close, not at shutdown.** (`app`, `trading`)
+- [x] **PR23 — the day's last candles are sealed at the close, not at shutdown.** (`app`, `trading`)
   - Candles after ~15:36 and the day's last 15/30/60-minute candles are sealed only at shutdown
     (dhan_feed_stack.rs:6125, :4361-4365, :7668); a crash loses them unless the next boot's WAL
     replay rebuilds them (Assumed, not verified). Seal every open bar at the session close on
     the drain's idle arm, the PR4b catch-up shape, and test the crash case.
+  - Built 2026-11-23 (owner: "fix everything"): `dhan_feed_stack/close_seal.rs` (`close_seal_cutoff`, `ClosePlan`); from the session end + 240 s + 5 s (15:44:05 IST, or a published Muhurat end) the catch-up cutoff takes `end + 3,600` (capped at the next session and midnight), so the sliced catch-up seals every open bar of the day on the idle arm, no longer only at shutdown. Not during WAL replay; only when a trade of that session was folded. Tests: `close_seal_tests.rs` (20), `muhurat_mid_session_exit.rs` (10), `restart_differential.rs` close-crash arm. Honest limit: a crash in the ~4 minutes before the first close pass finishes still depends on boot replay, which withholds (never writes short) those bars.
 - [ ] **PR24 — a future-dated timestamp cannot move a watermark past what is durable.**
   (`storage`, `trading`)
   - One future-dated vendor timestamp can push the WAL "applied" watermark ahead of what is
