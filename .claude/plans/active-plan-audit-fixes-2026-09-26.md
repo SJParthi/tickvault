@@ -260,7 +260,8 @@ inline (PR2, PR8, PR14).
   - WAL replay runs only at boot (main.rs:1001; catch-up drain dhan_feed_stack.rs:13808).
     After QuestDB is healthy again for 60 s, a background task replays un-applied WAL ranges on
     its own ILP sender, rate-capped, never on the drain. DEDUP keys make replay idempotent.
-- [ ] **PR13 — no JavaScript left in CI.** (`.github/workflows/`)
+- [x] **PR13 — no JavaScript left in CI.** (`.github/workflows/`)
+  - Closed 2026-11-22 (plan-box audit, confirmed by a second checker): done on main. No 'uses: actions/github-script' left in .github (only 'ported off' comments in safety.yml:54, dep-freshness-nightly.yml:17, fuzz.yml, chaos-nightly.yml, full-test-nightly.yml); 4e2194a27 (#2084, DA-19) removed the last ones and set crates/common/tests/rust_on
   - 14 `actions/github-script` steps: safety.yml (12) and dep-freshness-nightly.yml (2). Port each
     to the `gh` CLI with identical inputs/outputs, the way fuzz.yml / chaos-nightly.yml already were.
 - [x] **PR14 — order-update receiver cannot silently skip.** (`app`, `core`)
@@ -650,7 +651,8 @@ folded into them below), then PR18, PR19 and the decisions.
     production caller (seal_spill.rs:991; seal_dlq.rs:330), deleted or marked test-only. The
     cloud-log retention comment that says cold storage keeps older logs is false (logs expire after
     14 days and nothing exports them): fix the comment; an export is the owner's cost call.
-- [ ] **D7 — every socket refused at once (805, second login).** (`core`) All sockets park together
+- [x] **D7 — every socket refused at once (805, second login).** (`core`) All sockets park together
+  - Closed 2026-11-22 (plan-box audit, confirmed by a second checker): done on main. The main and depth 805 episodes are crates/core/src/websocket/pool_supervisor.rs::OVERFLOW_EPISODES / struct OverflowEpisodes (2fabc2e7b #2004), with eviction-corroborated probe windows (ba5ffb0b4 #2032, OVERFLOW_PROBE_WINDOW_MAX_SECS). The 808 refresh-before-
   and D3 has no spare to move to (pool_supervisor.rs:738-748, :1786-1832). Owner asked
   2026-09-26; the recommended option is: wait 5 minutes, redial one socket as a test, bring the
   rest back only if Dhan accepts it, critical alert either way. Until the owner picks another option, that default is what gets built.
@@ -816,7 +818,8 @@ PR25–PR27, PR18, PR19 and the decisions. One PR open at a time, as before.
     the renewal lock is held (secret_manager.rs:117-124; token_manager.rs:1308). The shared token
     can be overwritten by an older one (dhan_token_publisher.rs:66-74, :94-106): order the
     publishes, or check expiry before overwriting, and add a time limit.
-- [ ] **D11 — Muhurat trading is captured.** (`common`, `aws-lambdas`) Sunday 2026-11-08 is never
+- [x] **D11 — Muhurat trading is captured.** (`common`, `aws-lambdas`) Sunday 2026-11-08 is never
+  - Closed 2026-11-22 (plan-box audit, confirmed by a second checker): done on main. #2154 (0c373ac21) adds config/base.toml [[trading.muhurat_trading_dates]] 2026-11-08 with session_start_ist/session_end_ist, TradingCalendar::muhurat_session_secs, guards + liveness arming (owner Quote 49); #2127 (5d271f9b4, J8) adds start_watchdog.rs::run_muh
   captured: the holiday gate and the weekday start window keep the box off
   (common/src/session_window.rs:164-181; start_watchdog.rs:127-135). Default: add a dated
   special-session entry that opens the capture window for that evening only. The owner confirms
@@ -1714,7 +1717,8 @@ shown. The order after PR29b was set by re-check 6 (2026-09-27). One PR open at 
     on a flaky result instead would change the All Green evaluator, which the merge-gate lock
     §5.1 allows only with a dated owner quote, so retries-off is the default.
   - Touches `common`, so workspace tests.
-- [ ] **PR52 — the board sort is whichever is faster on the production host.** (`app`)
+- [x] **PR52 — the board sort is whichever is faster on the production host.** (`app`)
+  - Closed 2026-11-22 (plan-box audit, confirmed by a second checker): closed as obsolete. The board, the top_volume sweep module (SliceRadixSort) and volume_leaderboard were DELETED 2026-10-22 with top_volume (plan item 62, operator Quote 34); CLAUDE.md O(1) table rows marked DELETED; nothing left to sort or measure.
   Takes over the radix-sort bullet of the fifth re-check's PR4c follow-ups.
   - Re-check 6 measured the PR4c-1 radix sort still slower than the comparator sort it replaced,
     at every size, and by a wider margin than check 5 found: 1,385 vs 767 µs and 1,190 vs 820 µs
@@ -2527,7 +2531,8 @@ idle poll. No allocation on the tick path.
 - [x] **R3-12 (D6d) — `scripts/ensure-questdb.sh` replaced by `tickvault ensure-questdb`.**
   Delivered by PR #2005, folded into #2004 on 2026-10-03 (the earlier copy here was reverted
   first so only #2005's version lands).
-- [ ] **R3-13 (D11) — Special sessions (Muhurat).** Built inert on `wip/d11`, NOT merged: needs the
+- [x] **R3-13 (D11) — Special sessions (Muhurat).** Built inert on `wip/d11`, NOT merged: needs the
+  - Closed 2026-11-22 (plan-box audit, confirmed by a second checker): closed as obsolete. Superseded by owner Quote 49 (2026-10-30) and #2154 (0c373ac21): config/base.toml [[trading.muhurat_trading_dates]] with session times, common/src/market_hours.rs::installed_muhurat_session_secs, trading_calendar.rs::is_session_day, workflow guards; later #220
   owner to confirm date, hours and cost, and a compile + test run.
 - [x] **R3-14 — WAL segment names from a monotonic source** (replay order across a clock step). **Done 2026-10-04** (`ws_frame_spill.rs::next_segment_name_nanos`): a new segment is named `max(wall nanos, highest name in the directory + 1)`, the highest seeded once per directory from the live, `replaying/` and `archive/` names, so names only rise across a backward clock step or a restart; a clamped name is counted on `tv_wal_segment_name_clamped_total`. Tests: `test_regression_segment_names_keep_rising_across_a_backward_clock_step`, `test_regression_segment_names_seed_past_every_name_on_disk_after_a_restart` (both fail with the clamp removed), `test_segment_name_nanos_parses_only_segment_names`. Storage lib 1,763 passed, integration tests all passed.
 - [x] **L10 (audit thread, 2026-10-04) — the boot sequence probe trusted a corrupt record.**
@@ -3033,7 +3038,8 @@ and a call site; shell may only shrink. One PR per item, serial.
 
 - [x] **DA-12 — Free space is one `statvfs` call, never a `df` fork; tick append hardening**
   (RUST-5, DB-4, NT-1, tail HOT-3, DISK-9, DB-3, HOT-10, HOT-12, S3-1 partial). `storage`. Done: `disk_health_watcher::statvfs_probe`, `hours_left_warn_edge` (warns only when the disk fills before capture ends); `tick_persistence::{append_within_marker, SpillHeldBytesCache, tick_ilp_column}`; `candle_contract_labels::CandleContractLabels` on `ahash`; `wal_applied_watermark::RESCUE_FLOOR_SLOTS` = 16.
-- [ ] **DA-13 — Frame log, spill replay and archive close their counted-loss holes** (CR-2,
+- [x] **DA-13 — Frame log, spill replay and archive close their counted-loss holes** (CR-2,
+  - Closed 2026-11-22 (plan-box audit, confirmed by a second checker): done on main. All four sub-items merged: DA-13a #2089 (62822af03), DA-13d #2091 (5165da43b), DA-13c #2093 (12279157e: refold abandoned-bytes counter and settle-before-archive), DA-13b #2097 (649ead3e7). Symbols on main: tick_spill_replay.rs::spill_file_closed_and_quiet, set
   CLOCK-2, CRASH-2, QDB-3, QDB-6, RET-2, RET-3, RET-4, RET-5, RET-6, RET-7, OBS-11). `storage`, `app`.
   **Re-derived 2026-10-13:** the audit page that holds these findings' text could not be opened
   from the session that picked DA-13 up, so the list was rebuilt from the code by a 64-agent
