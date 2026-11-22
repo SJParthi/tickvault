@@ -1,3 +1,4 @@
+#![cfg(test)]
 //! Plan item PR23 (2026-11-23): the day's last bars are sealed at the close,
 //! on the drain's sliced catch-up sweep, not at shutdown
 //! (`close_seal::close_seal_cutoff`, `LiveIngest::catch_up_cutoff`). A
