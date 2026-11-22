@@ -3924,3 +3924,20 @@ This table records how the Quote 63 repair is built. It authorizes nothing beyon
 - A correction record file or any correction other than the permanent rule.
 - Writing a canonical key, manifest, amend record, DONE or `partition_archive_audit` row from the repair tool.
 - Writing `.done` without a passed verify, or applying while `_daily/2026-11-20/DONE` exists.
+
+#### Quote 64 (2026-11-22) — A SECURITY UPDATE: url 2.5.8 → 2.5.9 with its required form_urlencoded 1.2.2 → 1.2.3 (Cargo.lock, and that one Cargo.toml pin) (decision cards, preserve EXACTLY)
+
+The Security & Audit check on PR #2283 (head `23f3020`) failed `cargo deny` on an advisory published that day: RUSTSEC-2026-0592, a stack overflow in `Url::origin()` on nested `blob:` URLs, in `url` 2.5.8 (fixed from 2.5.9). `url` reaches the build through `aws-config`, `aws-sdk-s3`, `reqwest`, `totp-rs` and `tower-http`; no file under `crates/` calls `Url::origin()`. `main` carries the same version, so every PR fails until it moves.
+
+| Card | Owner's tap | What the card said |
+|---|---|---|
+| "CI now fails on every PR (including the trade-safety PR #2283) because of a new security advisory in the 'url' library (RUSTSEC-2026-0592, via the AWS SDK and the HTTP client). Our code never calls the affected function. The fix moves one library from 2.5.8 to 2.5.9 in the lock file only. The rules need your OK for this one update. Approve it?" | **"Update to 2.5.9 (Recommended)"** | "One package, lock file only, same shape as the earlier security bumps. Recorded as a dated quote in the rules; CI goes green again." |
+| "The 'url' 2.5.9 security fix needs one more change: 'url' 2.5.9 requires 'form_urlencoded' 1.2.3, but Cargo.toml pins that library to exactly 1.2.2 (the AWS Lambda crate uses it). So the fix needs that one pin in Cargo.toml moved 1.2.2 → 1.2.3 (same upstream project as 'url', a patch release), plus the two lock-file lines. Approve the pin change too?" | **"Move the pin too (Recommended)"** | "Cargo.toml: form_urlencoded \"=1.2.2\" → \"=1.2.3\", and the url + form_urlencoded lock lines. Nothing else moves. CI goes green." |
+
+**What this changes, and nothing else:** the `Cargo.lock` entry of `url` moves 2.5.8 → 2.5.9 ONCE, on PR #2283's branch (`claude/hopeful-cannon-q18ivr`). The crates.io index shows `url` 2.5.9 requires `form_urlencoded ^1.2.3` where the lock held 1.2.2, so `form_urlencoded` moves 1.2.2 → 1.2.3 with it (the same upstream project). The workspace pins `form_urlencoded = "=1.2.2"` in the root `Cargo.toml` (used by `crates/aws-lambdas`), so that one pin moves to `"=1.2.3"` too (the second card). `form_urlencoded` 1.2.3 requires `percent-encoding ^2.3.2`, already locked at 2.3.2; no other entry moves. Made by editing the pin and each lock entry's `version` and crates.io `checksum` line (the session's permission system refuses `cargo update`, as for Quotes 55 and 58).
+
+##### What violates Quote 64 (REJECT)
+- Moving any other package or version, or these two a second time, under this quote.
+- Any `Cargo.toml` change other than the `form_urlencoded` pin `"=1.2.2"` → `"=1.2.3"`, or any new dependency.
+- Committing `.claude/settings.json` with the `cargo update` deny rule removed.
+- Adding the advisory to an ignore list instead.

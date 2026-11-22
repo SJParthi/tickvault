@@ -248,7 +248,7 @@ regex = "=1.13.1"
 # Flagged in the PR body for operator visibility.
 base64 = "=0.22.1"
 percent-encoding = "=2.3.2"
-form_urlencoded = "=1.2.2"
+form_urlencoded = "=1.2.3"
 
 # ---- Section 16: CLI ----
 
