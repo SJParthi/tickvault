@@ -410,6 +410,7 @@ fn test_empty_boot_after_close_publishes_no_floor() {
 /// The catch-up progress the drain publishes after one complete sweep at
 /// each `walls` reading (IST epoch seconds) on [`session_book`], for the
 /// cross-check readiness test in `dhan_live_crossverify_boot`.
+// TEST-EXEMPT: test-only helper inside a #[cfg(test)] module, used by the cross-check readiness test
 pub(crate) fn published_after_sweeps(walls: &[u32]) -> Vec<Option<(u32, u32)>> {
     let progress: &'static CatchUpProgress = Box::leak(Box::new(CatchUpProgress::new()));
     let mut ingest = session_book();
@@ -425,11 +426,13 @@ pub(crate) fn published_after_sweeps(walls: &[u32]) -> Vec<Option<(u32, u32)>> {
 }
 
 /// [`DAY`]'s midnight as IST nanoseconds, for that test.
+// TEST-EXEMPT: test-only helper inside a #[cfg(test)] module
 pub(crate) const fn day_start_ist_nanos() -> i64 {
     nanos(DAY_START)
 }
 
 /// [`at`], for that test.
+// TEST-EXEMPT: test-only helper inside a #[cfg(test)] module
 pub(crate) const fn ist_at(h: u32, m: u32, s: u32) -> u32 {
     at(h, m, s)
 }
