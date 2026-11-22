@@ -250,6 +250,24 @@ pub struct RebuildReport {
     pub seal_residue: u64,
     pub new_spill_files: u64,
     pub ltt_refused: u64,
+    /// Backup contracts of the day judged by the numbers live wrote
+    /// (2026-11-22), and how many numbers live wrote for them.
+    pub live_kept_contracts: u64,
+    pub live_kept_numbers: u64,
+    /// Packets of those contracts judged, kept, kept although the replay's
+    /// dedup would have dropped them, dropped although it would have kept
+    /// them.
+    pub live_kept_judged: u64,
+    pub live_kept_kept: u64,
+    pub kept_against_dedup: u64,
+    pub dropped_against_dedup: u64,
+    /// Dropped because live wrote a byte-identical twin instead; decided by
+    /// the replay's dedup because live wrote neither (and of those, kept);
+    /// both copies written (a twin across a segment boundary).
+    pub dropped_for_twin: u64,
+    pub live_kept_fallback: u64,
+    pub live_kept_fallback_kept: u64,
+    pub duplicates_written: u64,
 }
 
 macro_rules! report_fields {
@@ -281,7 +299,17 @@ macro_rules! report_fields {
             seal_flush_failed,
             seal_residue,
             new_spill_files,
-            ltt_refused
+            ltt_refused,
+            live_kept_contracts,
+            live_kept_numbers,
+            live_kept_judged,
+            live_kept_kept,
+            kept_against_dedup,
+            dropped_against_dedup,
+            dropped_for_twin,
+            live_kept_fallback,
+            live_kept_fallback_kept,
+            duplicates_written
         )
     };
 }
@@ -349,6 +377,14 @@ impl RebuildReport {
         need_zero("lost", self.lost);
         if self.frames == 0 {
             out.push("no frame of the day was folded".to_owned());
+        }
+        // Backup contracts with no live number to judge them by would be
+        // judged as "live wrote none of them" and dropped whole.
+        if self.live_kept_contracts > 0 && self.live_kept_numbers == 0 {
+            out.push(format!(
+                "{} backup contracts but no live-written number to judge them by",
+                self.live_kept_contracts
+            ));
         }
         out
     }
@@ -520,6 +556,7 @@ pub async fn rebuild_day(
     day: NaiveDate,
     root: &Path,
     staging: &Path,
+    originals: &[String],
 ) -> anyhow::Result<RebuildReport> {
     let day_text = day.format("%Y-%m-%d").to_string();
     // The day's own contract names, never an earlier or later day's.
@@ -550,6 +587,9 @@ pub async fn rebuild_day(
         "day repair: rebuilding the day from its raw frames"
     );
     std::fs::create_dir_all(staging).with_context(|| format!("create {}", staging.display()))?;
+    let live_kept = live_kept_for_day(config, &s3, day, originals, staging).await?;
+    let (kept_contracts, kept_numbers) = live_kept.sizes();
+    let mut live_kept = Some(live_kept);
     let spill_before = spill_files(root);
     let refused_before = ltt_refused_total();
     let bounds = day_receipt_bounds_nanos(day)?;
@@ -609,10 +649,15 @@ pub async fn rebuild_day(
             if !begun {
                 let capture =
                     kept.frames[0].1.div_euclid(1_000_000_000) + i64::from(IST_UTC_OFFSET_SECONDS);
-                ingest
-                    .begin_past_day_refold(day_start, u32::try_from(capture).unwrap_or(day_start));
+                ingest.begin_past_day_refold(
+                    day_start,
+                    u32::try_from(capture).unwrap_or(day_start),
+                    live_kept.take(),
+                )?;
                 begun = true;
             }
+            // The live-written twins of this segment, before any of it folds.
+            ingest.begin_past_day_segment(&kept.frames);
             report.frames = report.frames.saturating_add(kept.frames.len() as u64);
             report.gaps = report.gaps.saturating_add(kept.gaps.len() as u64);
             let mut from = 0usize;
@@ -633,6 +678,7 @@ pub async fn rebuild_day(
     // The end-of-day seals run whatever happened, so a partial run never
     // leaves bars held only in memory; a failed run is still not finished.
     let mut pace_err: Option<anyhow::Error> = None;
+    let mut kept_counts = crate::main_feed_backup::LiveKeptCounts::default();
     if begun {
         let close =
             ingest.finish_past_day_refold(day_start.saturating_add(CLOSE_SEAL_CUTOFF_SECS), || {
@@ -642,6 +688,7 @@ pub async fn rebuild_day(
                     pace_err = Some(e);
                 }
             });
+        kept_counts = close.live_kept;
         info!(
             catch_up_bars = close.catch_up_bars,
             close_bars = close.close_bars,
@@ -680,7 +727,118 @@ pub async fn rebuild_day(
     let spill_after = spill_files(root);
     report.new_spill_files = spill_after.difference(&spill_before).count() as u64;
     report.ltt_refused = ltt_refused_total().saturating_sub(refused_before);
+    report.live_kept_contracts = kept_contracts as u64;
+    report.live_kept_numbers = kept_numbers as u64;
+    report.live_kept_judged = kept_counts.judged;
+    report.live_kept_kept = kept_counts.kept;
+    report.kept_against_dedup = kept_counts.kept_against_dedup;
+    report.dropped_against_dedup = kept_counts.dropped_against_dedup;
+    report.dropped_for_twin = kept_counts.dropped_for_twin;
+    report.live_kept_fallback = kept_counts.fallback;
+    report.live_kept_fallback_kept = kept_counts.fallback_kept;
+    report.duplicates_written = kept_counts.duplicates_written;
+    info!(
+        contracts = kept_contracts,
+        numbers = kept_numbers,
+        judged = kept_counts.judged,
+        kept = kept_counts.kept,
+        kept_against_dedup = kept_counts.kept_against_dedup,
+        dropped_against_dedup = kept_counts.dropped_against_dedup,
+        dropped_for_twin = kept_counts.dropped_for_twin,
+        fallback = kept_counts.fallback,
+        fallback_kept = kept_counts.fallback_kept,
+        duplicates_written = kept_counts.duplicates_written,
+        "day repair: backup-socket copies judged by the numbers live wrote"
+    );
     Ok(report)
+}
+
+/// The day's backup contracts and the numbers the live run WROTE for them
+/// (2026-11-22, the second verify): the union of the day's backup
+/// publications from the saved history, and every `capture_seq` of those
+/// contracts in the ORIGINAL quarantine copies (`originals`, the live day's
+/// copies only, never a re-export of a rebuilt partition). Fails closed: an
+/// unreadable history, or a copy that does not read, stops the rebuild, since
+/// a partial set would drop copies live kept. O(copy bytes), cold, once.
+///
+/// # Errors
+/// The backup history is unreadable or absent, there are backup contracts
+/// but no original copy, or a copy does not download or read.
+async fn live_kept_for_day(
+    config: &ApplicationConfig,
+    s3: &tickvault_storage::s3_cold::S3Cold,
+    day: NaiveDate,
+    originals: &[String],
+    staging: &Path,
+) -> anyhow::Result<crate::main_feed_backup::LiveKept> {
+    use crate::main_feed_backup::{
+        LiveKept, backup_set_path, contracts_published_on, read_backup_history,
+    };
+    let path = backup_set_path();
+    let history = read_backup_history(&path)
+        .map_err(|e| anyhow::anyhow!("read the backup history {}: {e}", path.display()))?
+        .with_context(|| {
+            format!(
+                "no backup history at {}: the rebuild cannot tell which socket copy live kept",
+                path.display()
+            )
+        })?;
+    let contracts = contracts_published_on(&history, ist_day_number(day)?);
+    if contracts.is_empty() {
+        info!("day repair: no backup publication on the day; every copy is judged by the dedup");
+        return Ok(LiveKept::new(&[], &[]));
+    }
+    if originals.is_empty() {
+        bail!(
+            "{} backup contracts on the day but no original quarantine copy to read",
+            contracts.len()
+        );
+    }
+    let set: std::sync::Arc<std::collections::HashSet<(u64, u8), ahash::RandomState>> =
+        std::sync::Arc::new(contracts.iter().copied().collect());
+    let mut seqs: Vec<u64> = Vec::new();
+    let mut rows = 0u64;
+    for (i, key) in originals.iter().enumerate() {
+        super::window_open_now(config)?;
+        let file = staging.join(format!("live-kept-{i}.csv.gz"));
+        let _stale = std::fs::remove_file(&file);
+        tickvault_storage::day_repair_coverage::download_copy(s3, key, &file)
+            .await
+            .with_context(|| format!("download {key}"))?;
+        let set_for_read = std::sync::Arc::clone(&set);
+        let read_path = file.clone();
+        let (read, mut part) = tokio::task::spawn_blocking(move || {
+            let mut part = Vec::new();
+            let keep = |sid: u64, seg: u8| set_for_read.contains(&(sid, seg));
+            tickvault_storage::day_repair_coverage::read_kept_seqs_gz(&read_path, &keep, &mut part)
+                .map(|r| (r, part))
+        })
+        .await
+        .context("the live-number reader stopped")?
+        .with_context(|| format!("read {key}"))?;
+        std::fs::remove_file(&file).with_context(|| format!("remove {}", file.display()))?;
+        rows = rows.saturating_add(read.rows);
+        seqs.append(&mut part);
+    }
+    let kept = LiveKept::new(&contracts, &seqs);
+    info!(
+        contracts = contracts.len(),
+        copies = originals.len(),
+        rows_read = rows,
+        numbers = kept.sizes().1,
+        "day repair: the numbers live wrote for the day's backup contracts are loaded"
+    );
+    Ok(kept)
+}
+
+/// `day` as days since 1970-01-01, the numbering IST days use in the backup
+/// history. Pure.
+///
+/// # Errors
+/// Never for a real calendar date (the epoch date always exists).
+pub fn ist_day_number(day: NaiveDate) -> anyhow::Result<i64> {
+    let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).context("the epoch date")?;
+    Ok(day.signed_duration_since(epoch).num_days())
 }
 
 /// Every trade-time refusal so far in this process. O(1).

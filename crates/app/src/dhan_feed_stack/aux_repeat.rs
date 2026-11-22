@@ -53,6 +53,23 @@ pub(super) fn production_filter() -> AuxRepeatFilter {
     AuxRepeatFilter::with_gap_epoch(gap_epoch)
 }
 
+/// The gap epoch of [`always_write_filter`]: a new value on every read, so no
+/// remembered row ever arms a skip. One relaxed add, O(1).
+fn always_moving_epoch() -> u64 {
+    static READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The past-day repair's filter (2026-11-22, the 2026-11-20 repair's second
+/// verify): it never skips. The live run wrote a repeat whenever ITS gap
+/// epoch moved (ring sheds, rows that did not land, contract-name publishes,
+/// restarts and the evening refold passes), a history one offline rebuild
+/// cannot replay, so the rebuild writes every wrong-day row: a superset of
+/// what live wrote, never fewer. Pre-sizes the map once.
+pub(super) fn always_write_filter() -> AuxRepeatFilter {
+    AuxRepeatFilter::with_gap_epoch(always_moving_epoch)
+}
+
 /// The `feed_aux_packets` row for a wrong-day `tick`, labelled by its receipt
 /// (`wrong_day_kind`: `connect_snapshot` before the cutover, `no_trade_today`
 /// from it), so a replayed frame gets the label the live drain gave it.

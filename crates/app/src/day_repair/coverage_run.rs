@@ -93,6 +93,8 @@ pub(crate) async fn run_coverage<S: CopyStore>(
     day_text: &str,
     staging: &Path,
     copies: &[(String, CopyRecord)],
+    pinned: &std::collections::BTreeMap<String, Vec<String>>,
+    known: &std::collections::BTreeSet<String>,
     mut window: impl FnMut() -> anyhow::Result<()>,
 ) -> anyhow::Result<Vec<String>> {
     std::fs::create_dir_all(staging).with_context(|| format!("create {}", staging.display()))?;
@@ -109,13 +111,25 @@ pub(crate) async fn run_coverage<S: CopyStore>(
             .split_once('/')
             .with_context(|| format!("{object} is not table/partition"))?;
         let prefix = cov::partition_copy_prefix(table, partition);
-        let listed = cov::copies_under_prefix(
-            &store
-                .list(&prefix)
-                .await
-                .with_context(|| format!("list the copies of {object}"))?,
-            &prefix,
-        );
+        // Pinned (2026-11-22): a run after a rebuild began recorded the live
+        // day's keys before it copied or dropped anything; a later drop's
+        // re-export holds REBUILT rows, so only the pinned keys are read.
+        let listed = if pinned.is_empty() {
+            cov::copies_under_prefix(
+                &store
+                    .list(&prefix)
+                    .await
+                    .with_context(|| format!("list the copies of {object}"))?,
+                &prefix,
+            )
+        } else if let Some(keys) = pinned.get(object) {
+            keys.clone()
+        } else {
+            findings.push(format!(
+                "{object} was dropped but its live copies were never pinned"
+            ));
+            continue;
+        };
         if !listed.contains(&rec.key) {
             findings.push(format!(
                 "the recorded copy {} of {object} is not in the bucket",
@@ -133,8 +147,11 @@ pub(crate) async fn run_coverage<S: CopyStore>(
     // the progress record lists: a progress file lost or replaced between
     // runs would otherwise leave earlier-dropped partitions unread
     // (2026-11-21 strict check).
-    let recorded: std::collections::BTreeSet<&str> =
+    // Every tick-path partition copied at any time (the live day's, and any a
+    // rebuild created and a later run copied before dropping it).
+    let mut recorded: std::collections::BTreeSet<&str> =
         copies.iter().map(|(o, _)| o.as_str()).collect();
+    recorded.extend(known.iter().map(String::as_str));
     for table in super::TICK_PATH_TABLES {
         window()?;
         let prefix = cov::table_copy_prefix(table);
@@ -550,8 +567,23 @@ mod tests {
         script: Vec<(&'static str, String)>,
         name: &str,
     ) -> (anyhow::Result<Vec<String>>, Vec<String>) {
+        run_with(store, copies, &BTreeMap::new(), &[], script, name).await
+    }
+
+    /// [`run`] with the live day's pinned keys and the other partitions
+    /// copied after a rebuild began.
+    async fn run_with(
+        store: &FakeStore,
+        copies: &[(String, CopyRecord)],
+        pinned: &BTreeMap<String, Vec<String>>,
+        known: &[&str],
+        script: Vec<(&'static str, String)>,
+        name: &str,
+    ) -> (anyhow::Result<Vec<String>>, Vec<String>) {
         let (url, seen) = exp_stub(script).await;
         let dir = staging(name);
+        let known: std::collections::BTreeSet<String> =
+            known.iter().map(|k| (*k).to_owned()).collect();
         let got = run_coverage(
             store,
             &reqwest::Client::new(),
@@ -559,6 +591,8 @@ mod tests {
             "2026-11-20",
             &dir,
             copies,
+            pinned,
+            &known,
             || Ok(()),
         )
         .await;
@@ -743,10 +777,115 @@ mod tests {
             "2026-11-20",
             &dir,
             &copies,
+            &BTreeMap::new(),
+            &std::collections::BTreeSet::new(),
             || anyhow::bail!("window closed"),
         )
         .await;
         std::fs::remove_dir_all(&dir).ok();
         assert!(format!("{:#}", got.expect_err("closed")).contains("window closed"));
+    }
+
+    /// The pinned live-day keys of [`dropped_store`].
+    fn pinned_live() -> BTreeMap<String, Vec<String>> {
+        let mut m = BTreeMap::new();
+        m.insert(
+            "ticks/2026-11-20T09".to_owned(),
+            vec![key("ticks", "2026-11-20T09", "csv.gz")],
+        );
+        m.insert(
+            "feed_aux_packets/2026-11-20".to_owned(),
+            vec![key("feed_aux_packets", "2026-11-20", "csv.gz")],
+        );
+        m
+    }
+
+    /// The clean rebuild of [`dropped_store`].
+    fn clean_script() -> Vec<(&'static str, String)> {
+        vec![
+            (
+                "SELECT DISTINCT",
+                String::from("security_id,segment\r\n9,NSE_EQ\r\n"),
+            ),
+            ("SELECT capture_seq FROM ticks", seqs(&[1, 2, 3])),
+            ("SELECT capture_seq FROM feed_aux_packets", seqs(&[4, 5])),
+        ]
+    }
+
+    /// A re-run's drop re-exported REBUILT rows (packet 77, which the rebuild
+    /// later left out as the twin of a live copy) under a `.sha-` key of a
+    /// live partition, and copied a partition the rebuild created. Pinned,
+    /// neither is read as the live day; unpinned, the re-export is (the bug
+    /// the pin closes: the rebuild's own rows would be demanded back).
+    #[tokio::test]
+    async fn test_run_coverage_reads_only_pinned_live_keys_after_a_rebuild() {
+        let (mut store, copies) = dropped_store();
+        let rebuilt = format!(
+            "{TICK_HEADER}{}",
+            trow("2026-11-20T09:30:00.000000Z", 8, "9.0", 7, 77)
+        );
+        store.objects.insert(
+            key(
+                "ticks",
+                "2026-11-20T09",
+                &format!("sha-{}.csv.gz", "c".repeat(64)),
+            ),
+            gzip_stored(rebuilt.as_bytes()),
+        );
+        store.objects.insert(
+            key("tick_quotes", "2026-11-20T15", "csv.gz"),
+            gzip_stored(format!("{TICK_HEADER}").as_bytes()),
+        );
+        let (got, _) = run_with(
+            &store,
+            &copies,
+            &pinned_live(),
+            &["tick_quotes/2026-11-20T15"],
+            clean_script(),
+            "pinned",
+        )
+        .await;
+        assert_eq!(got.expect("ran"), Vec::<String>::new());
+        // Bite: unpinned, the rebuilt re-export counts as dropped and 77 is
+        // demanded, and the created partition is an unrecorded copy.
+        let (got, _) = run(&store, &copies, clean_script(), "unpinned").await;
+        let findings = got.expect("ran");
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.contains("tick_quotes copies the progress record")),
+            "{findings:?}"
+        );
+        assert!(findings.iter().any(|f| f.contains("[77]")), "{findings:?}");
+    }
+
+    /// Pinned, a dropped partition with no pinned key is a finding, and the
+    /// recorded key must be among the pinned ones.
+    #[tokio::test]
+    async fn test_run_coverage_refuses_an_unpinned_or_mispinned_partition() {
+        let (store, copies) = dropped_store();
+        let mut pinned = pinned_live();
+        pinned.remove("feed_aux_packets/2026-11-20");
+        let (got, _) = run_with(&store, &copies, &pinned, &[], clean_script(), "unpin").await;
+        let findings = got.expect("ran");
+        assert!(
+            findings.iter().any(|f| f.contains("never pinned")),
+            "{findings:?}"
+        );
+        let mut wrong = pinned_live();
+        wrong.insert(
+            "ticks/2026-11-20T09".to_owned(),
+            vec![key(
+                "ticks",
+                "2026-11-20T09",
+                &format!("sha-{}.csv.gz", "d".repeat(64)),
+            )],
+        );
+        let (got, _) = run_with(&store, &copies, &wrong, &[], clean_script(), "mispin").await;
+        let findings = got.expect("ran");
+        assert!(
+            findings.iter().any(|f| f.contains("is not in the bucket")),
+            "{findings:?}"
+        );
     }
 }

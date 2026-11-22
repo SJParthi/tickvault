@@ -97,6 +97,11 @@ pub const WINDOW_STOP: &str = "day repair window closed";
 /// The progress object that stands for the whole day.
 pub const DAY_OBJECT: &str = "day";
 
+/// The progress object of the line written just before the rebuild starts
+/// (2026-11-22): every later line belongs to a run that may hold rebuilt
+/// rows.
+pub const REBUILD_START_OBJECT: &str = "rebuild-start";
+
 /// How long the keep-alive SSM write may take.
 const KEEP_ALIVE_PUT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15); // APPROVED: this IS the named constant the rule asks for
 
@@ -590,18 +595,33 @@ pub(crate) trait RepairIo {
     async fn copy_partition(&mut self, p: &Partition) -> anyhow::Result<CopyRecord>;
     /// Whether a copy recorded earlier is still in S3 with its size and SHA.
     async fn copy_still_verified(&mut self, rec: &CopyRecord) -> anyhow::Result<bool>;
-    /// Drops one partition in QuestDB (after its verified copy).
-    async fn drop_partition(&mut self, p: &Partition, rec: &CopyRecord) -> anyhow::Result<()>;
+    /// Drops one partition in QuestDB (after its verified copy). Returns the
+    /// quarantine key the drop verified against (the recorded copy, or a
+    /// re-export with other bytes).
+    async fn drop_partition(&mut self, p: &Partition, rec: &CopyRecord) -> anyhow::Result<String>;
+    /// Every quarantine copy key of one partition (the canonical key and any
+    /// `.sha-` re-export). Read only.
+    async fn list_copy_keys(&mut self, table: &str, partition: &str)
+    -> anyhow::Result<Vec<String>>;
     /// Copies one local day file (create-only) and verifies it.
     async fn copy_file(&mut self, rel: &Path) -> anyhow::Result<CopyRecord>;
-    /// Rebuilds the day from its raw frames.
-    async fn rebuild(&mut self) -> anyhow::Result<RebuildReport>;
+    /// Rebuilds the day from its raw frames. `originals` are the quarantine
+    /// keys holding the live day's tick-path rows ([`original_copy_keys`]).
+    async fn rebuild(&mut self, originals: &[String]) -> anyhow::Result<RebuildReport>;
     /// The verify gate; returns the findings (empty = repaired).
     async fn verify(&mut self, rep: &RebuildReport) -> anyhow::Result<Vec<String>>;
     /// The packet coverage check: every dropped packet (by `capture_seq`) of
     /// the given quarantine copies must be in the rebuilt day; rows of the
-    /// Quote 61 repeat-skip kinds are counted apart. Returns the findings.
-    async fn coverage(&mut self, copies: &[(String, CopyRecord)]) -> anyhow::Result<Vec<String>>;
+    /// Quote 61 repeat-skip kinds are counted apart. `pinned` are the live
+    /// day's copy keys per partition ([`pinned_original_keys`]; empty: every
+    /// copy listed is read), `known` every tick-path partition copied at any
+    /// time. Returns the findings.
+    async fn coverage(
+        &mut self,
+        copies: &[(String, CopyRecord)],
+        pinned: &std::collections::BTreeMap<String, Vec<String>>,
+        known: &std::collections::BTreeSet<String>,
+    ) -> anyhow::Result<Vec<String>>;
     /// `Ok` while the run window is open; an error carrying [`WINDOW_STOP`]
     /// once 08:00 IST on a session day (or the tool's expiry) is reached.
     async fn window_open(&mut self) -> anyhow::Result<()>;
@@ -712,6 +732,9 @@ pub(crate) async fn run_apply<I: RepairIo>(
         info!("day repair: already verified; apply has nothing to do");
         return Ok(rep);
     }
+    // A run after a rebuild STARTED: record the live day's copies BEFORE this
+    // run copies or drops anything, so no rebuilt row ever counts as live's.
+    ensure_originals_pinned(io, log).await?;
     let pre = io.preflight().await?;
     let waiting = waiting_wal_segments(wal_dir, day);
     let refusals = apply_refusals(&pre, &waiting, &day_text);
@@ -772,7 +795,10 @@ pub(crate) async fn run_apply<I: RepairIo>(
         if !io.copy_still_verified(&rec).await? {
             bail!("the quarantine copy of {obj} no longer verifies; not dropping it");
         }
-        io.drop_partition(p, &rec).await?;
+        let used = io.drop_partition(p, &rec).await?;
+        if used != rec.key {
+            info!(object = %obj, first = %rec.key, second = %used, "day repair: dropped against a re-export");
+        }
         note(log, Step::Drop, &obj, rec.encode())?;
         io.audit(Step::Drop, &obj, Some(&rec), "dropped", "")
             .await?;
@@ -815,7 +841,13 @@ pub(crate) async fn run_apply<I: RepairIo>(
     // 5. Rebuild (idempotent: every row upserts onto itself). The rebuild
     // re-checks the window between segments as well.
     io.window_open().await?;
-    let rep = io.rebuild().await?;
+    // Marks that a rebuild began: from here on a drop's re-export holds
+    // rebuilt rows, never the live day's.
+    if !log.lines().iter().any(|l| l.step == Step::Rebuild) {
+        note(log, Step::Rebuild, REBUILD_START_OBJECT, String::new())?;
+    }
+    let originals = live_copy_keys(io, log.lines()).await?;
+    let rep = io.rebuild(&originals).await?;
     note(log, Step::Rebuild, DAY_OBJECT, rep.encode())?;
     let reasons = rep.unfinished_reasons();
     let outcome = if reasons.is_empty() {
@@ -876,8 +908,10 @@ pub(crate) async fn run_verify<I: RepairIo>(
     // checks the rebuilt rows' times and readings, so a packet present with a
     // wrong value is caught there, not here.
     let copies = dropped_tick_path_copies(log.lines());
+    let pinned = pinned_original_keys(log.lines());
+    let known = known_tick_path_objects(log.lines());
     findings.extend(coverage_list_findings(log.lines(), &copies));
-    findings.extend(io.coverage(&copies).await?);
+    findings.extend(io.coverage(&copies, &pinned, &known).await?);
     if !findings.is_empty() {
         io.audit(
             Step::Verify,
@@ -911,14 +945,189 @@ pub(crate) async fn run_verify<I: RepairIo>(
 /// before and after, only the table may change with the corrected time.
 const TICK_PATH_TABLES: [&str; 3] = ["ticks", "tick_quotes", "feed_aux_packets"];
 
+/// Whether `object` (`table/partition`) is a tick-path partition. Pure.
+#[must_use]
+pub fn is_tick_path_object(object: &str) -> bool {
+    object
+        .split_once('/')
+        .is_some_and(|(table, _)| TICK_PATH_TABLES.contains(&table))
+}
+
+/// The index of the first `rebuild` line, or the line count when none:
+/// every line before it belongs to the live day's copy and drop. Pure,
+/// O(lines).
+#[must_use]
+pub fn first_rebuild_index(lines: &[ProgressLine]) -> usize {
+    lines
+        .iter()
+        .position(|l| l.step == Step::Rebuild)
+        .unwrap_or(lines.len())
+}
+
+/// The live day's copy keys per tick-path partition, from the `original`
+/// lines (2026-11-22; one line per partition, `keys=<k1>,<k2>`). Empty when
+/// none was recorded. Pure, O(lines).
+#[must_use]
+pub fn pinned_original_keys(
+    lines: &[ProgressLine],
+) -> std::collections::BTreeMap<String, Vec<String>> {
+    let mut out: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for l in lines.iter().filter(|l| l.step == Step::Original) {
+        let Some(list) = l.detail.strip_prefix("keys=") else {
+            continue;
+        };
+        let keys = out.entry(l.object.clone()).or_default();
+        for key in list.split(',').filter(|k| !k.is_empty()) {
+            if !keys.iter().any(|k| k == key) {
+                keys.push(key.to_owned());
+            }
+        }
+    }
+    for keys in out.values_mut() {
+        keys.sort();
+    }
+    out
+}
+
+/// Every pinned live-day copy key, sorted. Pure.
+#[must_use]
+pub fn original_copy_keys(lines: &[ProgressLine]) -> Vec<String> {
+    let mut keys: Vec<String> = pinned_original_keys(lines)
+        .into_values()
+        .flatten()
+        .collect();
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+/// Every tick-path partition copied at any time (the live day's and any the
+/// rebuild created). Pure, O(lines).
+#[must_use]
+pub fn known_tick_path_objects(lines: &[ProgressLine]) -> std::collections::BTreeSet<String> {
+    lines
+        .iter()
+        .filter(|l| l.step == Step::Copy && is_tick_path_object(&l.object))
+        .map(|l| l.object.clone())
+        .collect()
+}
+
+/// Whether a rebuild has started (a `rebuild` line of any object). Pure.
+#[must_use]
+pub fn rebuild_started(lines: &[ProgressLine]) -> bool {
+    first_rebuild_index(lines) < lines.len()
+}
+
+/// The quarantine keys holding the live day's tick-path rows, for the
+/// rebuild: the pinned keys when the live day is pinned, else (a first run,
+/// before any rebuild, when every copy is the live day's) every copy listed
+/// under each dropped partition. O(partitions) listings at most.
+///
+/// # Errors
+/// A listing failed.
+async fn live_copy_keys<I: RepairIo>(
+    io: &mut I,
+    lines: &[ProgressLine],
+) -> anyhow::Result<Vec<String>> {
+    let pinned = original_copy_keys(lines);
+    if !pinned.is_empty() {
+        return Ok(pinned);
+    }
+    let mut keys = Vec::new();
+    for (obj, _) in dropped_tick_path_copies(lines) {
+        let (table, partition) = obj
+            .split_once('/')
+            .with_context(|| format!("{obj} is not table/partition"))?;
+        keys.extend(io.list_copy_keys(table, partition).await?);
+    }
+    keys.sort();
+    keys.dedup();
+    Ok(keys)
+}
+
+/// Records the live day's copy keys of every dropped tick-path partition (one
+/// `original` line per partition), once, at the start of any run after a
+/// rebuild STARTED and before that run copies or drops anything: every key
+/// under such a partition's quarantine prefix at that moment holds live rows
+/// (a first run's copies and drop-time re-exports; nothing rebuilt has been
+/// copied yet, since only a later drop re-exports rebuilt rows). A partition
+/// already pinned is skipped, so a run that stopped half way finishes the pin
+/// before it copies or drops. No-op before any rebuild (the first run needs
+/// none). O(partitions) listings.
+///
+/// # Errors
+/// A listing failed, or the recorded copy is not in the bucket.
+async fn ensure_originals_pinned<I: RepairIo>(
+    io: &mut I,
+    log: &mut ProgressLog,
+) -> anyhow::Result<()> {
+    if !rebuild_started(log.lines()) {
+        return Ok(());
+    }
+    let pinned = pinned_original_keys(log.lines());
+    if pinned.is_empty() {
+        // A run after the rebuild already copied or dropped a tick-path
+        // partition without pinning (an older binary): a `.sha-` key may hold
+        // rebuilt rows, and pinning it would call them live. Refuse.
+        let after = &log.lines()[first_rebuild_index(log.lines())..];
+        if let Some(l) = after
+            .iter()
+            .find(|l| matches!(l.step, Step::Copy | Step::Drop) && is_tick_path_object(&l.object))
+        {
+            bail!(
+                "{} {} was recorded after the rebuild began, with no live-day pin; the \
+                 quarantine may hold rebuilt rows under a live partition, refusing to pin",
+                l.step.as_str(),
+                l.object
+            );
+        }
+    }
+    for (obj, rec) in dropped_tick_path_copies(log.lines()) {
+        if pinned.contains_key(&obj) {
+            continue;
+        }
+        let (table, partition) = obj
+            .split_once('/')
+            .with_context(|| format!("{obj} is not table/partition"))?;
+        let keys = io.list_copy_keys(table, partition).await?;
+        if !keys.contains(&rec.key) {
+            bail!(
+                "the recorded copy {} of {obj} is not in the bucket; not pinning the live day",
+                rec.key
+            );
+        }
+        if let Some(bad) = keys.iter().find(|k| k.contains(',')) {
+            bail!("a quarantine key holds a comma ({bad}); it cannot be pinned");
+        }
+        note(
+            log,
+            Step::Original,
+            &obj,
+            format!("keys={}", keys.join(",")),
+        )?;
+        io.audit(
+            Step::Original,
+            &obj,
+            Some(&rec),
+            "pinned",
+            "pinned live copies",
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 /// The dropped tick-path partitions' quarantine copies: the FIRST recorded
-/// copy of each partition (a re-run copies its own rebuilt rows again under a
-/// later line; those are not the original day). O(lines).
+/// copy of each partition, recorded before the first rebuild (a re-run copies
+/// its own rebuilt rows again under a later line, and a partition the rebuild
+/// created is first copied after it; neither is the original day). O(lines).
 #[must_use]
 pub fn dropped_tick_path_copies(lines: &[ProgressLine]) -> Vec<(String, CopyRecord)> {
     let mut seen = std::collections::BTreeSet::new();
     let mut out = Vec::new();
-    for l in lines.iter().filter(|l| l.step == Step::Copy) {
+    let live = &lines[..first_rebuild_index(lines)];
+    for l in live.iter().filter(|l| l.step == Step::Copy) {
         let table = l.object.split('/').next().unwrap_or_default();
         if !TICK_PATH_TABLES.contains(&table) || !seen.insert(l.object.as_str()) {
             continue;
@@ -944,7 +1153,9 @@ pub fn coverage_list_findings(
     }
     let have: std::collections::BTreeSet<&str> = copies.iter().map(|(o, _)| o.as_str()).collect();
     let mut out = Vec::new();
-    for l in lines.iter().filter(|l| l.step == Step::Drop) {
+    // Drops after the first rebuild drop rebuilt rows, not the live day's.
+    let live = &lines[..first_rebuild_index(lines)];
+    for l in live.iter().filter(|l| l.step == Step::Drop) {
         let table = l.object.split('/').next().unwrap_or_default();
         if TICK_PATH_TABLES.contains(&table) && !have.contains(l.object.as_str()) {
             out.push(format!(
@@ -1565,7 +1776,9 @@ mod prod_io {
 
     fn audit_step(step: Step) -> DayRepairStep {
         match step {
-            Step::Enumerate => DayRepairStep::Enumerate,
+            // The live-day pin is a listing record (2026-11-22): an
+            // `enumerate` row whose detail says `pinned live copies`.
+            Step::Enumerate | Step::Original => DayRepairStep::Enumerate,
             Step::Copy => DayRepairStep::Copy,
             Step::Drop => DayRepairStep::Drop,
             Step::Move => DayRepairStep::MoveFiles,
@@ -1729,7 +1942,11 @@ mod prod_io {
                 .is_some_and(|(len, sha)| len == rec.bytes && sha.as_deref() == Some(&want)))
         }
 
-        async fn drop_partition(&mut self, p: &Partition, rec: &CopyRecord) -> anyhow::Result<()> {
+        async fn drop_partition(
+            &mut self,
+            p: &Partition,
+            rec: &CopyRecord,
+        ) -> anyhow::Result<String> {
             // Copy-and-drop re-exports and re-verifies right before the drop
             // (an identical object is reused), so the drop never trusts the
             // earlier copy alone.
@@ -1757,7 +1974,7 @@ mod prod_io {
                              (different bytes); both copies are kept"
                         );
                     }
-                    Ok(())
+                    Ok(c.s3_key)
                 }
                 other => Err(outcome_error(&format!("drop {}", p.object()), other)),
             }
@@ -1776,8 +1993,26 @@ mod prod_io {
             }
         }
 
-        async fn rebuild(&mut self) -> anyhow::Result<RebuildReport> {
-            rebuild::rebuild_day(&self.config, self.day, &self.root, &self.staging).await
+        async fn list_copy_keys(
+            &mut self,
+            table: &str,
+            partition: &str,
+        ) -> anyhow::Result<Vec<String>> {
+            use tickvault_storage::day_repair_coverage as cov;
+            let s3 = tickvault_storage::s3_cold::S3Cold::load(
+                &self.config.partition_retention.archive_bucket,
+            )
+            .await
+            .context("no cold bucket resolves")?;
+            let prefix = cov::partition_copy_prefix(table, partition);
+            Ok(cov::copies_under_prefix(
+                &cov::list_copy_keys(&s3, &prefix).await?,
+                &prefix,
+            ))
+        }
+
+        async fn rebuild(&mut self, originals: &[String]) -> anyhow::Result<RebuildReport> {
+            rebuild::rebuild_day(&self.config, self.day, &self.root, &self.staging, originals).await
         }
 
         async fn window_open(&mut self) -> anyhow::Result<()> {
@@ -1795,6 +2030,8 @@ mod prod_io {
         async fn coverage(
             &mut self,
             copies: &[(String, CopyRecord)],
+            pinned: &std::collections::BTreeMap<String, Vec<String>>,
+            known: &std::collections::BTreeSet<String>,
         ) -> anyhow::Result<Vec<String>> {
             let s3 = tickvault_storage::s3_cold::S3Cold::load(
                 &self.config.partition_retention.archive_bucket,
@@ -1816,6 +2053,8 @@ mod prod_io {
                 &d,
                 &self.staging,
                 copies,
+                pinned,
+                known,
                 || super::window_open_now(config),
             )
             .await
@@ -2373,6 +2612,17 @@ mod tests {
         violations: Vec<String>,
         rebuilds: u32,
         verifies: u32,
+        /// The rebuild writes rows again into the live tick partitions and
+        /// creates one more (a later drop then re-exports REBUILT rows).
+        rebuild_recreates: bool,
+        /// Verifies still to fail (each a finding).
+        fail_verifies: u32,
+        /// The `originals` each rebuild was handed.
+        originals_seen: Vec<Vec<String>>,
+        /// `(copies objects, pinned)` each coverage call was handed.
+        coverage_seen: Vec<(Vec<String>, BTreeMap<String, Vec<String>>)>,
+        /// The tick partitions of the live day (what a rebuild recreates).
+        live_tick_partitions: Vec<Partition>,
     }
 
     struct FakeIo<'a> {
@@ -2426,16 +2676,51 @@ mod tests {
             self.tick()?;
             Ok(self.remote.borrow().copies.get(&rec.key) == Some(rec))
         }
-        async fn drop_partition(&mut self, p: &Partition, rec: &CopyRecord) -> anyhow::Result<()> {
+        async fn drop_partition(
+            &mut self,
+            p: &Partition,
+            rec: &CopyRecord,
+        ) -> anyhow::Result<String> {
             self.tick()?;
             let mut r = self.remote.borrow_mut();
             if r.copies.get(&format!("q/{}", p.object())) != Some(rec) {
                 r.violations
                     .push(format!("drop of {} without its copy", p.object()));
             }
+            // After a rebuild the partition holds rebuilt rows: the drop's
+            // re-export lands at a `.sha-` key beside the live copy.
+            let used = if r.rebuilds > 0 {
+                let moved = CopyRecord {
+                    key: format!("q/{}.sha-bb", p.object()),
+                    sha256: "bb".to_owned(),
+                    rows: 1,
+                    bytes: 1,
+                };
+                r.copies.insert(moved.key.clone(), moved.clone());
+                moved.key
+            } else {
+                rec.key.clone()
+            };
             r.partitions.remove(p);
             drop(r);
-            self.tick()
+            self.tick()?;
+            Ok(used)
+        }
+        async fn list_copy_keys(
+            &mut self,
+            table: &str,
+            partition: &str,
+        ) -> anyhow::Result<Vec<String>> {
+            self.tick()?;
+            let base = format!("q/{table}/{partition}");
+            Ok(self
+                .remote
+                .borrow()
+                .copies
+                .keys()
+                .filter(|k| **k == base || k.starts_with(&format!("{base}.sha-")))
+                .cloned()
+                .collect())
         }
         async fn copy_file(&mut self, rel: &Path) -> anyhow::Result<CopyRecord> {
             self.tick()?;
@@ -2453,10 +2738,11 @@ mod tests {
             self.tick()?;
             Ok(rec)
         }
-        async fn rebuild(&mut self) -> anyhow::Result<RebuildReport> {
+        async fn rebuild(&mut self, originals: &[String]) -> anyhow::Result<RebuildReport> {
             self.tick()?;
             let hours = day_unix_hours(nov20())?;
             let mut r = self.remote.borrow_mut();
+            r.originals_seen.push(originals.to_vec());
             if !r.partitions.is_empty() {
                 r.violations
                     .push("rebuild before every partition was dropped".to_owned());
@@ -2466,6 +2752,14 @@ mod tests {
                     .push("rebuild before every file was moved".to_owned());
             }
             r.rebuilds += 1;
+            if r.rebuild_recreates {
+                let mut parts = r.live_tick_partitions.clone();
+                parts.push(Partition {
+                    table: "tick_quotes".to_owned(),
+                    partition: format!("{REPAIR_DAY}T15"),
+                });
+                r.partitions.extend(parts);
+            }
             drop(r);
             self.tick()?;
             // More rows than any copy holds, so the dropped-rows check passes.
@@ -2481,14 +2775,25 @@ mod tests {
         }
         async fn verify(&mut self, _rep: &RebuildReport) -> anyhow::Result<Vec<String>> {
             self.tick()?;
-            self.remote.borrow_mut().verifies += 1;
+            let mut r = self.remote.borrow_mut();
+            r.verifies += 1;
+            if r.fail_verifies > 0 {
+                r.fail_verifies -= 1;
+                return Ok(vec!["injected verify finding".to_owned()]);
+            }
             Ok(Vec::new())
         }
         async fn coverage(
             &mut self,
-            _copies: &[(String, CopyRecord)],
+            copies: &[(String, CopyRecord)],
+            pinned: &BTreeMap<String, Vec<String>>,
+            _known: &BTreeSet<String>,
         ) -> anyhow::Result<Vec<String>> {
             self.tick()?;
+            self.remote.borrow_mut().coverage_seen.push((
+                copies.iter().map(|(o, _)| o.clone()).collect(),
+                pinned.clone(),
+            ));
             Ok(Vec::new())
         }
         async fn audit(
@@ -2542,6 +2847,12 @@ mod tests {
                 },
             });
         }
+        remote.live_tick_partitions = remote
+            .partitions
+            .iter()
+            .filter(|p| p.table == "ticks")
+            .cloned()
+            .collect();
         (root, RefCell::new(remote), files)
     }
 
@@ -2629,6 +2940,193 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// The 2026-11-20 shape: apply, a verify that fails, a second apply over
+    /// the rebuilt partitions (whose drops re-export REBUILT rows and copy a
+    /// partition the rebuild created), then a verify that passes. The live
+    /// day's keys are pinned before the second run copies or drops anything,
+    /// so the second rebuild and the coverage read the live copies only.
+    #[test]
+    fn test_rerun_after_a_rebuild_reads_only_the_live_day() {
+        let (root, remote, _files) = setup(3, 0);
+        {
+            let mut r = remote.borrow_mut();
+            r.rebuild_recreates = true;
+            r.fail_verifies = 1;
+        }
+        assert_eq!(drive(&root, &remote, &[]), 2);
+        let r = remote.borrow();
+        assert!(r.violations.is_empty(), "{:?}", r.violations);
+        let live = vec![
+            format!("q/ticks/{REPAIR_DAY}T09"),
+            format!("q/ticks/{REPAIR_DAY}T10"),
+        ];
+        assert_eq!(r.originals_seen, vec![live.clone(), live.clone()]);
+        // The second run's drops did re-export rebuilt rows.
+        assert!(
+            r.copies.keys().any(|k| k.contains(".sha-")),
+            "{:?}",
+            r.copies
+        );
+        for (objects, pinned) in &r.coverage_seen {
+            assert_eq!(
+                objects,
+                &vec![
+                    format!("ticks/{REPAIR_DAY}T09"),
+                    format!("ticks/{REPAIR_DAY}T10")
+                ]
+            );
+            let keys: Vec<String> = pinned.values().flatten().cloned().collect();
+            assert!(
+                keys.iter()
+                    .all(|k| !k.contains(".sha-") && !k.contains("tick_quotes"))
+            );
+        }
+        // The second coverage ran pinned, on exactly the live keys.
+        let (_, last) = r.coverage_seen.last().expect("coverage ran");
+        assert_eq!(last.values().flatten().cloned().collect::<Vec<_>>(), live);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    fn pline(step: Step, object: &str, detail: &str) -> ProgressLine {
+        ProgressLine {
+            step,
+            object: object.to_owned(),
+            detail: detail.to_owned(),
+        }
+    }
+
+    #[test]
+    fn test_first_rebuild_index_and_rebuild_started_see_the_start_line() {
+        let mut lines = vec![pline(Step::Copy, "ticks/A", "")];
+        assert_eq!(first_rebuild_index(&lines), 1);
+        assert!(!rebuild_started(&lines));
+        lines.push(pline(Step::Rebuild, REBUILD_START_OBJECT, ""));
+        lines.push(pline(Step::Rebuild, DAY_OBJECT, ""));
+        assert_eq!(first_rebuild_index(&lines), 1);
+        assert!(rebuild_started(&lines));
+    }
+
+    #[test]
+    fn test_is_tick_path_object_names_the_three_tables_only() {
+        for o in ["ticks/x", "tick_quotes/x", "feed_aux_packets/x"] {
+            assert!(is_tick_path_object(o), "{o}");
+        }
+        for o in [
+            "candles_1m/x",
+            "market_depth/x",
+            "ticks",
+            "data/spill/ticks/a",
+        ] {
+            assert!(!is_tick_path_object(o), "{o}");
+        }
+    }
+
+    #[test]
+    fn test_pinned_original_keys_and_original_copy_keys_merge_lines() {
+        let lines = vec![
+            pline(Step::Original, "ticks/A", "keys=q/b,q/a"),
+            pline(Step::Original, "ticks/A", "keys=q/a,,q/c"),
+            pline(Step::Original, "ticks/B", "keys="),
+            pline(Step::Copy, "ticks/C", "keys=q/x"),
+        ];
+        let pinned = pinned_original_keys(&lines);
+        assert_eq!(pinned["ticks/A"], vec!["q/a", "q/b", "q/c"]);
+        assert!(pinned.get("ticks/B").is_some_and(Vec::is_empty));
+        assert!(!pinned.contains_key("ticks/C"));
+        assert_eq!(original_copy_keys(&lines), vec!["q/a", "q/b", "q/c"]);
+    }
+
+    #[test]
+    fn test_known_tick_path_objects_lists_every_copied_tick_partition() {
+        let lines = vec![
+            pline(Step::Copy, "ticks/A", ""),
+            pline(Step::Copy, "candles_5m/A", ""),
+            pline(Step::Drop, "tick_quotes/B", ""),
+            pline(Step::Copy, "tick_quotes/C", ""),
+        ];
+        let known: Vec<String> = known_tick_path_objects(&lines).into_iter().collect();
+        assert_eq!(known, vec!["tick_quotes/C", "ticks/A"]);
+    }
+
+    #[test]
+    fn test_ensure_originals_pinned_refuses_a_run_that_copied_after_the_rebuild() {
+        let (root, remote, _files) = setup(3, 0);
+        let mut io = FakeIo {
+            remote: &remote,
+            root: root.clone(),
+            fail_at: None,
+            calls: 0,
+        };
+        let progress = ProgressLog::path_for(&root.join(DAY_REPAIR_DIR), REPAIR_DAY);
+        let mut log = ProgressLog::open(&progress).expect("log");
+        let rec = CopyRecord {
+            key: format!("q/ticks/{REPAIR_DAY}T09"),
+            sha256: "aa".to_owned(),
+            rows: 1,
+            bytes: 1,
+        };
+        for l in [
+            pline(Step::Copy, &format!("ticks/{REPAIR_DAY}T09"), &rec.encode()),
+            pline(Step::Rebuild, DAY_OBJECT, ""),
+            pline(Step::Copy, &format!("ticks/{REPAIR_DAY}T09"), &rec.encode()),
+        ] {
+            log.append(l).expect("append");
+        }
+        let err = block_on(ensure_originals_pinned(&mut io, &mut log)).expect_err("refused");
+        assert!(format!("{err:#}").contains("refusing to pin"), "{err:#}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn test_pin_helpers_parse_merge_and_bound_the_live_era() {
+        let l = |step, object: &str, detail: &str| ProgressLine {
+            step,
+            object: object.to_owned(),
+            detail: detail.to_owned(),
+        };
+        let rec = |k: &str| CopyRecord {
+            key: k.to_owned(),
+            sha256: "aa".to_owned(),
+            rows: 1,
+            bytes: 1,
+        };
+        let lines = vec![
+            l(Step::Copy, "ticks/A", &rec("q/a").encode()),
+            l(Step::Copy, "candles_1m/A", &rec("q/c").encode()),
+            l(Step::Drop, "ticks/A", &rec("q/a").encode()),
+            l(Step::Rebuild, DAY_OBJECT, ""),
+            l(Step::Original, "ticks/A", "keys=q/a,q/a.sha-1"),
+            l(Step::Original, "ticks/A", "keys=q/a"),
+            l(Step::Original, "ticks/B", "nonsense"),
+            l(Step::Copy, "tick_quotes/T15", &rec("q/t").encode()),
+            l(Step::Drop, "tick_quotes/T15", &rec("q/t").encode()),
+        ];
+        assert_eq!(first_rebuild_index(&lines), 3);
+        assert!(rebuild_started(&lines));
+        assert!(!rebuild_started(&lines[..3]));
+        let pinned = pinned_original_keys(&lines);
+        assert_eq!(pinned.len(), 1);
+        assert_eq!(
+            pinned["ticks/A"],
+            vec!["q/a".to_owned(), "q/a.sha-1".to_owned()]
+        );
+        assert_eq!(original_copy_keys(&lines), vec!["q/a", "q/a.sha-1"]);
+        let copies = dropped_tick_path_copies(&lines);
+        assert_eq!(
+            copies.len(),
+            1,
+            "the rebuild-era partition is not live: {copies:?}"
+        );
+        assert_eq!(copies[0].0, "ticks/A");
+        assert!(coverage_list_findings(&lines, &copies).is_empty());
+        let known = known_tick_path_objects(&lines);
+        assert!(known.contains("ticks/A") && known.contains("tick_quotes/T15"));
+        assert!(!known.contains("candles_1m/A"));
+        assert!(is_tick_path_object("feed_aux_packets/x"));
+        assert!(!is_tick_path_object("candles_1m/x"));
+        assert!(!is_tick_path_object("ticks"));
+    }
+
     #[test]
     fn test_verify_without_a_rebuild_refuses() {
         let root = scratch("noverify");
@@ -2657,8 +3155,16 @@ mod tests {
                 n_parts in 2usize..6, // at least one tick-path partition: a repair with none is refused at verify
                 n_files in 0usize..4,
                 crash_points in proptest::collection::vec(1u32..60, 0..4),
+                rerun in any::<bool>(),
             ) {
                 let (root, remote, files) = setup(n_parts, n_files);
+                if rerun {
+                    // The 2026-11-20 shape: a verify fails after a rebuild that
+                    // wrote the tick partitions again.
+                    let mut r = remote.borrow_mut();
+                    r.rebuild_recreates = true;
+                    r.fail_verifies = 1;
+                }
                 let payloads: Vec<Vec<u8>> = files
                     .iter()
                     .map(|f| std::fs::read(root.join(f)).expect("payload"))
@@ -2666,8 +3172,24 @@ mod tests {
                 drive(&root, &remote, &crash_points);
                 let r = remote.borrow();
                 prop_assert!(r.violations.is_empty(), "{:?}", r.violations);
-                prop_assert!(r.partitions.is_empty());
                 prop_assert!(r.rebuilds >= 1);
+                if !rerun {
+                    prop_assert!(r.partitions.is_empty());
+                }
+                // Never a rebuilt row read as the live day's, at any crash.
+                for keys in &r.originals_seen {
+                    prop_assert!(
+                        keys.iter().all(|k| !k.contains(".sha-") && !k.contains("tick_quotes")),
+                        "{keys:?}"
+                    );
+                    prop_assert_eq!(keys.len(), n_parts - 1);
+                }
+                for (_, pinned) in &r.coverage_seen {
+                    prop_assert!(pinned
+                        .values()
+                        .flatten()
+                        .all(|k| !k.contains(".sha-") && !k.contains("tick_quotes")));
+                }
                 for (f, want) in files.iter().zip(&payloads) {
                     prop_assert!(!root.join(f).exists());
                     let got = std::fs::read(root.join(held_target(f))).expect("held copy");

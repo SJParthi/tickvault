@@ -26,6 +26,10 @@ pub enum Step {
     Enumerate,
     /// One partition or file copied to the quarantine prefix and verified.
     Copy,
+    /// One quarantine copy key that holds the LIVE day's rows of a tick-path
+    /// partition (2026-11-22): recorded before any rebuilt row can be copied,
+    /// so the coverage check and the rebuild read the live day only.
+    Original,
     /// One partition dropped in QuestDB.
     Drop,
     /// One seal, spill or DLQ file moved into `data/held/<day>/`.
@@ -45,6 +49,7 @@ impl Step {
         match self {
             Self::Enumerate => "enumerate",
             Self::Copy => "copy",
+            Self::Original => "original",
             Self::Drop => "drop",
             Self::Move => "move",
             Self::Rebuild => "rebuild",
@@ -59,6 +64,7 @@ impl Step {
         Some(match s {
             "enumerate" => Self::Enumerate,
             "copy" => Self::Copy,
+            "original" => Self::Original,
             "drop" => Self::Drop,
             "move" => Self::Move,
             "rebuild" => Self::Rebuild,
@@ -385,6 +391,7 @@ mod tests {
         for s in [
             Step::Enumerate,
             Step::Copy,
+            Step::Original,
             Step::Drop,
             Step::Move,
             Step::Rebuild,

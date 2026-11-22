@@ -1094,6 +1094,22 @@ fn ist_day_of_nanos(nanos: i64) -> i64 {
     secs.div_euclid(86_400)
 }
 
+/// The past-day repair's backup contracts: the union of every publication
+/// in `history` made on the IST day `ist_day` (days since 1970-01-01 IST).
+/// Sorted, deduped. Cold, O(publications x contracts).
+#[must_use]
+pub fn contracts_published_on(history: &PersistedBackupHistory, ist_day: i64) -> Vec<(u64, u8)> {
+    let mut out: Vec<(u64, u8)> = history
+        .publications
+        .iter()
+        .filter(|p| ist_day_of_nanos(p.published_at_nanos) == ist_day)
+        .flat_map(|p| p.contracts.iter().copied())
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
 /// The WAL replay's dedup: each frame is judged with the publication the
 /// live drain was using when it received it — the one with the greatest
 /// instant at or before the frame's receipt, on the same IST day (the
@@ -1126,6 +1142,178 @@ pub struct ReplayBackup {
     trimmed_through_day: Option<i64>,
     /// [`BACKUP_REPLAY_UNJUDGED_COUNTER`], resolved once (no per-frame label).
     unjudged: metrics::Counter,
+    /// The one-off past-day repair only: which copies the live run WROTE
+    /// ([`LiveKept`]); `None` in every live replay.
+    live_kept: Option<LiveKept>,
+}
+
+/// The past-day repair's record of which backup-socket copies the LIVE run
+/// wrote (2026-11-22, the 2026-11-20 repair's second verify).
+///
+/// The replay's dedup cannot reproduce the live drain's choice: the WAL
+/// holds the two sockets' copies in write order, not drain order, so the
+/// first-arrival winner can differ, and a replayed frame has no socket, so a
+/// late packet the live drain accepted from the other socket
+/// (`AcceptLate`) and a same-socket identical repeat it kept are both
+/// dropped. The quarantine copies of the dropped day hold the numbers live
+/// wrote, so for a contract in the day's backup publications:
+///
+/// - a packet whose `capture_seq` live wrote is kept;
+/// - a packet live did NOT write is dropped only when a byte-identical twin
+///   of it IS one live wrote (live kept the other copy); the twins are the
+///   fingerprints [`Self::note_packet`] recorded for this segment and the
+///   one before (the two copies are milliseconds apart in the WAL);
+/// - otherwise the replay dedup decides, as before (a packet live captured
+///   but never landed, e.g. a row still in a spill file, is not lost).
+///
+/// Honest limits: a twin in a segment beyond the one before is not seen, so
+/// both copies can be written; each such duplicate is counted
+/// (`duplicates_written`). O(1) average per judged packet (`ahash` probes),
+/// fingerprint sets sized by the segment's backup packets.
+#[derive(Debug, Default)]
+pub struct LiveKept {
+    contracts: std::collections::HashSet<(u64, u8), ahash::RandomState>,
+    seqs: std::collections::HashSet<u64, ahash::RandomState>,
+    /// Fingerprints of packets live wrote: this segment and the one before.
+    twins: [std::collections::HashSet<u64, ahash::RandomState>; 2],
+    /// Fingerprints of packets written by the dedup fallback, same two
+    /// generations (to count a duplicate when the live copy follows).
+    fallback_kept: [std::collections::HashSet<u64, ahash::RandomState>; 2],
+    counts: LiveKeptCounts,
+}
+
+/// What [`LiveKept::judge`] decided, by packet.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct LiveKeptCounts {
+    /// Packets of a backup contract judged.
+    pub judged: u64,
+    /// Kept: live wrote the number.
+    pub kept: u64,
+    /// Kept although the replay's dedup would have dropped it.
+    pub kept_against_dedup: u64,
+    /// Dropped: live wrote a byte-identical twin instead.
+    pub dropped_for_twin: u64,
+    /// Of those, ones the replay's dedup would have kept.
+    pub dropped_against_dedup: u64,
+    /// Neither the number nor a twin was written by live: the replay's dedup
+    /// decided (`fallback_kept` of them kept).
+    pub fallback: u64,
+    pub fallback_kept: u64,
+    /// A live-written packet kept after the fallback had already kept its
+    /// twin: both copies are written (a twin across a segment boundary).
+    pub duplicates_written: u64,
+}
+
+impl LiveKept {
+    /// Builds the record. `contracts` are the day's backup contracts,
+    /// `seqs` the numbers live wrote for them. Cold, once.
+    #[must_use]
+    pub fn new(contracts: &[(u64, u8)], seqs: &[u64]) -> Self {
+        let mut c = std::collections::HashSet::with_capacity_and_hasher(
+            contracts.len(),
+            ahash::RandomState::new(),
+        );
+        c.extend(contracts.iter().copied());
+        let mut s = std::collections::HashSet::with_capacity_and_hasher(
+            seqs.len(),
+            ahash::RandomState::new(),
+        );
+        s.extend(seqs.iter().copied());
+        Self {
+            contracts: c,
+            seqs: s,
+            twins: Default::default(),
+            fallback_kept: Default::default(),
+            counts: LiveKeptCounts::default(),
+        }
+    }
+
+    /// `(contracts, numbers)` held. O(1).
+    #[must_use]
+    pub fn sizes(&self) -> (usize, usize) {
+        (self.contracts.len(), self.seqs.len())
+    }
+
+    /// Whether `(security_id, segment)` is a backup contract of the day.
+    #[must_use]
+    pub fn covers(&self, security_id: u64, segment: u8) -> bool {
+        self.contracts.contains(&(security_id, segment))
+    }
+
+    /// The fingerprint of one packet's bytes. Deterministic (fixed keys),
+    /// O(packet bytes), a fixed 162 at most.
+    #[must_use]
+    pub fn fingerprint(packet: &[u8]) -> u64 {
+        use std::hash::BuildHasher as _;
+        ahash::RandomState::with_seeds(0x5452_4155, 0x4e44_4159, 0x2026_1120, 0x0000_0d17)
+            .hash_one(packet)
+    }
+
+    /// Starts a new segment: the fingerprints two segments old are dropped.
+    /// O(1) apart from freeing that generation.
+    pub fn begin_segment(&mut self) {
+        self.twins.swap(0, 1);
+        self.twins[0].clear();
+        self.fallback_kept.swap(0, 1);
+        self.fallback_kept[0].clear();
+    }
+
+    /// Records, ahead of the fold, one packet of the segment: its fingerprint
+    /// is a live-written twin when it is a backup contract's packet whose
+    /// number live wrote. O(1) average.
+    pub fn note_packet(&mut self, security_id: u64, segment: u8, seq: Option<u64>, packet: &[u8]) {
+        if self.covers(security_id, segment) && seq.is_some_and(|s| self.seqs.contains(&s)) {
+            self.twins[0].insert(Self::fingerprint(packet));
+        }
+    }
+
+    /// Whether the packet of `(security_id, segment)` with number `seq` and
+    /// bytes `packet` is dropped. A contract outside the day's backup set
+    /// keeps the replay dedup's verdict `dedup_drops`. O(1) average.
+    pub fn judge(
+        &mut self,
+        security_id: u64,
+        segment: u8,
+        seq: Option<u64>,
+        packet: &[u8],
+        dedup_drops: bool,
+    ) -> bool {
+        if !self.covers(security_id, segment) {
+            return dedup_drops;
+        }
+        self.counts.judged = self.counts.judged.saturating_add(1);
+        let print = Self::fingerprint(packet);
+        if seq.is_some_and(|s| self.seqs.contains(&s)) {
+            self.counts.kept = self.counts.kept.saturating_add(1);
+            if dedup_drops {
+                self.counts.kept_against_dedup = self.counts.kept_against_dedup.saturating_add(1);
+            }
+            if self.fallback_kept.iter().any(|g| g.contains(&print)) {
+                self.counts.duplicates_written = self.counts.duplicates_written.saturating_add(1);
+            }
+            return false;
+        }
+        if self.twins.iter().any(|g| g.contains(&print)) {
+            self.counts.dropped_for_twin = self.counts.dropped_for_twin.saturating_add(1);
+            if !dedup_drops {
+                self.counts.dropped_against_dedup =
+                    self.counts.dropped_against_dedup.saturating_add(1);
+            }
+            return true;
+        }
+        self.counts.fallback = self.counts.fallback.saturating_add(1);
+        if !dedup_drops {
+            self.counts.fallback_kept = self.counts.fallback_kept.saturating_add(1);
+            self.fallback_kept[0].insert(print);
+        }
+        dedup_drops
+    }
+
+    /// The counts so far. O(1).
+    #[must_use]
+    pub const fn counts(&self) -> LiveKeptCounts {
+        self.counts
+    }
 }
 
 impl ReplayBackup {
@@ -1165,7 +1353,19 @@ impl ReplayBackup {
             until_nanos: i64::MAX,
             trimmed_through_day,
             unjudged: metrics::counter!(BACKUP_REPLAY_UNJUDGED_COUNTER),
+            live_kept: None,
         })
+    }
+
+    /// Installs the past-day repair's [`LiveKept`] record. Cold, once.
+    pub fn set_live_kept(&mut self, kept: LiveKept) {
+        self.live_kept = Some(kept);
+    }
+
+    /// The past-day repair's record, when installed.
+    #[inline]
+    pub fn live_kept_mut(&mut self) -> Option<&mut LiveKept> {
+        self.live_kept.as_mut()
     }
 
     /// Selects the publication for a frame received at `received_at_nanos`
@@ -2400,6 +2600,185 @@ mod tests {
                 prop_assert!(*n <= 1, "packet {} folded {} times", i, n);
                 if carried_by[i] == 0 && lag <= 4 {
                     prop_assert_eq!(*n, 1, "packet {} on both sockets was not folded", i);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_live_kept_keeps_live_numbers_drops_only_twins_and_falls_back_otherwise() {
+        let mut k = LiveKept::new(&[(42, SEG)], &[100, 102]);
+        assert_eq!(k.sizes(), (1, 2));
+        k.begin_segment();
+        k.note_packet(42, SEG, Some(100), b"copy-a");
+        k.note_packet(42, SEG, Some(999), b"never-written");
+        k.note_packet(7, SEG, Some(100), b"not-a-backup-contract");
+        // Live's number is kept even when the dedup drops it.
+        assert!(!k.judge(42, SEG, Some(100), b"copy-a", true));
+        // Not live's number, but its twin is: dropped, even if the dedup keeps it.
+        assert!(k.judge(42, SEG, Some(101), b"copy-a", false));
+        // Neither the number nor a twin: the dedup decides.
+        assert!(!k.judge(42, SEG, Some(103), b"lost-by-live", false));
+        assert!(k.judge(42, SEG, Some(104), b"never-written", true));
+        assert!(!k.judge(42, SEG, None, b"x", false));
+        // Outside the set (another segment of the same id too): the dedup.
+        assert!(!k.judge(42, 1, Some(999), b"copy-a", false));
+        assert!(k.judge(7, SEG, Some(100), b"copy-a", true));
+        assert_eq!(
+            k.counts(),
+            LiveKeptCounts {
+                judged: 5,
+                kept: 1,
+                kept_against_dedup: 1,
+                dropped_for_twin: 1,
+                dropped_against_dedup: 1,
+                fallback: 3,
+                fallback_kept: 2,
+                duplicates_written: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn test_live_kept_twins_last_two_segments_and_counts_a_duplicate() {
+        let mut k = LiveKept::new(&[(42, SEG)], &[200]);
+        k.begin_segment();
+        k.note_packet(42, SEG, Some(200), b"twin");
+        k.begin_segment();
+        // The twin noted one segment earlier still counts...
+        assert!(k.judge(42, SEG, Some(201), b"twin", false));
+        k.begin_segment();
+        // ...two segments earlier it no longer does: the dedup decides.
+        assert!(!k.judge(42, SEG, Some(202), b"twin", false));
+        // The live copy arriving after the fallback kept its twin: counted.
+        assert!(!k.judge(42, SEG, Some(200), b"twin", true));
+        assert_eq!(k.counts().duplicates_written, 1);
+        assert_eq!(
+            LiveKept::fingerprint(b"twin"),
+            LiveKept::fingerprint(b"twin")
+        );
+        assert_ne!(
+            LiveKept::fingerprint(b"twin"),
+            LiveKept::fingerprint(b"twim")
+        );
+    }
+
+    #[test]
+    fn test_begin_segment_retires_the_fingerprints_two_segments_old() {
+        let mut k = LiveKept::new(&[(1, SEG)], &[10]);
+        k.begin_segment();
+        k.note_packet(1, SEG, Some(10), b"p");
+        k.begin_segment();
+        assert!(
+            k.judge(1, SEG, Some(11), b"p", false),
+            "one segment old: a twin"
+        );
+        k.begin_segment();
+        assert!(
+            !k.judge(1, SEG, Some(12), b"p", false),
+            "two segments old: forgotten"
+        );
+    }
+
+    #[test]
+    fn test_note_packet_records_only_live_numbers_of_backup_contracts() {
+        let mut k = LiveKept::new(&[(1, SEG)], &[10]);
+        k.begin_segment();
+        k.note_packet(1, SEG, Some(11), b"not-live");
+        k.note_packet(2, SEG, Some(10), b"not-backup");
+        k.note_packet(1, SEG, None, b"no-number");
+        for p in [&b"not-live"[..], b"not-backup", b"no-number"] {
+            assert!(!k.judge(1, SEG, Some(99), p, false), "{p:?} is no twin");
+        }
+        assert!(k.covers(1, SEG) && !k.covers(2, SEG) && !k.covers(1, 1));
+    }
+
+    #[test]
+    fn test_set_live_kept_and_live_kept_mut_install_the_record() {
+        let mut r = ReplayBackup::new(&PersistedBackupHistory {
+            publications: vec![PersistedBackupSet {
+                published_at_nanos: 1,
+                contracts: vec![(1, SEG)],
+                process_started_at_nanos: 0,
+            }],
+            ..PersistedBackupHistory::default()
+        })
+        .expect("a history with a contract");
+        assert!(r.live_kept_mut().is_none());
+        r.set_live_kept(LiveKept::new(&[(1, SEG)], &[5]));
+        assert_eq!(r.live_kept_mut().map(|k| k.sizes()), Some((1, 1)));
+    }
+
+    #[test]
+    fn test_contracts_published_on_unions_only_that_ist_day() {
+        // 2026-11-20 00:00 IST = 2026-11-19T18:30Z.
+        let day_start_utc_nanos = 1_795_113_000_i64 * 1_000_000_000;
+        let ist_day = ist_day_of_nanos(day_start_utc_nanos);
+        let hist = PersistedBackupHistory {
+            publications: vec![
+                PersistedBackupSet {
+                    published_at_nanos: day_start_utc_nanos - 1,
+                    contracts: vec![(1, SEG)],
+                    process_started_at_nanos: 0,
+                },
+                PersistedBackupSet {
+                    published_at_nanos: day_start_utc_nanos,
+                    contracts: vec![(5, SEG), (4, SEG)],
+                    process_started_at_nanos: 0,
+                },
+                PersistedBackupSet {
+                    published_at_nanos: day_start_utc_nanos + 3_600 * 1_000_000_000,
+                    contracts: vec![(4, SEG), (6, 1)],
+                    process_started_at_nanos: 0,
+                },
+                PersistedBackupSet {
+                    published_at_nanos: day_start_utc_nanos + 86_400 * 1_000_000_000,
+                    contracts: vec![(9, SEG)],
+                    process_started_at_nanos: 0,
+                },
+            ],
+            ..PersistedBackupHistory::default()
+        };
+        assert_eq!(
+            contracts_published_on(&hist, ist_day),
+            vec![(4, SEG), (5, SEG), (6, 1)]
+        );
+        assert!(contracts_published_on(&hist, ist_day + 10).is_empty());
+    }
+
+    proptest! {
+        /// Over random backup sets, numbers, twins and dedup verdicts, within
+        /// one segment: a backup contract's packet is kept when live wrote
+        /// its number, dropped when live wrote a twin instead, and otherwise
+        /// (and for every other contract) the dedup decides.
+        #[test]
+        fn proptest_live_kept_matches_live_for_backup_and_dedup_elsewhere(
+            set in proptest::collection::btree_set(0u64..20, 0..8),
+            kept in proptest::collection::btree_set(0u64..200, 0..60),
+            packets in proptest::collection::vec((0u64..20, 0u64..200, 0u8..30, any::<bool>()), 0..200),
+        ) {
+            let contracts: Vec<(u64, u8)> = set.iter().map(|&s| (s, SEG)).collect();
+            let seqs: Vec<u64> = kept.iter().copied().collect();
+            let mut k = LiveKept::new(&contracts, &seqs);
+            k.begin_segment();
+            let mut twins = std::collections::BTreeSet::new();
+            for (sid, seq, body, _) in &packets {
+                k.note_packet(*sid, SEG, Some(*seq), &[*body, *sid as u8]);
+                if set.contains(sid) && kept.contains(seq) {
+                    twins.insert([*body, *sid as u8]);
+                }
+            }
+            for (sid, seq, body, dedup) in packets {
+                let bytes = [body, sid as u8];
+                let dropped = k.judge(sid, SEG, Some(seq), &bytes, dedup);
+                if !set.contains(&sid) {
+                    prop_assert_eq!(dropped, dedup);
+                } else if kept.contains(&seq) {
+                    prop_assert!(!dropped);
+                } else if twins.contains(&bytes) {
+                    prop_assert!(dropped);
+                } else {
+                    prop_assert_eq!(dropped, dedup);
                 }
             }
         }
