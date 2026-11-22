@@ -438,7 +438,7 @@ mod tests {
     }
 
     #[test]
-    fn test_marker_state_present_absent_unreadable() {
+    fn test_marker_state_in_present_absent_unreadable() {
         let tmp = unique_dir();
         let d = day("2026-11-20");
         // A missing folder is Absent (a fresh box is not blocked).

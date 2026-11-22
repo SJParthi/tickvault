@@ -2662,3 +2662,15 @@ fn test_chain_day_equals_trade_safety_day() {
         crate::trade_safety::ist_day_of_ist_nanos((OPEN - 600) * NS)
     );
 }
+
+/// Each chain reads its own switch (a private one under test, the process
+/// switch in production): engaging one chain's switch never blocks another.
+#[test]
+fn test_safety_switch_is_the_chains_own() {
+    let a = chain(emitting(), true);
+    let b = chain(emitting(), true);
+    a.safety_switch()
+        .engage(a.day(), crate::trade_safety::CAUSE_A);
+    assert!(a.safety_switch().blocked_on(a.day()).is_some());
+    assert!(b.safety_switch().blocked_on(b.day()).is_none());
+}

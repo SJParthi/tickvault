@@ -488,7 +488,7 @@ mod tests {
     }
 
     #[test]
-    fn test_seed_present_unreadable_absent() {
+    fn test_seed_from_markers_in_present_unreadable_absent() {
         let base = tmp("seed");
         // Absent: the folder does not even exist (a fresh box).
         let s = SafetySwitch::new();
