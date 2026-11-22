@@ -171,6 +171,18 @@ pub(super) async fn handle_live_fill_cmd(
             false
         }
         PaperCmd::Execute(x) => {
+            // Gate C (UTC-SAFETY, §28.7): the backstop for an entry the chain
+            // sent before today's feed-time alarm fired. Checked first, so a
+            // blocked entry spends no exit-retry round; it is refused with a
+            // row and the position report (the chain waits for one on every
+            // Execute). Blocked on the day it was decided OR today, so an
+            // entry decided at 23:59:59 on the alarm day is still refused
+            // after midnight. Exits pass. Cold: one atomic load per Execute,
+            // plus the day's marker read once a day.
+            if !x.exit && entry_blocked_by_feed_time(ctx.safety, &x) {
+                refuse_feed_time_entry(risk, ctx, &x);
+                return true;
+            }
             // An exit arriving while earlier exits wait for the order gates
             // goes to the back of their queue without a place attempt: the
             // gates that refused them are still closed, and every refused
@@ -279,6 +291,36 @@ fn refuse_behind_waiting_exit(
     let mut seq = x.next_seq;
     emit(ctx, &x.base, LiveOrderEventKind::Reject, &mut seq, |row| {
         paper_rows::fill_reject(row, x, format!("{gate};behind_waiting_exit"));
+    });
+    report_position(risk, ctx, x);
+}
+
+/// Whether today's (or the entry's decision day's) feed-time alarm blocks
+/// `x` (UTC-SAFETY gate C). Seeds today from the markers once a day, so a
+/// day roll is covered even with the drain gone. O(1) after the first call
+/// of a day.
+fn entry_blocked_by_feed_time(
+    safety: &crate::trade_safety::SafetySwitch,
+    x: &PaperExecution,
+) -> bool {
+    let today = crate::trade_safety::ist_day_now();
+    crate::trade_safety::ensure_seeded(safety, today);
+    let decided = crate::trade_safety::ist_day_of_ist_nanos(x.base.ts_ist_nanos);
+    safety.blocked_on(decided).is_some() || safety.blocked_on(today).is_some()
+}
+
+/// Refuses an entry while today's feed-time alarm is on: one Reject row
+/// (`refused:feed_time_alarm`, a runtime reject in the LF-7 report), the
+/// counter, and the position report. Nothing is booked. Cold.
+fn refuse_feed_time_entry(risk: &RiskEngine, ctx: &RuntimeCtx, x: &PaperExecution) {
+    metrics::counter!(crate::trade_safety::RUNTIME_BLOCKED_COUNTER).increment(1);
+    let mut seq = x.next_seq;
+    emit(ctx, &x.base, LiveOrderEventKind::Reject, &mut seq, |row| {
+        paper_rows::fill_reject(
+            row,
+            x,
+            crate::trade_safety::RUNTIME_REASON_FEED_TIME_ALARM.to_owned(),
+        );
     });
     report_position(risk, ctx, x);
 }
@@ -649,6 +691,7 @@ mod tests {
             leg_pnl_tx: None,
             live_fill_events: Some(events),
             live_fill_positions: None,
+            safety: crate::trade_safety::default_switch(),
         }
     }
 
@@ -796,6 +839,121 @@ mod tests {
             },
         )
         .await;
+    }
+
+    /// UTC-SAFETY gate C: with today's feed-time alarm on, an entry is
+    /// refused with one `refused:feed_time_alarm` row, nothing is placed or
+    /// booked, and the position report still goes back to the chain.
+    #[tokio::test]
+    async fn test_gate_c_refused_and_reports_position() {
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut ctx = ctx(tx);
+        let (pos_tx, mut pos_rx) = tickvault_core::websocket::frame_ring::frame_ring::<
+            crate::live_fill::chain::PositionReport,
+        >(8);
+        pos_rx.set_busy_polling(true);
+        ctx.live_fill_positions = Some(pos_tx);
+        ctx.safety.engage(
+            crate::trade_safety::ist_day_now(),
+            crate::trade_safety::CAUSE_A,
+        );
+        let mut oms = oms();
+        let mut risk = RiskEngine::new(2.0, 100, 1_000_000.0);
+        let mut book = BookState::new();
+        let changed = handle_live_fill_cmd(
+            &mut oms,
+            &mut risk,
+            &mut book,
+            &ctx,
+            PaperCmd::Execute(Box::new(execution(10, 10))),
+        )
+        .await;
+        assert!(changed);
+        let rows = drain(&mut rx);
+        assert_eq!(
+            rows,
+            vec![(
+                LiveOrderEventKind::Reject,
+                2,
+                Some(crate::trade_safety::RUNTIME_REASON_FEED_TIME_ALARM.to_owned())
+            )]
+        );
+        assert_eq!(
+            risk.net_lots_for_in_segment(2885, ExchangeSegment::NseEquity),
+            0,
+            "nothing booked"
+        );
+        assert_eq!(oms.active_order_count(), 0, "nothing placed");
+        let r = pos_rx.try_recv().expect("the position report");
+        assert_eq!(r.runtime_net_shares, 0);
+    }
+
+    /// Gate C never touches an exit: a long is closed with the switch on.
+    #[tokio::test]
+    async fn test_gate_c_exit_placed() {
+        let (tx, mut rx) = mpsc::channel(64);
+        let ctx = ctx(tx);
+        let mut oms = oms();
+        let mut risk = RiskEngine::new(2.0, 100, 1_000_000.0);
+        let mut book = BookState::new();
+        handle_live_fill_cmd(
+            &mut oms,
+            &mut risk,
+            &mut book,
+            &ctx,
+            PaperCmd::Execute(Box::new(execution(10, 10))),
+        )
+        .await;
+        assert_eq!(
+            risk.net_lots_for_in_segment(2885, ExchangeSegment::NseEquity),
+            10
+        );
+        ctx.safety.engage(
+            crate::trade_safety::ist_day_now(),
+            crate::trade_safety::CAUSE_B,
+        );
+        let mut exit = execution(10, 10);
+        exit.exit = true;
+        exit.side = Side::Sell;
+        let _ = drain(&mut rx);
+        handle_live_fill_cmd(
+            &mut oms,
+            &mut risk,
+            &mut book,
+            &ctx,
+            PaperCmd::Execute(Box::new(exit)),
+        )
+        .await;
+        assert_eq!(
+            risk.net_lots_for_in_segment(2885, ExchangeSegment::NseEquity),
+            0,
+            "the exit closed the long: {:?}",
+            drain(&mut rx)
+        );
+    }
+
+    /// Gate C blocks on the day the entry was decided OR today: an entry
+    /// decided on the alarm day and executed after midnight is still refused;
+    /// another day's alarm blocks nothing.
+    #[tokio::test]
+    async fn test_gate_c_blocks_on_stamp_day_or_now_day() {
+        let x = execution(10, 10);
+        let decided = crate::trade_safety::ist_day_of_ist_nanos(x.base.ts_ist_nanos);
+        let today = crate::trade_safety::ist_day_now();
+        assert_ne!(decided, today, "the fixture event is from another day");
+        let s = crate::trade_safety::default_switch();
+        assert!(!entry_blocked_by_feed_time(s, &x));
+        s.engage(decided, crate::trade_safety::CAUSE_A);
+        assert!(
+            entry_blocked_by_feed_time(s, &x),
+            "the decision day's alarm"
+        );
+        let s = crate::trade_safety::default_switch();
+        s.engage(today, crate::trade_safety::CAUSE_B);
+        assert!(entry_blocked_by_feed_time(s, &x), "today's alarm");
+        let s = crate::trade_safety::default_switch();
+        s.engage(today + 1, crate::trade_safety::CAUSE_B);
+        assert!(!entry_blocked_by_feed_time(s, &x), "another day's alarm");
     }
 
     #[tokio::test]

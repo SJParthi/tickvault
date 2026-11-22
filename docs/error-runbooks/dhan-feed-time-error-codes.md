@@ -90,6 +90,28 @@ catch-up skip it until a verified repair. If the hold write fails, a
 `DHAN-LTT-02` `feed_time_hold_write_failed` line says so: write the file by
 hand.
 
+**Trade-safety switch (2026-11-22, plan item UTC-SAFETY, daily-universe
+§28.7):** when cause A or B fires, new PAPER entries are refused for the rest
+of that IST day; exits always go out. It ends by itself at midnight IST. The
+switch also engages at start from the day's latch markers (an unreadable
+marker blocks too, fail closed; a missing one does not). Seen as:
+
+- one `warn!` with this code, `source = "trade_safety_entries_blocked"` and
+  the causes, on the edge into blocked (WARN: it never pages; the cause's own
+  `error!` above was the page);
+- the gauge `tv_trade_safety_entries_blocked` (1 while blocked) and the
+  counters `tv_live_fill_entries_blocked_feed_time_total` (the chain) and
+  `tv_paper_entries_blocked_feed_time_total` (the order runtime), local
+  `/metrics` only;
+- `live_order_events` Reject rows with reason `feed_time_alarm` (the chain)
+  or `refused:feed_time_alarm` (the runtime), and `entries_blocked` in the
+  day's live-fill report;
+- the morning paper self-test skipped with outcome `skipped_feed_time_alarm`
+  (not a failure).
+
+Nothing to do for the switch itself. The reversion reason
+(`dhan_time_format_reverted`) does not engage it.
+
 **Triage:**
 0. (2026-11-21) `dhan_time_format_reverted`: Dhan is sending IST epoch again.
    Fresh prints are left raw by the cap (correct IST) and counted as `cap`;

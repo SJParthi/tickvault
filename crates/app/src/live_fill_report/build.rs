@@ -85,6 +85,12 @@ pub struct Counts {
     pub recheck_incomplete: u64,
     pub recheck_unavailable: u64,
     pub recheck_skipped: u64,
+    /// New entries refused because the day's feed-time alarm was on (plan
+    /// item UTC-SAFETY): the chain's `feed_time_alarm` (gates A and B) and
+    /// the runtime's `refused:feed_time_alarm` (gate C). Also counted in
+    /// `skipped` or `rejected`. Serialize-only, so an older report without
+    /// it never fails to load.
+    pub entries_blocked: u64,
 }
 
 /// One would-be order.
@@ -479,6 +485,10 @@ pub fn held_share_known(rows: &[EventRow]) -> BTreeMap<i64, bool> {
                         runtime_reject(Some(why), true)
                             || why.starts_with(FILL_MODEL_REFUSED_PREFIX)
                             || why == crate::live_fill::PAPER_QUEUE_FULL_REASON
+                            // Gate B (UTC-SAFETY): a held entry refused at its
+                            // finish took no shares of its seconds.
+                            || why.split(';').next()
+                                == Some(crate::trade_safety::REASON_FEED_TIME_ALARM)
                     })
             });
         out.insert(group[0].signal_id, worked_out);
@@ -534,6 +544,15 @@ pub fn build_report(
             _ => counts.skipped += 1,
         }
         if let Some(r) = reject {
+            if matches!(
+                r.reason.as_deref().and_then(|why| why.split(';').next()),
+                Some(
+                    crate::trade_safety::REASON_FEED_TIME_ALARM
+                        | crate::trade_safety::RUNTIME_REASON_FEED_TIME_ALARM
+                )
+            ) {
+                counts.entries_blocked += 1;
+            }
             let e = rejects.entry(reject_key(r.reason.as_deref())).or_default();
             e.count += 1;
             e.qty = e.qty.saturating_add(r.remainder_qty.unwrap_or(0));

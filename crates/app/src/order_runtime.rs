@@ -469,6 +469,7 @@ pub fn spawn_order_runtime(params: OrderRuntimeParams) -> tokio::task::JoinHandl
                 leg_pnl_tx: leg_pnl_tx.clone(),
                 live_fill_events: live_fill_events.clone(),
                 live_fill_positions: live_fill_positions.clone(),
+                safety: crate::trade_safety::default_switch(),
             };
             let mark_rx_shared = Arc::clone(&mark_rx);
             let live_fill_shared = live_fill_rx.clone();
@@ -553,6 +554,9 @@ struct RuntimeCtx {
             crate::live_fill::chain::PositionReport,
         >,
     >,
+    /// The trade-safety switch (UTC-SAFETY, §28.7): gates C and D read it
+    /// for entries only. `trade_safety::SWITCH` in production.
+    safety: &'static crate::trade_safety::SafetySwitch,
 }
 
 // LF-6b: the live paper fill chain's arm (paper commands → dry-run OMS).
@@ -813,6 +817,16 @@ fn local_reconcile(
 // Self-test state machine
 // ---------------------------------------------------------------------------
 
+/// The skip text when no live price mark is available.
+const SKIP_TEXT_NO_MARK: &str = "no live price mark is available, so the order machinery was \
+     not exercised (this is not a failure of the machinery)";
+/// The skip text when today's feed-time alarm blocks new entries (UTC-SAFETY
+/// gate D).
+const SKIP_TEXT_FEED_TIME: &str = "new paper entries are paused today because Dhan feed times \
+     are flagged wrong (this is not a failure of the machinery)";
+/// The `tv_paper_selftest_total{outcome}` label of a gate-D skip.
+const SKIP_OUTCOME_FEED_TIME: &str = "skipped_feed_time_alarm";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SelfTestPhase {
     Idle,
@@ -853,13 +867,17 @@ impl SelfTestState {
     /// was never exercised. It is a coded `warn!` plus
     /// `tv_paper_selftest_total{outcome}` instead, latched once per day.
     fn skip(&mut self, today: i64, outcome: &'static str) {
+        self.skip_with(today, outcome, SKIP_TEXT_NO_MARK);
+    }
+
+    /// [`Self::skip`] with its own reason text (UTC-SAFETY gate D: the
+    /// feed-time alarm, not a missing mark). Same counter, same day latch.
+    fn skip_with(&mut self, today: i64, outcome: &'static str, why: &'static str) {
         warn!(
             code = ErrorCode::OmsGapDryRunSafety.code_str(),
             source = "selftest_skipped",
             outcome,
-            "paper self-test did not run today — no live price mark is \
-             available, so the order machinery was not exercised (this is not \
-             a failure of the machinery)"
+            "paper self-test did not run today: {why}"
         );
         metrics::counter!("tv_paper_selftest_total", "outcome" => outcome).increment(1);
         self.phase = SelfTestPhase::Idle;
@@ -1384,6 +1402,9 @@ async fn run_order_runtime(
 
     let mut book = BookState::new();
     let mut self_test = SelfTestState::new();
+    // UTC-SAFETY: the edge log and gauge of the trade-safety switch, on this
+    // 1 s tick (never the frame drain).
+    let mut safety_edge = crate::trade_safety::EdgePublisher::new();
     let mut mark_rx = mark_rx_shared.lock().await;
     // LF-6b: held for this run's lifetime, released on a respawn.
     let mut live_fill_rx = match live_fill_shared.as_ref() {
@@ -1660,6 +1681,7 @@ async fn run_order_runtime(
                     },
                 ).await;
                 republish_marks_wanted(&ctx.marks_wanted, &oms, &risk, &self_test);
+                safety_edge.tick(ctx.safety, today);
             }
         }
     }
@@ -1759,9 +1781,18 @@ async fn process_mark(
         && price.is_finite()
         && price > 0.0
     {
-        start_self_test_entry(oms, self_test, mark.security_id, mark.segment_code).await;
-        // HP-2: the entry placement changed the pending set.
-        book.rebuild_pending_paper(oms);
+        // Gate D, second half (UTC-SAFETY): the alarm fired after the cycle
+        // armed. The entry is not placed; the day is skipped, not failed. A
+        // cycle already past its entry finishes (its close is an exit).
+        // The mark still prices positions below (no early return).
+        let today = crate::trade_safety::ist_day_now();
+        if ctx.safety.blocked_on(today).is_some() {
+            self_test.skip_with(today, SKIP_OUTCOME_FEED_TIME, SKIP_TEXT_FEED_TIME);
+        } else {
+            start_self_test_entry(oms, self_test, mark.security_id, mark.segment_code).await;
+            // HP-2: the entry placement changed the pending set.
+            book.rebuild_pending_paper(oms);
+        }
     }
 
     // Runtime-side filter: only sids with a position or a pending paper
@@ -2125,6 +2156,14 @@ async fn drive_self_test_timers(
     {
         return;
     }
+    // Gate D (UTC-SAFETY, §28.7): the self-test places an ENTRY, so on a day
+    // the feed-time alarm is on it is skipped, never failed. Seeds today from
+    // the markers once a day (the drain may be gone). Cold.
+    crate::trade_safety::ensure_seeded(ctx.safety, today);
+    if ctx.safety.blocked_on(today).is_some() {
+        self_test.skip_with(today, SKIP_OUTCOME_FEED_TIME, SKIP_TEXT_FEED_TIME);
+        return;
+    }
     if !marks_available {
         // The mark channel is closed (no producer): arming would only wait out
         // the timeout. Skip once for the day instead.
@@ -2337,6 +2376,7 @@ mod tests {
             leg_pnl_tx: None,
             live_fill_events: None,
             live_fill_positions: None,
+            safety: crate::trade_safety::default_switch(),
         }
     }
 
@@ -3263,6 +3303,108 @@ mod tests {
             SelfTestPhase::AwaitingMark,
             "a non-index mark must not pick the self-test sid (E4)"
         );
+    }
+
+    /// UTC-SAFETY gate D, mark half: the alarm fired after the cycle armed.
+    /// The first index mark places no entry; the day is skipped (Idle,
+    /// latched), never failed; the mark is still applied below.
+    #[tokio::test]
+    async fn test_gate_d_mark_arm_skips_after_arming() {
+        let ctx = make_ctx();
+        let mut oms = make_oms();
+        let mut risk = make_risk();
+        let mut book = BookState::new();
+        let mut self_test = SelfTestState::new();
+        self_test.phase = SelfTestPhase::AwaitingMark;
+        self_test.started_at = std::time::Instant::now();
+        let today = crate::trade_safety::ist_day_now();
+        ctx.safety.engage(today, crate::trade_safety::CAUSE_A);
+        process_mark(
+            &mut oms,
+            &mut risk,
+            &mut book,
+            &mut self_test,
+            &ctx,
+            MarkUpdate {
+                security_id: 13,
+                segment_code: ExchangeSegment::IdxI.binary_code(),
+                price: 23_000.0,
+            },
+            true,
+            None,
+        )
+        .await;
+        assert_eq!(self_test.phase, SelfTestPhase::Idle, "skipped, not placed");
+        assert_eq!(self_test.last_run_day, today, "latched for the day");
+        assert_eq!(oms.active_order_count(), 0, "no entry placed");
+    }
+
+    /// Without the alarm the same mark places the self-test entry (the gate
+    /// is the only difference); an alarm that fires once the entry is placed
+    /// does not stop the cycle: the next mark fills its close (an exit), the
+    /// book is flat, and the day latches as a pass, never a failure.
+    #[tokio::test]
+    async fn test_gate_d_inflight_self_test_finishes() {
+        let ctx = make_ctx();
+        let mut oms = make_oms();
+        let mut risk = make_risk();
+        let mut book = BookState::new();
+        let mut self_test = SelfTestState::new();
+        self_test.phase = SelfTestPhase::AwaitingMark;
+        self_test.started_at = std::time::Instant::now();
+        let mark = |price: f64| MarkUpdate {
+            security_id: 13,
+            segment_code: ExchangeSegment::IdxI.binary_code(),
+            price,
+        };
+        process_mark(
+            &mut oms,
+            &mut risk,
+            &mut book,
+            &mut self_test,
+            &ctx,
+            mark(100.0),
+            true,
+            None,
+        )
+        .await;
+        assert!(
+            matches!(self_test.phase, SelfTestPhase::AwaitingCloseFill { .. }),
+            "the entry filled and the close is placed: {:?}",
+            self_test.phase
+        );
+        assert_eq!(risk.net_lots_for(13), 1);
+        // The alarm fires now; the close is an exit and still goes out.
+        let today = crate::trade_safety::ist_day_now();
+        ctx.safety.engage(today, crate::trade_safety::CAUSE_B);
+        process_mark(
+            &mut oms,
+            &mut risk,
+            &mut book,
+            &mut self_test,
+            &ctx,
+            mark(101.0),
+            true,
+            None,
+        )
+        .await;
+        assert_eq!(self_test.phase, SelfTestPhase::Idle, "the cycle completed");
+        assert_eq!(self_test.last_run_day, today, "latched as a pass");
+        assert_eq!(risk.net_lots_for(13), 0, "flat after the close fill");
+    }
+
+    /// A gate-D skip is a skip: the counter label and the day latch, and the
+    /// state never fails (no OMS-GAP-06 failure line).
+    #[test]
+    fn test_gate_d_not_counted_failed() {
+        let mut st = SelfTestState::new();
+        st.phase = SelfTestPhase::AwaitingMark;
+        st.skip_with(42, SKIP_OUTCOME_FEED_TIME, SKIP_TEXT_FEED_TIME);
+        assert_eq!(st.phase, SelfTestPhase::Idle);
+        assert_eq!(st.last_run_day, 42);
+        // The no-mark skip keeps its own text.
+        st.skip(43, "no_mark");
+        assert_eq!(st.last_run_day, 43);
     }
 
     #[test]

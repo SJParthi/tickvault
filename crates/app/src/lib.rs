@@ -373,6 +373,9 @@ pub mod subsystem_memory;
 /// Plan item 4 (2026-10-30): boot wiring for the background-task heartbeats
 /// and the memory action ladder (`tv-task-watch`).
 pub mod task_watch_boot;
+/// Plan item UTC-SAFETY (daily-universe §28.7, 2026-11-21): while today's
+/// feed-time alarm is on, the paper path opens no new entries; exits pass.
+pub mod trade_safety;
 pub mod trading_pipeline;
 // Dead live-WS sweep stage 1 (2026-07-17, operator directive via
 // coordinator): `wal_reinject` module DELETED — its own PR-C2 comments
