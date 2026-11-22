@@ -1244,7 +1244,6 @@ impl LiveKept {
     /// O(packet bytes), a fixed 162 at most.
     #[must_use]
     pub fn fingerprint(packet: &[u8]) -> u64 {
-        use std::hash::BuildHasher as _;
         ahash::RandomState::with_seeds(0x5452_4155, 0x4e44_4159, 0x2026_1120, 0x0000_0d17)
             .hash_one(packet)
     }

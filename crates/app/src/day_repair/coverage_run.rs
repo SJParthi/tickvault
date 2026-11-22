@@ -80,6 +80,15 @@ async fn read_copy<S: CopyStore, T: Send + 'static>(
     Ok(acc)
 }
 
+/// Which copies the coverage check reads (2026-11-22).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CoverageScope<'a> {
+    /// The live day's copy keys per partition; empty: read every copy listed.
+    pub pinned: &'a std::collections::BTreeMap<String, Vec<String>>,
+    /// Every tick-path partition copied at any time.
+    pub known: &'a std::collections::BTreeSet<String>,
+}
+
 /// The coverage check. `window` is asked before every long step and stops
 /// the run when it errors. Returns the findings (empty = every dropped packet
 /// is in the rebuilt day).
@@ -93,10 +102,10 @@ pub(crate) async fn run_coverage<S: CopyStore>(
     day_text: &str,
     staging: &Path,
     copies: &[(String, CopyRecord)],
-    pinned: &std::collections::BTreeMap<String, Vec<String>>,
-    known: &std::collections::BTreeSet<String>,
+    scope: CoverageScope<'_>,
     mut window: impl FnMut() -> anyhow::Result<()>,
 ) -> anyhow::Result<Vec<String>> {
+    let CoverageScope { pinned, known } = scope;
     std::fs::create_dir_all(staging).with_context(|| format!("create {}", staging.display()))?;
     let mut findings = Vec::new();
     // 1. Every copy in the store of each dropped partition: the recorded
@@ -591,8 +600,10 @@ mod tests {
             "2026-11-20",
             &dir,
             copies,
-            pinned,
-            &known,
+            CoverageScope {
+                pinned,
+                known: &known,
+            },
             || Ok(()),
         )
         .await;
@@ -777,8 +788,10 @@ mod tests {
             "2026-11-20",
             &dir,
             &copies,
-            &BTreeMap::new(),
-            &std::collections::BTreeSet::new(),
+            CoverageScope {
+                pinned: &BTreeMap::new(),
+                known: &std::collections::BTreeSet::new(),
+            },
             || anyhow::bail!("window closed"),
         )
         .await;
@@ -834,7 +847,7 @@ mod tests {
         );
         store.objects.insert(
             key("tick_quotes", "2026-11-20T15", "csv.gz"),
-            gzip_stored(format!("{TICK_HEADER}").as_bytes()),
+            gzip_stored(TICK_HEADER.as_bytes()),
         );
         let (got, _) = run_with(
             &store,

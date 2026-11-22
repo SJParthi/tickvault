@@ -2053,8 +2053,7 @@ mod prod_io {
                 &d,
                 &self.staging,
                 copies,
-                pinned,
-                known,
+                super::coverage_run::CoverageScope { pinned, known },
                 || super::window_open_now(config),
             )
             .await
