@@ -1658,7 +1658,14 @@ impl<E: StrategyEngine> LiveFillChain<E> {
                     reject.seq = 2;
                     reject.remainder_qty = i64::try_from(order.qty).ok();
                     reject.model_price_paise = summary.vwap_paise;
-                    reject.reason = Some(REASON_FEED_TIME_ALARM.to_owned());
+                    // A late print the entry saw is kept on the row (review
+                    // 2026-11-22): the daily re-pricing then reads its share
+                    // as unknown, as it would for a filled entry, and never
+                    // compares a later exit against a wrong remainder.
+                    reject.reason = Some(match late_fill_ticks {
+                        0 => REASON_FEED_TIME_ALARM.to_owned(),
+                        l => format!("{REASON_FEED_TIME_ALARM};{LATE_FILL_TICKS_KEY}={l}"),
+                    });
                     let _queued = self.push_finished(ChainOutput::Event(Box::new(reject)));
                     return;
                 }

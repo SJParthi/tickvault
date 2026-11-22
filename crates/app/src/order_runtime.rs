@@ -3340,7 +3340,9 @@ mod tests {
     }
 
     /// Without the alarm the same mark places the self-test entry (the gate
-    /// is the only difference).
+    /// is the only difference); an alarm that fires once the entry is placed
+    /// does not stop the cycle: the next mark fills its close (an exit), the
+    /// book is flat, and the day latches as a pass, never a failure.
     #[tokio::test]
     async fn test_gate_d_inflight_self_test_finishes() {
         let ctx = make_ctx();
@@ -3350,36 +3352,45 @@ mod tests {
         let mut self_test = SelfTestState::new();
         self_test.phase = SelfTestPhase::AwaitingMark;
         self_test.started_at = std::time::Instant::now();
+        let mark = |price: f64| MarkUpdate {
+            security_id: 13,
+            segment_code: ExchangeSegment::IdxI.binary_code(),
+            price,
+        };
         process_mark(
             &mut oms,
             &mut risk,
             &mut book,
             &mut self_test,
             &ctx,
-            MarkUpdate {
-                security_id: 13,
-                segment_code: ExchangeSegment::IdxI.binary_code(),
-                price: 23_000.0,
-            },
+            mark(100.0),
             true,
             None,
         )
         .await;
-        assert_ne!(
-            self_test.phase,
-            SelfTestPhase::AwaitingMark,
-            "the entry was placed"
+        assert!(
+            matches!(self_test.phase, SelfTestPhase::AwaitingCloseFill { .. }),
+            "the entry filled and the close is placed: {:?}",
+            self_test.phase
         );
-        assert_ne!(self_test.phase, SelfTestPhase::Idle);
-        // An alarm now does not stop the cycle: its close is an exit.
-        ctx.safety.engage(
-            crate::trade_safety::ist_day_now(),
-            crate::trade_safety::CAUSE_B,
-        );
-        assert!(matches!(
-            self_test.phase,
-            SelfTestPhase::AwaitingEntryFill { .. } | SelfTestPhase::AwaitingCloseFill { .. }
-        ));
+        assert_eq!(risk.net_lots_for(13), 1);
+        // The alarm fires now; the close is an exit and still goes out.
+        let today = crate::trade_safety::ist_day_now();
+        ctx.safety.engage(today, crate::trade_safety::CAUSE_B);
+        process_mark(
+            &mut oms,
+            &mut risk,
+            &mut book,
+            &mut self_test,
+            &ctx,
+            mark(101.0),
+            true,
+            None,
+        )
+        .await;
+        assert_eq!(self_test.phase, SelfTestPhase::Idle, "the cycle completed");
+        assert_eq!(self_test.last_run_day, today, "latched as a pass");
+        assert_eq!(risk.net_lots_for(13), 0, "flat after the close fill");
     }
 
     /// A gate-D skip is a skip: the counter label and the day latch, and the

@@ -283,14 +283,20 @@ impl EdgePublisher {
         Self { last: None }
     }
 
-    /// Compares `switch` on `today` with the last tick. Returns true on an
-    /// edge (blocked, unblocked, or new causes).
+    /// Compares `switch` on `today` with the last tick. One `warn!` and the
+    /// gauge at 1 on the edge INTO blocked, the gauge at 0 on the edge out
+    /// (midnight); a cause added while already blocked changes nothing
+    /// visible (the cause's own page said so). Returns true on either edge.
+    /// A respawned order runtime starts a fresh publisher, so it can log the
+    /// edge once more.
     pub fn tick(&mut self, switch: &SafetySwitch, today: i64) -> bool {
         let now = switch.blocked_on(today).map(|causes| (today, causes));
-        if now == self.last {
+        let edge = now.is_some() != self.last.is_some()
+            || matches!((now, self.last), (Some((a, _)), Some((b, _))) if a != b);
+        self.last = now;
+        if !edge {
             return false;
         }
-        self.last = now;
         match now {
             Some((day, causes)) => {
                 metrics::gauge!(ENTRIES_BLOCKED_GAUGE).set(1.0);
@@ -590,7 +596,7 @@ mod tests {
         assert!(p.tick(&s, DAY), "edge into blocked");
         assert!(!p.tick(&s, DAY), "still blocked, no second line");
         s.engage(DAY, CAUSE_B);
-        assert!(p.tick(&s, DAY), "a new cause is a new edge");
+        assert!(!p.tick(&s, DAY), "a cause added while blocked logs nothing");
         assert!(p.tick(&s, DAY + 1), "midnight: the edge out");
         assert!(!p.tick(&s, DAY + 1));
     }

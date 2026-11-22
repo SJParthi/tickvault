@@ -487,7 +487,8 @@ pub fn held_share_known(rows: &[EventRow]) -> BTreeMap<i64, bool> {
                             || why == crate::live_fill::PAPER_QUEUE_FULL_REASON
                             // Gate B (UTC-SAFETY): a held entry refused at its
                             // finish took no shares of its seconds.
-                            || why == crate::trade_safety::REASON_FEED_TIME_ALARM
+                            || why.split(';').next()
+                                == Some(crate::trade_safety::REASON_FEED_TIME_ALARM)
                     })
             });
         out.insert(group[0].signal_id, worked_out);
@@ -544,7 +545,7 @@ pub fn build_report(
         }
         if let Some(r) = reject {
             if matches!(
-                r.reason.as_deref(),
+                r.reason.as_deref().and_then(|why| why.split(';').next()),
                 Some(
                     crate::trade_safety::REASON_FEED_TIME_ALARM
                         | crate::trade_safety::RUNTIME_REASON_FEED_TIME_ALARM
