@@ -77,6 +77,7 @@ use super::timing::{
     BookClock, FEED_WATCH_CLOSE_SOD, ReleaseQueue, SESSION_OPEN_SOD, bar_in_session,
 };
 use crate::dhan_feed_stack::live_fill_tap::TapTick;
+use crate::trade_safety::{REASON_FEED_TIME_ALARM, SafetySwitch, ist_day_of_ist_nanos};
 
 const NANOS_PER_SEC: i64 = 1_000_000_000;
 const SECS_PER_DAY: i64 = 86_400;
@@ -290,6 +291,10 @@ pub struct ChainCounters {
     /// instrument's next trade (`note_cumulative`): each breaks the chain's
     /// bars as the fold's own restart does. Not a metric.
     pub dropped_tick_restarts: u64,
+    /// New entries refused because today's feed-time alarm is on (plan item
+    /// UTC-SAFETY, §28.7): gate A at decide, gate B for an entry already
+    /// held. Each also counts in `refused`.
+    pub entries_blocked_feed_time: u64,
 }
 
 /// Context carried with a held order, for its rows.
@@ -406,6 +411,9 @@ pub struct LiveFillChain<E: StrategyEngine> {
     signal_next: i64,
     now_ns: i64,
     counters: ChainCounters,
+    /// The trade-safety switch (UTC-SAFETY, §28.7): `trade_safety::SWITCH`
+    /// in production; read by gates A and B only for entries.
+    safety: &'static SafetySwitch,
 }
 
 impl<E: StrategyEngine> LiveFillChain<E> {
@@ -483,9 +491,7 @@ impl<E: StrategyEngine> LiveFillChain<E> {
             outbox_cap,
             mark_slot: vec![u32::MAX; keys],
             pass_floor: 0,
-            day: now_ist_ns
-                .div_euclid(NANOS_PER_SEC)
-                .div_euclid(SECS_PER_DAY),
+            day: ist_day_of_ist_nanos(now_ist_ns),
             // The day the setup was checked for, not the start clock's (LF-9
             // hardening): a start just past midnight on a setup checked the
             // evening before stays inert until a setup for today is loaded.
@@ -494,6 +500,7 @@ impl<E: StrategyEngine> LiveFillChain<E> {
             signal_next: 0,
             now_ns: now_ist_ns,
             counters: ChainCounters::default(),
+            safety: crate::trade_safety::default_switch(),
             engine,
             setup,
             params,
@@ -504,6 +511,13 @@ impl<E: StrategyEngine> LiveFillChain<E> {
         };
         chain.taint_chain_start(now_ist_ns);
         Ok(chain)
+    }
+
+    /// The chain's trade-safety switch (tests engage it; production reads
+    /// `trade_safety::SWITCH` through it).
+    #[cfg(test)]
+    pub(crate) fn safety_switch(&self) -> &'static SafetySwitch {
+        self.safety
     }
 
     /// A start after 09:15:00 (a restart): every first bar is partial and the
@@ -527,9 +541,7 @@ impl<E: StrategyEngine> LiveFillChain<E> {
     /// # Errors
     /// The engine or the book refused.
     pub fn new_day(&mut self, now_ist_ns: i64) -> Result<usize, ChainError> {
-        let day = now_ist_ns
-            .div_euclid(NANOS_PER_SEC)
-            .div_euclid(SECS_PER_DAY);
+        let day = ist_day_of_ist_nanos(now_ist_ns);
         if day == self.setup_day {
             self.engine
                 .configure(
@@ -1099,9 +1111,7 @@ impl<E: StrategyEngine> LiveFillChain<E> {
         mono_ns: i64,
         backlogged: bool,
     ) -> Result<(), ChainError> {
-        let day = wall_ist_ns
-            .div_euclid(NANOS_PER_SEC)
-            .div_euclid(SECS_PER_DAY);
+        let day = ist_day_of_ist_nanos(wall_ist_ns);
         if day != self.day {
             self.new_day(wall_ist_ns)?;
         }
@@ -1371,6 +1381,16 @@ impl<E: StrategyEngine> LiveFillChain<E> {
             self.refuse_unplaced(intent, Some(bar), "intent_for_other_instrument");
             return;
         }
+        // Gate A (UTC-SAFETY, §28.7): while today's feed-time alarm is on, no
+        // NEW entry is held; an exit never reads the switch. First of the
+        // order refusals, so every blocked entry carries this one reason and
+        // the count is exact. One Acquire load and one compare.
+        if intent.kind != IntentKind::Exit && self.safety.blocked_on(self.day).is_some() {
+            self.counters.entries_blocked_feed_time =
+                self.counters.entries_blocked_feed_time.saturating_add(1);
+            self.refuse_unplaced(intent, Some(bar), REASON_FEED_TIME_ALARM);
+            return;
+        }
         // The candle AND its whole fill window `[end, end + max_fill_seconds]`
         // (LF-6b review round 2, finding 3): a stretch tainted and handed out
         // to the held orders BEFORE this order existed (a feed gap starting
@@ -1623,6 +1643,25 @@ impl<E: StrategyEngine> LiveFillChain<E> {
                 late_fill_ticks,
                 beyond_limit_qty,
             } => {
+                // Gate B (UTC-SAFETY, §28.7): an entry already held when
+                // today's feed-time alarm fired is refused here, before the
+                // outbox check and before any position count moves. Same row
+                // shape as `Tainted`, plus the model price so the daily
+                // re-pricing does not read it as diverged. Exits pass.
+                if !order.meta.exit && self.safety.blocked_on(self.day).is_some() {
+                    self.counters.refused = self.counters.refused.saturating_add(1);
+                    self.counters.entries_blocked_feed_time =
+                        self.counters.entries_blocked_feed_time.saturating_add(1);
+                    let mut reject = order.meta.base;
+                    reject.ts_ist_nanos = self.now_ns;
+                    reject.event = LiveOrderEventKind::Reject;
+                    reject.seq = 2;
+                    reject.remainder_qty = i64::try_from(order.qty).ok();
+                    reject.model_price_paise = summary.vwap_paise;
+                    reject.reason = Some(REASON_FEED_TIME_ALARM.to_owned());
+                    let _queued = self.push_finished(ChainOutput::Event(Box::new(reject)));
+                    return;
+                }
                 let Some(segment) = ExchangeSegment::from_byte(order.key.exchange_segment) else {
                     return;
                 };

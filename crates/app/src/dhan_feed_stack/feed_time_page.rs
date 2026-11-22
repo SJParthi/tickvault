@@ -52,9 +52,9 @@ pub(super) const CAUSE_B_SCANS: u32 = 20;
 /// One source with the reversion guard's window (review fix 2026-11-21).
 const MUHURAT_WINDOW_LEAD_SECS: u32 = tickvault_storage::ltt_correction::MUHURAT_GUARD_LEAD_SECS;
 const MUHURAT_WINDOW_TAIL_SECS: u32 = tickvault_storage::ltt_correction::MUHURAT_GUARD_TAIL_SECS;
-/// Daily-marker task names (one per cause), kept 7 days.
-const TASK_CAUSE_A: &str = "feed-time-page-a";
-const TASK_CAUSE_B: &str = "feed-time-page-b";
+/// Daily-marker task names (one per cause), kept 7 days. One source with the
+/// trade-safety switch, which reads the same markers strictly (UTC-SAFETY).
+use crate::trade_safety::{TASK_CAUSE_A, TASK_CAUSE_B};
 /// Hand-offs the writer thread can hold (at most three a day: causes A and
 /// B, and one reversion hold).
 const PERSIST_DEPTH: usize = 4;
@@ -235,16 +235,32 @@ pub(super) struct FeedTimePage {
     /// `(IST day, cause bits)` of hand-off failures already logged, so a
     /// retry every 30 s logs once per cause per day.
     handoff_failures_logged: (i64, u8),
+    /// The trade-safety switch (plan item UTC-SAFETY): `fire` engages it,
+    /// `restore_latch` seeds it. `trade_safety::SWITCH` in production.
+    safety: &'static crate::trade_safety::SafetySwitch,
 }
 
-fn restore_latch(day: i64) -> [bool; 2] {
-    let Some(date) = ist_day_date(day) else {
-        return [false; 2];
-    };
-    [
-        crate::daily_task_marker::daily_marker_exists(TASK_CAUSE_A, date),
-        crate::daily_task_marker::daily_marker_exists(TASK_CAUSE_B, date),
-    ]
+/// Restores the day's page latches AND seeds the trade-safety switch from
+/// the same strict read (UTC-SAFETY; no extra file read). The page latch
+/// stays fail-OPEN (only a present marker restores it, so an unreadable one
+/// can never silence a page); the switch is fail-CLOSED (an unreadable
+/// marker blocks entries, §28.7). Two small file reads, cold.
+fn restore_latch(safety: &crate::trade_safety::SafetySwitch, day: i64) -> [bool; 2] {
+    restore_latch_in(
+        safety,
+        day,
+        std::path::Path::new(crate::daily_task_marker::DAILY_MARKER_DIR),
+    )
+}
+
+/// [`restore_latch`] against a marker folder (the test seam).
+fn restore_latch_in(
+    safety: &crate::trade_safety::SafetySwitch,
+    day: i64,
+    base: &std::path::Path,
+) -> [bool; 2] {
+    let states = crate::trade_safety::seed_from_markers_in(safety, day, base);
+    states.map(|state| state == crate::daily_task_marker::MarkerState::Present)
 }
 
 fn run_persist(rx: &Receiver<(NaiveDate, Cause)>) {
@@ -285,7 +301,8 @@ impl FeedTimePage {
     /// drain, before its loop (two small file reads).
     pub(super) fn start() -> Self {
         let day = super::ist_day_number_now();
-        let restored = restore_latch(day);
+        let safety = crate::trade_safety::default_switch();
+        let restored = restore_latch(safety, day);
         let (tx, rx) = sync_channel(PERSIST_DEPTH);
         let persist = match std::thread::Builder::new()
             .name("tv-feed-time-latch".to_string())
@@ -304,13 +321,14 @@ impl FeedTimePage {
                 None
             }
         };
-        Self::with_writer(day, restored, persist)
+        Self::with_writer(day, restored, persist, safety)
     }
 
     fn with_writer(
         day: i64,
         restored: [bool; 2],
         persist: Option<SyncSender<(NaiveDate, Cause)>>,
+        safety: &'static crate::trade_safety::SafetySwitch,
     ) -> Self {
         Self {
             episode: FeedTimeEpisode::new(day, restored),
@@ -321,6 +339,7 @@ impl FeedTimePage {
             reversion_held_day: i64::MIN,
             reversion_pending_day: None,
             handoff_failures_logged: (i64::MIN, 0),
+            safety,
         }
     }
 
@@ -331,7 +350,7 @@ impl FeedTimePage {
         let day = receipt_ist_day(now_nanos);
         if day != self.restored_day {
             self.restored_day = day;
-            self.restored = restore_latch(day);
+            self.restored = restore_latch(self.safety, day);
         }
         let sod = receipt_ist_secs(now_nanos).rem_euclid(86_400) as u64;
         let muhurat = ist_day_date(day).and_then(|date| {
@@ -418,11 +437,22 @@ impl FeedTimePage {
             Cause::NoCandles => "no candle has formed for 10 minutes while prices arrive",
             Cause::FormatReverted => return,
         };
+        // UTC-SAFETY (§28.7): block today's new paper entries FIRST, before
+        // the page and before the hand-off, so a full queue or a missing
+        // writer thread still blocks in RAM. One CAS, no allocation.
+        let bit = match cause {
+            Cause::PricesOutsideSession => crate::trade_safety::CAUSE_A,
+            Cause::NoCandles => crate::trade_safety::CAUSE_B,
+            Cause::FormatReverted => 0,
+        };
+        self.safety.engage(day, bit);
         error!(
             code = ErrorCode::DhanFeedTime01TradeTimesWrong.code_str(),
             cause = cause.label(),
+            trade_safety_engaged = true,
             "Dhan feed times look wrong during the session: {what}. Today is held out of the \
-             archive and the export until it is repaired; raw data is kept."
+             archive and the export until it is repaired; raw data is kept. New paper \
+             entries are paused for today; exits still go out."
         );
         if let Some(index) = self.restored.get_mut(cause.index()) {
             *index = true;
@@ -591,7 +621,7 @@ mod tests {
     }
 
     fn page_with(tx: Option<SyncSender<(NaiveDate, Cause)>>) -> FeedTimePage {
-        FeedTimePage::with_writer(DAY, [false; 2], tx)
+        FeedTimePage::with_writer(DAY, [false; 2], tx, crate::trade_safety::default_switch())
     }
 
     #[test]
@@ -658,6 +688,59 @@ mod tests {
         );
         assert_eq!(page.reversion_pending_day, None);
         assert!(!page.hold_after_reversion_page(1, DAY), "once a day");
+    }
+
+    #[test]
+    fn test_fire_engages_before_error_and_hand_off_with_no_writer() {
+        // UTC-SAFETY: with no writer thread the hand-off fails, and today's
+        // entries are blocked anyway (the engage comes first, in RAM).
+        let mut page = page_with(None);
+        assert_eq!(page.safety.blocked_on(DAY), None);
+        page.fire(DAY, Cause::PricesOutsideSession);
+        assert_eq!(
+            page.safety.blocked_on(DAY),
+            Some(crate::trade_safety::CAUSE_A)
+        );
+        page.fire(DAY, Cause::NoCandles);
+        assert_eq!(
+            page.safety.blocked_on(DAY),
+            Some(crate::trade_safety::CAUSE_A | crate::trade_safety::CAUSE_B)
+        );
+        assert_eq!(
+            page.safety.blocked_on(DAY + 1),
+            None,
+            "ends at the day roll"
+        );
+    }
+
+    #[test]
+    fn test_restore_latch_seeds_switch_and_stays_fail_open() {
+        let base =
+            std::env::temp_dir().join(format!("tv-feed-time-restore-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let date = ist_day_date(DAY).expect("date");
+        // Present (cause A): the latch restores and the switch blocks.
+        let safety = crate::trade_safety::default_switch();
+        assert!(crate::daily_task_marker::test_write_marker_in(&base, TASK_CAUSE_A, date).is_ok());
+        assert_eq!(restore_latch_in(safety, DAY, &base), [true, false]);
+        assert_eq!(safety.blocked_on(DAY), Some(crate::trade_safety::CAUSE_A));
+        // Unreadable (cause B torn): the page latch stays OPEN (false, so an
+        // unreadable marker can never silence a page) while the switch
+        // blocks (fail closed).
+        let torn = crate::daily_task_marker::daily_marker_path(TASK_CAUSE_B, date);
+        let torn = base.join(torn.file_name().expect("name"));
+        assert!(std::fs::write(&torn, b"half").is_ok());
+        let safety = crate::trade_safety::default_switch();
+        assert_eq!(restore_latch_in(safety, DAY, &base), [true, false]);
+        assert_eq!(
+            safety.blocked_on(DAY),
+            Some(crate::trade_safety::CAUSE_A | crate::trade_safety::CAUSE_MARKER_UNREADABLE)
+        );
+        // Absent: nothing restored, nothing blocked.
+        let safety = crate::trade_safety::default_switch();
+        assert_eq!(restore_latch_in(safety, DAY + 1, &base), [false, false]);
+        assert_eq!(safety.blocked_on(DAY + 1), None);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

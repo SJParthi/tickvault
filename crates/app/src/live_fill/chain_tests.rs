@@ -2502,3 +2502,163 @@ fn test_fold_flags_a_counter_restart_as_stale_and_restarted() {
     assert!(stats.cumulative_restarted);
     assert!(stats.stale_packet);
 }
+
+// ---------------------------------------------------------------------------
+// UTC-SAFETY (daily-universe §28.7): the trade-safety switch's chain gates.
+// ---------------------------------------------------------------------------
+
+/// Gate A: while today's feed-time alarm is on, an entry is refused at
+/// decide with the Decision and Reject rows, counted twice (refused and
+/// entries_blocked_feed_time), and no Execute is sent.
+#[test]
+fn test_gate_a_entry_refused_decision_and_reject_rows() {
+    let mut c = chain(emitting(), true);
+    assert!(
+        c.safety_switch()
+            .engage(c.day(), crate::trade_safety::CAUSE_A)
+    );
+    let mut f = Feed::new();
+    f.drive(&mut c, (OPEN, OPEN + 130, 66), rising, 1_000);
+    assert!(executions(&f.out).is_empty(), "no entry is sent");
+    let ev = events(&f.out);
+    let blocked: Vec<_> = ev
+        .iter()
+        .filter(|e| e.2.as_deref() == Some(crate::trade_safety::REASON_FEED_TIME_ALARM))
+        .collect();
+    assert!(!blocked.is_empty(), "{ev:?}");
+    assert!(
+        blocked
+            .iter()
+            .all(|e| e.0 == LiveOrderEventKind::Reject && e.1 == 1)
+    );
+    assert!(ev.iter().any(|e| e.0 == LiveOrderEventKind::Decision));
+    let counters = c.counters();
+    assert_eq!(counters.entries_blocked_feed_time, blocked.len() as u64);
+    assert!(counters.refused >= counters.entries_blocked_feed_time);
+    assert_eq!(counters.sent, 0);
+}
+
+/// Gate A never touches an exit: a long the runtime reports is closed by the
+/// strategy's exit exactly as with the switch off.
+#[test]
+fn test_gate_a_exit_identical_to_switch_off() {
+    let run = |blocked: bool| {
+        let engine = Recorder {
+            emit_all: true,
+            exits: true,
+            side: Some(Side::Sell),
+            ..Recorder::default()
+        };
+        let mut c = chain(engine, true);
+        if blocked {
+            c.safety_switch()
+                .engage(c.day(), crate::trade_safety::CAUSE_B);
+        }
+        c.on_position_report(&PositionReport {
+            security_id: 2885,
+            segment: 1,
+            expected_shares: 0,
+            runtime_net_shares: 10,
+        });
+        let mut f = Feed::new();
+        f.drive(&mut c, (OPEN, OPEN + 130, 66), rising, 1_000);
+        (
+            executions(&f.out),
+            c.net_shares[0],
+            c.counters().entries_blocked_feed_time,
+        )
+    };
+    let (off, off_net, off_blocked) = run(false);
+    let (on, on_net, on_blocked) = run(true);
+    assert!(!on.is_empty() && on.iter().all(|x| x.exit), "{on:?}");
+    assert_eq!(
+        format!("{on:?}"),
+        format!("{off:?}"),
+        "an exit is never changed by the switch"
+    );
+    assert_eq!((on_net, off_net), (0, 0));
+    assert_eq!((on_blocked, off_blocked), (0, 0));
+}
+
+/// Yesterday's alarm never blocks today, and tomorrow's never blocks today.
+#[test]
+fn test_gate_a_ignores_yesterdays_block() {
+    for other in [-1, 1] {
+        let mut c = chain(emitting(), true);
+        c.safety_switch()
+            .engage(c.day() + other, crate::trade_safety::CAUSE_A);
+        let mut f = Feed::new();
+        f.drive(&mut c, (OPEN, OPEN + 130, 66), rising, 1_000);
+        assert!(
+            !executions(&f.out).is_empty(),
+            "day {other}: {:?}",
+            events(&f.out)
+        );
+        assert_eq!(c.counters().entries_blocked_feed_time, 0);
+    }
+}
+
+/// Gate B: an entry already held when the alarm fires is refused at its
+/// finish with a seq-2 Reject that carries the model price, before any
+/// position count moves; the exit decided against it still finishes (exits
+/// pass), the chain goes short, and the runtime's position report (which
+/// booked nothing for the entry and refused the exit) resyncs it to flat.
+#[test]
+fn test_gate_b_refuses_held_entry_before_any_mutation_and_held_exit_finishes() {
+    let engine = Recorder {
+        entry_then_exit: true,
+        ..Recorder::default()
+    };
+    let mut c = chain(engine, true);
+    let mut f = Feed::new();
+    // As test_regression_an_exit_decided_while_its_entry_is_held_is_placed:
+    // the entry is decided and held, waiting for volume in the 09:16 minute.
+    f.drive(&mut c, (OPEN, OPEN + 60, 0), |_| 100.0, 1_000);
+    f.drive(&mut c, (OPEN + 60, OPEN + 119, 0), |_| 100.0, 0);
+    assert!(executions(&f.out).is_empty(), "the entry is still held");
+    // The alarm fires now.
+    c.safety_switch()
+        .engage(c.day(), crate::trade_safety::CAUSE_B);
+    f.drive(&mut c, (OPEN + 119, OPEN + 200, 5), |_| 100.0, 1_000);
+    let ev = events(&f.out);
+    let gate_b: Vec<_> = f
+        .out
+        .iter()
+        .filter_map(|o| match o {
+            ChainOutput::Event(e)
+                if e.reason.as_deref() == Some(crate::trade_safety::REASON_FEED_TIME_ALARM) =>
+            {
+                Some((**e).clone())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(gate_b.len(), 1, "{ev:?}");
+    assert_eq!(gate_b[0].event, LiveOrderEventKind::Reject);
+    assert_eq!(gate_b[0].seq, 2);
+    assert!(gate_b[0].model_price_paise.is_some(), "{:?}", gate_b[0]);
+    assert_eq!(gate_b[0].remainder_qty, Some(10));
+    let x = executions(&f.out);
+    assert!(x.iter().all(|e| e.exit), "only the exit is sent: {x:?}");
+    assert_eq!(x.len(), 1, "{ev:?}");
+    assert_eq!(c.counters().entries_blocked_feed_time, 1);
+    // The chain counted the exit against an entry the runtime never booked.
+    assert!(c.net_shares[0] < 0, "{}", c.net_shares[0]);
+    c.on_position_report(&PositionReport {
+        security_id: 2885,
+        segment: 1,
+        expected_shares: c.net_shares[0],
+        runtime_net_shares: 0,
+    });
+    assert_eq!(c.net_shares[0], 0, "resynced to what the runtime holds");
+}
+
+/// The chain's day key is the trade-safety day formula on the same clock.
+#[test]
+fn test_chain_day_equals_trade_safety_day() {
+    let c = chain(emitting(), true);
+    assert_eq!(
+        c.day(),
+        crate::trade_safety::ist_day_of_ist_nanos((OPEN - 600) * NS)
+    );
+}

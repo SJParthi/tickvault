@@ -776,3 +776,45 @@ fn test_fill_model_refused_is_priced_against_the_stored_seconds() {
         assert!(priced_signal_ids(&rows).is_empty(), "{reason}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// UTC-SAFETY: the feed-time alarm's refusals in the daily report.
+// ---------------------------------------------------------------------------
+
+/// Gate B (a held entry refused at its finish, seq 2) took no shares of its
+/// seconds, so the later orders of its instrument are re-priced as usual,
+/// not read as `shared_volume_unknown`.
+#[test]
+fn test_feed_time_reject_is_worked_out_share() {
+    let mut rows = vec![decision(1), row(1, 1, "built", T10 + 2_100_000)];
+    let mut reject = row(1, 2, "reject", T10 + 70 * NS);
+    reject.reason = Some(crate::trade_safety::REASON_FEED_TIME_ALARM.to_owned());
+    reject.model_price_paise = Some(10_105);
+    rows.push(reject);
+    let known = held_share_known(&rows);
+    assert_eq!(known.get(&1), Some(&true), "{known:?}");
+}
+
+/// `entries_blocked` counts the chain's `feed_time_alarm` (gate A at seq 1,
+/// gate B at seq 2) and the runtime's `refused:feed_time_alarm` (gate C);
+/// gate A reads as a chain skip, gate C as a runtime reject.
+#[test]
+fn test_entries_blocked_counts_both_reasons_gate_a_skipped_gate_c_rejected() {
+    let mut rows = Vec::new();
+    // 1: gate A (refused at decide).
+    rows.push(decision(1));
+    let mut a = row(1, 1, "reject", T10 + 2_000_000);
+    a.reason = Some(crate::trade_safety::REASON_FEED_TIME_ALARM.to_owned());
+    rows.push(a);
+    // 2: gate C (the runtime refused the Execute).
+    rows.push(decision(2));
+    rows.push(row(2, 1, "built", T10 + 2_100_000));
+    let mut c = row(2, 2, "reject", T10 + 70 * NS);
+    c.reason = Some(crate::trade_safety::RUNTIME_REASON_FEED_TIME_ALARM.to_owned());
+    rows.push(c);
+    let r = build_report(DAY, &rows, &[], ctx());
+    assert_eq!(r.counts.entries_blocked, 2, "{:?}", r.counts);
+    assert_eq!(r.counts.orders, 2);
+    assert_eq!(r.counts.skipped, 1, "gate A is the chain's own skip");
+    assert_eq!(r.counts.rejected, 1, "gate C is a runtime reject");
+}

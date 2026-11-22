@@ -236,6 +236,14 @@ pub fn boot_decision(
 // TEST-EXEMPT: boot glue — every decision is the pure `boot_decision` (tested); the chain start is `start_chain` (tested with test-double engines); the writer has its own source-scan ratchet.
 pub fn boot(config: &ApplicationConfig) -> BootOutcome {
     register_metrics();
+    // UTC-SAFETY (§28.7): seed today's trade-safety switch from the day's
+    // feed-time latch markers on EVERY boot outcome, before the order
+    // runtime and the drain start (fail closed on an unreadable marker).
+    crate::trade_safety::register_metrics();
+    crate::trade_safety::seed_from_markers(
+        crate::trade_safety::default_switch(),
+        crate::trade_safety::ist_day_now(),
+    );
     let engine = select_engine();
     let outcome = boot_decision(
         config.live_fill.enabled,
@@ -467,6 +475,9 @@ pub fn send_output(
 pub struct CounterPublisher {
     refused: metrics::Counter,
     late: metrics::Counter,
+    /// `tv_live_fill_entries_blocked_feed_time_total` (UTC-SAFETY gates A and
+    /// B), resolved once.
+    entries_blocked: metrics::Counter,
     taints: [metrics::Counter; TaintReason::COUNT],
     published: chain::ChainCounters,
     taints_published: [u64; TaintReason::COUNT],
@@ -484,6 +495,7 @@ impl CounterPublisher {
         Self {
             refused: metrics::counter!(ORDERS_REFUSED_COUNTER),
             late: metrics::counter!(LATE_TICKS_COUNTER),
+            entries_blocked: metrics::counter!(crate::trade_safety::CHAIN_BLOCKED_COUNTER),
             taints: std::array::from_fn(
                 |i| metrics::counter!(TAINT_COUNTER, "reason" => TaintReason::ALL[i].as_str()),
             ),
@@ -514,6 +526,10 @@ impl CounterPublisher {
             .increment(c.refused.saturating_sub(published.refused));
         self.late
             .increment(c.late_ticks.saturating_sub(published.late_ticks));
+        self.entries_blocked.increment(
+            c.entries_blocked_feed_time
+                .saturating_sub(published.entries_blocked_feed_time),
+        );
         for (i, counter) in self.taints.iter().enumerate() {
             counter.increment(t[i].saturating_sub(self.taints_published[i]));
         }
