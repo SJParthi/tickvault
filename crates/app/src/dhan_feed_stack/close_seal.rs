@@ -255,13 +255,13 @@ mod close_seal_cutoff_tests {
     }
 
     #[test]
-    fn longest_bucket_secs_is_the_hour() {
+    fn test_longest_bucket_secs_is_the_hour() {
         assert_eq!(LONGEST_BUCKET_SECS, 3_600);
         assert_eq!(CLOSE_SEAL_DELAY_SECS, 245);
     }
 
     #[test]
-    fn close_seal_cutoff_zero_until_end_plus_margin_plus_interval() {
+    fn test_close_seal_cutoff_zero_until_end_plus_margin_plus_interval() {
         let plan = regular();
         assert_eq!(plan.cutoff(at(15, 44, 4), at(15, 39, 50)), 0);
         assert_eq!(plan.cutoff(at(15, 44, 5), at(15, 39, 50)), at(16, 40, 0));
@@ -269,7 +269,7 @@ mod close_seal_cutoff_tests {
     }
 
     #[test]
-    fn close_seal_cutoff_zero_without_session_trade() {
+    fn test_close_seal_cutoff_zero_without_session_trade() {
         let plan = regular();
         // No trade folded today (yesterday's watermark, or an empty boot).
         assert_eq!(plan.cutoff(at(15, 50, 0), 0), 0);
@@ -279,7 +279,7 @@ mod close_seal_cutoff_tests {
     }
 
     #[test]
-    fn close_seal_cutoff_capped_at_next_session_start() {
+    fn test_close_seal_cutoff_capped_at_next_session_start() {
         let plan = ClosePlan::build(
             DAY,
             true,
@@ -304,7 +304,7 @@ mod close_seal_cutoff_tests {
     }
 
     #[test]
-    fn close_seal_cutoff_capped_at_midnight() {
+    fn test_close_seal_cutoff_capped_at_midnight() {
         let day_end = DAY_START + 86_400;
         let cutoff = close_seal_cutoff(
             at(23, 55, 0),
@@ -316,7 +316,7 @@ mod close_seal_cutoff_tests {
     }
 
     #[test]
-    fn close_seal_cutoff_muhurat_published_end() {
+    fn test_close_seal_cutoff_muhurat_published_end() {
         let plan = ClosePlan::build(
             DAY,
             true,
@@ -330,7 +330,7 @@ mod close_seal_cutoff_tests {
     }
 
     #[test]
-    fn close_seal_cutoff_muhurat_only_date_no_regular_term() {
+    fn test_close_seal_cutoff_muhurat_only_date_no_regular_term() {
         let plan = ClosePlan::build(
             DAY,
             false,
@@ -345,7 +345,7 @@ mod close_seal_cutoff_tests {
     }
 
     #[test]
-    fn close_plan_build_sorts_and_cutoff_checks_the_day() {
+    fn test_build_sorts_sessions_and_cutoff_checks_the_day() {
         let plan = ClosePlan::build(DAY, true, Some((7 * 3_600, 8 * 3_600)));
         assert_eq!(
             plan.sessions(),
@@ -360,7 +360,7 @@ mod close_seal_cutoff_tests {
     }
 
     #[test]
-    fn close_plan_for_installed_calendar_keeps_the_day() {
+    fn test_for_installed_calendar_keeps_the_day() {
         // A unit-test process may or may not have a calendar installed; either
         // way a weekday plan holds at most two sessions and the day is kept.
         let (plan, _missing) = ClosePlan::for_installed_calendar(DAY);
