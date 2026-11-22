@@ -115,6 +115,12 @@ impl LiveIngest {
         // the rebuild (scope lock 2026-10-02).
         self.load_replay_backup();
         if let Some(kept) = live_kept {
+            // With live's repeat numbers, the drain's own filter runs and
+            // every row live wrote is written by number: exact, where the
+            // never-skip fallback writes millions of repeats live skipped.
+            if kept.repeat_numbers() > 0 && self.replay_backup.is_some() {
+                self.aux_repeat = super::aux_repeat::production_filter();
+            }
             match self.replay_backup.as_mut() {
                 Some(r) => r.set_live_kept(kept),
                 None if kept.sizes().0 == 0 => {}
@@ -949,5 +955,49 @@ mod live_fold_tests {
         let mut out = WalRefoldOutcome::default();
         ingest.refold_past_day_segment(&frames, &[], &mut out);
         assert_eq!(out.refolded, 1, "{out:?}");
+    }
+
+    /// With live's repeat numbers installed, the rebuild writes exactly the
+    /// repeat rows live wrote: three identical wrong-day packets of which
+    /// live wrote only the first give one row (the drain's filter skips the
+    /// other two), where the never-skip fallback writes three.
+    #[test]
+    fn test_live_repeat_numbers_make_the_wrong_day_rows_exact() {
+        let day_start = u32::try_from(DAY_START_UTC + 19_800).expect("u32");
+        let trade = DAY_START_UTC - 86_400 + 15 * 3_600 + 29 * 60;
+        let frames: Vec<_> = (0..3i64)
+            .map(|i| {
+                let (r, f) = ticker_at(
+                    2_885,
+                    1,
+                    trade,
+                    DAY_START_UTC + 10 * 3_600 + 60 * i,
+                    1_500.0,
+                );
+                ((1u64 + i as u64) << 17, r, WalEndpoint::MainFeed, f)
+            })
+            .collect();
+        let aux_rows = |with_record: bool| {
+            let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
+            ingest.install_replay_backup(Some(&backup_history((4_242, 2))));
+            let record = with_record.then(|| {
+                let mut k = crate::main_feed_backup::LiveKept::new(&[(4_242, 2)], &[]);
+                k.note_live_row(tickvault_storage::day_repair_coverage::LiveRow {
+                    seq: 1 << 17,
+                    backup: false,
+                    repeat: true,
+                });
+                k
+            });
+            ingest
+                .begin_past_day_refold(day_start, day_start + 8 * 3_600, record)
+                .expect("begin");
+            let mut out = WalRefoldOutcome::default();
+            ingest.begin_past_day_segment(&frames);
+            ingest.refold_past_day_segment(&frames, &[], &mut out);
+            ingest.past_day_row_counts().2
+        };
+        assert_eq!(aux_rows(true), 1, "exactly live's row");
+        assert_eq!(aux_rows(false), 3, "the fallback writes every repeat");
     }
 }

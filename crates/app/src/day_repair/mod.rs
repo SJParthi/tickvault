@@ -796,11 +796,14 @@ pub(crate) async fn run_apply<I: RepairIo>(
             bail!("the quarantine copy of {obj} no longer verifies; not dropping it");
         }
         let used = io.drop_partition(p, &rec).await?;
-        if used != rec.key {
+        let detail = if used == rec.key {
+            String::new()
+        } else {
             info!(object = %obj, first = %rec.key, second = %used, "day repair: dropped against a re-export");
-        }
+            format!("checked against {used}")
+        };
         note(log, Step::Drop, &obj, rec.encode())?;
-        io.audit(Step::Drop, &obj, Some(&rec), "dropped", "")
+        io.audit(Step::Drop, &obj, Some(&rec), "dropped", &detail)
             .await?;
     }
     // A partition an earlier run copied and dropped (the drop landed, the
@@ -890,6 +893,12 @@ pub(crate) async fn run_verify<I: RepairIo>(
         .find(Step::Rebuild, DAY_OBJECT)
         .and_then(|l| RebuildReport::decode(&l.detail))
         .context("no rebuild recorded; run apply first")?;
+    // The report must belong to the LAST rebuild: a later apply that dropped
+    // again and then failed to rebuild leaves an older report as the last
+    // `rebuild day` line (2026-11-22 review).
+    if let Some(stale) = report_older_than_last_drop(log.lines()) {
+        bail!("{stale}; run apply again");
+    }
     let unfinished = rep.unfinished_reasons();
     if !unfinished.is_empty() {
         bail!(
@@ -938,6 +947,28 @@ pub(crate) async fn run_verify<I: RepairIo>(
     io.audit(Step::Done, DAY_OBJECT, None, "released", "")
         .await?;
     Ok(())
+}
+
+/// Why the last `rebuild day` report is not the last rebuild's, or `None`
+/// when it is: a drop or a `rebuild-start` line after it means a later apply
+/// dropped again and its rebuild never finished. Pure, O(lines).
+#[must_use]
+pub fn report_older_than_last_drop(lines: &[ProgressLine]) -> Option<String> {
+    let report = lines
+        .iter()
+        .rposition(|l| l.step == Step::Rebuild && l.object == DAY_OBJECT)?;
+    lines[report + 1..]
+        .iter()
+        .find(|l| {
+            l.step == Step::Drop || (l.step == Step::Rebuild && l.object == REBUILD_START_OBJECT)
+        })
+        .map(|l| {
+            format!(
+                "the last rebuild report is older than {} {}: that apply's rebuild did not finish",
+                l.step.as_str(),
+                l.object
+            )
+        })
 }
 
 /// The tick-path tables whose rows conserve one row per packet across the
@@ -3074,6 +3105,131 @@ mod tests {
         let err = block_on(ensure_originals_pinned(&mut io, &mut log)).expect_err("refused");
         assert!(format!("{err:#}").contains("refusing to pin"), "{err:#}");
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The box on 2026-11-22: the first run's copy and drop lines, one
+    /// `rebuild day` line in the OLD report format, no `rebuild-start`, the
+    /// first rebuild's partitions back in QuestDB, and a live `.sha-` copy
+    /// beside one recorded copy. The next apply pins before it copies or
+    /// drops anything, the rebuild gets exactly the live keys (the `.sha-`
+    /// one included), and the verify then reads the new report.
+    #[test]
+    fn test_the_box_state_of_2026_11_22_reruns_on_the_live_day_only() {
+        let (root, remote, _files) = setup(3, 0);
+        let t09 = format!("ticks/{REPAIR_DAY}T09");
+        let t10 = format!("ticks/{REPAIR_DAY}T10");
+        let candles = format!("candles_1m/{REPAIR_DAY}");
+        let rec = |obj: &str| CopyRecord {
+            key: format!("q/{obj}"),
+            sha256: "aa".to_owned(),
+            rows: 1,
+            bytes: 1,
+        };
+        let progress = ProgressLog::path_for(&root.join(DAY_REPAIR_DIR), REPAIR_DAY);
+        {
+            let mut log = ProgressLog::open(&progress).expect("log");
+            for obj in [&candles, &t09, &t10] {
+                log.append(pline(Step::Copy, obj, &rec(obj).encode()))
+                    .expect("copy");
+            }
+            for obj in [&candles, &t09, &t10] {
+                log.append(pline(Step::Drop, obj, &rec(obj).encode()))
+                    .expect("drop");
+            }
+            log.append(pline(Step::Rebuild, DAY_OBJECT, "segments=1;frames=1"))
+                .expect("old report");
+        }
+        {
+            let mut r = remote.borrow_mut();
+            for obj in [&candles, &t09, &t10] {
+                r.copies.insert(rec(obj).key, rec(obj));
+            }
+            let live_sha = CopyRecord {
+                key: format!("q/{t09}.sha-aa"),
+                ..rec(&t09)
+            };
+            r.copies.insert(live_sha.key.clone(), live_sha);
+            r.rebuilds = 1;
+            r.rebuild_recreates = true;
+            // The first rebuild's partitions are in QuestDB again.
+            let parts = r.live_tick_partitions.clone();
+            r.partitions = parts.into_iter().collect();
+            r.partitions.insert(Partition {
+                table: "tick_quotes".to_owned(),
+                partition: format!("{REPAIR_DAY}T15"),
+            });
+        }
+        let day = nov20();
+        let wal = root.join("data/ws_wal");
+        let mut io = FakeIo {
+            remote: &remote,
+            root: root.clone(),
+            fail_at: None,
+            calls: 0,
+        };
+        let mut log = ProgressLog::open(&progress).expect("log");
+        assert!(
+            block_on(run_verify(&mut io, &mut log, &root, day, day)).is_err(),
+            "the old-format report cannot be verified"
+        );
+        block_on(run_apply(&mut io, &mut log, &root, &wal, day)).expect("apply");
+        let lines = log.lines().to_vec();
+        let old_report = lines
+            .iter()
+            .position(|l| l.step == Step::Rebuild && l.object == DAY_OBJECT)
+            .expect("the old report");
+        let first_original = lines
+            .iter()
+            .position(|l| l.step == Step::Original)
+            .expect("pinned");
+        assert!(first_original > old_report);
+        assert!(
+            lines[old_report + 1..first_original]
+                .iter()
+                .all(|l| !matches!(l.step, Step::Copy | Step::Drop)),
+            "nothing copied or dropped before the pin: {lines:?}"
+        );
+        {
+            let r = remote.borrow();
+            assert!(r.violations.is_empty(), "{:?}", r.violations);
+            assert_eq!(
+                r.originals_seen.last().expect("rebuilt"),
+                &vec![
+                    format!("q/{t09}"),
+                    format!("q/{t09}.sha-aa"),
+                    format!("q/{t10}")
+                ]
+            );
+        }
+        block_on(run_verify(&mut io, &mut log, &root, day, day)).expect("verify");
+        let (objects, pinned) = remote
+            .borrow()
+            .coverage_seen
+            .last()
+            .cloned()
+            .expect("coverage");
+        assert_eq!(objects, vec![t09.clone(), t10.clone()]);
+        assert_eq!(
+            pinned[&t09],
+            vec![format!("q/{t09}"), format!("q/{t09}.sha-aa")]
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn test_report_older_than_last_drop_refuses_a_stale_report() {
+        let fresh = vec![
+            pline(Step::Drop, "ticks/A", ""),
+            pline(Step::Rebuild, DAY_OBJECT, ""),
+        ];
+        assert_eq!(report_older_than_last_drop(&fresh), None);
+        let mut stale = fresh.clone();
+        stale.push(pline(Step::Drop, "ticks/A", ""));
+        assert!(report_older_than_last_drop(&stale).is_some_and(|m| m.contains("did not finish")));
+        let mut started = fresh;
+        started.push(pline(Step::Rebuild, REBUILD_START_OBJECT, ""));
+        assert!(report_older_than_last_drop(&started).is_some());
+        assert_eq!(report_older_than_last_drop(&[]), None);
     }
 
     #[test]

@@ -268,6 +268,8 @@ pub struct RebuildReport {
     pub live_kept_fallback: u64,
     pub live_kept_fallback_kept: u64,
     pub duplicates_written: u64,
+    /// Repeat-kind rows live wrote, each written again by number.
+    pub live_repeat_numbers: u64,
 }
 
 macro_rules! report_fields {
@@ -309,7 +311,8 @@ macro_rules! report_fields {
             dropped_for_twin,
             live_kept_fallback,
             live_kept_fallback_kept,
-            duplicates_written
+            duplicates_written,
+            live_repeat_numbers
         )
     };
 }
@@ -589,6 +592,7 @@ pub async fn rebuild_day(
     std::fs::create_dir_all(staging).with_context(|| format!("create {}", staging.display()))?;
     let live_kept = live_kept_for_day(config, &s3, day, originals, staging).await?;
     let (kept_contracts, kept_numbers) = live_kept.sizes();
+    let repeat_numbers = live_kept.repeat_numbers();
     let mut live_kept = Some(live_kept);
     let spill_before = spill_files(root);
     let refused_before = ltt_refused_total();
@@ -737,6 +741,7 @@ pub async fn rebuild_day(
     report.live_kept_fallback = kept_counts.fallback;
     report.live_kept_fallback_kept = kept_counts.fallback_kept;
     report.duplicates_written = kept_counts.duplicates_written;
+    report.live_repeat_numbers = repeat_numbers as u64;
     info!(
         contracts = kept_contracts,
         numbers = kept_numbers,
@@ -783,21 +788,30 @@ async fn live_kept_for_day(
                 path.display()
             )
         })?;
-    let contracts = contracts_published_on(&history, ist_day_number(day)?);
+    let day_number = ist_day_number(day)?;
+    // A history trimmed through the day no longer holds its publications: an
+    // empty set would then judge every copy by the dedup, the failure this
+    // record exists to fix. Refuse instead.
+    if history.trimmed_through_day.is_some_and(|t| t >= day_number) {
+        bail!(
+            "the backup history was trimmed through day {} (the repaired day is {day_number}); \
+             its publications are gone",
+            history.trimmed_through_day.unwrap_or_default()
+        );
+    }
+    let contracts = contracts_published_on(&history, day_number);
     if contracts.is_empty() {
         info!("day repair: no backup publication on the day; every copy is judged by the dedup");
-        return Ok(LiveKept::new(&[], &[]));
     }
     if originals.is_empty() {
-        bail!(
-            "{} backup contracts on the day but no original quarantine copy to read",
-            contracts.len()
-        );
+        bail!("no original quarantine copy to read the live numbers from");
     }
     let set: std::sync::Arc<std::collections::HashSet<(u64, u8), ahash::RandomState>> =
         std::sync::Arc::new(contracts.iter().copied().collect());
-    let mut seqs: Vec<u64> = Vec::new();
-    let mut rows = 0u64;
+    // The record is filled straight from the reader (no intermediate list,
+    // so no doubling buffer beside the sets).
+    let mut kept = LiveKept::new(&contracts, &[]);
+    let (mut rows, mut unjudged) = (0u64, 0u64);
     for (i, key) in originals.iter().enumerate() {
         super::window_open_now(config)?;
         let file = staging.join(format!("live-kept-{i}.csv.gz"));
@@ -807,26 +821,31 @@ async fn live_kept_for_day(
             .with_context(|| format!("download {key}"))?;
         let set_for_read = std::sync::Arc::clone(&set);
         let read_path = file.clone();
-        let (read, mut part) = tokio::task::spawn_blocking(move || {
-            let mut part = Vec::new();
+        let (read, back) = tokio::task::spawn_blocking(move || {
             let keep = |sid: u64, seg: u8| set_for_read.contains(&(sid, seg));
-            tickvault_storage::day_repair_coverage::read_kept_seqs_gz(&read_path, &keep, &mut part)
-                .map(|r| (r, part))
+            let r = tickvault_storage::day_repair_coverage::read_kept_seqs_gz(
+                &read_path,
+                &keep,
+                &mut |row| kept.note_live_row(row),
+            );
+            r.map(|r| (r, kept))
         })
         .await
         .context("the live-number reader stopped")?
         .with_context(|| format!("read {key}"))?;
+        kept = back;
         std::fs::remove_file(&file).with_context(|| format!("remove {}", file.display()))?;
         rows = rows.saturating_add(read.rows);
-        seqs.append(&mut part);
+        unjudged = unjudged.saturating_add(read.unjudged);
     }
-    let kept = LiveKept::new(&contracts, &seqs);
     info!(
         contracts = contracts.len(),
         copies = originals.len(),
         rows_read = rows,
+        rows_unjudged = unjudged,
         numbers = kept.sizes().1,
-        "day repair: the numbers live wrote for the day's backup contracts are loaded"
+        repeat_numbers = kept.repeat_numbers(),
+        "day repair: the numbers live wrote are loaded"
     );
     Ok(kept)
 }
@@ -836,7 +855,7 @@ async fn live_kept_for_day(
 ///
 /// # Errors
 /// Never for a real calendar date (the epoch date always exists).
-pub fn ist_day_number(day: NaiveDate) -> anyhow::Result<i64> {
+pub(crate) fn ist_day_number(day: NaiveDate) -> anyhow::Result<i64> {
     let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).context("the epoch date")?;
     Ok(day.signed_duration_since(epoch).num_days())
 }
@@ -1403,6 +1422,19 @@ mod tests {
         assert_eq!(chunk_gaps(&[0, 5, 12, 20], 10, 20), vec![2]);
         assert_eq!(chunk_gaps(&[0, 5], 0, 6), vec![0, 5]);
         assert!(chunk_gaps(&[], 0, 10).is_empty());
+    }
+
+    #[test]
+    fn test_ist_day_number_counts_days_since_the_epoch() {
+        let d = |y, m, dd| NaiveDate::from_ymd_opt(y, m, dd).expect("date");
+        assert_eq!(ist_day_number(d(1970, 1, 1)).expect("n"), 0);
+        // 2026-11-20 00:00 IST is 2026-11-19T18:30Z: the backup history's
+        // IST day of that instant is this number, and of one second before
+        // it the number below.
+        let n = ist_day_number(d(2026, 11, 20)).expect("n");
+        let start_utc = 1_795_113_000_i64;
+        assert_eq!((start_utc + 19_800).div_euclid(86_400), n);
+        assert_eq!((start_utc - 1 + 19_800).div_euclid(86_400), n - 1);
     }
 
     #[test]

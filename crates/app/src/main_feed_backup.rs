@@ -1174,6 +1174,9 @@ pub struct ReplayBackup {
 pub struct LiveKept {
     contracts: std::collections::HashSet<(u64, u8), ahash::RandomState>,
     seqs: std::collections::HashSet<u64, ahash::RandomState>,
+    /// The numbers of every Quote 61 repeat-kind row live wrote (any
+    /// contract): the rebuild writes exactly those (2026-11-22 review).
+    repeat_seqs: std::collections::HashSet<u64, ahash::RandomState>,
     /// Fingerprints of packets live wrote: this segment and the one before.
     twins: [std::collections::HashSet<u64, ahash::RandomState>; 2],
     /// Fingerprints of packets written by the dedup fallback, same two
@@ -1222,6 +1225,7 @@ impl LiveKept {
         Self {
             contracts: c,
             seqs: s,
+            repeat_seqs: std::collections::HashSet::with_hasher(ahash::RandomState::new()),
             twins: Default::default(),
             fallback_kept: Default::default(),
             counts: LiveKeptCounts::default(),
@@ -1232,6 +1236,31 @@ impl LiveKept {
     #[must_use]
     pub fn sizes(&self) -> (usize, usize) {
         (self.contracts.len(), self.seqs.len())
+    }
+
+    /// Records one row the live run wrote, read from an original copy:
+    /// its number joins the backup numbers and/or the repeat numbers.
+    /// Inserted straight into the sets while reading (no intermediate list).
+    /// O(1) average.
+    pub fn note_live_row(&mut self, row: tickvault_storage::day_repair_coverage::LiveRow) {
+        if row.backup {
+            self.seqs.insert(row.seq);
+        }
+        if row.repeat {
+            self.repeat_seqs.insert(row.seq);
+        }
+    }
+
+    /// Repeat-kind numbers held. O(1).
+    #[must_use]
+    pub fn repeat_numbers(&self) -> usize {
+        self.repeat_seqs.len()
+    }
+
+    /// Whether live wrote a repeat-kind row with number `seq`. O(1).
+    #[must_use]
+    pub fn wrote_repeat(&self, seq: u64) -> bool {
+        self.repeat_seqs.contains(&seq)
     }
 
     /// Whether `(security_id, segment)` is a backup contract of the day.
@@ -2706,6 +2735,42 @@ mod tests {
         assert!(r.live_kept_mut().is_none());
         r.set_live_kept(LiveKept::new(&[(1, SEG)], &[5]));
         assert_eq!(r.live_kept_mut().map(|k| k.sizes()), Some((1, 1)));
+    }
+
+    #[test]
+    fn test_note_live_row_fills_backup_and_repeat_numbers_wrote_repeat_and_repeat_numbers() {
+        use tickvault_storage::day_repair_coverage::LiveRow;
+        let mut k = LiveKept::new(&[(1, SEG)], &[]);
+        k.note_live_row(LiveRow {
+            seq: 10,
+            backup: true,
+            repeat: false,
+        });
+        k.note_live_row(LiveRow {
+            seq: 11,
+            backup: false,
+            repeat: true,
+        });
+        k.note_live_row(LiveRow {
+            seq: 12,
+            backup: true,
+            repeat: true,
+        });
+        k.note_live_row(LiveRow {
+            seq: 12,
+            backup: true,
+            repeat: true,
+        });
+        assert_eq!(k.sizes(), (1, 2));
+        assert_eq!(k.repeat_numbers(), 2);
+        assert!(k.wrote_repeat(11) && k.wrote_repeat(12) && !k.wrote_repeat(10));
+        k.begin_segment();
+        k.note_packet(1, SEG, Some(10), b"x");
+        assert!(!k.judge(1, SEG, Some(10), b"x", true));
+        assert!(
+            !k.judge(1, SEG, Some(11), b"y", false),
+            "a repeat number alone is not a backup number"
+        );
     }
 
     #[test]
