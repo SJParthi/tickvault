@@ -38,7 +38,8 @@ fn entry(date: &str, start: &str, end: &str) -> MuhuratTradingEntry {
 /// daytime 14:05-15:40 session (the shipped 2026 shape) on 2026-11-10, an
 /// 18:15-19:45 session on 2026-11-15 and a 14:30-16:00 session on 2026-11-22
 /// (audit round 4: both outrun the fold, one starts after it), and an
-/// 18:00-19:00 session on the trading day 2026-11-11 (plan item PR23).
+/// 18:00-19:00 session on the trading day 2026-11-11 (plan item PR23), and
+/// the shipped 14:05-15:40 shape on Sunday 2026-11-29 (PR23 review).
 /// Idempotent.
 fn install_calendar() {
     let cfg = TradingConfig {
@@ -57,6 +58,7 @@ fn install_calendar() {
             entry("2026-11-15", "18:15", "19:45"),
             entry("2026-11-22", "14:30", "16:00"),
             entry("2026-11-11", "18:00", "19:00"),
+            entry("2026-11-29", "14:05", "15:40"),
         ],
         nse_mock_trading_dates: vec![],
     };
@@ -221,8 +223,8 @@ fn exit_at_1542_still_force_seals() {
 
 /// Plan item PR23: on a trading day with a Muhurat evening, the 15:44 close
 /// seal never reaches an evening bucket; the evening's own term starts at
-/// the fold's evening end (19:30) plus the delay. A Muhurat-only date has no
-/// 15:44 term at all.
+/// the fold's evening end (19:30) plus the delay. A weekend Muhurat date keeps
+/// the regular term too (the fold admits 09:00-15:40 by time of day).
 #[test]
 fn muhurat_evening_bucket_not_sealed_at_1544() {
     install_calendar();
@@ -251,15 +253,58 @@ fn muhurat_evening_bucket_not_sealed_at_1544() {
         plan.cutoff(secs(2026, 11, 11, 19, 34, 5), secs(2026, 11, 11, 19, 29, 0)),
         secs(2026, 11, 11, 20, 30, 0)
     );
-    // A Muhurat-only date (Sunday 2026-11-08): no regular term.
+    // A weekend Muhurat date with an evening session (Sunday 2026-11-08,
+    // synthetic 18:00-19:00): the fold still admits 09:00-15:40 by time of
+    // day, so the regular term is there too (PR23 review), and it never
+    // reaches the evening.
     let (sunday, _) = ClosePlan::for_installed_calendar(ist_day(2026, 11, 8));
-    assert_eq!(sunday.sessions().len(), 1);
+    assert_eq!(sunday.sessions().len(), 2);
     assert_eq!(
         sunday.cutoff(secs(2026, 11, 8, 15, 44, 5), secs(2026, 11, 8, 15, 39, 0)),
-        0
+        secs(2026, 11, 8, 16, 40, 0)
     );
     assert_eq!(
         sunday.cutoff(secs(2026, 11, 8, 19, 34, 5), secs(2026, 11, 8, 18, 30, 0)),
         secs(2026, 11, 8, 20, 30, 0)
+    );
+}
+
+/// PR23 review (2026-11-22): the shipped 2026 shape, a DAYTIME Muhurat on a
+/// non-trading date (Sunday, 14:05-15:40), gets the close seal at 15:44:05.
+/// Before, the plan held the regular session only on a trading day and the
+/// daytime session gives no evening window, so the plan was empty and that
+/// day's last bars waited for the shutdown seal.
+#[test]
+fn test_regression_weekend_daytime_muhurat_gets_the_close_seal() {
+    install_calendar();
+    for (d, h, m) in [(29, 14, 20), (22, 14, 35)] {
+        let (plan, missing) = ClosePlan::for_installed_calendar(ist_day(2026, 11, d));
+        assert!(!missing);
+        assert_eq!(plan.sessions().len(), 1, "2026-11-{d}: the regular session");
+        let watermark = secs(2026, 11, d, 15, 39, 50);
+        assert_eq!(plan.cutoff(secs(2026, 11, d, 15, 44, 4), watermark), 0);
+        assert_eq!(
+            plan.cutoff(secs(2026, 11, d, 15, 44, 5), watermark),
+            secs(2026, 11, d, 16, 40, 0),
+            "2026-11-{d}: the close seal runs on a weekend daytime Muhurat"
+        );
+        // A trade early in the session is enough.
+        assert_eq!(
+            plan.cutoff(secs(2026, 11, d, 15, 50, 0), secs(2026, 11, d, h, m, 0)),
+            secs(2026, 11, d, 16, 40, 0)
+        );
+    }
+    // A plain Saturday (a mock trading day folds trades the same way): the
+    // term runs only once a trade of the day was folded.
+    let (saturday, _) = ClosePlan::for_installed_calendar(ist_day(2026, 11, 14));
+    assert_eq!(saturday.sessions().len(), 1);
+    assert_eq!(
+        saturday.cutoff(secs(2026, 11, 14, 15, 50, 0), secs(2026, 11, 13, 15, 39, 0)),
+        0,
+        "no trade today: nothing to seal"
+    );
+    assert_eq!(
+        saturday.cutoff(secs(2026, 11, 14, 15, 50, 0), secs(2026, 11, 14, 10, 0, 0)),
+        secs(2026, 11, 14, 16, 40, 0)
     );
 }

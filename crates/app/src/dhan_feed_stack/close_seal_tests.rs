@@ -195,8 +195,18 @@ fn test_crash_after_close_seal_loses_no_bar() {
     );
 }
 
+/// A crash after the close but before the close seal, then a boot at 16:00
+/// whose WAL replay re-folds the session: the boot writes NO bar, right or
+/// wrong. Every closing bar (the ones the close seal would have written)
+/// ended in the downtime or is still open with an instrument that never
+/// confirms, so the hand-over withholds and counts it (the honest limit in
+/// `close_seal.rs` and CLAUDE.md: such bars stay missing, never short), and
+/// the earlier bars are the previous process's stored rows, which a replay
+/// that begins mid-session cannot prove complete. PR23 review (2026-11-22):
+/// this test was named "rebuilds" and only checked bars conditionally, so it
+/// also passed with nothing written; it now pins that exact outcome.
 #[test]
-fn test_crash_after_close_before_seal_boot_replay_rebuilds() {
+fn test_crash_after_close_before_seal_boot_replay_writes_no_bar_short() {
     // The uninterrupted twin's bars, sealed at the close.
     let mut twin = session_book();
     twin.note_wall_clock(nanos(at(15, 44, 5)));
@@ -270,10 +280,20 @@ fn test_crash_after_close_before_seal_boot_replay_rebuilds() {
         INSTRUMENTS as usize,
         "the replay re-folded every instrument"
     );
+    assert!(
+        truth.len() >= INSTRUMENTS as usize * tickvault_trading::candles::TF_COUNT,
+        "the twin's close sweep wrote every closing bar ({} bars)",
+        truth.len()
+    );
+    assert_eq!(
+        (written, sealed(&boot)),
+        (0, 0),
+        "the boot withholds every bar it cannot prove complete, never writes it short"
+    );
     assert_eq!(
         boot.aggregator.force_seal_all(|_, _, _, _, _| {}),
         0,
-        "no bar is left open: each was written ({written}) or withheld and counted"
+        "no bar is left open: each was withheld at the hand-over and counted"
     );
 }
 

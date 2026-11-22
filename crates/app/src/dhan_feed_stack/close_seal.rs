@@ -19,8 +19,28 @@
 //! margin has passed.
 //!
 //! The sessions of one IST day are kept in a [`ClosePlan`], rebuilt once a
-//! day (one calendar check, one Muhurat probe). A Muhurat evening session is
-//! the fold's own evening window ([`super::mid_session_exit::muhurat_exit_window`]).
+//! day (one calendar check, one Muhurat probe). The regular `[09:00, 15:40)`
+//! session is in every day's plan, trading day or not, because the fold
+//! admits trades there by time of day alone (a weekend daytime Muhurat or a
+//! mock trading Saturday folds them too). A Muhurat evening session is the
+//! fold's own evening window ([`super::mid_session_exit::muhurat_exit_window`]).
+//!
+//! # Honest limits
+//! - The close term reads the box clock alone, where the usual cutoff is
+//!   capped by `min(watermark, wall)`, and it starts 5 s after the lateness
+//!   margin (245 − 240). A box clock more than about 5 s ahead of exchange
+//!   time at the close therefore seals the day's last buckets before a trade
+//!   stamped just before the end and delivered at the full 240 s margin; that
+//!   trade then lands as a late amendment of the sealed bar, as any trade
+//!   past the margin does. The clock-offset page (`CLOCK-SKEW-01`, over 1 ms
+//!   for 5 minutes) watches the box clock, so this needs an unpaged clock
+//!   error 5,000 times that threshold.
+//! - The drain's wall reading comes from two clocks that are not ordered (a
+//!   frame's receipt stamp and the catch-up timer's `now`), so within about a
+//!   second of midnight the IST day can read back and forth and the plan is
+//!   rebuilt more than once (each rebuild is cheap and allocation-free; the
+//!   no-calendar `warn!` can then repeat, never in production, where the
+//!   calendar is installed before the lane starts).
 //!
 //! # Complexity
 //! [`close_seal_cutoff`] is O(sessions), at most 2, no allocation.
@@ -164,10 +184,21 @@ impl ClosePlan {
     }
 
     /// The plan for IST day `ist_day` from the installed trading calendar:
-    /// the regular session on a trading day, plus the date's Muhurat evening
-    /// window. With no calendar installed, the regular session only, and
-    /// `true` in the second slot (the caller logs it). O(1): one calendar
-    /// check and at most two hash probes.
+    /// the regular `[09:00, 15:40)` session on EVERY day, plus the date's
+    /// Muhurat evening window. With no calendar installed, the regular
+    /// session only, and `true` in the second slot (the caller logs it).
+    ///
+    /// The regular session is in every day's plan, trading day or not,
+    /// because the fold admits trades in `[09:00, 15:40)` by time of day
+    /// alone, whatever the calendar says: a daytime Muhurat on a weekend (the
+    /// shipped 2026 shape, Sunday 2026-11-08, 14:05 to 15:40) or an NSE mock
+    /// trading Saturday folds trades there, and their last bars need the same
+    /// close seal (PR23 review, 2026-11-22: gating it on the trading-day flag
+    /// left those days to the shutdown seal). A day with no trade costs
+    /// nothing: the term needs this process to have folded a trade of the
+    /// session (the watermark at or past its start).
+    ///
+    /// O(1): one calendar check and at most two hash probes.
     #[must_use]
     pub fn for_installed_calendar(ist_day: i64) -> (Self, bool) {
         let day_start = ist_day.saturating_mul(i64::from(SECONDS_PER_DAY));
@@ -180,7 +211,7 @@ impl ClosePlan {
                 } else {
                     None
                 };
-                (Self::build(ist_day, info.trading, muhurat), false)
+                (Self::build(ist_day, true, muhurat), false)
             }
             None => (Self::build(ist_day, true, None), true),
         }

@@ -2000,8 +2000,9 @@ impl LiveIngest {
 
     /// Rebuilds the close plan for IST day `day` from the installed trading
     /// calendar (plan item PR23). With no calendar, the regular session only,
-    /// and one coded `warn!` for the day: the cap and the margin still hold,
-    /// so the fallback seals nothing a late trade can still reach.
+    /// and one coded `warn!` per rebuild (once a day, more than once only within
+    /// about a second of midnight, see `close_seal`): the cap and the margin
+    /// still hold, so the fallback seals nothing a late trade can still reach.
     ///
     /// # Complexity
     /// O(1), cold: once per IST day.
