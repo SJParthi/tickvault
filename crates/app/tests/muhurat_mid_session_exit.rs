@@ -17,6 +17,7 @@
 
 use std::sync::Arc;
 
+use tickvault_app::dhan_feed_stack::close_seal::ClosePlan;
 use tickvault_app::dhan_feed_stack::mid_session_exit::{
     is_mid_session_exit_at, muhurat_exit_window,
 };
@@ -36,7 +37,8 @@ fn entry(date: &str, start: &str, end: &str) -> MuhuratTradingEntry {
 /// a Muhurat date with no published times on 2025-10-21, and a
 /// daytime 14:05-15:40 session (the shipped 2026 shape) on 2026-11-10, an
 /// 18:15-19:45 session on 2026-11-15 and a 14:30-16:00 session on 2026-11-22
-/// (audit round 4: both outrun the fold, one starts after it).
+/// (audit round 4: both outrun the fold, one starts after it), and an
+/// 18:00-19:00 session on the trading day 2026-11-11 (plan item PR23).
 /// Idempotent.
 fn install_calendar() {
     let cfg = TradingConfig {
@@ -54,6 +56,7 @@ fn install_calendar() {
             entry("2026-11-10", "14:05", "15:40"),
             entry("2026-11-15", "18:15", "19:45"),
             entry("2026-11-22", "14:30", "16:00"),
+            entry("2026-11-11", "18:00", "19:00"),
         ],
         nse_mock_trading_dates: vec![],
     };
@@ -179,4 +182,84 @@ fn test_regression_a_daytime_muhurat_session_past_1540_force_seals_after_1540() 
     assert!(is_mid_session_exit_at(ist(2026, 11, 22, 15, 39, 59)));
     assert!(!is_mid_session_exit_at(ist(2026, 11, 22, 15, 45, 0)));
     assert!(!is_mid_session_exit_at(ist(2026, 11, 22, 15, 59, 59)));
+}
+
+/// IST day number (IST epoch seconds / 86,400) of `y-mo-d`.
+fn ist_day(y: i32, mo: u32, d: u32) -> i64 {
+    ist(y, mo, d, 0, 0, 0).div_euclid(86_400)
+}
+
+/// `ist` as the fold's `u32` seconds.
+fn secs(y: i32, mo: u32, d: u32, h: u32, m: u32, s: u32) -> u32 {
+    u32::try_from(ist(y, mo, d, h, m, s)).expect("fits u32")
+}
+
+/// Plan item PR23 with the B1 review note: an exit between 15:40 and 15:44
+/// on a trading day force-seals (it is after the session), and the close
+/// seal has not started yet (it starts at 15:44:05), so the exit seal still
+/// writes the day's last bars.
+#[test]
+fn exit_at_1542_still_force_seals() {
+    install_calendar();
+    assert!(
+        !is_mid_session_exit_at(ist(2026, 11, 11, 15, 42, 0)),
+        "15:42 is after the regular session: force-seal, never withhold"
+    );
+    let (plan, missing) = ClosePlan::for_installed_calendar(ist_day(2026, 11, 11));
+    assert!(!missing, "the calendar is installed");
+    let watermark = secs(2026, 11, 11, 15, 39, 50);
+    assert_eq!(
+        plan.cutoff(secs(2026, 11, 11, 15, 42, 0), watermark),
+        0,
+        "the close seal waits for 15:44:05"
+    );
+    assert_eq!(
+        plan.cutoff(secs(2026, 11, 11, 15, 44, 5), watermark),
+        secs(2026, 11, 11, 16, 40, 0)
+    );
+}
+
+/// Plan item PR23: on a trading day with a Muhurat evening, the 15:44 close
+/// seal never reaches an evening bucket; the evening's own term starts at
+/// the fold's evening end (19:30) plus the delay. A Muhurat-only date has no
+/// 15:44 term at all.
+#[test]
+fn muhurat_evening_bucket_not_sealed_at_1544() {
+    install_calendar();
+    let (plan, missing) = ClosePlan::for_installed_calendar(ist_day(2026, 11, 11));
+    assert!(!missing);
+    assert_eq!(plan.sessions().len(), 2, "regular and evening sessions");
+    let cutoff = plan.cutoff(
+        secs(2026, 11, 11, 15, 44, 5),
+        secs(2026, 11, 11, 15, 39, 50),
+    );
+    let evening_open = secs(2026, 11, 11, 18, 0, 0);
+    assert!(
+        cutoff <= evening_open,
+        "cutoff {cutoff} reaches the evening"
+    );
+    for tf in tickvault_trading::candles::TfIndex::ALL {
+        let end = tf.bucket_end(tf.bucket_start(evening_open));
+        assert!(end > cutoff, "{tf:?} evening bucket must stay open");
+    }
+    // During the evening, before its end + delay: still the regular term.
+    assert_eq!(
+        plan.cutoff(secs(2026, 11, 11, 19, 34, 4), secs(2026, 11, 11, 19, 29, 0)),
+        cutoff
+    );
+    assert_eq!(
+        plan.cutoff(secs(2026, 11, 11, 19, 34, 5), secs(2026, 11, 11, 19, 29, 0)),
+        secs(2026, 11, 11, 20, 30, 0)
+    );
+    // A Muhurat-only date (Sunday 2026-11-08): no regular term.
+    let (sunday, _) = ClosePlan::for_installed_calendar(ist_day(2026, 11, 8));
+    assert_eq!(sunday.sessions().len(), 1);
+    assert_eq!(
+        sunday.cutoff(secs(2026, 11, 8, 15, 44, 5), secs(2026, 11, 8, 15, 39, 0)),
+        0
+    );
+    assert_eq!(
+        sunday.cutoff(secs(2026, 11, 8, 19, 34, 5), secs(2026, 11, 8, 18, 30, 0)),
+        secs(2026, 11, 8, 20, 30, 0)
+    );
 }

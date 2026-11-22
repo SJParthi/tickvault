@@ -106,6 +106,8 @@ pub mod fold_verdict;
 mod aux_repeat;
 // Audit finding 3 (2026-11-14): the exit seal's window, Muhurat session included.
 pub mod mid_session_exit;
+// Plan item PR23 (2026-11-23): the day's last bars are sealed at the close.
+pub mod close_seal;
 // 2026-11-15 audit (live-5): the WAL replay is paced on a non-trading day.
 mod replay_pace;
 // 2026-11-17: the 30 s silence arm's per-report tally.
@@ -1753,6 +1755,10 @@ pub struct LiveIngest {
     /// Where a completed catch-up sweep is published (plan item 51d):
     /// [`CATCHUP_PROGRESS`] in production; a test points it at its own.
     catch_up_progress: &'static CatchUpProgress,
+    /// The sessions of the current IST day for the close-seal term of
+    /// [`Self::catch_up_cutoff`] (plan item PR23), rebuilt by
+    /// [`Self::note_wall_clock`] when the IST day changes.
+    close_plan: close_seal::ClosePlan,
     /// `true` while [`refold_wal_frames`] is re-folding a WAL backlog through
     /// this ingest. Read to label log lines `origin = "replay"`.
     ///
@@ -1975,11 +1981,42 @@ impl LiveIngest {
     /// Replaced the top-volume close-clock polls on 2026-10-22 (plan item 62):
     /// those stored the same reading as a side effect.
     ///
+    /// Plan item PR23 (2026-11-23): when the reading's IST day differs from
+    /// the close plan's, the plan is rebuilt (once a day, cold).
+    ///
     /// # Complexity
-    /// O(1): one division and one store, no allocation.
+    /// O(1): two divisions, one compare and one store, no allocation. The
+    /// rebuild (one calendar check, at most two hash probes) runs once per IST
+    /// day.
     pub(crate) fn note_wall_clock(&mut self, wall_ist_nanos: i64) {
         if let Ok(wall_secs) = u32::try_from(wall_ist_nanos.div_euclid(1_000_000_000)) {
             self.drain_wall_secs = wall_secs;
+            let day = i64::from(wall_secs / tickvault_common::constants::SECONDS_PER_DAY);
+            if day != self.close_plan.ist_day {
+                self.rebuild_close_plan(day);
+            }
+        }
+    }
+
+    /// Rebuilds the close plan for IST day `day` from the installed trading
+    /// calendar (plan item PR23). With no calendar, the regular session only,
+    /// and one coded `warn!` for the day: the cap and the margin still hold,
+    /// so the fallback seals nothing a late trade can still reach.
+    ///
+    /// # Complexity
+    /// O(1), cold: once per IST day.
+    #[cold]
+    fn rebuild_close_plan(&mut self, day: i64) {
+        let (plan, calendar_missing) = close_seal::ClosePlan::for_installed_calendar(day);
+        self.close_plan = plan;
+        if calendar_missing {
+            warn!(
+                code = ErrorCode::WsGapConnectionState.code_str(),
+                ist_day = day,
+                "candle close seal: no trading calendar is installed, so today's last \
+                 bars are sealed after the regular 15:40 session only (a Muhurat \
+                 session is not known)"
+            );
         }
     }
 
@@ -2197,6 +2234,7 @@ impl LiveIngest {
             catch_up_overruns: 0,
             catch_up_overrun_counter: metrics::counter!(CATCHUP_SEAL_OVERRUN_COUNTER),
             catch_up_progress: &CATCHUP_PROGRESS,
+            close_plan: close_seal::ClosePlan::UNSET,
             replaying_wal: false,
             aux_repeat: aux_repeat::production_filter(),
             market_data_floor_unix_nanos: None,
@@ -3745,6 +3783,8 @@ impl LiveIngest {
     pub fn roll_trading_day(&mut self) -> (u64, u64) {
         let sealed = self.seal_open_buckets_at_close();
         self.reset_ranking_daily();
+        // Plan item PR23: the next wall reading rebuilds the day's sessions.
+        self.close_plan = close_seal::ClosePlan::UNSET;
         sealed
     }
 
@@ -4537,7 +4577,20 @@ impl LiveIngest {
     /// keeps a WAL replay's late-tick bound (receipt plus the clock skew) at
     /// or above anything live could have sealed, whatever frames it skipped.
     ///
-    /// O(1): one compare and one subtraction.
+    /// # The close term (plan item PR23, 2026-11-23)
+    ///
+    /// The watermark stops with the session's last trade, so this cutoff
+    /// stops about the margin short of the close and the day's last bars
+    /// waited for the shutdown seal. From the session end plus the margin
+    /// plus one sweep interval (15:44:05 IST, or a published Muhurat end the
+    /// same way), the cutoff is the larger of the above and
+    /// [`close_seal::close_seal_cutoff`]: the end plus the longest bucket,
+    /// capped at the next session's start that day and at midnight. Only when
+    /// this process folded a trade of that session (the watermark reached its
+    /// start), never while it re-folds the WAL, and only with a wall reading.
+    ///
+    /// O(1): one compare and one subtraction, plus the close term's scan of
+    /// at most two sessions.
     fn catch_up_cutoff(&self) -> u32 {
         let watermark = self.aggregator.watermark_secs();
         let clock = if self.drain_wall_secs == 0 {
@@ -4545,7 +4598,11 @@ impl LiveIngest {
         } else {
             watermark.min(self.drain_wall_secs)
         };
-        clock.saturating_sub(CATCHUP_LATENESS_MARGIN_SECS)
+        let normal = clock.saturating_sub(CATCHUP_LATENESS_MARGIN_SECS);
+        if self.replaying_wal || self.drain_wall_secs == 0 {
+            return normal;
+        }
+        normal.max(self.close_plan.cutoff(self.drain_wall_secs, watermark))
     }
 
     /// Starts a sliced catch-up seal — the only part the drain's 5 s timer
@@ -25555,6 +25612,9 @@ mod tests {
             ingest.catch_up_cutoff() > before,
             "control: with no wall reading the cutoff follows the watermark"
         );
+        // This test reads the real clock: an empty close plan for today keeps
+        // the PR23 close term (15:44:05 onward) out of the wall-cap check.
+        ingest.close_plan = close_seal::ClosePlan::build(i64::from(before / 86_400), false, None);
         ingest.finish_wal_replay(false);
         let after = now_ist();
         let cutoff = ingest.catch_up_cutoff();
@@ -29914,6 +29974,9 @@ mod tick_quotes_route_tests;
 
 #[cfg(test)]
 mod seed_step_tests;
+
+#[cfg(test)]
+pub(crate) mod close_seal_tests;
 
 #[cfg(test)]
 mod drain_thread_tests;

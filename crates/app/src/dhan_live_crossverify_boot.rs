@@ -6791,6 +6791,46 @@ mod tests {
         );
     }
 
+    /// Plan item PR23 (2026-11-23): on the values the drain really publishes,
+    /// the cross-check reads `Final` at the first completed sweep at or after
+    /// 15:44:05 (the close seal), and never earlier.
+    #[test]
+    fn test_crossverify_reads_final_after_close_seal() {
+        use crate::dhan_feed_stack::close_seal_tests::{
+            day_start_ist_nanos, ist_at, published_after_sweeps,
+        };
+        let day = ReadinessDay::new(day_start_ist_nanos());
+        let walls = [
+            ist_at(15, 39, 51),
+            ist_at(15, 42, 0),
+            ist_at(15, 44, 4),
+            ist_at(15, 44, 5),
+            ist_at(15, 50, 0),
+        ];
+        let published = published_after_sweeps(&walls);
+        let verdicts: Vec<Option<Completeness>> = published
+            .iter()
+            .map(|p| {
+                let latest = p.map(|(floor, done)| SealProgress {
+                    floor_fold_secs: floor,
+                    done_unix_secs: done,
+                });
+                classify_completeness(day, latest, latest, false)
+            })
+            .collect();
+        assert_eq!(
+            verdicts,
+            vec![
+                None,
+                None,
+                None,
+                Some(Completeness::Final),
+                Some(Completeness::Final)
+            ],
+            "Final from the first sweep at 15:44:05, never earlier: {published:?}"
+        );
+    }
+
     #[test]
     fn test_classify_completeness_table() {
         let d = day0();

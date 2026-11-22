@@ -18,6 +18,11 @@
 //! still open. Its old exit seal (`force_seal_all` at any hour) wrote those
 //! buckets truncated, and check 5 fails on it within a second.
 //!
+//! In about 3 of the other cases in 10 both runs end with the close seal
+//! (plan item PR23): one sweep to the session end plus the longest bucket
+//! once the wall passes the end plus the margin, then a crash with no
+//! day-close seal.
+//!
 //! Every bar the restart writes is compared with the truth, and with what the
 //! previous process stored (a third run, live up to the crash):
 //!
@@ -120,6 +125,11 @@ struct Case {
     /// instant and withheld every bucket still open. Before, its exit seal
     /// wrote those truncated buckets as complete bars.
     clean_exit: bool,
+    /// Both runs end with the close seal (plan item PR23): once the wall
+    /// passes the session end plus the margin, one catch-up sweep to the end
+    /// plus the longest bucket, then a stop with no day-close seal (a crash
+    /// after the close seal). Only when `day_close` is off.
+    close_crash: bool,
 }
 
 fn event() -> impl Strategy<Value = Event> {
@@ -156,6 +166,7 @@ fn case() -> impl Strategy<Value = Case> {
         prop::bool::weighted(0.35),
         prop::bool::weighted(0.2),
         prop::bool::weighted(0.3),
+        prop::bool::weighted(0.3),
     )
         .prop_map(
             |(
@@ -168,6 +179,7 @@ fn case() -> impl Strategy<Value = Case> {
                 day_close,
                 near_wrap,
                 clean_exit,
+                close_crash,
             )| Case {
                 instruments,
                 crash_per_mille,
@@ -178,6 +190,7 @@ fn case() -> impl Strategy<Value = Case> {
                 day_close,
                 near_wrap,
                 clean_exit,
+                close_crash,
             },
         )
 }
@@ -329,12 +342,57 @@ fn sweep(agg: &mut MultiTfAggregator, wall_secs: u32, out: &mut Written) {
     agg.catch_up_seal_all(cutoff, |_, sid, _, tf, bar| out.put(sid, tf, bar));
 }
 
-/// Ends a run: the day-close seal, or a final catch-up sweep to `end_cutoff`.
-fn finish(agg: &mut MultiTfAggregator, day_close: bool, end_cutoff: u32, out: &mut Written) {
-    if day_close {
-        agg.force_seal_all(|_, sid, _, tf, bar| out.put(sid, tf, bar));
-    } else {
-        agg.catch_up_seal_all(end_cutoff, |_, sid, _, tf, bar| out.put(sid, tf, bar));
+/// The session end (15:40 IST), where the fold stops admitting trades.
+const SESSION_END: u32 = DAY + 56_400;
+
+/// The longest bucket the fold carries (the app's `LONGEST_BUCKET_SECS`).
+fn longest_bucket_secs() -> u32 {
+    TfIndex::ALL
+        .iter()
+        .map(|tf| tf.seconds_per_bucket())
+        .max()
+        .unwrap_or(0)
+}
+
+/// How a run ends.
+#[derive(Clone, Copy)]
+enum End {
+    /// The day-close seal (`force_seal_all`).
+    DayClose,
+    /// A final catch-up sweep to this cutoff.
+    CatchUp(u32),
+    /// The close seal (plan item PR23): the usual sweep once the wall passes
+    /// the session end plus the margin and one 5 s interval, then one sweep
+    /// to the end plus the longest bucket, then a crash (no day close).
+    CloseCrash,
+}
+
+impl End {
+    fn of(c: &Case, end_cutoff: u32) -> Self {
+        if c.day_close {
+            Self::DayClose
+        } else if c.close_crash {
+            Self::CloseCrash
+        } else {
+            Self::CatchUp(end_cutoff)
+        }
+    }
+}
+
+/// Ends a run.
+fn finish(agg: &mut MultiTfAggregator, end: End, out: &mut Written) {
+    match end {
+        End::DayClose => {
+            agg.force_seal_all(|_, sid, _, tf, bar| out.put(sid, tf, bar));
+        }
+        End::CatchUp(cutoff) => {
+            agg.catch_up_seal_all(cutoff, |_, sid, _, tf, bar| out.put(sid, tf, bar));
+        }
+        End::CloseCrash => {
+            sweep(agg, SESSION_END + MARGIN + 5, out);
+            let cutoff = SESSION_END + longest_bucket_secs();
+            agg.catch_up_seal_all(cutoff, |_, sid, _, tf, bar| out.put(sid, tf, bar));
+        }
     }
 }
 
@@ -395,7 +453,8 @@ fn check(c: &Case) -> Result<(), TestCaseError> {
 
     let mut truth = Written::default();
     let mut truth_agg = fold_live(all.iter(), &mut truth);
-    finish(&mut truth_agg, c.day_close, end_cutoff, &mut truth);
+    let end = End::of(c, end_cutoff);
+    finish(&mut truth_agg, end, &mut truth);
 
     let crash_ms = first.received_ms
         + (last.received_ms - first.received_ms) * u64::from(c.crash_per_mille) / 1000;
@@ -558,7 +617,7 @@ fn check(c: &Case) -> Result<(), TestCaseError> {
         );
         sweep(&mut agg, (*received / 1000) as u32, &mut restart);
     }
-    finish(&mut agg, c.day_close, end_cutoff, &mut restart);
+    finish(&mut agg, end, &mut restart);
     // The first live receipt of ANY instrument confirms the capture start.
     let confirmed_start = live.first().map_or(capture_start, |(received, _, _)| {
         capture_start.max((*received / 1000) as u32)
