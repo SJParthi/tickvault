@@ -53,6 +53,25 @@ pub(super) fn production_filter() -> AuxRepeatFilter {
     AuxRepeatFilter::with_gap_epoch(gap_epoch)
 }
 
+/// The gap epoch of [`always_write_filter`]: a new value on every read, so no
+/// remembered row ever arms a skip. One relaxed add, O(1).
+fn always_moving_epoch() -> u64 {
+    static READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The past-day repair's fallback filter (2026-11-22, the 2026-11-20
+/// repair's second verify): it never skips. The live run wrote a repeat
+/// whenever ITS gap epoch moved (ring sheds, rows that did not land,
+/// contract-name publishes, restarts and the evening refold passes), a
+/// history one offline rebuild cannot replay. Used only when no live record
+/// of the repeat rows is installed: then every wrong-day row is written (a
+/// superset, never fewer). With the record, the drain's filter runs and every
+/// row live wrote is written by number. Pre-sizes the map once.
+pub(super) fn always_write_filter() -> AuxRepeatFilter {
+    AuxRepeatFilter::with_gap_epoch(always_moving_epoch)
+}
+
 /// The `feed_aux_packets` row for a wrong-day `tick`, labelled by its receipt
 /// (`wrong_day_kind`: `connect_snapshot` before the cutover, `no_trade_today`
 /// from it), so a replayed frame gets the label the live drain gave it.
@@ -73,7 +92,20 @@ impl LiveIngest {
             return;
         };
         let key = (tick.security_id, tick.exchange_segment_code);
-        let verdict = if self.carried_twice(key) {
+        // The past-day repair (2026-11-22): a row live WROTE is always
+        // written again, whatever the filter would say; the live run's gap
+        // history that made it write that repeat cannot be replayed. One
+        // `ahash` probe, only while a live record is installed.
+        let live_wrote = self.replaying_wal
+            && u64::try_from(capture_seq).is_ok_and(|seq| {
+                self.replay_backup
+                    .as_mut()
+                    .and_then(|r| r.live_kept_mut())
+                    .is_some_and(|k| k.wrote_repeat(seq))
+            });
+        let verdict = if live_wrote {
+            self.aux_repeat.check_always_write(key, &row)
+        } else if self.carried_twice(key) {
             self.aux_repeat.check_never_skip(key, &row)
         } else if self.frame_wal_unbacked {
             // The skip rests on the WAL keeping the packet; this frame has no

@@ -598,6 +598,129 @@ pub async fn download_copy(s3: &crate::s3_cold::S3Cold, key: &str, path: &Path) 
     s3.get_to_path(key, path).await
 }
 
+/// The wire code of a stored `segment` symbol (`NSE_FNO` -> 2), or `None`
+/// for a name no segment has. Pure, O(segments).
+#[must_use]
+pub fn segment_code_of(name: &str) -> Option<u8> {
+    (0u8..=8).find(|&c| {
+        tickvault_common::types::ExchangeSegment::from_byte(c).is_some_and(|s| s.as_str() == name)
+    })
+}
+
+/// What [`read_kept_seqs_lines`] read from one copy.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct KeptRead {
+    /// Data rows read.
+    pub rows: u64,
+    /// Rows of a contract that passed the filter (their numbers were handed on).
+    pub kept: u64,
+    /// Rows of a Quote 61 repeat kind (their numbers were handed on).
+    pub repeat: u64,
+    /// Rows with no usable contract (an unknown segment or a non-numeric id):
+    /// they cannot be a filtered contract, so they are counted and skipped.
+    pub unjudged: u64,
+}
+
+/// One row the live run WROTE that the rebuild must judge by: its number,
+/// whether its contract passed the filter (a backup contract), and whether it
+/// is a Quote 61 repeat kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LiveRow {
+    /// `capture_seq`.
+    pub seq: u64,
+    /// The contract passed the filter.
+    pub backup: bool,
+    /// `kind` is a [`REPEAT_SKIP_KINDS`] kind.
+    pub repeat: bool,
+}
+
+/// Reads one dropped copy and hands every row the rebuild must judge by to
+/// `sink` (2026-11-22, the second verify): rows of a contract passing `keep`
+/// (the backup contracts) and rows of a Quote 61 repeat kind. A row with no
+/// usable contract cannot pass `keep` and is skipped and counted; a row the
+/// rebuild needs whose `capture_seq` does not parse is an error, so a partial
+/// set is never handed on. O(bytes).
+///
+/// # Errors
+/// The header lacks `capture_seq`, `security_id` or `segment`, or a needed
+/// row's `capture_seq` does not parse.
+pub fn read_kept_seqs_lines<R: std::io::BufRead>(
+    mut reader: R,
+    keep: &dyn Fn(u64, u8) -> bool,
+    sink: &mut dyn FnMut(LiveRow),
+) -> Result<KeptRead> {
+    let mut read = KeptRead::default();
+    let mut header = String::new();
+    if reader.read_line(&mut header).context("read the header")? == 0 {
+        return Ok(read);
+    }
+    let cols = Columns::from_header(&header)
+        .with_context(|| format!("the header has no capture_seq column: {}", header.trim()))?;
+    let (Some(sid_idx), Some(seg_idx)) = (cols.sid, cols.seg) else {
+        bail!(
+            "the header has no security_id or segment column: {}",
+            header.trim()
+        );
+    };
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line).context("read a row")? == 0 {
+            return Ok(read);
+        }
+        if line.trim().is_empty() {
+            continue;
+        }
+        let f = csv_fields(&line);
+        let text = |i: usize| f.get(i).map_or("", |s| s.trim());
+        read.rows = read.rows.saturating_add(1);
+        let contract = text(sid_idx)
+            .parse::<u64>()
+            .ok()
+            .zip(segment_code_of(text(seg_idx)));
+        if contract.is_none() {
+            read.unjudged = read.unjudged.saturating_add(1);
+        }
+        let backup = contract.is_some_and(|(sid, seg)| keep(sid, seg));
+        let repeat = cols
+            .kind
+            .is_some_and(|k| REPEAT_SKIP_KINDS.contains(&text(k)));
+        if !backup && !repeat {
+            continue;
+        }
+        let seq_text = text(cols.seq);
+        let seq: u64 = seq_text
+            .parse()
+            .with_context(|| format!("capture_seq {seq_text:?} is not a number"))?;
+        if backup {
+            read.kept = read.kept.saturating_add(1);
+        }
+        if repeat {
+            read.repeat = read.repeat.saturating_add(1);
+        }
+        sink(LiveRow {
+            seq,
+            backup,
+            repeat,
+        });
+    }
+}
+
+/// [`read_kept_seqs_lines`] over one gzipped copy on disk. O(bytes).
+///
+/// # Errors
+/// As [`read_kept_seqs_lines`], or the file does not read or unzip.
+pub fn read_kept_seqs_gz(
+    path: &Path,
+    keep: &dyn Fn(u64, u8) -> bool,
+    sink: &mut dyn FnMut(LiveRow),
+) -> Result<KeptRead> {
+    let file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let dec = flate2::read::MultiGzDecoder::new(std::io::BufReader::new(file));
+    read_kept_seqs_lines(std::io::BufReader::with_capacity(1 << 20, dec), keep, sink)
+        .with_context(|| format!("read {}", path.display()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -956,6 +1079,140 @@ mod tests {
         read_missing_contents_gz(&path, &[6], 0, &mut out).expect("read");
         assert_eq!(out.keys().copied().collect::<Vec<_>>(), vec![6]);
         assert!(read_missing_contents_gz(&dir.join("absent.gz"), &[6], 0, &mut out).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_segment_code_of_maps_every_stored_name() {
+        assert_eq!(segment_code_of("IDX_I"), Some(0));
+        assert_eq!(segment_code_of("NSE_EQ"), Some(1));
+        assert_eq!(segment_code_of("NSE_FNO"), Some(2));
+        assert_eq!(segment_code_of("BSE_FNO"), Some(8));
+        assert_eq!(segment_code_of("nse_fno"), None);
+        assert_eq!(segment_code_of(""), None);
+    }
+
+    fn collect(body: &str, keep: &dyn Fn(u64, u8) -> bool) -> Result<(KeptRead, Vec<LiveRow>)> {
+        let mut rows = Vec::new();
+        let read = read_kept_seqs_lines(body.as_bytes(), keep, &mut |r| rows.push(r))?;
+        Ok((read, rows))
+    }
+
+    #[test]
+    fn test_read_kept_seqs_lines_keeps_only_the_filtered_contracts() {
+        let body = "\"ts\",\"security_id\",\"segment\",\"capture_seq\"\n\
+                    2026-11-20T04:00:00.000000Z,10,NSE_FNO,100\n\
+                    2026-11-20T04:00:00.000000Z,11,NSE_FNO,101\n\
+                    \n\
+                    2026-11-20T04:00:01.000000Z,10,NSE_EQ,102\n\
+                    2026-11-20T04:00:02.000000Z,10,NSE_FNO,103\n";
+        let keep = |sid: u64, seg: u8| sid == 10 && seg == 2;
+        let (read, rows) = collect(body, &keep).expect("read");
+        assert_eq!(
+            read,
+            KeptRead {
+                rows: 4,
+                kept: 2,
+                repeat: 0,
+                unjudged: 0
+            }
+        );
+        let seqs: Vec<u64> = rows.iter().map(|r| r.seq).collect();
+        assert_eq!(seqs, vec![100, 103]);
+        assert!(rows.iter().all(|r| r.backup && !r.repeat));
+    }
+
+    #[test]
+    fn test_read_kept_seqs_lines_hands_on_repeat_kinds_of_every_contract() {
+        let body = "security_id,segment,kind,capture_seq\n\
+                    10,NSE_FNO,no_trade_today,1\n\
+                    11,NSE_EQ,no_trade_today,2\n\
+                    11,NSE_EQ,oi,3\n\
+                    12,NSE_EQ,connect_snapshot,4\n";
+        let keep = |sid: u64, _: u8| sid == 10;
+        let (read, rows) = collect(body, &keep).expect("read");
+        assert_eq!(
+            read,
+            KeptRead {
+                rows: 4,
+                kept: 1,
+                repeat: 3,
+                unjudged: 0
+            }
+        );
+        assert_eq!(
+            rows,
+            vec![
+                LiveRow {
+                    seq: 1,
+                    backup: true,
+                    repeat: true
+                },
+                LiveRow {
+                    seq: 2,
+                    backup: false,
+                    repeat: true
+                },
+                LiveRow {
+                    seq: 4,
+                    backup: false,
+                    repeat: true
+                },
+            ]
+        );
+    }
+
+    /// A row with no usable contract (unknown segment, non-numeric id, a
+    /// market-status row with an empty id) cannot be a backup contract: it is
+    /// skipped and counted, never a reason to stop the rebuild. A NEEDED row
+    /// whose number does not parse still stops it.
+    #[test]
+    fn test_read_kept_seqs_lines_skips_unjudgeable_rows_and_refuses_a_needed_bad_number() {
+        let keep = |_: u64, _: u8| true;
+        let body = "security_id,segment,kind,capture_seq\n\
+                    10,MOON,oi,x\n\
+                    ,NSE_EQ,market_status,y\n\
+                    z,NSE_FNO,oi,1\n\
+                    10,NSE_FNO,oi,7\n";
+        let (read, rows) = collect(body, &keep).expect("read");
+        assert_eq!(
+            read,
+            KeptRead {
+                rows: 4,
+                kept: 1,
+                repeat: 0,
+                unjudged: 3
+            }
+        );
+        assert_eq!(rows.len(), 1);
+        for bad in [
+            "security_id,segment,capture_seq\n10,NSE_FNO,x\n",
+            "security_id,segment,kind,capture_seq\n,MOON,no_trade_today,x\n",
+            "segment,capture_seq\nNSE_FNO,1\n",
+            "security_id,segment\n10,NSE_FNO\n",
+        ] {
+            assert!(collect(bad, &keep).is_err(), "{bad:?} must be refused");
+        }
+        assert_eq!(collect("", &keep).expect("empty").0, KeptRead::default());
+    }
+
+    #[test]
+    fn test_read_kept_seqs_gz_reads_a_gzipped_copy() {
+        let dir = std::env::temp_dir().join(format!("tv-cov-kept-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("k.csv.gz");
+        let mut gz = flate2::write::GzEncoder::new(
+            std::fs::File::create(&path).expect("file"),
+            flate2::Compression::fast(),
+        );
+        gz.write_all(b"security_id,segment,capture_seq\n7,IDX_I,5\n8,IDX_I,6\n")
+            .expect("write");
+        gz.finish().expect("finish");
+        let keep = |sid: u64, _: u8| sid == 8;
+        let mut out = Vec::new();
+        let read = read_kept_seqs_gz(&path, &keep, &mut |r| out.push(r.seq)).expect("read");
+        assert_eq!((read.rows, read.kept, out), (2, 1, vec![6]));
+        assert!(read_kept_seqs_gz(&dir.join("absent.gz"), &keep, &mut |_| {}).is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
 }

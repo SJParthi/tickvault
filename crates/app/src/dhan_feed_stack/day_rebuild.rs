@@ -15,6 +15,20 @@
 //!   seal and the replay hand-over, all while the fold is still the repair's
 //!   own (never `withhold_open_buckets`, never the live capture start "now").
 //!
+//! Two more, from the second verify (2026-11-22), both because the rebuild
+//! cannot replay the live run's HISTORY, only its frames:
+//!
+//! - the Quote 61 exact-repeat skip never fires here
+//!   ([`super::aux_repeat::always_write_filter`]): live wrote a repeat after
+//!   every gap-epoch move (sheds, rows that did not land, name publishes,
+//!   restarts, evening refold passes), so the rebuild writes every
+//!   wrong-day row, a superset of live's;
+//! - a contract in the day's backup publications (carried on two sockets)
+//!   is judged by the numbers live WROTE ([`crate::main_feed_backup::LiveKept`],
+//!   read from the quarantine copies), never by the replay's first-arrival
+//!   dedup: the WAL holds the two sockets' copies in write order, not drain
+//!   order, and a replayed frame has no socket.
+//!
 //! No depth sink is installed by the repair (depth rows were correct and are
 //! not dropped), so a depth frame is counted and skipped, and a Full packet's
 //! inline levels are not re-written.
@@ -36,6 +50,9 @@ pub(crate) struct PastDayClose {
     pub catch_up_bars: u64,
     /// Bars the day-boundary seal emitted.
     pub close_bars: u64,
+    /// What the live-written numbers decided for the backup contracts
+    /// (all zero when none were installed).
+    pub live_kept: crate::main_feed_backup::LiveKeptCounts,
     /// Buckets the replay hand-over tainted (none expected after the close
     /// seals: nothing is still open).
     pub tainted: u64,
@@ -66,15 +83,22 @@ impl LiveIngest {
     /// `day_start_ist_secs` is 00:00 IST of the day as fold seconds (epoch
     /// seconds plus the IST offset); `capture_start_ist_secs` is the receipt
     /// of the day's first main-feed frame, the instant the live process began
-    /// capturing that morning. Call once, before the first segment. O(1)
-    /// apart from the backup history read.
+    /// capturing that morning. `live_kept` holds the numbers the live run
+    /// wrote for the day's backup contracts. Call once, before the first
+    /// segment. O(1) apart from the backup history read.
+    ///
+    /// # Errors
+    /// `live_kept` names backup contracts but no saved backup set loaded, so
+    /// the rebuild could not judge their copies.
     pub(crate) fn begin_past_day_refold(
         &mut self,
         day_start_ist_secs: u32,
         capture_start_ist_secs: u32,
-    ) {
+        live_kept: Option<crate::main_feed_backup::LiveKept>,
+    ) -> anyhow::Result<()> {
         self.replaying_wal = true;
-        self.aux_repeat.clear();
+        // Never skip a wrong-day row (see the module docs).
+        self.aux_repeat = super::aux_repeat::always_write_filter();
         // LIVE fold semantics, not WAL-replay semantics (2026-11-21 review,
         // critical): the repaired day's partitions are dropped, so there is no
         // stored bar to protect, and replay mode would suppress every
@@ -90,6 +114,98 @@ impl LiveIngest {
         // The live drain folded one copy of each backed-up packet; so must
         // the rebuild (scope lock 2026-10-02).
         self.load_replay_backup();
+        if let Some(kept) = live_kept {
+            // With live's repeat numbers, the drain's own filter runs and
+            // every row live wrote is written by number: exact, where the
+            // never-skip fallback writes millions of repeats live skipped.
+            if kept.repeat_numbers() > 0 && self.replay_backup.is_some() {
+                self.aux_repeat = super::aux_repeat::production_filter();
+            }
+            match self.replay_backup.as_mut() {
+                Some(r) => r.set_live_kept(kept),
+                None if kept.sizes().0 == 0 => {}
+                None => anyhow::bail!(
+                    "{} backup contracts to judge by the live numbers, but no saved backup set \
+                     loaded",
+                    kept.sizes().0
+                ),
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether the backup copy of `(security_id, segment)` with number `seq`
+    /// is dropped: the live-written numbers decide for a backup contract
+    /// when installed, else the replay dedup's verdict `dedup_drops`. O(1).
+    fn past_day_backup_drops(
+        &mut self,
+        security_id: u64,
+        segment: u8,
+        seq: Option<u64>,
+        packet: &[u8],
+        dedup_drops: bool,
+    ) -> bool {
+        match self.replay_backup.as_mut().and_then(|r| r.live_kept_mut()) {
+            Some(kept) => kept.judge(security_id, segment, seq, packet, dedup_drops),
+            None => dedup_drops,
+        }
+    }
+
+    /// Before a segment's frames are folded: records the fingerprint of every
+    /// backup-contract packet in them whose number live wrote, so a copy
+    /// live did not write is dropped only when its twin is one live did
+    /// ([`crate::main_feed_backup::LiveKept`]). The same packet walk and
+    /// numbering as [`Self::refold_past_day_segment`]. O(packets), no-op
+    /// without a live record.
+    pub(crate) fn begin_past_day_segment(
+        &mut self,
+        frames: &[(u64, i64, WalEndpoint, bytes::Bytes)],
+    ) {
+        let Some(kept) = self.replay_backup.as_mut().and_then(|r| r.live_kept_mut()) else {
+            return;
+        };
+        kept.begin_segment();
+        for (frame_seq, _, endpoint, bytes) in frames {
+            if matches!(endpoint, WalEndpoint::Depth20 | WalEndpoint::Depth200)
+                || is_depth_socket_frame(bytes)
+            {
+                continue;
+            }
+            let (mut offset, mut packets) = (0usize, 0u32);
+            while offset < bytes.len() {
+                let Some(len) =
+                    tickvault_core::parser::dispatcher::main_feed_packet_len(&bytes[offset..])
+                else {
+                    match unknown_packet_skip(bytes, offset) {
+                        Some(next) => {
+                            offset = next;
+                            packets = packets.saturating_add(1);
+                            continue;
+                        }
+                        None => break,
+                    }
+                };
+                let end = offset.saturating_add(len);
+                let Some(packet) = bytes.get(offset..end) else {
+                    break;
+                };
+                if let (Some(&segment), Some(id)) = (
+                    packet.get(3),
+                    packet
+                        .get(4..8)
+                        .and_then(|b| <[u8; 4]>::try_from(b).ok())
+                        .map(u32::from_le_bytes),
+                ) {
+                    let seq = tickvault_storage::ws_frame_spill::packet_capture_seq(
+                        *frame_seq,
+                        u64::from(packets),
+                    );
+                    kept.note_packet(u64::from(id), segment, seq, packet);
+                }
+                packets = packets.saturating_add(1);
+                offset = end;
+            }
+        }
     }
 
     /// Folds one segment's frames of the repaired day.
@@ -205,11 +321,25 @@ impl LiveIngest {
                 break;
             }
             let packet = &bytes[offset..end];
-            match dispatch_frame(packet, receipt) {
-                Ok(ParsedFrame::Tick(ref t) | ParsedFrame::TickWithDepth(ref t, _))
-                    if backup_covers && self.replay_backup_drops_tick(t, packet) =>
-                {
-                    out.backup_dropped = out.backup_dropped.saturating_add(1);
+            let parsed = dispatch_frame(packet, receipt);
+            // The number the row gets (the same `packet_capture_seq` the
+            // ingest stamps), for the live-written judgement.
+            let seq = tickvault_storage::ws_frame_spill::packet_capture_seq(
+                frame_seq,
+                u64::from(packets),
+            );
+            // The dedup still runs first, so its state is what the replay's
+            // would be; the live numbers then decide for a backup contract.
+            let backup_drops = match &parsed {
+                Ok(ParsedFrame::Tick(t) | ParsedFrame::TickWithDepth(t, _)) => {
+                    let dedup = backup_covers && self.replay_backup_drops_tick(t, packet);
+                    self.past_day_backup_drops(
+                        t.security_id,
+                        t.exchange_segment_code,
+                        seq,
+                        packet,
+                        dedup,
+                    )
                 }
                 Ok(
                     ParsedFrame::PreviousClose {
@@ -222,8 +352,29 @@ impl LiveIngest {
                         exchange_segment_code,
                         ..
                     },
-                ) if backup_covers
-                    && self.replay_backup_drops_aux(security_id, exchange_segment_code, packet) =>
+                ) => {
+                    let dedup = backup_covers
+                        && self.replay_backup_drops_aux(
+                            *security_id,
+                            *exchange_segment_code,
+                            packet,
+                        );
+                    self.past_day_backup_drops(
+                        *security_id,
+                        *exchange_segment_code,
+                        seq,
+                        packet,
+                        dedup,
+                    )
+                }
+                _ => false,
+            };
+            match parsed {
+                Ok(ParsedFrame::Tick(_) | ParsedFrame::TickWithDepth(_, _)) if backup_drops => {
+                    out.backup_dropped = out.backup_dropped.saturating_add(1);
+                }
+                Ok(ParsedFrame::PreviousClose { .. } | ParsedFrame::OiUpdate { .. })
+                    if backup_drops =>
                 {
                     out.non_tick = out.non_tick.saturating_add(1);
                     out.backup_dropped = out.backup_dropped.saturating_add(1);
@@ -334,11 +485,20 @@ impl LiveIngest {
                     );
                 });
         self.apply_seal_tally(tally);
+        let live_kept = self
+            .replay_backup
+            .as_mut()
+            .and_then(|r| r.live_kept_mut())
+            .map(|k| k.counts())
+            .unwrap_or_default();
         self.replay_backup = None;
+        // Back to the drain's filter: the always-write one is the repair's.
+        self.aux_repeat = super::aux_repeat::production_filter();
         self.replaying_wal = false;
         PastDayClose {
             catch_up_bars: catch_up as u64,
             close_bars: close as u64,
+            live_kept,
             tainted,
             suppressed,
         }
@@ -365,7 +525,9 @@ mod tests {
     fn test_begin_past_day_refold_seeds_the_day_not_today() {
         let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
         let day_start = 1_795_113_000u32.saturating_add(19_800);
-        ingest.begin_past_day_refold(day_start, day_start + 9 * 3_600);
+        ingest
+            .begin_past_day_refold(day_start, day_start + 9 * 3_600, None)
+            .expect("begin");
         assert_eq!(ingest.aggregator.watermark_secs(), day_start);
         assert!(ingest.replaying_wal);
         assert_eq!(ingest.past_day_row_counts(), (0, 0, 0));
@@ -376,7 +538,9 @@ mod tests {
     fn test_finish_past_day_refold_ends_replay_and_clears_the_backup() {
         let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
         let day_start = 1_795_113_000u32.saturating_add(19_800);
-        ingest.begin_past_day_refold(day_start, day_start + 9 * 3_600);
+        ingest
+            .begin_past_day_refold(day_start, day_start + 9 * 3_600, None)
+            .expect("begin");
         let close = ingest.finish_past_day_refold(day_start + 16 * 3_600 + 300, || {});
         assert_eq!(close.tainted, 0);
         assert!(!ingest.replaying_wal);
@@ -387,7 +551,9 @@ mod tests {
     fn test_refold_past_day_segment_counts_depth_frames_and_marks_gaps() {
         let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
         let day_start = 1_795_113_000u32.saturating_add(19_800);
-        ingest.begin_past_day_refold(day_start, day_start + 9 * 3_600);
+        ingest
+            .begin_past_day_refold(day_start, day_start + 9 * 3_600, None)
+            .expect("begin");
         let receipt = 1_795_113_000_000_000_000i64 + 4 * 3_600 * 1_000_000_000;
         let frames = vec![
             (
@@ -457,7 +623,9 @@ mod live_fold_tests {
         let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
         let day_start = u32::try_from(DAY_START_UTC + 19_800).expect("u32");
         // The live process began capturing at 08:31, before the open.
-        ingest.begin_past_day_refold(day_start, day_start + 8 * 3_600 + 31 * 60);
+        ingest
+            .begin_past_day_refold(day_start, day_start + 8 * 3_600 + 31 * 60, None)
+            .expect("begin");
         let (r1, f1) = nifty_at(9 * 3_600 + 15 * 60 + 1, 24_000.0);
         let (r2, f2) = nifty_at(9 * 3_600 + 16 * 60 + 5, 24_010.0);
         let frames = vec![
@@ -491,7 +659,9 @@ mod live_fold_tests {
     fn test_non_tick_packets_and_a_truncated_tail_are_counted() {
         let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
         let day_start = u32::try_from(DAY_START_UTC + 19_800).expect("u32");
-        ingest.begin_past_day_refold(day_start, day_start + 8 * 3_600 + 31 * 60);
+        ingest
+            .begin_past_day_refold(day_start, day_start + 8 * 3_600 + 31 * 60, None)
+            .expect("begin");
         let receipt = (DAY_START_UTC + 10 * 3_600) * 1_000_000_000;
         let mut frame = packet(5, 12, 2, 4_242, &9_000i32.to_le_bytes());
         let mut prev = 24_100.5f32.to_le_bytes().to_vec();
@@ -545,7 +715,9 @@ mod live_fold_tests {
     fn test_a_restart_gap_withholds_the_bucket_it_cuts() {
         let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
         let day_start = u32::try_from(DAY_START_UTC + 19_800).expect("u32");
-        ingest.begin_past_day_refold(day_start, day_start + 8 * 3_600 + 31 * 60);
+        ingest
+            .begin_past_day_refold(day_start, day_start + 8 * 3_600 + 31 * 60, None)
+            .expect("begin");
         let (r1, f1) = nifty_at(10 * 3_600 + 1, 24_000.0);
         // Downtime, then the restarted process's first frame mid-minute.
         let (r2, f2) = nifty_at(10 * 3_600 + 5 * 60 + 30, 24_050.0);
@@ -570,5 +742,262 @@ mod live_fold_tests {
             seals(&ingest) > before,
             "bars after the restart are written"
         );
+    }
+
+    /// One Ticker packet frame for `(id, segment)` whose raw (UTC) trade time
+    /// is `trade_utc`, received at `receipt_utc` (both epoch seconds).
+    fn ticker_at(
+        id: u32,
+        segment: u8,
+        trade_utc: i64,
+        receipt_utc: i64,
+        ltp: f32,
+    ) -> (i64, bytes::Bytes) {
+        let mut f = vec![0u8; 16];
+        f[0] = 2;
+        f[1..3].copy_from_slice(&16u16.to_le_bytes());
+        f[3] = segment;
+        f[4..8].copy_from_slice(&id.to_le_bytes());
+        f[8..12].copy_from_slice(&ltp.to_le_bytes());
+        f[12..16].copy_from_slice(&u32::try_from(trade_utc).expect("u32").to_le_bytes());
+        (receipt_utc * 1_000_000_000, bytes::Bytes::from(f))
+    }
+
+    /// 2026-11-22 (the second verify, repeat class): live wrote a repeat of a
+    /// no-trade-today row after every gap-epoch move the rebuild cannot
+    /// replay, so the past-day refold writes EVERY wrong-day row. The same
+    /// frames through the drain's filter skip the repeat (the bite).
+    #[test]
+    fn test_past_day_refold_writes_every_wrong_day_repeat() {
+        let day_start = u32::try_from(DAY_START_UTC + 19_800).expect("u32");
+        // A trade from the day before (19 Nov 15:29 IST), received twice on
+        // 20 Nov at 10:00 and 10:01 IST: a wrong-day packet, byte-identical.
+        let trade = DAY_START_UTC - 86_400 + 15 * 3_600 + 29 * 60;
+        let (r1, f1) = ticker_at(2_885, 1, trade, DAY_START_UTC + 10 * 3_600, 1_500.0);
+        let (r2, f2) = ticker_at(2_885, 1, trade, DAY_START_UTC + 10 * 3_600 + 60, 1_500.0);
+        let frames = vec![
+            (1u64 << 17, r1, WalEndpoint::MainFeed, f1),
+            (2u64 << 17, r2, WalEndpoint::MainFeed, f2),
+        ];
+        let aux_rows = |drain_filter: bool| {
+            let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
+            ingest
+                .begin_past_day_refold(day_start, day_start + 8 * 3_600, None)
+                .expect("begin");
+            if drain_filter {
+                ingest.aux_repeat = super::super::aux_repeat::production_filter();
+            }
+            let mut out = WalRefoldOutcome::default();
+            ingest.refold_past_day_segment(&frames, &[], &mut out);
+            ingest.past_day_row_counts().2
+        };
+        assert_eq!(aux_rows(false), 2, "both no-trade-today rows are written");
+        assert_eq!(aux_rows(true), 1, "the drain's filter skips the repeat");
+    }
+
+    /// The saved backup history with one publication covering `contract` from
+    /// 08:30 IST on 2026-11-20.
+    fn backup_history(contract: (u64, u8)) -> crate::main_feed_backup::PersistedBackupHistory {
+        crate::main_feed_backup::PersistedBackupHistory {
+            publications: vec![crate::main_feed_backup::PersistedBackupSet {
+                published_at_nanos: (DAY_START_UTC + 8 * 3_600 + 30 * 60) * 1_000_000_000,
+                contracts: vec![contract],
+                process_started_at_nanos: 0,
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// Two byte-identical copies of one backed-up packet: X first in the WAL,
+    /// Y second. Returns `(refold outcome, live-kept counts)` with `kept` the
+    /// numbers live wrote (`None`: no record, the replay's dedup alone).
+    fn refold_two_copies(
+        kept: Option<&[u64]>,
+    ) -> (WalRefoldOutcome, crate::main_feed_backup::LiveKeptCounts) {
+        let day_start = u32::try_from(DAY_START_UTC + 19_800).expect("u32");
+        let contract = (4_242u64, 2u8);
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
+        ingest.install_replay_backup(Some(&backup_history(contract)));
+        let record = kept.map(|k| crate::main_feed_backup::LiveKept::new(&[contract], k));
+        ingest
+            .begin_past_day_refold(day_start, day_start + 8 * 3_600, record)
+            .expect("begin");
+        let trade = DAY_START_UTC + 9 * 3_600 + 20 * 60;
+        let (rx, fx) = ticker_at(4_242, 2, trade, trade + 1, 101.5);
+        let (ry, fy) = ticker_at(4_242, 2, trade, trade + 1, 101.5);
+        let frames = vec![
+            (1u64 << 17, rx, WalEndpoint::MainFeed, fx),
+            (2u64 << 17, ry + 1_000, WalEndpoint::MainFeed, fy),
+        ];
+        let mut out = WalRefoldOutcome::default();
+        ingest.begin_past_day_segment(&frames);
+        ingest.refold_past_day_segment(&frames, &[], &mut out);
+        let close = ingest.finish_past_day_refold(day_start + 16 * 3_600 + 300, || {});
+        (out, close.live_kept)
+    }
+
+    /// 2026-11-22 (the second verify, backup class): live kept copy Y; the
+    /// replay's first-arrival dedup keeps X. With the live numbers installed,
+    /// X is dropped and Y kept: the number live wrote is rebuilt, never both.
+    #[test]
+    fn test_backup_copies_follow_the_numbers_live_wrote() {
+        let y = 2u64 << 17;
+        let (out, counts) = refold_two_copies(Some(&[y]));
+        assert_eq!((out.refolded, out.backup_dropped), (1, 1), "{out:?}");
+        assert_eq!(
+            counts,
+            crate::main_feed_backup::LiveKeptCounts {
+                judged: 2,
+                kept: 1,
+                kept_against_dedup: 1,
+                dropped_for_twin: 1,
+                dropped_against_dedup: 1,
+                ..Default::default()
+            }
+        );
+        // The bite: without the record the dedup keeps X and drops Y.
+        let (out, counts) = refold_two_copies(None);
+        assert_eq!((out.refolded, out.backup_dropped), (1, 1), "{out:?}");
+        assert_eq!(counts, crate::main_feed_backup::LiveKeptCounts::default());
+    }
+
+    /// A packet live accepted late from the other socket, or a same-socket
+    /// repeat it kept: live wrote BOTH numbers, so both are rebuilt, where the
+    /// socket-blind replay dedup drops one.
+    #[test]
+    fn test_both_copies_are_rebuilt_when_live_wrote_both() {
+        let (out, counts) = refold_two_copies(Some(&[1u64 << 17, 2u64 << 17]));
+        assert_eq!((out.refolded, out.backup_dropped), (2, 0), "{out:?}");
+        assert_eq!((counts.kept, counts.kept_against_dedup), (2, 1));
+    }
+
+    /// Fail closed: live numbers for backup contracts but no saved backup set
+    /// to judge them with; an empty record needs none.
+    #[test]
+    fn test_begin_refuses_a_live_record_with_no_backup_set() {
+        let day_start = u32::try_from(DAY_START_UTC + 19_800).expect("u32");
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
+        ingest.install_replay_backup(None);
+        let record = crate::main_feed_backup::LiveKept::new(&[(1, 2)], &[5]);
+        assert!(
+            ingest
+                .begin_past_day_refold(day_start, day_start + 8 * 3_600, Some(record))
+                .is_err()
+        );
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
+        ingest.install_replay_backup(None);
+        let empty = crate::main_feed_backup::LiveKept::new(&[], &[]);
+        assert!(
+            ingest
+                .begin_past_day_refold(day_start, day_start + 8 * 3_600, Some(empty))
+                .is_ok()
+        );
+    }
+
+    /// A packet live captured but never landed (no number of either copy in
+    /// the live copies, e.g. a row still in a spill file): the replay dedup
+    /// keeps one copy, as before the live record existed. Nothing is lost.
+    #[test]
+    fn test_a_packet_live_wrote_neither_copy_of_keeps_one_copy() {
+        let (out, counts) = refold_two_copies(Some(&[]));
+        assert_eq!((out.refolded, out.backup_dropped), (1, 1), "{out:?}");
+        assert_eq!(
+            (counts.fallback, counts.fallback_kept),
+            (2, 1),
+            "{counts:?}"
+        );
+        assert_eq!(counts.dropped_for_twin, 0);
+    }
+
+    /// Copy X (not live's) ends one segment, its twin Y (live's) opens the
+    /// next: X's twin is not known yet, so the dedup keeps X and Y is kept as
+    /// live's. Both are written, and the duplicate is counted.
+    #[test]
+    fn test_a_twin_across_a_segment_boundary_is_written_twice_and_counted() {
+        let day_start = u32::try_from(DAY_START_UTC + 19_800).expect("u32");
+        let contract = (4_242u64, 2u8);
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
+        ingest.install_replay_backup(Some(&backup_history(contract)));
+        let y = 2u64 << 17;
+        let record = crate::main_feed_backup::LiveKept::new(&[contract], &[y]);
+        ingest
+            .begin_past_day_refold(day_start, day_start + 8 * 3_600, Some(record))
+            .expect("begin");
+        let trade = DAY_START_UTC + 9 * 3_600 + 20 * 60;
+        let (rx, fx) = ticker_at(4_242, 2, trade, trade + 1, 101.5);
+        let (ry, fy) = ticker_at(4_242, 2, trade, trade + 1, 101.5);
+        let mut out = WalRefoldOutcome::default();
+        let first = vec![(1u64 << 17, rx, WalEndpoint::MainFeed, fx)];
+        ingest.begin_past_day_segment(&first);
+        ingest.refold_past_day_segment(&first, &[], &mut out);
+        let second = vec![(y, ry + 1_000, WalEndpoint::MainFeed, fy)];
+        ingest.begin_past_day_segment(&second);
+        ingest.refold_past_day_segment(&second, &[], &mut out);
+        let close = ingest.finish_past_day_refold(day_start + 16 * 3_600 + 300, || {});
+        assert_eq!(out.refolded, 2, "{out:?}");
+        assert_eq!(
+            close.live_kept.duplicates_written, 1,
+            "{:?}",
+            close.live_kept
+        );
+    }
+
+    #[test]
+    fn test_begin_past_day_segment_is_a_no_op_without_a_live_record() {
+        let day_start = u32::try_from(DAY_START_UTC + 19_800).expect("u32");
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
+        ingest
+            .begin_past_day_refold(day_start, day_start + 8 * 3_600, None)
+            .expect("begin");
+        let (r, f) = nifty_at(10 * 3_600, 24_000.0);
+        let frames = vec![(1u64 << 17, r, WalEndpoint::MainFeed, f)];
+        ingest.begin_past_day_segment(&frames);
+        let mut out = WalRefoldOutcome::default();
+        ingest.refold_past_day_segment(&frames, &[], &mut out);
+        assert_eq!(out.refolded, 1, "{out:?}");
+    }
+
+    /// With live's repeat numbers installed, the rebuild writes exactly the
+    /// repeat rows live wrote: three identical wrong-day packets of which
+    /// live wrote only the first give one row (the drain's filter skips the
+    /// other two), where the never-skip fallback writes three.
+    #[test]
+    fn test_live_repeat_numbers_make_the_wrong_day_rows_exact() {
+        let day_start = u32::try_from(DAY_START_UTC + 19_800).expect("u32");
+        let trade = DAY_START_UTC - 86_400 + 15 * 3_600 + 29 * 60;
+        let frames: Vec<_> = (0..3i64)
+            .map(|i| {
+                let (r, f) = ticker_at(
+                    2_885,
+                    1,
+                    trade,
+                    DAY_START_UTC + 10 * 3_600 + 60 * i,
+                    1_500.0,
+                );
+                ((1u64 + i as u64) << 17, r, WalEndpoint::MainFeed, f)
+            })
+            .collect();
+        let aux_rows = |with_record: bool| {
+            let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
+            ingest.install_replay_backup(Some(&backup_history((4_242, 2))));
+            let record = with_record.then(|| {
+                let mut k = crate::main_feed_backup::LiveKept::new(&[(4_242, 2)], &[]);
+                k.note_live_row(tickvault_storage::day_repair_coverage::LiveRow {
+                    seq: 1 << 17,
+                    backup: false,
+                    repeat: true,
+                });
+                k
+            });
+            ingest
+                .begin_past_day_refold(day_start, day_start + 8 * 3_600, record)
+                .expect("begin");
+            let mut out = WalRefoldOutcome::default();
+            ingest.begin_past_day_segment(&frames);
+            ingest.refold_past_day_segment(&frames, &[], &mut out);
+            ingest.past_day_row_counts().2
+        };
+        assert_eq!(aux_rows(true), 1, "exactly live's row");
+        assert_eq!(aux_rows(false), 3, "the fallback writes every repeat");
     }
 }
