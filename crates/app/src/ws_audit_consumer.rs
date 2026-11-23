@@ -1103,26 +1103,6 @@ mod tests {
         assert_eq!(next_audit_row(&mut rx, Some(far)).await, (None, true));
     }
 
-    #[test]
-    fn test_both_consumers_batch_and_back_off() {
-        let src = include_str!("ws_audit_consumer.rs");
-        let production = src.split(concat!("#[cfg(", "test)]")).next().unwrap_or(src);
-        assert_eq!(
-            production
-                .matches("batch.take(AUDIT_BATCH_MAX_ROWS)")
-                .count(),
-            2
-        );
-        assert_eq!(
-            production
-                .matches("next_audit_row(&mut rx, backoff.wait_until(")
-                .count(),
-            2
-        );
-        assert_eq!(production.matches("match flush_step(").count(), 2);
-        assert!(!production.contains("while let Some(row) = rx.recv().await"));
-    }
-
     /// A QuestDB config pointing at a port nothing listens on.
     ///
     /// The consumer's DB work is deliberately NOT exercised here — see the
@@ -1175,6 +1155,22 @@ mod tests {
             .count();
         let all = production.matches("writer.flush()").count();
         assert_eq!(wrapped, 2, "both consumers must flush off the worker");
+        // 2026-11-23: both consumers batch queued rows and back off after a
+        // failed flush, never flush once per received row.
+        assert_eq!(
+            production
+                .matches("batch.take(AUDIT_BATCH_MAX_ROWS)")
+                .count(),
+            2
+        );
+        assert_eq!(
+            production
+                .matches("next_audit_row(&mut rx, backoff.wait_until(")
+                .count(),
+            2
+        );
+        assert_eq!(production.matches("match flush_step(").count(), 2);
+        assert!(!production.contains("while let Some(row) = rx.recv().await"));
         assert_eq!(
             all, wrapped,
             "a bare writer.flush() sits on the tokio worker"
