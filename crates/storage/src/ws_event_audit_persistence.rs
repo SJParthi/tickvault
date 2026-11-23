@@ -299,9 +299,17 @@ pub struct WsEventAuditWriter {
 /// Targets the QuestDB HTTP port (9000-class), NOT the ILP TCP port (9009) —
 /// HTTP gives a per-flush server ACK (see the 2026-07-05 note on
 /// [`WsEventAuditWriter`]). Pure + unit-tested (the transport ratchet).
+///
+/// 2026-11-23: `retry_timeout=0;request_timeout=5000;`, the order-audit
+/// writer's shape. The consumer flushes once per lifecycle event, so with the
+/// client's default retry window a QuestDB outage held each event for the
+/// whole retry loop and a reconnect storm backed the 1,024-slot forwarder up
+/// until it dropped rows. Now a failed flush gives up after one 5 s request;
+/// the rows stay in the buffer (capped at `MAX_PENDING_ROWS`) and go out with
+/// the next flush, so no row is lost to the shorter wait.
 fn ilp_http_conf(config: &QuestDbConfig) -> String {
     format!(
-        "http::addr={}:{};protocol_version=1;",
+        "http::addr={}:{};protocol_version=1;retry_timeout=0;request_timeout=5000;",
         config.host, config.http_port
     )
 }
@@ -570,7 +578,10 @@ mod tests {
             ilp_port: 9009,
         };
         let conf = ilp_http_conf(&cfg);
-        assert_eq!(conf, "http::addr=tv-questdb:9000;protocol_version=1;");
+        assert_eq!(
+            conf,
+            "http::addr=tv-questdb:9000;protocol_version=1;retry_timeout=0;request_timeout=5000;"
+        );
         assert!(
             conf.starts_with("http::addr="),
             "must be ILP-over-HTTP, never tcp:: — got {conf}"
