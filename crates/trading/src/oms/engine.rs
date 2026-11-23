@@ -37,6 +37,8 @@ use super::order_readiness::{OrderReadinessState, ReadinessRefusal, evaluate_ord
 use super::placement_telemetry::{self, PaperTradeRecord, PlacementLatency};
 use super::rate_limiter::{OrderBudget, OrderRateLimiter};
 use super::reconciliation::reconcile_orders;
+
+mod order_book;
 use super::state_machine::{
     UNKNOWN_ORDER_STATUS_COUNTER, UNKNOWN_STATUS_LOG_MAX_CHARS, is_valid_transition,
     parse_order_status,
@@ -51,6 +53,7 @@ use super::types::{
     SuperOrderLegSnapshot, SuperOrderPlacement, VerifyState, parse_segment_chars,
     resolve_order_segment_str,
 };
+use order_book::{OrderBook, OrderMap};
 
 // ---------------------------------------------------------------------------
 // Token Provider trait
@@ -168,8 +171,9 @@ pub trait OmsAlertSink: Send + Sync {
 /// modify/cancel update local state only, reconcile is a no-op.
 /// This ensures the system NEVER touches real money during development.
 pub struct OrderManagementSystem {
-    /// Order state keyed by Dhan order ID.
-    orders: HashMap<String, ManagedOrder, ahash::RandomState>,
+    /// Order state keyed by Dhan order ID, with an O(1) count of the
+    /// non-terminal orders kept beside it (audit plan PR6, `order_book.rs`).
+    orders: OrderBook,
     /// Broker `order_no` -> the canonical key in [`Self::orders`].
     ///
     /// Exists because a WebSocket update can arrive carrying a broker
@@ -410,10 +414,7 @@ impl OrderManagementSystem {
         // process), so no placement pays for it.
         placement_telemetry::ensure_paper_trade_logger();
         let mut oms = Self {
-            orders: HashMap::with_capacity_and_hasher(
-                ORDER_BOOK_PREFAULT_ORDERS,
-                ahash::RandomState::new(),
-            ),
+            orders: OrderBook::with_capacity(ORDER_BOOK_PREFAULT_ORDERS),
             order_no_aliases: HashMap::with_capacity_and_hasher(64, ahash::RandomState::new()),
             correlations: CorrelationTracker::new(),
             api_client,
@@ -1138,7 +1139,7 @@ impl OrderManagementSystem {
 
         // ---- DRY-RUN: update local state only, no HTTP ----
         if self.dry_run {
-            if let Some(order) = self.orders.get_mut(order_id) {
+            if let Some(mut order) = self.orders.get_mut(order_id) {
                 order.order_type = request.order_type;
                 order.quantity = request.quantity;
                 order.price = request.price;
@@ -1213,7 +1214,7 @@ impl OrderManagementSystem {
         }
 
         // Update local state with modification details
-        if let Some(order) = self.orders.get_mut(order_id) {
+        if let Some(mut order) = self.orders.get_mut(order_id) {
             order.order_type = request.order_type;
             order.quantity = request.quantity;
             order.price = request.price;
@@ -1256,7 +1257,7 @@ impl OrderManagementSystem {
 
         // ---- DRY-RUN: simulate cancel locally ----
         if self.dry_run {
-            if let Some(order) = self.orders.get_mut(order_id) {
+            if let Some(mut order) = self.orders.get_mut(order_id) {
                 order.status = OrderStatus::Cancelled;
                 order.updated_at_us = now_epoch_us();
             }
@@ -1307,7 +1308,7 @@ impl OrderManagementSystem {
 
         // Mark for reconciliation — cancel is async; WebSocket will confirm,
         // but if WS is down we need REST reconciliation to pick it up.
-        if let Some(order) = self.orders.get_mut(order_id) {
+        if let Some(mut order) = self.orders.get_mut(order_id) {
             order.needs_reconciliation = true;
             order.updated_at_us = now_epoch_us();
         }
@@ -1456,7 +1457,7 @@ impl OrderManagementSystem {
                     "unknown order status in WebSocket update — update skipped and counted; \
                      order marked needs_reconciliation, which nothing acts on today"
                 );
-                if let Some(order) = self.orders.get_mut(&order_id) {
+                if let Some(mut order) = self.orders.get_mut(&order_id) {
                     order.needs_reconciliation = true;
                 }
                 return Ok(None);
@@ -1464,7 +1465,7 @@ impl OrderManagementSystem {
         };
 
         // Get mutable reference to order
-        let order = match self.orders.get_mut(&order_id) {
+        let mut order = match self.orders.get_mut(&order_id) {
             Some(o) => o,
             None => return Ok(None),
         };
@@ -1496,8 +1497,8 @@ impl OrderManagementSystem {
             // Same status — just update fields (e.g., partial fill qty update).
             // Fill delta is computed BEFORE the copy so incremental
             // PART_TRADED quantity refreshes still produce a FillEvent.
-            let fill = Self::extract_fill_delta(order, update);
-            Self::apply_fill_fields(order, update);
+            let fill = Self::extract_fill_delta(&order, update);
+            Self::apply_fill_fields(&mut order, update);
             return Ok(fill);
         }
 
@@ -1519,11 +1520,11 @@ impl OrderManagementSystem {
         }
 
         // Fill delta BEFORE the copy overwrites the previous traded_qty.
-        let fill = Self::extract_fill_delta(order, update);
+        let fill = Self::extract_fill_delta(&order, update);
 
         // Apply transition
         order.status = new_status;
-        Self::apply_fill_fields(order, update);
+        Self::apply_fill_fields(&mut order, update);
 
         // Emit metrics for terminal states
         match new_status {
@@ -1693,7 +1694,7 @@ impl OrderManagementSystem {
             .get_all_orders(access_token.expose_secret())
             .await?;
 
-        let (report, updates) = reconcile_orders(&self.orders, &dhan_orders);
+        let (report, updates) = reconcile_orders(self.orders.map(), &dhan_orders);
 
         // Apply corrections (status + fill data).
         //
@@ -1711,7 +1712,7 @@ impl OrderManagementSystem {
         // the umbrella follow-up. Non-terminal corrections apply as before.
         let mut skipped_local_terminal: u64 = 0;
         for update in updates {
-            if let Some(order) = self.orders.get_mut(&update.order_id) {
+            if let Some(mut order) = self.orders.get_mut(&update.order_id) {
                 // C8 (fix-round 2026-07-14, honest envelope): an UPWARD
                 // traded_qty correction here raises the delta baseline
                 // WITHOUT emitting a FillEvent — the missed fill can never
@@ -1846,14 +1847,25 @@ impl OrderManagementSystem {
     /// — the marks-gate republish runs per event arm).
     ///
     /// # Performance
-    /// O(N_all_orders) scan, zero allocation.
+    /// O(1), zero allocation: the count is kept beside the order map and
+    /// moved on every insert, status change and clear (audit plan PR6,
+    /// `engine/order_book.rs`). Until 2026-11-23 this was an O(orders held)
+    /// scan, terminal orders included, run once a second by the order
+    /// runtime. Debug builds still run the old scan and assert the two
+    /// agree, so every engine and runtime test cross-checks the count.
     pub fn active_order_count(&self) -> usize {
-        self.orders.values().filter(|o| !o.is_terminal()).count()
+        let count = self.orders.active_count();
+        debug_assert_eq!(
+            count,
+            self.orders.values().filter(|o| !o.is_terminal()).count(),
+            "O(1) active-order count drifted from the scan"
+        );
+        count
     }
 
     /// Returns all orders (active + terminal).
-    pub fn all_orders(&self) -> &HashMap<String, ManagedOrder, ahash::RandomState> {
-        &self.orders
+    pub fn all_orders(&self) -> &OrderMap {
+        self.orders.map()
     }
 
     /// Returns the total number of orders placed.
@@ -2429,7 +2441,7 @@ impl OrderManagementSystem {
         // broker-side, so the tracked entry is flagged for the REST
         // reconcile (the registry apply above stays, mirroring dry-run).
         if accepted_unparsed {
-            if let Some(order) = self.orders.get_mut(order_id) {
+            if let Some(mut order) = self.orders.get_mut(order_id) {
                 order.needs_reconciliation = true;
                 order.updated_at_us = now_epoch_us();
             }
@@ -2563,7 +2575,7 @@ impl OrderManagementSystem {
                 // Cancel is async server-side — flag the tracked entry for
                 // reconciliation (mirror of cancel_order's live path); the
                 // verify ladder / reconcile confirms the terminal state.
-                if let Some(order) = self.orders.get_mut(order_id) {
+                if let Some(mut order) = self.orders.get_mut(order_id) {
                     order.needs_reconciliation = true;
                     order.updated_at_us = now_epoch_us();
                 }
@@ -3439,7 +3451,7 @@ impl OrderManagementSystem {
             price,
             ..
         } = modify
-            && let Some(order) = self.orders.get_mut(order_id)
+            && let Some(mut order) = self.orders.get_mut(order_id)
         {
             order.order_type = *order_type;
             order.quantity = *quantity;
@@ -3471,7 +3483,7 @@ impl OrderManagementSystem {
             so.updated_at_us = now_us;
         }
         if leg == OrderLeg::EntryLeg
-            && let Some(order) = self.orders.get_mut(order_id)
+            && let Some(mut order) = self.orders.get_mut(order_id)
         {
             order.status = OrderStatus::Cancelled;
             order.updated_at_us = now_us;
@@ -3539,7 +3551,7 @@ impl OrderManagementSystem {
                 traded_qty,
                 avg_price,
             } => {
-                if let Some(order) = self.orders.get_mut(order_id) {
+                if let Some(mut order) = self.orders.get_mut(order_id) {
                     order.traded_qty = *traded_qty;
                     order.avg_traded_price = *avg_price;
                     if order.status != OrderStatus::Traded {
@@ -3553,7 +3565,7 @@ impl OrderManagementSystem {
                 }
             }
             ExecutionVerdict::PartiallyFilled { traded_qty, .. } => {
-                if let Some(order) = self.orders.get_mut(order_id) {
+                if let Some(mut order) = self.orders.get_mut(order_id) {
                     order.traded_qty = *traded_qty;
                     if order.status != OrderStatus::PartTraded
                         && is_valid_transition(order.status, OrderStatus::PartTraded)
@@ -3567,7 +3579,7 @@ impl OrderManagementSystem {
                     // forgotten. Live policy actions (modify-to-aggressive /
                     // cancel-remainder) are deliberately NOT implemented in
                     // this dry-run PR — logged + flagged only.
-                    if let Some(order) = self.orders.get_mut(order_id) {
+                    if let Some(mut order) = self.orders.get_mut(order_id) {
                         order.needs_reconciliation = true;
                     }
                     error!(
@@ -3583,7 +3595,7 @@ impl OrderManagementSystem {
                 // H1 (2026-07-14 hostile review): an at-limit resting order
                 // is flagged for the REST reconcile — verify-ladder
                 // exhaustion is never a silent Pending.
-                if let Some(order) = self.orders.get_mut(order_id) {
+                if let Some(mut order) = self.orders.get_mut(order_id) {
                     order.needs_reconciliation = true;
                     order.updated_at_us = now_us;
                 }
@@ -3607,7 +3619,7 @@ impl OrderManagementSystem {
                 let in_budget_list_lag = raw_status == exit_rules::VERIFY_RAW_NOT_IN_SUPER_LIST
                     && elapsed_secs < deadline_secs;
                 if !in_budget_list_lag {
-                    if let Some(order) = self.orders.get_mut(order_id) {
+                    if let Some(mut order) = self.orders.get_mut(order_id) {
                         order.needs_reconciliation = true;
                         order.updated_at_us = now_us;
                     }
@@ -3622,7 +3634,7 @@ impl OrderManagementSystem {
                 }
             }
             ExecutionVerdict::Terminal { status } => {
-                if let Some(order) = self.orders.get_mut(order_id) {
+                if let Some(mut order) = self.orders.get_mut(order_id) {
                     if order.status != *status {
                         if is_valid_transition(order.status, *status) {
                             order.status = *status;
@@ -4604,7 +4616,7 @@ mod tests {
     fn test_fill_lots_i32_clamp_and_lot_size_zero_normalized() {
         // Clamp: an absurd cumulative qty saturates to i32::MAX lots.
         let mut oms = make_oms_with_order("1", OrderStatus::Pending);
-        if let Some(order) = oms.orders.get_mut("1") {
+        if let Some(mut order) = oms.orders.get_mut("1") {
             order.lot_size = 1;
         }
         let mut update = make_order_update("1", "TRADED");
@@ -4619,7 +4631,7 @@ mod tests {
 
         // lot_size 0 → normalized to 1 (3 units = 3 lots).
         let mut oms2 = make_oms_with_order("2", OrderStatus::Pending);
-        if let Some(order) = oms2.orders.get_mut("2") {
+        if let Some(mut order) = oms2.orders.get_mut("2") {
             order.lot_size = 0;
         }
         let mut u2 = make_order_update("2", "TRADED");
@@ -4655,7 +4667,7 @@ mod tests {
     fn test_fill_sign_from_managed_order_transaction_type() {
         // Sell order: positive traded_qty delta must yield NEGATIVE lots.
         let mut oms = make_oms_with_order("1", OrderStatus::Pending);
-        if let Some(order) = oms.orders.get_mut("1") {
+        if let Some(mut order) = oms.orders.get_mut("1") {
             order.transaction_type = TransactionType::Sell;
         }
         let mut update = make_order_update("1", "TRADED");
