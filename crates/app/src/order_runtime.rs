@@ -1032,14 +1032,17 @@ impl BookState {
     }
 
     /// Rebuilds the sid → pending-PAPER-order index from the OMS book.
-    /// O(N_all_orders) + per-pending-id clones — COLD path (called on
+    /// O(active-set capacity + active orders) + per-pending-id clones (O(N_all_orders) until
+    /// 2026-11-23, audit plan PR6) — COLD path (called on
     /// order-mutating events only, never per mark). Honest trade-off: a
     /// full rebuild per order event beats maintaining incremental deltas
     /// across 6 mutation sites (drift there would silently kill fills).
     fn rebuild_pending_paper(&mut self, oms: &OrderManagementSystem) {
         self.pending_paper.clear();
-        for order in oms.all_orders().values() {
-            if !order.is_terminal() && order.order_id.starts_with("PAPER-") {
+        // O(active-set capacity + active orders): the OMS keeps the active keys beside its map, so
+        // the terminal orders of the day are not visited (audit plan PR6).
+        for order in oms.active_orders_iter() {
+            if order.order_id.starts_with("PAPER-") {
                 self.pending_paper
                     .entry((order.security_id, order.exchange_segment))
                     .or_default()
