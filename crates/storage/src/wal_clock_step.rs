@@ -166,6 +166,34 @@
 //!   lies within one margin of an old one, so the hours between are no
 //!   longer held for it.
 //!
+//! # Frame-counter lead episodes (⚠ CHANGED 2026-11-23, PR24a)
+//!
+//! The limits above about a burst lead are narrower now. The minter marks a
+//! lead over [`COUNTER_LEAD_RECORD_NANOS`] (500 ms) when it mints it
+//! (`ws_frame_spill::note_lead_began_in`), and [`ClockStepLog::record_pending_lead`]
+//! records the episode as its own window ([`lead_window`], no 1 s floor)
+//! from the wall time it began to two margins past the newest sequence. It
+//! runs on every tick-writer batch ([`persist_clock_step_log_if_dirty`],
+//! no longer only while a window exists), at every segment rotation, and
+//! inside the archive verdict before it reads the windows, so a tick writer
+//! stalled for the whole lead no longer leaves it unrecorded: the episode
+//! stays pending until a call records it. Each of those calls writes the
+//! windows to disk itself when its record changed them, and the episode
+//! ends only once they are written
+//! ([`ClockStepLog::record_and_persist_pending_lead`]; 2026-11-23 review:
+//! before, a rotation or the verdict recorded the window in RAM only and the
+//! file waited for the tick writer's next batch). A boot belt
+//! ([`ClockStepLog::note_boot_counter_lead`]) holds the last session when
+//! the newest WAL record's sequence is more than 500 ms ahead of its receipt
+//! or more than 1 s behind it, and the bind writes what it added at once.
+//! Remaining limits: a crash while an episode is pending and no call has
+//! recorded it yet (the tick writer stalled, no segment rotation and no
+//! archive verdict since the lead began), or while its window's write is
+//! failing, with the newest frame no longer off its receipt (the lead
+//! decayed before the crash), loses the episode; two clock steps less than
+//! one 30 s anchor refresh apart are seen as their net move (predates
+//! PR24a).
+//!
 //! # Complexity
 //!
 //! O(1) (⚠ CHANGED 2026-11-16: O([`MAX_STEP_WINDOWS`]) = O(8), a fixed
@@ -179,6 +207,20 @@
 //! only when the counter passes the top less one margin).
 //! Never on the frame path. An unreadable file adds one header walk of the
 //! newest WAL segments at boot (`wal_last_receipt`), cold.
+//!
+//! ⚠ CHANGED 2026-11-23 (PR24a): the per-batch figure above is stale. Every
+//! tick-writer batch now reads the clock and the frame counter and calls
+//! [`record_pending_counter_lead`] and [`ClockStepLog::follow_counter_lead`]
+//! whether or not a window is recorded: one clock read and a few atomic
+//! loads per batch, plus one lock and an O([`MAX_STEP_WINDOWS`]) scan while
+//! a lead episode is pending (or while `follow_counter_lead` records a lead
+//! over 1 s), and at most one small file write when that changed the
+//! windows. Every segment rotation and every archive verdict make the same
+//! record call. [`ClockStepLog::bind`] now walks the newest WAL segments'
+//! headers on EVERY boot (the boot belt), not only for an unreadable file,
+//! and writes the file once if the bind added a window; cold, once per
+//! process. [`ClockStepLog::persist_if_dirty`] takes one more uncontended
+//! lock, only when a write is due.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -206,6 +248,20 @@ pub(crate) const CLOCK_STEP_MIN_NANOS: u64 = 1_000_000_000;
 /// How many separate step windows are kept (2026-11-16). Past it the two
 /// closest are merged into one (keeps more, never less).
 pub(crate) const MAX_STEP_WINDOWS: usize = 8;
+
+/// The frame-counter lead over the wall clock that opens a lead episode
+/// (2026-11-23, PR24a).
+///
+/// Rule: no frame sequence may lead the wall by more than this unless a
+/// recorded step window covers it, from the wall time the lead began up to
+/// the highest sequence minted while it lasted. The minter marks the
+/// episode (`ws_frame_spill::note_lead_began_in`, one compare per frame);
+/// [`ClockStepLog::record_pending_lead`] turns it into a window at the next
+/// tick-writer batch, segment rotation or archive verdict, whichever comes
+/// first. A lead at or below it stays inside an hour's 2 s receipt slop
+/// (`partition_archive::snapshot_gate` asserts `CLOCK_STEP_MIN_NANOS + this
+/// < RECEIPT_SLOP_NANOS` at compile time).
+pub(crate) const COUNTER_LEAD_RECORD_NANOS: u64 = 500_000_000;
 
 /// How far before the last process's newest WAL receipt the window of an
 /// unreadable file reaches: 24 h. A process runs at most from the 08:30 start
@@ -265,6 +321,38 @@ pub(crate) const fn step_window(
         from_seen
     };
     Some((lo, at_wall_nanos.saturating_add(reach)))
+}
+
+/// The window one frame-counter lead episode needs (2026-11-23, PR24a):
+/// from one margin before the wall time the lead began (`since_nanos`, or
+/// `at_wall_nanos` if earlier) to two margins past the highest sequence
+/// minted so far (`frame_seq`, or the wall if later). Unlike
+/// [`step_window`] it has no 1 s floor: a lead above
+/// [`COUNTER_LEAD_RECORD_NANOS`] is recorded whatever its size, because the
+/// lead that matters (the episode's peak) can be larger than what is still
+/// left when it is sampled. The second margin on top is hysteresis, as in
+/// [`ClockStepLog::follow_counter_lead`]: the window is widened again only
+/// once the counter comes within one margin of its top. Pure, O(1).
+#[must_use]
+pub(crate) const fn lead_window(
+    since_nanos: u64,
+    at_wall_nanos: u64,
+    frame_seq: u64,
+) -> (u64, u64) {
+    let began = if since_nanos < at_wall_nanos {
+        since_nanos
+    } else {
+        at_wall_nanos
+    };
+    let top = if frame_seq > at_wall_nanos {
+        frame_seq
+    } else {
+        at_wall_nanos
+    };
+    (
+        began.saturating_sub(CLOCK_STEP_MARGIN_NANOS),
+        top.saturating_add(CLOCK_STEP_MARGIN_NANOS.saturating_mul(2)),
+    )
 }
 
 /// Whether `window` overlaps the inclusive span `[lo, hi]`. Pure, O(1).
@@ -503,6 +591,9 @@ struct LogState {
     /// ([`ClockStepLog::follow_counter_lead`]); meaningful only while
     /// `following` is set.
     follow_hi: u64,
+    /// The start of the last lead episode logged by
+    /// [`ClockStepLog::record_pending_lead`], so each episode logs once.
+    lead_logged_since: u64,
 }
 
 /// One step log. The process uses one ([`note_clock_step`] and the other
@@ -516,6 +607,11 @@ pub(crate) struct ClockStepLog {
     paths: OnceLock<(PathBuf, PathBuf)>,
     /// A write is failing (one warning per episode).
     persist_failing: AtomicBool,
+    /// Serializes [`Self::persist_if_dirty`] (2026-11-23, PR24a review):
+    /// the tick writer, a segment rotation (WAL writer thread) and the
+    /// archive verdict can each write, and two writers of the one temp file
+    /// would refuse each other. Never held with `state`'s lock.
+    persist_lock: Mutex<()>,
     /// A window is recorded (kept with `state` under its lock), so the tick
     /// writer reads the clock and the frame counter only while one exists.
     active: AtomicBool,
@@ -534,10 +630,12 @@ impl ClockStepLog {
             state: Mutex::new(LogState {
                 windows: StepWindows::EMPTY,
                 follow_hi: 0,
+                lead_logged_since: 0,
             }),
             dirty: AtomicBool::new(false),
             paths: OnceLock::new(),
             persist_failing: AtomicBool::new(false),
+            persist_lock: Mutex::new(()),
             active: AtomicBool::new(false),
             following: AtomicBool::new(false),
         }
@@ -591,10 +689,15 @@ impl ClockStepLog {
     /// not taken: a counter ahead of the wall is the case the window
     /// protects, and dropping it would keep less. The follow ends when the
     /// counter is at or behind the wall.
+    ///
+    /// ⚠ CHANGED 2026-11-23 (PR24a): it no longer returns at once while no
+    /// window is recorded. Before, a burst lead over 1 s with no window yet
+    /// recorded was caught only at a WAL segment rotation. The tick writer
+    /// now calls it on every batch ([`persist_clock_step_log_if_dirty`]),
+    /// after [`Self::record_pending_lead`], which records the lead episode
+    /// the minter marked; this path is the backstop for a lead with no
+    /// episode behind it.
     pub(crate) fn follow_counter_lead(&self, now_nanos: u64, frame_seq: u64) {
-        if !self.active.load(Ordering::Acquire) {
-            return;
-        }
         let lead = frame_seq.saturating_sub(now_nanos);
         if lead == 0 {
             self.following.store(false, Ordering::Release);
@@ -620,6 +723,135 @@ impl ClockStepLog {
         state.windows.insert(add);
         state.follow_hi = state.windows.containing(top).map_or(top, |(_, hi)| hi);
         self.dirty.store(true, Ordering::Release);
+    }
+
+    /// Records the frame-counter lead episode that began at `since_nanos`
+    /// (2026-11-23, PR24a; `0`: none pending) as a step window, through
+    /// [`lead_window`] (no 1 s floor). Returns whether the episode is over:
+    /// the counter (`frame_seq`) is at or behind the wall (`now_nanos`), so
+    /// the caller ends it (`ws_frame_spill::end_counter_lead_episode`); a
+    /// minter racing that end opens a new episode, which keeps more.
+    ///
+    /// The window is recorded whenever an episode is pending, including at
+    /// the sample that ends it: the counter at the sample is the highest
+    /// sequence minted so far, so the window covers every sequence of the
+    /// episode even when the sampler was stalled for the whole of it and the
+    /// lead had already decayed. Nothing is written while a recorded window
+    /// already covers it, so a long episode rewrites the file about once
+    /// per margin of counter advance. Logs once per episode
+    /// (`source = "counter_lead"`). O(windows), one lock.
+    pub(crate) fn record_pending_lead(
+        &self,
+        since_nanos: u64,
+        now_nanos: u64,
+        frame_seq: u64,
+    ) -> bool {
+        let met = frame_seq <= now_nanos;
+        if met {
+            self.following.store(false, Ordering::Release);
+        }
+        if since_nanos == 0 {
+            return false;
+        }
+        let window = lead_window(since_nanos, now_nanos, frame_seq);
+        let needed_hi = frame_seq
+            .max(now_nanos)
+            .saturating_add(CLOCK_STEP_MARGIN_NANOS);
+        let logged = {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            let covered = state
+                .windows
+                .iter()
+                .any(|(lo, hi)| lo <= window.0 && needed_hi <= hi);
+            if covered {
+                None
+            } else {
+                if state.windows.insert(window) {
+                    self.dirty.store(true, Ordering::Release);
+                }
+                self.active.store(true, Ordering::Release);
+                let holding = state.windows.containing(window.1).unwrap_or(window);
+                if !met {
+                    state.follow_hi = holding.1;
+                    self.following.store(true, Ordering::Release);
+                }
+                if state.lead_logged_since == since_nanos {
+                    None
+                } else {
+                    state.lead_logged_since = since_nanos;
+                    Some((holding, state.windows.len()))
+                }
+            }
+        };
+        if let Some((holding, windows)) = logged {
+            info!(
+                source = "counter_lead",
+                lead_ms = frame_seq.saturating_sub(now_nanos) / 1_000_000,
+                lead_began_nanos = since_nanos,
+                window_lo_nanos = window.0,
+                window_hi_nanos = window.1,
+                held_as = ?holding,
+                windows,
+                "wall clock step recorded: the frame counter ran ahead of the wall clock; \
+                 archive hours that overlap this window are kept until nothing of the window \
+                 is still on its way to QuestDB"
+            );
+        }
+        met
+    }
+
+    /// The boot belt (2026-11-23, PR24a): when the newest record an earlier
+    /// process left on the WAL (`newest`: its frame sequence and receipt,
+    /// both UTC nanos) carries a sequence more than
+    /// [`COUNTER_LEAD_RECORD_NANOS`] ahead of its receipt, that process was
+    /// inside a lead episode it may not have persisted (a crash in the
+    /// second before its tick writer's next batch). A sequence more than
+    /// [`CLOCK_STEP_MIN_NANOS`] BELOW its receipt is a backward clock step the receipt anchor had not
+    /// yet noted (a crash within 30 s of the step), and is judged the same
+    /// way (found by the lead model). The last session is then judged as
+    /// stepped: [`rejected_file_window`] over that receipt, widened to one
+    /// margin either side of the sequence. Keeps more; rare. Returns
+    /// whether it recorded. O(windows), cold (bind, once per process).
+    pub(crate) fn note_boot_counter_lead(
+        &self,
+        boot_nanos: u64,
+        newest: Option<(u64, i64)>,
+    ) -> bool {
+        let Some((seq, receipt)) = newest else {
+            return false;
+        };
+        let Ok(receipt) = u64::try_from(receipt) else {
+            return false;
+        };
+        let ahead = seq > receipt.saturating_add(COUNTER_LEAD_RECORD_NANOS);
+        // Below: past the 1 s a receipt anchor may refuse to rewind (a refused
+        // backward move leaves receipts up to 1 s ahead of the wall for good).
+        let behind = seq.saturating_add(CLOCK_STEP_MIN_NANOS) < receipt;
+        if receipt == 0 || !(ahead || behind) {
+            return false;
+        }
+        let (lo, hi) = rejected_file_window(boot_nanos, Some(receipt));
+        let window = (
+            lo.min(seq.saturating_sub(CLOCK_STEP_MARGIN_NANOS)),
+            hi.max(seq.saturating_add(CLOCK_STEP_MARGIN_NANOS)),
+        );
+        self.widen(window);
+        self.dirty.store(true, Ordering::Release);
+        warn!(
+            code = tickvault_common::error_code::ErrorCode::WsSpill01WriterRespawn.code_str(),
+            source = "clock_step_boot_counter_lead",
+            newest_frame_seq = seq,
+            newest_receipt_nanos = receipt,
+            gap_ms = seq.abs_diff(receipt) / 1_000_000,
+            seq_ahead_of_receipt = seq > receipt,
+            window = ?window,
+            "the last process's newest frame sequence is off its receipt by more than a \
+             lead or a refused anchor rewind explains: it may have ended inside an unrecorded frame-counter lead or clock \
+             step, so archive hours from 24 hours \
+             before that frame up to the boot are judged as stepped until every frame of \
+             them is acknowledged and unmarked"
+        );
+        true
     }
 
     /// [`Self::note_from`] for a test (`source = "test"`).
@@ -714,6 +946,10 @@ impl ClockStepLog {
         if !set {
             return;
         }
+        // Cold: one header walk of the newest segments. ⚠ CHANGED 2026-11-23
+        // (PR24a): on every bind, for the boot belt below; before, only for an
+        // unreadable file.
+        let newest = crate::wal_last_receipt::newest_seq_and_receipt_on_disk(wal_dir);
         match read_file(wal_dir) {
             StepFile::Absent => {}
             StepFile::Loaded(loaded) => {
@@ -730,9 +966,7 @@ impl ClockStepLog {
                 }
             }
             StepFile::Rejected => {
-                // Cold and rare: one header walk of the newest segments.
-                let last_receipt = crate::wal_last_receipt::newest_receipt_nanos_on_disk(wal_dir)
-                    .and_then(|nanos| u64::try_from(nanos).ok());
+                let last_receipt = newest.and_then(|(_, nanos)| u64::try_from(nanos).ok());
                 let window = rejected_file_window(now_nanos, last_receipt);
                 self.widen(window);
                 self.dirty.store(true, Ordering::Release);
@@ -750,17 +984,34 @@ impl ClockStepLog {
                 );
             }
         }
+        self.note_boot_counter_lead(now_nanos, newest);
+        // PR24a (found by the lead model): a window the bind itself added (the
+        // boot belt or an unreadable file) is written now, before any frame,
+        // so a second crash before the first tick-writer batch keeps it.
+        self.persist_if_dirty();
     }
 
     /// Writes the windows when they changed since the last write. Unbound or
     /// unchanged: one load and nothing else. A failed write keeps it dirty
     /// and warns once per episode. Cold (tick writer thread, once a batch).
-    pub(crate) fn persist_if_dirty(&self) {
+    ///
+    /// Returns `false` only when a write was needed and failed (2026-11-23,
+    /// PR24a review: [`Self::record_and_persist_pending_lead`] keeps a lead
+    /// episode open until its window is on disk). Unbound or unchanged:
+    /// `true`, nothing more to write.
+    pub(crate) fn persist_if_dirty(&self) -> bool {
         let Some((path, tmp)) = self.paths.get() else {
-            return;
+            return true;
         };
+        if !self.dirty.load(Ordering::Acquire) {
+            return true;
+        }
+        let _writing = self
+            .persist_lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         if !self.dirty.swap(false, Ordering::AcqRel) {
-            return;
+            return true;
         }
         let bytes = encode(&self.windows());
         let written = crate::wal_applied_watermark::write_fresh(tmp, &bytes)
@@ -770,6 +1021,7 @@ impl ClockStepLog {
                 if self.persist_failing.swap(false, Ordering::AcqRel) {
                     info!(path = %path.display(), "wall clock step window is persisting again");
                 }
+                true
             }
             Err(err) => {
                 self.dirty.store(true, Ordering::Release);
@@ -784,8 +1036,33 @@ impl ClockStepLog {
                          retried; a restart before it lands forgets the step"
                     );
                 }
+                false
             }
         }
+    }
+
+    /// Records the pending lead episode that began at `since_nanos`
+    /// ([`Self::record_pending_lead`]) and, when it changed the windows,
+    /// writes them at once (2026-11-23, PR24a review). Returns whether the
+    /// episode may end: the counter met the wall AND nothing recorded is
+    /// left unwritten. So a window a segment rotation or the archive verdict
+    /// recorded is on disk before the episode ends; a failed write keeps the
+    /// episode open and the next call records and writes again. No episode
+    /// (`since_nanos == 0`): `false`, nothing written. One lock and
+    /// O([`MAX_STEP_WINDOWS`]) plus at most one small file write per call
+    /// while an episode is pending. Cold.
+    pub(crate) fn record_and_persist_pending_lead(
+        &self,
+        since_nanos: u64,
+        now_nanos: u64,
+        frame_seq: u64,
+    ) -> bool {
+        let met = self.record_pending_lead(since_nanos, now_nanos, frame_seq);
+        if since_nanos == 0 {
+            return false;
+        }
+        let written = self.persist_if_dirty();
+        met && written
     }
 }
 
@@ -821,24 +1098,54 @@ pub(crate) fn bind_clock_step_log(wal_dir: &Path) {
     LOG.bind(wal_dir, crate::wal_applied_watermark::wall_nanos());
 }
 
-/// Writes the process windows when they changed (tick writer thread, at most
-/// once a batch). First, while a window is recorded, raises the followed
-/// window's top over a frame counter still ahead of the wall
-/// ([`ClockStepLog::follow_counter_lead`]: one clock read and one atomic
-/// load). No window and nothing changed: two atomic loads.
-pub(crate) fn persist_clock_step_log_if_dirty() {
-    if LOG.active.load(Ordering::Acquire) {
-        LOG.follow_counter_lead(
-            crate::wal_applied_watermark::wall_nanos(),
-            crate::ws_frame_spill::current_frame_seq(),
-        );
+/// Records the process's pending frame-counter lead episode
+/// ([`ClockStepLog::record_pending_lead`]) against the wall `now_nanos` and
+/// the newest minted sequence `frame_seq` (read after the wall), and ends
+/// the episode once the counter is back at or behind the wall. Called by
+/// the tick writer per batch, at every segment rotation and by the archive
+/// verdict before it reads the windows (2026-11-23, PR24a). No episode: one
+/// atomic load. O(windows) and one lock while one is pending. Cold.
+///
+/// ⚠ CHANGED 2026-11-23 (PR24a review): it writes the windows to disk itself
+/// when the record changed them ([`ClockStepLog::record_and_persist_pending_lead`]),
+/// and ends the episode only once they are written. Before, a rotation or
+/// the verdict recorded the window in RAM and ended the episode, and the
+/// file was written only at the tick writer's next batch, so a crash with
+/// the tick writer stalled lost the window.
+pub(crate) fn record_pending_counter_lead(now_nanos: u64, frame_seq: u64) {
+    let since = crate::ws_frame_spill::counter_lead_since_nanos();
+    if LOG.record_and_persist_pending_lead(since, now_nanos, frame_seq) {
+        crate::ws_frame_spill::end_counter_lead_episode(since);
     }
+}
+
+/// Writes the process windows when they changed (tick writer thread, at most
+/// once a batch). First records the pending frame-counter lead episode
+/// ([`record_pending_counter_lead`]) and raises the followed window's top
+/// over a frame counter still ahead of the wall
+/// ([`ClockStepLog::follow_counter_lead`]).
+///
+/// ⚠ CHANGED 2026-11-23 (PR24a): both run on every batch, not only while a
+/// window is recorded, so a burst lead is recorded at the next batch rather
+/// than at the next segment rotation. Cost per batch: one clock read, a few
+/// atomic loads; the lock only while an episode is pending or the counter
+/// passes the followed top less one margin. Cold (tick writer thread).
+pub(crate) fn persist_clock_step_log_if_dirty() {
+    let now = crate::wal_applied_watermark::wall_nanos();
+    let frame_seq = crate::ws_frame_spill::current_frame_seq();
+    record_pending_counter_lead(now, frame_seq);
+    LOG.follow_counter_lead(now, frame_seq);
     LOG.persist_if_dirty();
 }
 
-/// Called at every WAL segment rotation (cold, writer thread): records a
+/// Called at every WAL segment rotation (cold, writer thread): records the
+/// pending lead episode ([`record_pending_counter_lead`], PR24a), then a
 /// step when the name or the frame counter is ahead of the wall. O(1).
 pub(crate) fn note_segment_rotation(now_nanos: u128, named_nanos: u128) {
+    record_pending_counter_lead(
+        u64::try_from(now_nanos).unwrap_or(u64::MAX),
+        crate::ws_frame_spill::current_frame_seq(),
+    );
     note_rotation_on(
         &LOG,
         now_nanos,
@@ -1115,10 +1422,15 @@ mod tests {
     #[test]
     fn test_regression_follow_counter_lead_keeps_the_window_top_over_a_counter_still_ahead() {
         let hms = |h: u64, m: u64, s: u64| ((h * 60 + m) * 60 + s) * SEC;
+        // ⚠ CHANGED 2026-11-23 (PR24a): no window and the counter far ahead
+        // now records a new step (before, nothing until a segment rotation).
+        let bare = ClockStepLog::new();
+        bare.follow_counter_lead(hms(11, 50, 0), hms(12, 0, 0));
+        assert_eq!(
+            one(&bare),
+            step_window(hms(11, 50, 0), hms(11, 50, 0), 600 * SEC)
+        );
         let log = ClockStepLog::new();
-        // No window: the counter far ahead records nothing.
-        log.follow_counter_lead(hms(11, 50, 0), hms(12, 0, 0));
-        assert_eq!(one(&log), None);
         log.note(hms(11, 58, 54), hms(11, 59, 34), 600 * SEC);
         let (lo, top) = one(&log).expect("the step");
         assert_eq!(top, hms(11, 59, 34) + 630 * SEC);
@@ -1147,11 +1459,17 @@ mod tests {
             seen + CLOCK_STEP_MARGIN_NANOS
         ));
         assert!(window_overlaps(one(&log), row_seq, row_seq));
-        // A retired window stops the follow.
+        // A retired window stops the follow. ⚠ CHANGED 2026-11-23 (PR24a): a
+        // counter still far ahead is then recorded as a new, logged step
+        // (before, nothing).
         let now = one(&log).expect("kept");
         assert!(log.retire_if_settled(now, true));
+        assert!(!log.following.load(Ordering::Acquire));
         log.follow_counter_lead(hms(12, 1, 0), hms(12, 30, 0));
-        assert_eq!(one(&log), None);
+        assert_eq!(
+            one(&log),
+            step_window(hms(12, 1, 0), hms(12, 1, 0), 29 * 60 * SEC)
+        );
     }
 
     /// 2026-11-15 audit (live-3): a 1.76 s step recorded on day 1 at 16:11 was
@@ -1425,7 +1743,10 @@ mod tests {
         let written = temp_dir("rejected-spill");
         {
             let spill = WsFrameSpill::new(&written).expect("spill");
-            let seq = crate::ws_frame_spill::next_frame_seq();
+            // 2026-11-23 (PR24a): the sequence is minted at the receipt, as in
+            // production; one minted now (days later) would trip the boot belt.
+            let seq = (last >> crate::ws_frame_spill::PACKET_INDEX_BITS)
+                << crate::ws_frame_spill::PACKET_INDEX_BITS;
             let at = i64::try_from(last).expect("fits");
             spill.append_with_seq_at(
                 WsType::LiveFeed,
@@ -1521,5 +1842,285 @@ mod tests {
             "nothing recorded, nothing written"
         );
         drop(std::fs::remove_dir_all(&dir));
+    }
+
+    /// 2026-11-23 (PR24a): a 0.6 s lead is recorded through `lead_window`,
+    /// which has no 1 s floor. Bite: routed through `step_window`, the same
+    /// lead gives `None` and nothing is recorded.
+    #[test]
+    fn test_lead_window_and_record_pending_lead_record_a_lead_below_the_step_floor() {
+        let wall = 10_000 * SEC;
+        let since = wall - 2 * SEC;
+        let seq = wall + 600_000_000;
+        assert_eq!(step_window(since, wall, seq - wall), None, "the bite");
+        assert_eq!(
+            lead_window(since, wall, seq),
+            (
+                since - CLOCK_STEP_MARGIN_NANOS,
+                seq + 2 * CLOCK_STEP_MARGIN_NANOS
+            )
+        );
+        // The wall below the start (a backward step mid-episode) and the
+        // counter behind the wall widen it to the wall.
+        assert_eq!(
+            lead_window(wall, wall - SEC, wall - 2 * SEC),
+            (
+                wall - SEC - CLOCK_STEP_MARGIN_NANOS,
+                wall - SEC + 2 * CLOCK_STEP_MARGIN_NANOS
+            )
+        );
+        // Saturation at both ends.
+        assert_eq!(lead_window(0, 0, u64::MAX), (0, u64::MAX));
+        let log = ClockStepLog::new();
+        assert!(!log.record_pending_lead(since, wall, seq), "still ahead");
+        assert_eq!(one(&log), Some(lead_window(since, wall, seq)));
+        assert!(log.dirty.load(Ordering::Acquire));
+        assert!(log.active.load(Ordering::Acquire));
+        assert!(log.following.load(Ordering::Acquire));
+    }
+
+    /// The episode ends only once the counter is at or behind the wall, and
+    /// the sample that ends it still records it (a writer stalled for the
+    /// whole lead sees it only then). No episode pending: nothing at all.
+    #[test]
+    fn test_record_pending_lead_clears_only_when_the_counter_is_at_or_behind_the_wall() {
+        let wall = 20_000 * SEC;
+        let log = ClockStepLog::new();
+        assert!(!log.record_pending_lead(0, wall, wall + 5 * SEC));
+        assert_eq!(one(&log), None, "no episode, nothing recorded");
+        assert!(
+            !log.record_pending_lead(wall, wall, wall + 1),
+            "one ns ahead"
+        );
+        let first = one(&log).expect("recorded");
+        // Covered: no rewrite, no new window.
+        log.dirty.store(false, Ordering::Release);
+        assert!(!log.record_pending_lead(wall, wall + SEC, wall + SEC + 1));
+        assert!(!log.dirty.load(Ordering::Acquire), "already covered");
+        assert_eq!(one(&log), Some(first));
+        // The counter climbs past the top less one margin: widened.
+        let high = first.1 - CLOCK_STEP_MARGIN_NANOS + SEC;
+        assert!(!log.record_pending_lead(wall, wall + 2 * SEC, high));
+        assert_eq!(
+            one(&log),
+            Some((first.0, high + 2 * CLOCK_STEP_MARGIN_NANOS))
+        );
+        // Counter equal to the wall: over, following ends.
+        assert!(log.record_pending_lead(wall, high, high));
+        assert!(!log.following.load(Ordering::Acquire));
+        // A stalled writer: the first sample of the episode finds the counter
+        // behind the wall, and still records the episode before it ends it.
+        let stalled = ClockStepLog::new();
+        let began = 30_000 * SEC;
+        let counter = began + 5 * SEC;
+        assert!(stalled.record_pending_lead(began, counter + SEC, counter));
+        assert_eq!(
+            one(&stalled),
+            Some(lead_window(began, counter + SEC, counter))
+        );
+        assert!(!stalled.following.load(Ordering::Acquire));
+    }
+
+    /// The boot belt: a newest frame more than the lead threshold ahead of
+    /// its receipt adds the last session (from 24 h before the receipt to
+    /// the boot, raised over the sequence); anything else adds nothing.
+    #[test]
+    fn test_note_boot_counter_lead_holds_the_last_session_only_for_a_leading_newest_frame() {
+        let receipt = 400_000 * SEC;
+        let boot = receipt + 3_600 * SEC;
+        let log = ClockStepLog::new();
+        assert!(!log.note_boot_counter_lead(boot, None));
+        let at = i64::try_from(receipt).expect("fits");
+        assert!(!log.note_boot_counter_lead(boot, Some((receipt, at))));
+        assert!(!log.note_boot_counter_lead(boot, Some((receipt + COUNTER_LEAD_RECORD_NANOS, at))));
+        assert!(!log.note_boot_counter_lead(boot, Some((receipt + SEC, -1))));
+        assert!(!log.note_boot_counter_lead(boot, Some((receipt + SEC, 0))));
+        assert_eq!(one(&log), None);
+        let seq = receipt + COUNTER_LEAD_RECORD_NANOS + 1;
+        assert!(log.note_boot_counter_lead(boot, Some((seq, at))));
+        assert_eq!(one(&log), Some(rejected_file_window(boot, Some(receipt))));
+        // A sequence past the boot: the window reaches one margin past it.
+        let ahead = ClockStepLog::new();
+        let far = boot + 7_200 * SEC;
+        assert!(ahead.note_boot_counter_lead(boot, Some((far, at))));
+        assert_eq!(
+            one(&ahead),
+            Some((
+                rejected_file_window(boot, Some(receipt)).0,
+                far + CLOCK_STEP_MARGIN_NANOS
+            ))
+        );
+        assert!(ahead.dirty.load(Ordering::Acquire));
+        // Below the receipt: up to 1 s is a refused anchor rewind, nothing;
+        // past it, an unnoted backward step, held the same way.
+        let below = ClockStepLog::new();
+        assert!(!below.note_boot_counter_lead(boot, Some((receipt - SEC, at))));
+        assert_eq!(one(&below), None);
+        let stepped_back = receipt - 7_200 * SEC;
+        assert!(below.note_boot_counter_lead(boot, Some((stepped_back, at))));
+        assert_eq!(one(&below), Some(rejected_file_window(boot, Some(receipt))));
+        let far_back = receipt - 2 * REJECTED_FILE_LOOKBACK_NANOS;
+        let deep = ClockStepLog::new();
+        assert!(deep.note_boot_counter_lead(boot, Some((far_back, at))));
+        assert_eq!(one(&deep), Some((far_back - CLOCK_STEP_MARGIN_NANOS, boot)));
+    }
+
+    /// The tick writer, the segment rotation and the archive verdict each
+    /// record the pending lead, and neither the tick writer nor the follow
+    /// is gated on a recorded window any more (source scan; the behaviour is
+    /// pinned by the tests above and the lead model in `snapshot_gate`).
+    /// Bites: an `active` guard back in either function fails it.
+    #[test]
+    fn test_persist_clock_step_log_if_dirty_note_segment_rotation_follow_counter_lead_and_record_pending_counter_lead_have_no_active_guard()
+     {
+        let src = include_str!("wal_clock_step.rs");
+        let prod = &src[..src.find("#[cfg(test)]\nmod tests").expect("tests module")];
+        let free_fn = |head: &str| {
+            let start = prod.find(head).expect("fn present");
+            let rest = &prod[start..];
+            rest[..rest.find("\n}\n").expect("end")].to_string()
+        };
+        let persist = free_fn("pub(crate) fn persist_clock_step_log_if_dirty() {");
+        assert!(!persist.contains("active"), "{persist}");
+        let record = persist
+            .find("record_pending_counter_lead(now, frame_seq);")
+            .expect("records the lead");
+        let follow = persist
+            .find("LOG.follow_counter_lead(now, frame_seq);")
+            .expect("follows");
+        assert!(record < follow, "recorded first, then followed");
+        let start = prod
+            .find("    pub(crate) fn follow_counter_lead(&self, now_nanos: u64, frame_seq: u64) {")
+            .expect("method present");
+        let rest = &prod[start..];
+        let follow_fn = &rest[..rest.find("\n    }\n").expect("end")];
+        assert!(!follow_fn.contains("!self.active"), "{follow_fn}");
+        let rotation =
+            free_fn("pub(crate) fn note_segment_rotation(now_nanos: u128, named_nanos: u128) {");
+        assert!(rotation.contains("record_pending_counter_lead("));
+        let pending =
+            free_fn("pub(crate) fn record_pending_counter_lead(now_nanos: u64, frame_seq: u64) {");
+        assert!(pending.contains("crate::ws_frame_spill::counter_lead_since_nanos()"));
+        assert!(
+            pending.contains("LOG.record_and_persist_pending_lead(since, now_nanos, frame_seq)")
+        );
+        assert!(pending.contains("crate::ws_frame_spill::end_counter_lead_episode(since)"));
+        // Review finding (2026-11-23): the wall is read BEFORE the frame
+        // sequence, so a sequence minted between the two reads is judged
+        // against an older wall (reads more lead, never less).
+        let wall = persist
+            .find("let now = crate::wal_applied_watermark::wall_nanos();")
+            .expect("wall read");
+        let seq = persist
+            .find("let frame_seq = crate::ws_frame_spill::current_frame_seq();")
+            .expect("sequence read");
+        assert!(wall < seq, "the wall is read before the sequence");
+    }
+
+    /// 2026-11-23 (PR24a review): a lead episode a segment rotation or the
+    /// archive verdict records is written to disk by that call, before the
+    /// episode may end, so a crash with the tick writer stalled keeps it. A
+    /// failed write keeps the episode open. Bites: dropping the persist from
+    /// `record_and_persist_pending_lead` leaves no file (the first restart
+    /// below is empty); returning `met` alone ends the episode over a failed
+    /// write.
+    #[test]
+    fn test_record_and_persist_pending_lead_writes_the_window_before_the_episode_ends() {
+        let dir = temp_dir("record-persist");
+        let since = 500_000 * SEC;
+        let now = since + 3 * SEC;
+        let log = ClockStepLog::new();
+        log.bind(&dir, now);
+        // No episode: nothing recorded, nothing written, nothing to end.
+        assert!(!log.record_and_persist_pending_lead(0, now, now));
+        assert_eq!(read_file(&dir), StepFile::Absent);
+        // The counter still leads: recorded and written, the episode stays.
+        assert!(!log.record_and_persist_pending_lead(since, now, now + 2 * SEC));
+        let restarted = ClockStepLog::new();
+        restarted.bind(&dir, now);
+        assert_eq!(list(&restarted.windows()), list(&log.windows()));
+        assert!(
+            restarted.windows().is_recorded(),
+            "written by the record call"
+        );
+        // The counter met the wall: written, and the episode may end.
+        assert!(log.record_and_persist_pending_lead(since, now + 5 * SEC, now + 4 * SEC));
+        let again = ClockStepLog::new();
+        again.bind(&dir, now);
+        assert_eq!(list(&again.windows()), list(&log.windows()));
+        // A failed write (the temp path is a folder) keeps the episode open.
+        let failing_dir = temp_dir("record-persist-fail");
+        let failing = ClockStepLog::new();
+        failing.bind(&failing_dir, now);
+        std::fs::create_dir_all(failing_dir.join(CLOCK_STEP_TMP)).expect("blocker");
+        std::fs::write(failing_dir.join(CLOCK_STEP_TMP).join("x"), b"x").expect("blocker");
+        assert!(!failing.record_and_persist_pending_lead(since, now + 5 * SEC, now + 4 * SEC));
+        assert!(
+            failing.dirty.load(Ordering::Acquire),
+            "kept dirty for a retry"
+        );
+        std::fs::remove_dir_all(failing_dir.join(CLOCK_STEP_TMP)).expect("unblock");
+        assert!(failing.record_and_persist_pending_lead(since, now + 5 * SEC, now + 4 * SEC));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&failing_dir);
+    }
+
+    /// 2026-11-23 (PR24a review): `bind` runs the boot belt over the newest
+    /// record on the WAL itself and writes the window at once, before any
+    /// tick-writer batch, so a second crash keeps it. Bites: removing the
+    /// belt call or the persist from `bind` leaves the second process with
+    /// no window.
+    #[test]
+    fn test_bind_runs_the_boot_belt_from_the_wal_and_writes_it_at_once() {
+        use crate::ws_frame_spill::{PACKET_INDEX_BITS, WalEndpoint, WsFrameSpill, WsType};
+        let base = |n: u64| (n >> PACKET_INDEX_BITS) << PACKET_INDEX_BITS;
+        let receipt = 1_792_987_200 * SEC;
+        let leading = base(receipt + 2 * SEC);
+        let later = base(receipt + 20 * SEC);
+        // Write the records in folders of their own and copy the segments,
+        // so no process-wide log ever binds to the folder under test.
+        let write = |tag: &str, seq: u64, at: u64| -> PathBuf {
+            let src = temp_dir(tag);
+            let spill = WsFrameSpill::new(&src).expect("spill");
+            spill.append_with_seq_at(
+                WsType::LiveFeed,
+                vec![7u8; 16],
+                seq,
+                i64::try_from(at).expect("fits"),
+                WalEndpoint::MainFeed,
+            );
+            spill.shutdown(std::time::Duration::from_secs(5));
+            src
+        };
+        let copy_segments = |from: &Path, to: &Path| {
+            for entry in std::fs::read_dir(from).expect("read") {
+                let path = entry.expect("entry").path();
+                if path.extension().is_some_and(|e| e == "wal") {
+                    std::fs::copy(&path, to.join(path.file_name().expect("name"))).expect("copy");
+                }
+            }
+        };
+        let dir = temp_dir("bind-belt");
+        let first_src = write("bind-belt-a", leading, receipt);
+        copy_segments(&first_src, &dir);
+        let boot = receipt + 60 * SEC;
+        let first = ClockStepLog::new();
+        first.bind(&dir, boot);
+        let (lo, hi) = rejected_file_window(boot, Some(receipt));
+        let belt = (
+            lo.min(leading - CLOCK_STEP_MARGIN_NANOS),
+            hi.max(leading + CLOCK_STEP_MARGIN_NANOS),
+        );
+        assert_eq!(one(&first), Some(belt), "the belt fired from the WAL");
+        // A newer record that does not lead its receipt, so the next bind's
+        // belt cannot fire again: only the file can carry the window now.
+        let second_src = write("bind-belt-b", later, later);
+        copy_segments(&second_src, &dir);
+        let second = ClockStepLog::new();
+        second.bind(&dir, boot + 60 * SEC);
+        assert_eq!(one(&second), Some(belt), "written by the first bind itself");
+        for d in [&dir, &first_src, &second_src] {
+            let _ = std::fs::remove_dir_all(d);
+        }
     }
 }

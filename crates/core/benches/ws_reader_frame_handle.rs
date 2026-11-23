@@ -31,6 +31,15 @@
 //! mean of that batch. The supervisor's own `Stage::SocketToWal` clock read
 //! and telemetry atomics around `accept` are not timed here.
 //!
+//! ⚠ 2026-11-23 (PR24a): these loops mint frame sequences millions of times a
+//! second, so after about 3,800 frames the frame counter leads the wall by
+//! more than half a second for the rest of the run, and nothing in this
+//! process ends the lead episode. Every measured mint (`ws_reader/next_frame_seq`
+//! and the `accept` benches) therefore takes the LEADING path: the
+//! `#[cold]` call to `note_lead_began_in` plus one atomic load. The normal
+//! frame's cost (one compare, no call) is not measured by any bench; it is
+//! Assumed to be below the leading path's.
+//!
 //! Budget: `quality/benchmark-budgets.toml::ws_reader_frame_handle` = 1,000 ns
 //! (matches `ws_reader/frame_handle_ns`; bench-gate reads Criterion's median).
 

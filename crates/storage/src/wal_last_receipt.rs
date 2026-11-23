@@ -20,9 +20,11 @@
 //!
 //! ## Cost
 //!
-//! Boot only, once: one header walk per directory (O(records in one segment),
+//! Boot only: one header walk per directory (O(records in one segment),
 //! payloads seeked past, never read) plus one whole-record read. Never on the
-//! frame path.
+//! frame path. ⚠ CHANGED 2026-11-23 (PR24a): TWICE per boot, not once:
+//! `main.rs` for the downtime row, and `wal_clock_step::ClockStepLog::bind`
+//! (through [`newest_seq_and_receipt_on_disk`]) for the boot belt.
 //!
 //! ## Honest limits
 //!
@@ -35,7 +37,10 @@
 //!   writes no downtime row rather than guess.
 //! - It must run after the WAL directory is claimed and before this process's
 //!   writer appends its first frame; otherwise it reads this process's own
-//!   frame. `main.rs` calls it right after `lock_wal_dir`.
+//!   frame. `main.rs` calls it right after `lock_wal_dir`. The step log's
+//!   bind (2026-11-23, PR24a) calls it inside `WsFrameSpill::new_with_guard`,
+//!   before the WAL writer thread is spawned, so it too reads only an
+//!   earlier process's frames.
 
 use std::fs::File;
 use std::io::Read;
@@ -67,8 +72,20 @@ const RECEIPT_OFFSET: usize = 13;
 /// receipt).
 #[must_use]
 pub fn newest_receipt_nanos_on_disk(wal_dir: &Path) -> Option<i64> {
+    newest_seq_and_receipt_on_disk(wal_dir).map(|(_, receipt)| receipt)
+}
+
+/// The frame sequence and receipt instant (both UTC epoch nanos) of the
+/// newest intact v3/v4 record under `wal_dir`, `None` as for
+/// [`newest_receipt_nanos_on_disk`] (2026-11-23, PR24a). The step log's boot
+/// belt compares the two (`wal_clock_step::ClockStepLog::note_boot_counter_lead`):
+/// a sequence well ahead of its receipt means the last process ended inside
+/// a frame-counter lead. Same cost: one header walk per directory plus one
+/// whole-record read, boot only.
+#[must_use]
+pub(crate) fn newest_seq_and_receipt_on_disk(wal_dir: &Path) -> Option<(u64, i64)> {
     let (seq, path, offset) = newest_record_on_disk(wal_dir)?;
-    receipt_of_record(&path, offset, seq)
+    receipt_of_record(&path, offset, seq).map(|receipt| (seq, receipt))
 }
 
 /// `(frame_seq, segment, offset)` of the record with the greatest header
@@ -188,6 +205,32 @@ mod tests {
             spill.shutdown(std::time::Duration::from_secs(5));
         }
         assert_eq!(newest_receipt_nanos_on_disk(dir.0.as_path()), Some(second));
+    }
+
+    /// 2026-11-23 (PR24a): the boot belt reads the newest record's sequence
+    /// with its receipt, from the same record.
+    #[test]
+    fn test_newest_seq_and_receipt_on_disk_pairs_the_newest_sequence_with_its_receipt() {
+        let dir = TmpDir::new();
+        assert_eq!(newest_seq_and_receipt_on_disk(dir.0.as_path()), None);
+        let receipt = 1_792_987_200_000_000_000_i64;
+        let seq = {
+            let spill = WsFrameSpill::new(dir.0.as_path()).expect("spill");
+            let s = crate::ws_frame_spill::next_frame_seq();
+            spill.append_with_seq_at(
+                WsType::LiveFeed,
+                vec![3u8; 16],
+                s,
+                receipt,
+                WalEndpoint::MainFeed,
+            );
+            spill.shutdown(std::time::Duration::from_secs(5));
+            s
+        };
+        assert_eq!(
+            newest_seq_and_receipt_on_disk(dir.0.as_path()),
+            Some((seq, receipt))
+        );
     }
 
     #[test]
