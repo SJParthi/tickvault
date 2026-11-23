@@ -112,6 +112,16 @@ const BUDGET: &[(&str, usize)] = &[
     // and, in `archive_quiesce`,
     // `test_regression_archiver_stands_aside_while_a_replay_is_registered`.
     ("dhan_feed_stack/catchup_stop.rs", 2),
+    // 2026-11-23 (PR23, close seal): +2 scans in one test,
+    // `test_close_seal_source_scan`, pinning that `close_seal_cutoff` allocates
+    // nothing and loops only over the session slice, that the calendar is
+    // probed only on a day change, and that no drain arm calls
+    // `force_seal_all` (the drain loop cannot be staged in a unit test).
+    // Paired behaviour tests: `test_close_seal_seals_every_open_bar_without_shutdown`,
+    // `test_close_seal_then_shutdown_and_midnight_roll_emit_nothing_more`,
+    // `test_close_seal_never_starts_during_wal_replay`,
+    // `test_crash_after_close_seal_loses_no_bar`.
+    ("dhan_feed_stack/close_seal_tests.rs", 2),
     ("dhan_feed_stack/contract_attach_tests.rs", 3),
     // 2026-11-07 (PR AA steps 1 and 2, owner Quote 51): 3 scans. Each bucket
     // binds the archive quiesce guard through its flush, the floor wait runs
