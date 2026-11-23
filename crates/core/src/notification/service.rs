@@ -403,7 +403,12 @@ impl NotificationService {
                         .is_some_and(|key| key.family != EpisodeFamily::Boot || self.boot_bubble)
                 {
                     let svc = Arc::clone(self);
-                    let inflight = InflightAlertTask::start();
+                    let Some(inflight) = InflightAlertTask::try_start(admits_past_inflight_cap(
+                        severity,
+                        Some(event.episode_role()),
+                    )) else {
+                        return;
+                    };
                     tokio::spawn(async move {
                         let _inflight = inflight;
                         svc.dispatch_episode_event(event).await;
@@ -479,11 +484,14 @@ impl NotificationService {
                     let base_url = telegram_api_base_url.clone();
                     let chunks = split_message_for_telegram(&message);
 
-                    let inflight = InflightAlertTask::start();
-                    tokio::spawn(async move {
-                        let _inflight = inflight;
-                        send_chunked_page(&client, &base_url, &token, &chat_id, &chunks).await;
-                    });
+                    if let Some(inflight) =
+                        InflightAlertTask::try_start(admits_past_inflight_cap(severity, None))
+                    {
+                        tokio::spawn(async move {
+                            let _inflight = inflight;
+                            send_chunked_page(&client, &base_url, &token, &chat_id, &chunks).await;
+                        });
+                    }
                 }
 
                 // Critical/High only: SNS SMS
@@ -2425,6 +2433,13 @@ static ALERT_SEND_TASKS_INFLIGHT: AtomicU64 = AtomicU64::new(0);
 /// coalescer, and a task lives at most `TELEGRAM_SEND_MAX_ATTEMPTS` sends
 /// plus `(TELEGRAM_SEND_MAX_ATTEMPTS − 1) × TELEGRAM_RETRY_AFTER_CAP_SECS`
 /// of waiting per chunk. This gauge is the measurement of that bound.
+///
+/// 2026-11-23: a soft cap is now added on top ([`InflightAlertTask::try_start`],
+/// [`ALERT_SEND_TASKS_SOFT_CAP`]). It refuses only alerts below High that are
+/// not an episode recovery edge, so the reason above for not capping (a
+/// Critical page must never be dropped or delayed) still holds: Critical and
+/// High pages, their SMS copies and every recovery edge start without the
+/// cap. A refusal is counted on `tv_telegram_dropped_total{reason="inflight_cap"}`.
 pub(crate) struct InflightAlertTask;
 
 impl InflightAlertTask {
@@ -2435,6 +2450,68 @@ impl InflightAlertTask {
             .saturating_add(1);
         publish_inflight_alert_tasks(now);
         Self
+    }
+
+    /// Counts a task in unless it is below High, not a recovery edge, and
+    /// [`ALERT_SEND_TASKS_SOFT_CAP`] tasks are already running. A refusal is
+    /// counted on `tv_telegram_dropped_total{reason="inflight_cap"}` and
+    /// logged once per crossing of the cap. O(1): one `fetch_add`, at most
+    /// one `fetch_sub`, no allocation.
+    pub(crate) fn try_start(admit_past_cap: bool) -> Option<Self> {
+        let now = ALERT_SEND_TASKS_INFLIGHT
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        if !inflight_cap_admits(now, admit_past_cap) {
+            ALERT_SEND_TASKS_INFLIGHT.fetch_sub(1, Ordering::Relaxed);
+            note_inflight_cap_refusal();
+            return None;
+        }
+        if now <= ALERT_SEND_TASKS_SOFT_CAP / 2 {
+            INFLIGHT_CAP_LATCHED.store(false, Ordering::Relaxed);
+        }
+        publish_inflight_alert_tasks(now);
+        Some(Self)
+    }
+}
+
+/// Above this many running alert-send tasks, an alert below High that is
+/// not a recovery edge is counted and not sent. Critical and High pages
+/// and episode recovery edges are never refused (PR47 follow-up,
+/// 2026-11-23). Each task lives at most `TELEGRAM_SEND_MAX_ATTEMPTS` sends
+/// plus 60 s of `retry_after` waits per chunk, so 256 tasks is far above
+/// any measured storm; the cap bounds memory if Telegram stalls for long.
+pub(crate) const ALERT_SEND_TASKS_SOFT_CAP: u64 = 256;
+
+/// One `warn!` per crossing of the cap; cleared once the count falls to
+/// half of it.
+static INFLIGHT_CAP_LATCHED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether an alert may start a send task past [`ALERT_SEND_TASKS_SOFT_CAP`]:
+/// High and Critical always, and an episode recovery edge always, so a
+/// bubble that opened is never left without its close. Pure, O(1).
+pub(crate) fn admits_past_inflight_cap(
+    severity: Severity,
+    episode_role: Option<super::episode::EpisodeRole>,
+) -> bool {
+    severity >= Severity::High || episode_role == Some(super::episode::EpisodeRole::Resolve)
+}
+
+/// Whether a task that would make `now` running tasks is admitted. Pure, O(1).
+fn inflight_cap_admits(now: u64, admit_past_cap: bool) -> bool {
+    admit_past_cap || now <= ALERT_SEND_TASKS_SOFT_CAP
+}
+
+fn note_inflight_cap_refusal() {
+    metrics::counter!("tv_telegram_dropped_total", "reason" => "inflight_cap").increment(1);
+    if !INFLIGHT_CAP_LATCHED.swap(true, Ordering::Relaxed) {
+        warn!(
+            target: "notification",
+            code = tickvault_common::error_code::ErrorCode::Telegram01Dropped.code_str(),
+            source = "inflight_cap",
+            cap = ALERT_SEND_TASKS_SOFT_CAP,
+            "notification: too many alert sends running; alerts below High are counted, not sent, until the backlog clears (High and Critical pages still go)"
+        );
     }
 }
 
@@ -5130,6 +5207,67 @@ mod tests {
     }
 
     #[test]
+    fn test_inflight_cap_admits_only_up_to_the_cap_unless_exempt() {
+        assert!(inflight_cap_admits(1, false));
+        assert!(inflight_cap_admits(ALERT_SEND_TASKS_SOFT_CAP, false));
+        assert!(!inflight_cap_admits(ALERT_SEND_TASKS_SOFT_CAP + 1, false));
+        assert!(inflight_cap_admits(ALERT_SEND_TASKS_SOFT_CAP + 1, true));
+        assert!(inflight_cap_admits(u64::MAX, true));
+    }
+
+    #[test]
+    fn test_high_critical_and_recovery_edges_are_never_capped() {
+        use super::super::episode::EpisodeRole;
+        assert!(admits_past_inflight_cap(Severity::Critical, None));
+        assert!(admits_past_inflight_cap(Severity::High, None));
+        assert!(admits_past_inflight_cap(
+            Severity::High,
+            Some(EpisodeRole::Open)
+        ));
+        assert!(admits_past_inflight_cap(
+            Severity::Low,
+            Some(EpisodeRole::Resolve)
+        ));
+        assert!(admits_past_inflight_cap(
+            Severity::Info,
+            Some(EpisodeRole::Resolve)
+        ));
+        assert!(!admits_past_inflight_cap(Severity::Medium, None));
+        assert!(!admits_past_inflight_cap(
+            Severity::Low,
+            Some(EpisodeRole::Open)
+        ));
+        assert!(!admits_past_inflight_cap(
+            Severity::Info,
+            Some(EpisodeRole::Progress)
+        ));
+    }
+
+    #[test]
+    fn test_try_start_refuses_low_severity_past_the_cap_and_never_high() {
+        // Fill past the cap with plain counted tasks (other tests only add
+        // to the count, so the cap is exceeded whatever else runs).
+        let held: Vec<InflightAlertTask> = (0..=ALERT_SEND_TASKS_SOFT_CAP)
+            .map(|_| InflightAlertTask::start())
+            .collect();
+        let before = inflight_alert_tasks();
+        assert!(before > ALERT_SEND_TASKS_SOFT_CAP);
+        let refused = InflightAlertTask::try_start(false);
+        assert!(
+            refused.is_none(),
+            "a low-severity send past the cap is refused"
+        );
+        assert!(
+            inflight_alert_tasks() <= before,
+            "a refusal gives its slot back"
+        );
+        let admitted = InflightAlertTask::try_start(true);
+        assert!(admitted.is_some(), "a High/Critical send is never refused");
+        drop(admitted);
+        drop(held);
+    }
+
+    #[test]
     fn test_every_notify_spawn_is_counted_in_flight() {
         let src = include_str!("service.rs");
         let start = src.find("pub fn notify(self: &Arc<Self>").unwrap();
@@ -5137,8 +5275,16 @@ mod tests {
         let notify = &src[start..end];
         assert_eq!(
             notify.matches("tokio::spawn(").count(),
-            notify.matches("InflightAlertTask::start()").count(),
+            notify.matches("InflightAlertTask::start()").count()
+                + notify.matches("InflightAlertTask::try_start(").count(),
             "every task notify spawns is counted on tv_telegram_send_tasks_inflight"
+        );
+        assert_eq!(
+            notify
+                .matches("InflightAlertTask::try_start(admits_past_inflight_cap(")
+                .count(),
+            2,
+            "the Telegram and episode sends go through the cap; the SMS copy (High+ only) does not"
         );
         assert_eq!(notify.matches("tokio::spawn(").count(), 3);
     }
