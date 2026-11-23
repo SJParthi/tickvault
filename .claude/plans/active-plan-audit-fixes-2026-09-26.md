@@ -810,6 +810,30 @@ PR25–PR27, PR18, PR19 and the decisions. One PR open at a time, as before.
     durable, and the archive ignores apply lag. Cap each watermark at the wall clock (the
     PR4c-2 `window_close_reference_secs` shape, which caps the top-volume close clock at the
     wall with no lead) and gate the archive on applied, not written.
+  - (2026-11-23, PR24a, storage only; PR24b and PR24c still to come, so this box stays open)
+    Corrected premise: no vendor timestamp reaches the WAL watermark. `capture_seq` comes from
+    `next_frame_seq`, which reads only the box clock (`max(previous + 1, wall)`), and the
+    applied watermark holds those sequences. Capping the STORED watermark at the wall is
+    unsafe: it seeds the frame counter at the next boot (`seed_frame_seq_from_disk`), and a
+    lower seed could mint `capture_seq` values already in the DEDUP key. The real gap is the
+    frame counter running ahead of the wall (a burst above about 7,600 frames a second, a
+    backward clock step, a counter seeded ahead at boot): rows then carry sequences outside
+    their receipt hour's span, and a lead under 1 s or one no tick batch sampled was never
+    recorded. Mechanism (owner decision cards 2026-11-23: do not cap the stored watermark;
+    record the lead at mint time and cap the acknowledgement at the wall where the archive
+    reads it): the minter marks a lead over 500 ms (`COUNTER_LEAD_RECORD_NANOS`, one compare
+    per frame, a cold compare-and-swap once per episode); the step log turns it into a step
+    window with no 1 s floor (`record_pending_lead`) on every tick-writer batch, every segment
+    rotation and inside the archive verdict before it reads the windows; the verdict and the
+    window settlement read `acked_high.min(wall)`; a boot belt holds the last session when the
+    newest WAL record's sequence is far from its receipt. Proven by the model proptest
+    `frame_seq_lead_window_properties`. Each record call writes the window it recorded to disk
+    itself, and the episode ends only once it is written (review, 2026-11-23). Honest limits:
+    a crash while a lead is pending and no record call has run since it began (tick writer
+    stalled, no segment rotation, no archive verdict), or while its window's write is failing,
+    when the newest frame no longer leads its receipt, is not covered; two clock steps less
+    than one 30 s anchor refresh apart are seen as their net move (predates PR24a; the model
+    spaces steps apart).
 - [ ] **PR25 — a misspelled config key fails the boot.** (`common`)
   - Unknown keys are silently ignored, so a typo in `live_subscription_from_master` silently
     runs the four-index fallback (common/src/config.rs:21-110). `#[serde(deny_unknown_fields)]`

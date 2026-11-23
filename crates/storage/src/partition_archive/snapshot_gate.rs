@@ -103,6 +103,15 @@ pub(crate) const RECEIPT_SLOP_NANOS: u64 = 2_000_000_000;
 /// to receipt hours and nothing can be proven about an hour.
 pub(crate) const CLOCK_AHEAD_LIMIT_NANOS: u64 = 1_000_000_000;
 
+// 2026-11-23 (PR24a): a frame-counter lead at or below
+// `COUNTER_LEAD_RECORD_NANOS` opens no lead episode and a clock move at or
+// below `CLOCK_STEP_MIN_NANOS` records no step, so both together must stay
+// inside the receipt slop an hour's frame span already allows.
+const _: () = assert!(
+    crate::wal_clock_step::CLOCK_STEP_MIN_NANOS + crate::wal_clock_step::COUNTER_LEAD_RECORD_NANOS
+        < RECEIPT_SLOP_NANOS
+);
+
 const NANOS_PER_SEC: u64 = 1_000_000_000;
 
 /// Whether `table` is archived through the snapshot gate in EVERY pass. The
@@ -525,8 +534,9 @@ pub(crate) fn clock_step_window_settled(
 /// can pass instances it owns (PR AA review finding 9): the global
 /// watermark, mark table and step log are shared by every test in the
 /// binary, so a test over them could assert only what any answer satisfies.
-/// The two counters are read through closures at the point the verdict
-/// reads them, after the step-window retire, as before. Cold.
+/// ⚠ CHANGED 2026-11-23 (PR24a): the wall and the newest frame sequence are
+/// read ONCE, first (wall before the sequence), then the pending lead
+/// episode is recorded, then the windows are read. Cold.
 pub(crate) struct ProcessInFlightState<'a> {
     /// The applied watermark (the process one: `applied_watermark()`).
     pub(crate) watermark: &'a crate::wal_applied_watermark::AppliedWatermark,
@@ -540,6 +550,12 @@ pub(crate) struct ProcessInFlightState<'a> {
     pub(crate) last_frame_seq: &'a dyn Fn() -> u64,
     /// The wall clock now, UTC nanoseconds.
     pub(crate) wall_nanos: &'a dyn Fn() -> u64,
+    /// Records the pending frame-counter lead episode as a step window
+    /// (`(wall, newest frame sequence)`; the process one:
+    /// `wal_clock_step::record_pending_counter_lead`), so a lead the tick
+    /// writer has not sampled (a writer stalled during it) is a window
+    /// before the verdict reads them (2026-11-23, PR24a).
+    pub(crate) record_pending_lead: &'a dyn Fn(u64, u64),
 }
 
 /// [`hour_in_flight_verdict`] over this process's live state: the applied
@@ -556,6 +572,7 @@ pub(crate) fn process_in_flight_verdict(table: &str, span: HourFrameSpan) -> InF
             retire_clock_window: &crate::wal_clock_step::retire_clock_step_window_if_settled,
             last_frame_seq: &crate::ws_frame_spill::current_frame_seq,
             wall_nanos: &crate::wal_applied_watermark::wall_nanos,
+            record_pending_lead: &crate::wal_clock_step::record_pending_counter_lead,
         },
         table,
         span,
@@ -563,12 +580,27 @@ pub(crate) fn process_in_flight_verdict(table: &str, span: HourFrameSpan) -> InF
 }
 
 /// [`process_in_flight_verdict`] over `state`. Cold, O(bounded tables).
+///
+/// ⚠ CHANGED 2026-11-23 (PR24a): (1) it records the pending frame-counter
+/// lead episode before it reads the step windows, so the verdict itself
+/// turns a lead into a window even when the tick writer did not sample it;
+/// (2) it reads the sink's acknowledged high-water mark capped at the wall
+/// (`acked_high.min(wall)`), in the verdict and in the window settlement
+/// alike. A frame sequence the counter minted ahead of the wall maps to no
+/// receipt hour, so an acknowledgement past the wall proves nothing about
+/// hours the wall has not reached. The cap is monotone: it can only hold
+/// more and only delay a window's retirement. The STORED watermark is not
+/// capped (it seeds the frame counter at the next boot, and lowering that
+/// seed could mint `capture_seq` values already in the DEDUP key).
 #[must_use]
 pub(crate) fn process_in_flight_verdict_on(
     state: &ProcessInFlightState<'_>,
     table: &str,
     span: HourFrameSpan,
 ) -> InFlightVerdict {
+    let wall = (state.wall_nanos)();
+    let last_frame_seq = (state.last_frame_seq)();
+    (state.record_pending_lead)(wall, last_frame_seq);
     let watermark = state.watermark;
     let applied = watermark.snapshot();
     let sink = sink_for_table(table);
@@ -578,7 +610,8 @@ pub(crate) fn process_in_flight_verdict_on(
     let acked_high = match sink {
         AppliedSink::Depth => applied.hwm_depth,
         AppliedSink::Ticks => applied.hwm_ticks,
-    };
+    }
+    .min(wall);
     let mut clock_step = (state.clock_window)();
     // PR AA finding 2 recheck: a step window that holds nothing on its way
     // for either sink is dropped (and the drop persisted), so a window from
@@ -596,7 +629,8 @@ pub(crate) fn process_in_flight_verdict_on(
             acked_high: match sink {
                 AppliedSink::Depth => applied.hwm_depth,
                 AppliedSink::Ticks => applied.hwm_ticks,
-            },
+            }
+            .min(wall),
             last_frame_seq: 0,
             wall_nanos: 0,
             clock_step: crate::wal_clock_step::StepWindows::EMPTY,
@@ -618,8 +652,8 @@ pub(crate) fn process_in_flight_verdict_on(
         deferred: deferred.as_ref(),
         rescue_floor_lowest: watermark.rescue_floor_lowest(sink),
         acked_high,
-        last_frame_seq: (state.last_frame_seq)(),
-        wall_nanos: (state.wall_nanos)(),
+        last_frame_seq,
+        wall_nanos: wall,
         clock_step,
     };
     hour_in_flight_verdict(span, &inputs)
@@ -1944,6 +1978,7 @@ mod tests {
                 retire_clock_window: &log_retire,
                 last_frame_seq: &no_lead,
                 wall_nanos: &at_wall,
+                record_pending_lead: &|_, _| {},
             },
             DEPTH,
             hour_span_at(old_at - 3_600 * SEC + 20 * SEC),
@@ -2006,6 +2041,7 @@ mod tests {
             retire_clock_window: &retire,
             last_frame_seq: &no_lead,
             wall_nanos: &at_wall,
+            record_pending_lead: &|_, _| {},
         };
         assert_eq!(
             process_in_flight_verdict_on(&state, DEPTH, hour),
@@ -2109,6 +2145,7 @@ mod tests {
                         retire_clock_window: &no_retire,
                         last_frame_seq: last,
                         wall_nanos: &at_wall,
+                        record_pending_lead: &|_, _| {},
                     },
                     table,
                     span,
@@ -2218,6 +2255,7 @@ mod tests {
                     retire_clock_window: &log_retire,
                     last_frame_seq: &at_wall,
                     wall_nanos: &at_wall,
+                    record_pending_lead: &|_, _| {},
                 },
                 DEPTH,
                 span,
@@ -2274,6 +2312,274 @@ mod tests {
             .replace('@', "");
         assert_ne!(swapped, wrapper);
         assert!(!wrapper_reads_the_globals(&swapped), "{swapped}");
+    }
+
+    /// 2026-11-23 (PR24a): the verdict records the pending frame-counter
+    /// lead BEFORE it reads the step windows, so a lead the tick writer never
+    /// sampled holds the hour. A 0.6 s lead (below the 1 s step floor)
+    /// begun inside the hour, acknowledged past the hour but not past the
+    /// lead window. Bites: with the recorder a no-op the verdict reads
+    /// `Clear`; with the windows read first the order check fails.
+    #[test]
+    fn test_process_in_flight_verdict_on_calls_record_pending_lead_before_clock_window() {
+        use crate::wal_clock_step::ClockStepLog;
+        let span = the_span();
+        let wall = span.hi + 3_600 * SEC;
+        let lead_seq = wall + 600_000_000;
+        let since = span.lo + 10 * SEC;
+        let dir = reader_test_dir("pending-lead");
+        let wm = AppliedWatermark::new_for_tests();
+        wm.bind(&dir);
+        let past_span = span.hi + REPLAY_REORDER_SLACK_SEQ + 1;
+        wm.note_ticks_acked(past_span);
+        wm.note_depth_acked(past_span);
+        let marks = DeferredDepth::new_for_tests();
+        let at_wall = || wall;
+        let last = || lead_seq;
+        let run = |record: &dyn Fn(u64, u64), log: &ClockStepLog| {
+            let recorded = std::cell::Cell::new(false);
+            let record_and_note = |w: u64, s: u64| {
+                assert_eq!(
+                    (w, s),
+                    (wall, lead_seq),
+                    "wall and sequence read once, passed on"
+                );
+                record(w, s);
+                recorded.set(true);
+            };
+            let windows = || {
+                assert!(
+                    recorded.get(),
+                    "the lead is recorded before the windows are read"
+                );
+                log.windows()
+            };
+            let retire = |w: (u64, u64), s: bool| log.retire_if_settled(w, s);
+            process_in_flight_verdict_on(
+                &ProcessInFlightState {
+                    watermark: &wm,
+                    deferred: &marks,
+                    clock_window: &windows,
+                    retire_clock_window: &retire,
+                    last_frame_seq: &last,
+                    wall_nanos: &at_wall,
+                    record_pending_lead: &record_and_note,
+                },
+                "ticks",
+                span,
+            )
+        };
+        // The recorder turns the pending episode into a window: held.
+        let log = ClockStepLog::new();
+        let record = |w: u64, s: u64| {
+            assert!(
+                !log.record_pending_lead(since, w, s),
+                "still ahead, not ended"
+            );
+        };
+        assert_eq!(run(&record, &log), InFlightVerdict::ClockStepped);
+        assert!(log.windows().is_recorded());
+        // Bite: no recorder, no window, the hour reads clear.
+        let bare = ClockStepLog::new();
+        assert_eq!(run(&|_, _| {}, &bare), InFlightVerdict::Clear);
+        // Source scan: the production body records before it reads windows.
+        let source = include_str!("snapshot_gate.rs");
+        let start = source
+            .find("pub(crate) fn process_in_flight_verdict_on(")
+            .expect("fn");
+        let body = &source[start..];
+        let body = &body[..body.find("\n\u{7d}\n").expect("end")];
+        let record_at = body
+            .find("(state.record_pending_lead)(wall, last_frame_seq);")
+            .expect("records the lead");
+        let windows_at = body.find("(state.clock_window)()").expect("reads windows");
+        assert!(
+            record_at < windows_at,
+            "recorded before the windows are read"
+        );
+        // Review finding (2026-11-23): the wall is read BEFORE the frame
+        // sequence, as the state's doc says.
+        let wall_at = body
+            .find("let wall = (state.wall_nanos)();")
+            .expect("wall read");
+        let seq_at = body
+            .find("let last_frame_seq = (state.last_frame_seq)();")
+            .expect("sequence read");
+        assert!(wall_at < seq_at, "the wall is read before the sequence");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 2026-11-23 (PR24a review): the window settlement reads the
+    /// acknowledgement capped at the wall too. A step window whose top is
+    /// past the wall, with both sinks acknowledged past that top (minted
+    /// ahead of the wall), is NOT settled and is not retired. Bite: removing
+    /// `.min(wall)` from `sink_inputs` reads the window settled and retires
+    /// it.
+    #[test]
+    fn test_window_settlement_reads_acked_high_capped_at_the_wall() {
+        use crate::wal_clock_step::StepWindows;
+        let wall = 1_795_404_600 * SEC;
+        let window = (wall - 600 * SEC, wall + 600 * SEC);
+        let acked = window.1 + REPLAY_REORDER_SLACK_SEQ + SEC;
+        let dir = reader_test_dir("settle-cap");
+        let wm = AppliedWatermark::new_for_tests();
+        wm.bind(&dir);
+        wm.note_ticks_acked(acked);
+        wm.note_depth_acked(acked);
+        let marks = DeferredDepth::new_for_tests();
+        let settled_seen = std::cell::Cell::new(None);
+        let windows = || StepWindows::from(Some(window));
+        let retire = |w: (u64, u64), settled: bool| {
+            assert_eq!(w, window);
+            settled_seen.set(Some(settled));
+            settled
+        };
+        let at_wall = || wall;
+        let state = ProcessInFlightState {
+            watermark: &wm,
+            deferred: &marks,
+            clock_window: &windows,
+            retire_clock_window: &retire,
+            last_frame_seq: &at_wall,
+            wall_nanos: &at_wall,
+            record_pending_lead: &|_, _| {},
+        };
+        let hour = hour_span_at(wall - 3 * 3_600 * SEC);
+        let _ = process_in_flight_verdict_on(&state, "ticks", hour);
+        assert_eq!(
+            settled_seen.get(),
+            Some(false),
+            "an acknowledgement past the wall settles no window"
+        );
+        // Bite, by hand: the same window over the raw acknowledgement reads
+        // settled.
+        let applied = wm.snapshot();
+        let raw = ack_only_inputs(&applied, acked, StepWindows::EMPTY);
+        assert!(clock_step_window_settled(window, &raw, &raw));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 2026-11-23 (PR24a): the archive reads the acknowledged high-water mark
+    /// capped at the wall. An acknowledgement minted ahead of the wall proves
+    /// nothing about an hour the wall has not passed. Bite: without the cap
+    /// the same state reads `Clear`.
+    #[test]
+    fn test_archive_reads_acked_high_capped_at_the_wall() {
+        let span = the_span();
+        // The wall is still inside the hour's slop; the counter (and the
+        // acknowledgement) ran an hour ahead of it.
+        let wall = span.hi;
+        let acked = span.hi + 3_600 * SEC;
+        let dir = reader_test_dir("acked-cap");
+        let wm = AppliedWatermark::new_for_tests();
+        wm.bind(&dir);
+        wm.note_ticks_acked(acked);
+        wm.note_depth_acked(acked);
+        let marks = DeferredDepth::new_for_tests();
+        let no_window = || crate::wal_clock_step::StepWindows::EMPTY;
+        let no_retire = |_w: (u64, u64), _s: bool| false;
+        let at_wall = || wall;
+        for table in ["ticks", DEPTH] {
+            let verdict = process_in_flight_verdict_on(
+                &ProcessInFlightState {
+                    watermark: &wm,
+                    deferred: &marks,
+                    clock_window: &no_window,
+                    retire_clock_window: &no_retire,
+                    last_frame_seq: &at_wall,
+                    wall_nanos: &at_wall,
+                    record_pending_lead: &|_, _| {},
+                },
+                table,
+                span,
+            );
+            assert_eq!(verdict, InFlightVerdict::NotAcked, "{table}");
+        }
+        // Bite: the same inputs with the raw acknowledgement read clear.
+        let applied = wm.snapshot();
+        let uncapped = InFlightInputs {
+            wal_bound: true,
+            applied: &applied,
+            deferred: None,
+            rescue_floor_lowest: u64::MAX,
+            acked_high: acked,
+            last_frame_seq: wall,
+            wall_nanos: wall,
+            clock_step: crate::wal_clock_step::StepWindows::EMPTY,
+        };
+        assert_eq!(
+            hour_in_flight_verdict(span, &uncapped),
+            InFlightVerdict::Clear
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 2026-11-23 (PR24a): only the archive's READ is capped. The stored
+    /// watermark keeps an acknowledgement ahead of the wall, in RAM and in
+    /// the file, because it seeds the frame counter at the next boot
+    /// (`seed_frame_seq_from_disk`): a capped seed could mint `capture_seq`
+    /// values already in the DEDUP key.
+    #[test]
+    fn test_stored_watermark_is_not_capped_at_the_wall() {
+        let dir = reader_test_dir("stored-uncapped");
+        let wm = AppliedWatermark::new_for_tests();
+        wm.bind(&dir);
+        let ahead = crate::wal_applied_watermark::wall_nanos() + 10 * SEC;
+        wm.note_ticks_acked(ahead);
+        wm.note_depth_acked(ahead - SEC);
+        assert_eq!(wm.snapshot().hwm_ticks, ahead);
+        assert_eq!(wm.snapshot().hwm_depth, ahead - SEC);
+        // Two persists past the 60 s durability lag write the live value.
+        let mono = 1_000 * SEC;
+        wm.persist_at(mono);
+        wm.persist_at(mono + 120 * SEC);
+        assert_eq!(AppliedSnapshot::persisted_high_water(&dir), ahead);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(512))]
+
+        /// 2026-11-23 (PR24a): the wall cap can only hold more: whenever the
+        /// verdict over the capped acknowledgement reads `Clear`, the
+        /// verdict over the raw one does too, for any hour, wall, counter,
+        /// acknowledgement and step window.
+        #[test]
+        fn proptest_capped_ack_clear_implies_uncapped_clear(
+            hour in 0_u64..48,
+            wall_off in 0_u64..(3 * 86_400),
+            ack_off in 0_u64..(3 * 86_400),
+            lead in 0_u64..4_000,
+            step in proptest::option::of((0_u64..(3 * 86_400), 2_u64..7_200)),
+        ) {
+            use crate::wal_clock_step::{step_window, StepWindows};
+            let base = 1_794_000_000 * SEC;
+            let span = hour_span_at(base + hour * 3_600 * SEC);
+            let wall = base + wall_off * SEC;
+            let acked = base + ack_off * SEC;
+            let last = wall + lead * 1_000_000;
+            let windows = step.map_or(StepWindows::EMPTY, |(at, mag)| {
+                let at = base + at * SEC;
+                StepWindows::from(step_window(at, at, mag * SEC))
+            });
+            let applied = AppliedSnapshot::default();
+            let inputs = |acked_high: u64| InFlightInputs {
+                wal_bound: true,
+                applied: &applied,
+                deferred: None,
+                rescue_floor_lowest: u64::MAX,
+                acked_high,
+                last_frame_seq: last,
+                wall_nanos: wall,
+                clock_step: windows,
+            };
+            let capped = hour_in_flight_verdict(span, &inputs(acked.min(wall)));
+            let raw = hour_in_flight_verdict(span, &inputs(acked));
+            proptest::prop_assert!(
+                capped != InFlightVerdict::Clear || raw == InFlightVerdict::Clear,
+                "capped {:?} raw {:?}", capped, raw
+            );
+        }
     }
 
     // Regression: 2026-11-09 — review of finding 12. The only guard that
@@ -2383,6 +2689,7 @@ mod tests {
             "retire_clock_window: &crate::wal_clock_step::retire_clock_step_window_if_settled,",
             "last_frame_seq: &crate::ws_frame_spill::current_frame_seq,",
             "wall_nanos: &crate::wal_applied_watermark::wall_nanos,",
+            "record_pending_lead: &crate::wal_clock_step::record_pending_counter_lead,",
             "process_in_flight_verdict_on(",
         ];
         let banned = ["new_for_tests", "::new()", "ClockStepLog"];
@@ -2833,3 +3140,9 @@ mod tests {
         assert_eq!(io.count(|e| *e == Event::Pause), 1);
     }
 }
+
+// 2026-11-23 (PR24a): the frame-counter lead model. Declared last:
+// source-scan guards treat everything after the first `#[cfg(test)] mod` as
+// test code.
+#[cfg(test)]
+mod lead_model_tests;
