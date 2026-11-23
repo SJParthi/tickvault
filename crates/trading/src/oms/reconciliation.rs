@@ -67,10 +67,16 @@ pub fn prices_equal_within_paise(a: f64, b: f64) -> bool {
 ///
 /// # Side Effects
 /// Logs ERROR for each mismatch (triggers Telegram alert via tracing).
-pub fn reconcile_orders<S: std::hash::BuildHasher>(
-    oms_orders: &HashMap<String, ManagedOrder, S>,
+pub fn reconcile_orders<K, S>(
+    oms_orders: &HashMap<K, ManagedOrder, S>,
     dhan_orders: &[DhanOrderResponse],
-) -> (ReconciliationReport, Vec<ReconciliationUpdate>) {
+) -> (ReconciliationReport, Vec<ReconciliationUpdate>)
+where
+    // Generic over the key so the OMS book (`Arc<str>` keys since
+    // 2026-11-23, audit plan PR6) and plain `String` maps both work.
+    K: std::borrow::Borrow<str> + std::hash::Hash + Eq + std::fmt::Display,
+    S: std::hash::BuildHasher,
+{
     let mut report = ReconciliationReport::default();
     let mut updates: Vec<ReconciliationUpdate> = Vec::new();
 
@@ -102,7 +108,7 @@ pub fn reconcile_orders<S: std::hash::BuildHasher>(
 
         report.total_checked = report.total_checked.saturating_add(1);
 
-        match oms_orders.get(&dhan_order.order_id) {
+        match oms_orders.get(dhan_order.order_id.as_str()) {
             Some(oms_order) => {
                 let status_mismatch = oms_order.status != dhan_status;
                 // 2026-08-07 (red-team finding #6): this compared prices with
@@ -170,7 +176,7 @@ pub fn reconcile_orders<S: std::hash::BuildHasher>(
         dhan_orders.iter().map(|o| o.order_id.as_str()).collect();
 
     for (order_id, oms_order) in oms_orders {
-        if !oms_order.is_terminal() && !dhan_order_ids.contains(order_id.as_str()) {
+        if !oms_order.is_terminal() && !dhan_order_ids.contains(order_id.borrow()) {
             warn!(
                 order_id = %order_id,
                 oms_status = %oms_order.status.as_str(),

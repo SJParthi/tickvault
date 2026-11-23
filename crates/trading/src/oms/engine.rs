@@ -905,7 +905,7 @@ impl OrderManagementSystem {
 
             self.correlations
                 .track_ref(&order.correlation_id, paper_order_id.clone());
-            self.orders.insert(paper_order_id.clone(), order);
+            self.orders.insert(paper_order_id.as_str(), order);
             self.total_placed = self.total_placed.saturating_add(1);
 
             self.paper_placed_total
@@ -1076,7 +1076,7 @@ impl OrderManagementSystem {
         // Step 7: Track in state
         self.correlations
             .track(correlation_id, response.order_id.clone());
-        self.orders.insert(response.order_id.clone(), order);
+        self.orders.insert(response.order_id.as_str(), order);
         self.total_placed = self.total_placed.saturating_add(1);
 
         counter!("tv_orders_placed_total", "mode" => "live").increment(1);
@@ -1512,6 +1512,9 @@ impl OrderManagementSystem {
                 "INVALID ORDER STATE TRANSITION — flagging for reconciliation"
             );
             order.needs_reconciliation = true;
+            // The guard borrows `order_id` as the book key; release it (and
+            // let it settle the active set) before the id moves into the error.
+            drop(order);
             return Err(OmsError::InvalidTransition {
                 order_id,
                 from: old_status.as_str().to_owned(),
@@ -1835,11 +1838,21 @@ impl OrderManagementSystem {
     /// Returns all active (non-terminal) orders.
     ///
     /// # Performance
-    /// O(N_all_orders) + a `Vec` heap alloc per call (terminal orders
-    /// accumulate until the daily reset) — COLD-PATH ONLY. Per-mark callers
-    /// use the runtime's sid-keyed pending index instead (HP-2).
+    /// O(active-set capacity + active orders) + a `Vec` heap alloc per call — COLD-PATH ONLY
+    /// (exit commands). Until 2026-11-23 this scanned every order held,
+    /// terminal ones included (they accumulate until the daily reset); the
+    /// book now keeps the active keys beside the map (audit plan PR6,
+    /// `engine/order_book.rs`). Order is unspecified. Per-mark callers use
+    /// the runtime's sid-keyed pending index instead (HP-2).
     pub fn active_orders(&self) -> Vec<&ManagedOrder> {
-        self.orders.values().filter(|o| !o.is_terminal()).collect()
+        self.active_orders_iter().collect()
+    }
+
+    /// The active (non-terminal) orders without the `Vec`: O(active-set
+    /// capacity + active orders), no allocation (see `OrderBook::active_values`). Terminal orders are not visited. Order is
+    /// unspecified.
+    pub fn active_orders_iter(&self) -> impl Iterator<Item = &ManagedOrder> {
+        self.orders.active_values()
     }
 
     /// Returns the number of active (non-terminal) orders WITHOUT the
@@ -2064,7 +2077,7 @@ impl OrderManagementSystem {
 
             self.correlations
                 .track(correlation_id, entry_order_id.clone());
-            self.orders.insert(entry_order_id.clone(), entry);
+            self.orders.insert(entry_order_id.as_str(), entry);
             self.super_orders.insert(entry_order_id.clone(), managed);
             self.total_placed = self.total_placed.saturating_add(1);
 
@@ -2254,7 +2267,7 @@ impl OrderManagementSystem {
 
         self.correlations
             .track(correlation_id, entry_order_id.clone());
-        self.orders.insert(entry_order_id.clone(), entry);
+        self.orders.insert(entry_order_id.as_str(), entry);
         self.super_orders.insert(entry_order_id.clone(), managed);
         self.total_placed = self.total_placed.saturating_add(1);
 
@@ -2658,7 +2671,7 @@ impl OrderManagementSystem {
 
             self.correlations
                 .track(correlation_id, paper_order_id.clone());
-            self.orders.insert(paper_order_id.clone(), order);
+            self.orders.insert(paper_order_id.as_str(), order);
             self.total_placed = self.total_placed.saturating_add(1);
 
             counter!("tv_forever_orders_placed_total", "mode" => "paper").increment(1);
@@ -2750,7 +2763,7 @@ impl OrderManagementSystem {
 
         self.correlations
             .track(correlation_id, response.order_id.clone());
-        self.orders.insert(response.order_id.clone(), order);
+        self.orders.insert(response.order_id.as_str(), order);
         self.total_placed = self.total_placed.saturating_add(1);
 
         counter!("tv_forever_orders_placed_total", "mode" => "live").increment(1);
@@ -2825,7 +2838,7 @@ impl OrderManagementSystem {
                     needs_reconciliation: false,
                     modification_count: 0,
                 };
-                self.orders.insert(paper_order_id.clone(), order);
+                self.orders.insert(paper_order_id.as_str(), order);
                 self.total_placed = self.total_placed.saturating_add(1);
                 counter!("tv_orders_placed_total", "mode" => "paper").increment(1);
                 order_ids.push(paper_order_id);
@@ -3007,7 +3020,7 @@ impl OrderManagementSystem {
                 needs_reconciliation: true,
                 modification_count: 0,
             };
-            self.orders.insert(resp.order_id.clone(), order);
+            self.orders.insert(resp.order_id.as_str(), order);
             self.total_placed = self.total_placed.saturating_add(1);
             counter!("tv_orders_placed_total", "mode" => "live").increment(1);
             order_ids.push(resp.order_id.clone());
@@ -4659,6 +4672,28 @@ mod tests {
         let _ = oms.handle_order_update(&traded);
         assert_eq!(oms.active_order_count(), 0, "terminal orders excluded");
         assert_eq!(oms.active_order_count(), oms.active_orders().len());
+    }
+
+    /// PR6 index half: the active iterator lists exactly the non-terminal
+    /// orders, the same set the full scan finds, and skips terminal ones.
+    #[test]
+    fn test_active_orders_iter_lists_only_open_orders() {
+        let mut oms = make_oms_with_order("1", OrderStatus::Pending);
+        let ids: Vec<&str> = oms
+            .active_orders_iter()
+            .map(|o| o.order_id.as_str())
+            .collect();
+        assert_eq!(ids, ["1"]);
+        let mut traded = make_order_update("1", "TRADED");
+        traded.traded_qty = 50;
+        traded.avg_traded_price = 100.0;
+        let _ = oms.handle_order_update(&traded);
+        assert_eq!(oms.active_orders_iter().count(), 0, "terminal skipped");
+        assert_eq!(
+            oms.all_orders().len(),
+            1,
+            "the terminal order is still held"
+        );
     }
 
     /// Fill sign comes from the tracked ManagedOrder's transaction_type
@@ -7288,7 +7323,7 @@ mod tests {
                 order.correlation_id = String::new();
                 order.created_at_us = 0;
                 order.updated_at_us = 0;
-                (key.clone(), order)
+                (key.to_string(), order)
             })
             .collect();
         rows.sort_by(|a, b| a.0.cmp(&b.0));

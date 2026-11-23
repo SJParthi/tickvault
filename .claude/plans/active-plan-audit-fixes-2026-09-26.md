@@ -182,7 +182,7 @@ inline (PR2, PR8, PR14).
     guard test.
   - `clippy::arithmetic_side_effects` denied in `crates/core/src/parser/` (fixed-offset decode),
     with each unavoidable site `checked_*`/`saturating_*`. Other crates: follow-up, flagged.
-- [ ] **PR6 — O(1) active-order count.** (`trading`)
+- [x] **PR6 — O(1) active-order count.** (`trading`)
   - Correction: there is no `ActiveOrderBook`; the O(n) scans are OMS
     `active_order_count()` (engine.rs:1660) and `active_orders()` (:1650), called on every
     order-runtime event arm (order_runtime.rs:1749, :1808). Maintain an `active` counter updated
@@ -197,6 +197,12 @@ inline (PR2, PR8, PR14).
     test_get_mut_guard_corrects_the_count_on_drop, test_clear_resets_the_count,
     proptest_active_count_equals_the_scan. Still open: the per-`(security_id, segment)` active
     index (so `active_orders()` and `rebuild_pending_paper` stop scanning).
+  - Closed 2026-11-23 (index half): the count became a set of active order keys
+    (`OrderBook.active`, sharing the order map's `Arc<str>` keys, so no allocation per activation), so `active_orders()` / `active_orders_iter()` and `rebuild_pending_paper`
+    walk the active set (O(set capacity) plus one probe per active order). A per-`(security_id, segment)` index was not needed: no caller asks by
+    instrument (the runtime keeps its own composite `pending_paper` map, rebuilt from the active
+    set). Tests: test_active_values_walks_only_open_orders, test_active_orders_iter_lists_only_open_orders,
+    proptest_active_count_equals_the_scan (now also compares the active ids).
 - [ ] **PR7 — benches for the paths with none.** (`trading`, `storage`)
   - Criterion benches: `MultiTfAggregator::consume_tick` (hit, new slot, seal-crossing),
     seal ring push/pop, tick ILP append, candle ILP append. Budgets added to
