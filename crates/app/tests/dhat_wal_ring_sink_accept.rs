@@ -46,6 +46,15 @@
 //! it to the house 8 blocks / 1 KiB budget. Still NOT measured here: the
 //! read buffering inside `tokio-tungstenite`, upstream of `accept`.
 //!
+//! **ADDED 2026-11-23 (PR24a):** a burst arm. A tight accept loop runs the
+//! frame counter more than half a second ahead of the wall, which takes the
+//! minter's cold lead hook (`ws_frame_spill::note_lead_began_in`); the arm
+//! asserts the lead episode was marked and holds the burst to the house
+//! budget. Before each attempt the episode the earlier arms opened is ended
+//! off-clock (`end_lead_episode_off_clock`), and the arm asserts the cell
+//! was empty when the attempt began and the episode opened inside it, so
+//! the once-per-episode compare-and-swap is inside the measured window.
+//!
 //! CI ENFORCEMENT: un-gated, house pattern; the Coverage lane skips it by the
 //! `dhat_` name prefix. One profiler per process, so both arms share one test.
 //!
@@ -68,6 +77,38 @@ use tickvault_storage::ws_frame_spill::{WsFrameSpill, WsType};
 
 mod dhat_support;
 
+/// The wall clock, UTC nanoseconds (the minter's own clock). No allocation.
+fn wall_nanos_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+/// Ends the process's frame-counter lead episode off-clock (2026-11-23,
+/// PR24a review): waits, at most 60 s, until the counter is back within
+/// 400 ms of the wall (so ending it does not reopen it), then ends it, so
+/// the burst arm's next attempt opens a fresh episode inside its window.
+fn end_lead_episode_off_clock() {
+    use tickvault_storage::ws_frame_spill::{
+        counter_lead_since_nanos, current_frame_seq, end_counter_lead_episode,
+    };
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while current_frame_seq().saturating_sub(wall_nanos_now()) > 400_000_000 {
+        assert!(
+            Instant::now() < deadline,
+            "the frame counter stayed ahead of the wall for 60 s"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    end_counter_lead_episode(counter_lead_since_nanos());
+    assert_eq!(
+        counter_lead_since_nanos(),
+        0,
+        "no lead episode is open before the burst arm"
+    );
+}
+
 /// House budget for 10,000 calls (same as `dhat_ws_lag_recorder.rs`).
 const STEADY_BUDGET_BYTES: u64 = 1024;
 const STEADY_BUDGET_BLOCKS: u64 = 8;
@@ -77,6 +118,13 @@ const WARMUP_FRAMES: usize = 4_096;
 const BACKLOG_FRAMES: usize = 4_096;
 /// Frames sent into EACH shed arm per measured attempt.
 const SHED_FRAMES: usize = 4_096;
+/// Frames in the burst arm (2026-11-23, PR24a): a tight accept loop mints
+/// one 131,072 ns frame base per frame, so 30,000 frames lead the wall by
+/// about 3.9 s less the loop's own time.
+const BURST_FRAMES: usize = 30_000;
+/// Frames sent off-clock before the burst arm's window (2026-11-23, PR24a
+/// review), well under the 3,814 that lead the wall by half a second.
+const BURST_PRIME_FRAMES: usize = 64;
 /// Attempts `measure_with_phantom_retry` may make, so every attempt gets
 /// fresh frames.
 const MEASURE_ATTEMPTS: usize = 3;
@@ -239,6 +287,10 @@ fn dhat_wal_ring_sink_accept_allocates_nothing_in_steady_state_backlog_or_shed()
     persisted_target += WARMUP_FRAMES as u64 + 4;
     wait_persisted(&spill, persisted_target);
 
+    // The burst arm's one frame, cloned per accept (an Arc bump), built
+    // off-clock.
+    let burst_frame = shared_ticker(u32::MAX);
+
     let _profiler = dhat::Profiler::builder().testing().build();
 
     // ---- Arm A: steady state. A fresh slice of frames per attempt, so a
@@ -375,6 +427,96 @@ fn dhat_wal_ring_sink_accept_allocates_nothing_in_steady_state_backlog_or_shed()
         send_budget.resident(),
         16,
         "a refused try_send releases its reservation; only the filling frame is held"
+    );
+
+    // ---- Arm D (2026-11-23, PR24a): a burst. A tight accept loop with the
+    // drain keeping up mints frame bases faster than the wall clock, so the
+    // frame counter runs ahead of it and the minter marks a lead episode
+    // (`counter_lead_since_nanos`): a cold, once-per-episode compare-and-swap
+    // that must allocate nothing, inside the same house budget.
+    //
+    // Review finding (2026-11-23): the arms above already run the counter
+    // ahead of the wall and open an episode, which nothing in this binary
+    // ends, so the opening compare-and-swap could have run before the
+    // window. Before every attempt, off-clock, the episode is ended once the
+    // counter is back within half a second of the wall; each attempt then
+    // records whether the cell was empty when it began and whether the
+    // episode it saw at its end opened inside it.
+    end_lead_episode_off_clock();
+    // The wait above can park the WAL writer (50 ms idle) and the frame
+    // counter's first frames after it; a few frames off-clock wake it, as
+    // the arms above leave it, so the window measures the burst itself.
+    for _ in 0..BURST_PRIME_FRAMES {
+        let outcome = sink.accept(burst_frame.clone());
+        assert_eq!(outcome, FrameSinkOutcome::Captured);
+        drop(ring_rx.try_recv());
+        budget.release(burst_frame.len());
+    }
+    persisted_target += BURST_PRIME_FRAMES as u64;
+    wait_persisted(&spill, persisted_target);
+    assert_eq!(
+        tickvault_storage::ws_frame_spill::counter_lead_since_nanos(),
+        0,
+        "the priming frames must not open a lead episode"
+    );
+    let lead_seen = std::cell::Cell::new(0_u64);
+    let since_at_start = std::cell::Cell::new(u64::MAX);
+    let attempt_start_wall = std::cell::Cell::new(0_u64);
+    let since_at_end = std::cell::Cell::new(0_u64);
+    let (d_bytes, d_blocks) = dhat_support::measure_with_phantom_retry(
+        STEADY_BUDGET_BYTES,
+        STEADY_BUDGET_BLOCKS,
+        end_lead_episode_off_clock,
+        || {
+            attempt_start_wall.set(wall_nanos_now());
+            since_at_start.set(tickvault_storage::ws_frame_spill::counter_lead_since_nanos());
+            for _ in 0..BURST_FRAMES {
+                let outcome = sink.accept(burst_frame.clone());
+                assert_eq!(outcome, FrameSinkOutcome::Captured);
+                let got = ring_rx.try_recv();
+                assert!(got.is_some(), "frame must be in the ring");
+                drop(got);
+                budget.release(burst_frame.len());
+            }
+            since_at_end.set(tickvault_storage::ws_frame_spill::counter_lead_since_nanos());
+            let lead = tickvault_storage::ws_frame_spill::current_frame_seq()
+                .saturating_sub(wall_nanos_now());
+            lead_seen.set(lead_seen.get().max(lead));
+            persisted_target += BURST_FRAMES as u64;
+            wait_persisted(&spill, persisted_target);
+        },
+    );
+    let since = since_at_end.get();
+    eprintln!(
+        "dhat_wal_ring_sink_accept: burst of {BURST_FRAMES} frames: {d_bytes} B / {d_blocks} \
+         blocks, counter lead at the end {} ms, lead cell at the attempt's start {}, lead \
+         episode began at {since} (attempt began at {})",
+        lead_seen.get() / 1_000_000,
+        since_at_start.get(),
+        attempt_start_wall.get()
+    );
+    assert!(
+        lead_seen.get() > 500_000_000,
+        "the burst did not lead the wall by more than half a second ({} ns); the arm \
+         proves nothing on this host",
+        lead_seen.get()
+    );
+    assert_eq!(
+        since_at_start.get(),
+        0,
+        "the lead episode must be ended before the measured attempt"
+    );
+    assert!(
+        since >= attempt_start_wall.get(),
+        "the lead episode ({since}) must open inside the measured attempt (began {}), so the \
+         opening compare-and-swap is inside the DHAT window",
+        attempt_start_wall.get()
+    );
+    assert!(
+        d_bytes <= STEADY_BUDGET_BYTES && d_blocks <= STEADY_BUDGET_BLOCKS,
+        "a burst of {BURST_FRAMES} frames that leads the wall allocated {d_bytes} B / \
+         {d_blocks} blocks (budget {STEADY_BUDGET_BYTES} B / {STEADY_BUDGET_BLOCKS} blocks): \
+         the lead hook on the mint path must not allocate"
     );
 
     assert_eq!(spill.shutdown(Duration::from_secs(10)), 0);

@@ -3143,6 +3143,129 @@ pub(crate) const fn round_up_to_frame_base(seq: u64) -> u64 {
     base << PACKET_INDEX_BITS
 }
 
+/// The wall instant (UTC nanos) at which the frame counter's current lead
+/// over the wall clock passed [`crate::wal_clock_step::COUNTER_LEAD_RECORD_NANOS`],
+/// or `0` when no lead episode is pending (2026-11-23, PR24a). Set once per
+/// episode by the minter ([`note_lead_began_in`]); cleared only by
+/// `wal_clock_step::record_pending_counter_lead`, after it recorded the
+/// episode as a step window.
+static LEAD_SINCE_NANOS: AtomicU64 = AtomicU64::new(0);
+
+/// [`crate::wal_clock_step::COUNTER_LEAD_RECORD_NANOS`] in frame bases
+/// (3,814 bases of 131,072 ns, 499.9 ms).
+const LEAD_RECORD_BASES: u64 =
+    crate::wal_clock_step::COUNTER_LEAD_RECORD_NANOS >> PACKET_INDEX_BITS;
+
+/// The next frame base: one past `prev_base`, or the wall's base when that
+/// is later, never above `ceiling`. The arithmetic [`next_frame_seq`]
+/// compare-and-swaps. Pure, O(1).
+#[must_use]
+pub(crate) const fn mint_base(prev_base: u64, now_base: u64, ceiling: u64) -> u64 {
+    let next = prev_base.saturating_add(1);
+    let next = if next > now_base { next } else { now_base };
+    if next > ceiling { ceiling } else { next }
+}
+
+/// Whether a minted base leads the wall's base by more than
+/// [`crate::wal_clock_step::COUNTER_LEAD_RECORD_NANOS`]. Pure, O(1).
+#[must_use]
+pub(crate) const fn lead_exceeds(next_base: u64, now_base: u64) -> bool {
+    next_base > now_base.saturating_add(LEAD_RECORD_BASES)
+}
+
+/// Marks a lead episode as begun at `now_nanos` in `cell` when none is
+/// pending: one load, and one compare-and-swap only when the cell is `0`
+/// (once per episode). `0` itself is stored as `1`, so a clock that reads 0
+/// still opens an episode. No lock, no allocation. Cold: only a mint that
+/// leads the wall by more than half a second reaches it.
+///
+/// Every access is `SeqCst`, pairing with the minter's `SeqCst`
+/// compare-and-swap on [`WAL_FRAME_SEQ`] and with
+/// [`end_counter_lead_episode_on`] (a `SeqCst` clear, then a `SeqCst` read
+/// of the counter): in that store-buffering shape at least one side sees the
+/// other's write, so a lead minted while an episode is being ended is never
+/// missed by both (review finding, 2026-11-23). Cold path only, so the
+/// stronger ordering costs a normal frame nothing.
+#[cold]
+#[inline(never)]
+pub(crate) fn note_lead_began_in(cell: &AtomicU64, now_nanos: u64) {
+    if cell.load(Ordering::SeqCst) == 0 {
+        let _opened =
+            cell.compare_exchange(0, now_nanos.max(1), Ordering::SeqCst, Ordering::SeqCst);
+    }
+}
+
+/// The wall instant (UTC nanos) at which the pending lead episode began, or
+/// `0` when none is pending. One atomic load. Read by the step log before it
+/// records the episode (`wal_clock_step::record_pending_counter_lead`).
+#[must_use]
+pub fn counter_lead_since_nanos() -> u64 {
+    LEAD_SINCE_NANOS.load(Ordering::Acquire)
+}
+
+/// Ends the lead episode that began at `since` once the step log recorded it
+/// and the counter met the wall. A compare-and-swap, so it never clears an
+/// episode a minter opened after `since` was read (a minter only writes a
+/// `0` cell, so in practice this is a swap to `0`). O(1).
+///
+/// A mint that led the wall while the old episode was still open set
+/// nothing, so after the clear the counter is read again and a lead still
+/// standing opens a new episode at once (one clock read, one load).
+///
+/// `pub` (not `pub(crate)`) only so the app's DHAT burst arm can end an
+/// episode off-clock and prove the opening compare-and-swap runs inside its
+/// measured window; production calls it only from
+/// `wal_clock_step::record_pending_counter_lead`.
+pub fn end_counter_lead_episode(since: u64) {
+    end_counter_lead_episode_on(
+        &LEAD_SINCE_NANOS,
+        since,
+        &WAL_FRAME_SEQ,
+        crate::wal_applied_watermark::wall_nanos,
+    );
+}
+
+/// [`end_counter_lead_episode`] on `cell`: the clear, then `counter` read
+/// against `wall()` and a lead still standing reopened. The clear and the
+/// counter read are `SeqCst` (see [`note_lead_began_in`] for why).
+/// `since == 0`: nothing. O(1).
+pub(crate) fn end_counter_lead_episode_on(
+    cell: &AtomicU64,
+    since: u64,
+    counter: &AtomicU64,
+    wall: impl Fn() -> u64,
+) {
+    if since == 0 {
+        return;
+    }
+    end_counter_lead_episode_in(cell, since);
+    let now = wall();
+    let counter_base = counter.load(Ordering::SeqCst) >> PACKET_INDEX_BITS;
+    if lead_exceeds(counter_base, now >> PACKET_INDEX_BITS) {
+        note_lead_began_in(cell, now);
+    }
+}
+
+/// The clear half of [`end_counter_lead_episode_on`]: a `SeqCst`
+/// compare-and-swap of `since` to `0`, so it never clears an episode opened
+/// after `since` was read. O(1).
+pub(crate) fn end_counter_lead_episode_in(cell: &AtomicU64, since: u64) {
+    if since != 0 {
+        let _ended = cell.compare_exchange(since, 0, Ordering::SeqCst, Ordering::SeqCst);
+    }
+}
+
+/// Mints the next frame sequence (see [`WAL_FRAME_SEQ`]).
+///
+/// ⚠ CHANGED 2026-11-23 (PR24a): after a successful compare-and-swap, a base
+/// that leads the wall by more than
+/// [`crate::wal_clock_step::COUNTER_LEAD_RECORD_NANOS`] (a burst above about
+/// 7,600 frames a second, a backward clock step, or a counter seeded ahead
+/// of the wall at boot) opens a lead episode ([`note_lead_began_in`]), which
+/// the step log turns into a step window at its next tick-writer batch or
+/// archive verdict. A normal frame pays one compare; a frame during a lead
+/// one more atomic load; one compare-and-swap per episode. No lock, no
+/// allocation. Socket read task only, never the frame drain.
 pub fn next_frame_seq() -> u64 {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -3155,13 +3278,15 @@ pub fn next_frame_seq() -> u64 {
     let base_ceiling = u64::MAX >> PACKET_INDEX_BITS;
     loop {
         let prev = WAL_FRAME_SEQ.load(Ordering::Relaxed);
-        let prev_base = prev >> PACKET_INDEX_BITS;
-        let next_base = prev_base.saturating_add(1).max(now_base).min(base_ceiling);
+        let next_base = mint_base(prev >> PACKET_INDEX_BITS, now_base, base_ceiling);
         let next = next_base << PACKET_INDEX_BITS;
         if WAL_FRAME_SEQ
             .compare_exchange_weak(prev, next, Ordering::SeqCst, Ordering::Relaxed)
             .is_ok()
         {
+            if lead_exceeds(next_base, now_base) {
+                note_lead_began_in(&LEAD_SINCE_NANOS, now);
+            }
             return next;
         }
     }
@@ -13518,3 +13643,6 @@ mod tests {
 
 #[cfg(test)]
 mod queue_depth_visibility_tests;
+
+#[cfg(test)]
+mod lead_episode_tests;

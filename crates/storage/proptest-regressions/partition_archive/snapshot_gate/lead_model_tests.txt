@@ -1,0 +1,10 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 6c502289b3af9d5391430ded90532b32408665e314ddd071d7eed0bdfbacbdc1 # shrinks to start_off = 0, segs = [Segment { event: Step { forward: false, nanos: 134792067818 }, dur_ms: 1, rate: 1000, sample_every_ms: Some(1) }, Segment { event: Restart { back: 0 }, dur_ms: 1, rate: 0, sample_every_ms: Some(1) }]
+cc 736fb4472a3abca8983359cd399e7a4f8b7beb48f8948db0a629aea58b0971ee # shrinks to start_off = 2969, segs = [Segment { event: None, dur_ms: 40501, rate: 0, sample_every_ms: Some(1) }, Segment { event: Step { forward: false, nanos: 3080143069230 }, dur_ms: 1, rate: 1000, sample_every_ms: Some(1) }, Segment { event: Restart { back: 200635347 }, dur_ms: 3, rate: 334, sample_every_ms: Some(4) }, Segment { event: Restart { back: 0 }, dur_ms: 1, rate: 0, sample_every_ms: Some(1) }]
+cc 20f87e8bd1bb281de4a35599d08ce3c6364c952810bae84a8370b43c8a90b475 # shrinks to start_off = 0, segs = [Segment { event: Step { forward: false, nanos: 91447246465 }, dur_ms: 2365, rate: 8000, sample_every_ms: Some(1) }, Segment { event: None, dur_ms: 27636, rate: 603, sample_every_ms: Some(5) }, Segment { event: Restart { back: 0 }, dur_ms: 1, rate: 0, sample_every_ms: Some(1) }]
+cc b095723b86016e7b14e8fd72b15565d2eb312784f32311d87674b841c8924424 # shrinks to start_off = 0, segs = [Segment { event: Step { forward: false, nanos: 30000902721 }, dur_ms: 2, rate: 500, sample_every_ms: Some(1) }, Segment { event: Step { forward: true, nanos: 15000885826 }, dur_ms: 1, rate: 0, sample_every_ms: Some(1) }]
