@@ -1680,6 +1680,7 @@ shown. The order after PR29b was set by re-check 6 (2026-09-27). One PR open at 
     (core/src/notification/service.rs:462, :489-494, :2109-2131, :2316-2345): honour the
     retry-after reply, count the final failure, and count SMS failures too.
   - (Done 2026-10-11: 429 replies wait Telegram's `retry_after`, capped at 30 s, on the send, episode and edit ladders; the chunked page path counts `tv_telegram_dropped_total{reason="send_failed"}` once per lost page; SMS failures count on `tv_sns_sms_failed_total{reason}` with a coded TELEGRAM-01 error; row 166 recorded, not capped: `tv_telegram_send_tasks_inflight` gauge. Tests: `test_regression_send_retry_waits_for_telegram_retry_after`, `test_regression_chunked_page_loss_counts_one_drop_per_page`, `test_regression_sns_sms_failure_is_counted_per_reason`.)
+  - (2026-11-23: row 166 now also CAPPED, softly: above `ALERT_SEND_TASKS_SOFT_CAP` (256) running send tasks, an alert below High that is not an episode recovery edge is counted on `tv_telegram_dropped_total{reason="inflight_cap"}` and not sent, with one coded TELEGRAM-01 `warn!` per crossing; Critical and High pages, their SMS copies and recovery edges are never refused. Tests: test_inflight_cap_admits_only_up_to_the_cap_unless_exempt, test_admits_past_inflight_cap_never_caps_high_critical_or_recovery, test_try_start_refuses_low_severity_past_the_cap_and_never_high, test_every_notify_spawn_is_counted_in_flight.)
 - [ ] **PR48 — console destructive actions finish before the open and never report a false
   complete.** (`aws-lambdas`) The open holes of ticked PR28a.
   - A reset or nuke started 08:30-08:59 runs into the open
@@ -3078,7 +3079,7 @@ and a call site; shell may only shrink. One PR per item, serial.
     and archived only after two clean probes behind its last flush
     (`files_awaiting_confirm`, `seals_awaiting_confirm`, `kind="boot_awaiting_confirm"`); the
     mid-session replay gets the same startup fix through `ReplayProbe::is_running`.
-  - [ ] **DA-13b — tick and depth spill replay.** The live hour file's half-written last line is
+  - [x] **DA-13b — tick and depth spill replay.** The live hour file's half-written last line is
     posted and resumed mid-line; a 2xx from a suspended table truncates the only local copy; the
     live file is chosen by name order (a clock step); a drained live file is never emptied after
     its hour; stuck rounds are not counted; a whole-file quarantine misreports bytes.
@@ -3098,9 +3099,11 @@ and a call site; shell may only shrink. One PR per item, serial.
     - C6: a round that only set bytes aside is not a recovery (`landed`, depth `sent_bytes`).
     - C7: a torn tail (tick and depth, and a damaged depth stretch) is on the paged
       `tv_tick_spill_replay_lines_rejected_total`.
-  - [ ] **DA-13c — WAL refold and confirm.** A bad packet boundary abandons the rest of a frame
+    - Closed 2026-11-23 (verified on main): the tick and depth spill replay no longer posts a half-written last line, keeps a drained file until the database has really confirmed its rows (test_regression_da13b_a_half_written_last_line_of_the_live_file_is_not_posted, test_regression_da13b_a_drained_closed_file_waits_for_confirmed_acks), treats a file as finished only once its hour has been over for 2 minutes and empties a file drained while live after its hour ends (test_regression_da13b_a_file_is_closed_only_a_quiet_period_after_its_hour, test_regression_da13b_a_file_drained_while_live_is_emptied_after_its_hour_closes), counts held rounds and reports quarantined bytes correctly (test_regression_da13b_the_replay_loop_holds_while_the_sink_is_suspect, test_regression_da13b_a_whole_file_quarantine_counts_the_chunks_already_accepted). All seven review-round-2 fixes have their own tests, among them test_regression_da13b_a_repeat_refusal_is_set_aside, test_regression_da13b_confirmation_is_sticky, test_regression_da13b_a_failed_recheck_counts_the_accepted_bytes, test_regression_da13b_a_set_aside_only_round_is_not_a_recovery and test_regression_da13b_a_torn_tail_is_paged, plus the order-book versions in the depth spill replay. The tests were found in the code on main.
+  - [x] **DA-13c — WAL refold and confirm.** A bad packet boundary abandons the rest of a frame
     with no counter or log; segments are archived the instant their rows are acked, ignoring the
     60 s durability lag and a suspect flag that lags one probe.
+    - Closed 2026-11-23 (verified on main): merged in #2093 (12279157e). When the replay meets a bad packet boundary, it now counts the bytes it gives up on and writes one coded log line, and it skips unknown packets the same way the live feed does (test_regression_da13c_refold_counts_the_bytes_it_abandons, test_regression_da13c_refold_steps_over_an_unknown_packet_like_the_live_drain). Replayed segments wait in a settling folder until the 60-second durability delay has passed and two clean database checks have come in. The trouble check is read when the batch starts, so it no longer runs one probe behind (test_regression_da13c_settled_batch_waits_out_the_durability_lag, test_regression_da13c_settled_batch_needs_clean_probes_after_the_ack, test_regression_da13c_episode_inside_the_refold_holds_the_batch, test_regression_da13c_an_episode_open_at_batch_start_holds_the_batch, test_regression_da13c_boot_rereads_segments_left_settling_by_a_crash).
   - [x] **DA-13d — the split findings, re-verified first.** Audit spill drain deletes on any 2xx;
     the after-close deferred-depth pass and the partition archiver touch the same partitions;
     pinned depth segments deleted under the disk floor. **Verdicts:** the audit-spill finding is
