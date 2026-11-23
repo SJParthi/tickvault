@@ -476,36 +476,48 @@ async fn test_ws_audit_consumer_spawn_ws_event_audit_consumer_refused_flush_keep
     tx.send(row1).await.expect("send row 1");
     tx.send(row2).await.expect("send row 2");
 
-    // A refused flush is logged and the loop continues: the second row is
-    // still attempted (a second POST reaches the stub).
-    let attempted = wait_until(Duration::from_secs(5), || {
+    // 2026-11-23 (batched flush with backoff): rows already queued go out
+    // in one request, and a refused flush keeps them buffered and tries
+    // again after the backoff wait (5 s), not once per row. So: both rows
+    // reach the database in the first request, a second request (the retry)
+    // follows the wait, and each refusal is logged with its code and the
+    // number of rows kept.
+    let posts = || {
         seen.lock()
             .expect("log")
             .iter()
             .filter(|s| s.method == "POST")
-            .count()
+            .map(|s| s.body.clone())
+            .collect::<Vec<String>>()
+    };
+    let attempted = wait_until(Duration::from_secs(5), || {
+        let all = posts().concat();
+        all.contains("connection_index=9001i") && all.contains("connection_index=9002i")
+    })
+    .await;
+    assert!(attempted, "both rows are sent to the database: {seen:?}");
+    let retried = wait_until(Duration::from_secs(10), || posts().len() >= 2).await;
+    assert!(
+        retried,
+        "a refused flush is retried after the backoff wait, rows kept: {seen:?}"
+    );
+    assert!(
+        posts()[1].contains("connection_index=9001i")
+            && posts()[1].contains("connection_index=9002i"),
+        "the retry re-sends the rows the refusal kept: {:?}",
+        posts()
+    );
+
+    let code = ErrorCode::AuditWs01EventWriteFailed.code_str();
+    let logged = wait_until(Duration::from_secs(5), || {
+        cap.lines_with(&["ws_event_audit: flush failed", code, "pending="])
+            .len()
             >= 2
     })
     .await;
     assert!(
-        attempted,
-        "every row must be attempted even after a refused flush: {seen:?}"
-    );
-
-    // Each refusal is logged with its code and names the row it failed.
-    let code = ErrorCode::AuditWs01EventWriteFailed.code_str();
-    let logged = wait_until(Duration::from_secs(5), || {
-        ["connection_index=9001", "connection_index=9002"]
-            .iter()
-            .all(|marker| {
-                !cap.lines_with(&["ws_event_audit: flush failed", code, marker])
-                    .is_empty()
-            })
-    })
-    .await;
-    assert!(
         logged,
-        "both refusals are logged as {code}: {:?}",
+        "each refusal is logged as {code} with the rows kept: {:?}",
         cap.lines_with(&["ws_event_audit: flush failed"])
     );
     // ... counted on the flush-error counter ...
