@@ -5216,7 +5216,7 @@ mod tests {
     }
 
     #[test]
-    fn test_high_critical_and_recovery_edges_are_never_capped() {
+    fn test_admits_past_inflight_cap_never_caps_high_critical_or_recovery() {
         use super::super::episode::EpisodeRole;
         assert!(admits_past_inflight_cap(Severity::Critical, None));
         assert!(admits_past_inflight_cap(Severity::High, None));
