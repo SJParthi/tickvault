@@ -241,9 +241,14 @@ pub async fn ensure_feed_gap_audit_table(questdb_config: &QuestDbConfig) {
 
 /// ILP-over-HTTP conf. HTTP (not TCP) so every flush gets a server ACK and a
 /// server-side reject surfaces as `Err` instead of a silently empty table.
+///
+/// 2026-11-23: `retry_timeout=0;request_timeout=5000;`, the order-audit
+/// writer's shape, so a QuestDB outage holds each per-gap flush for at most
+/// one 5 s request instead of the client's default retry loop. Unsent rows stay
+/// in the buffer and go out with the next flush.
 fn feed_gap_audit_ilp_http_conf(config: &QuestDbConfig) -> String {
     format!(
-        "http::addr={}:{};protocol_version=1;",
+        "http::addr={}:{};protocol_version=1;retry_timeout=0;request_timeout=5000;",
         config.host, config.http_port
     )
 }
@@ -419,6 +424,29 @@ mod tests {
         w.append_row(&sample())
             .expect("append after a failed ensure");
         assert_eq!(w.pending(), 1);
+    }
+
+    /// Transport ratchet: ILP-over-HTTP on the HTTP port, and a failed flush
+    /// gives up after one 5 s request (no client retry loop), the order-audit
+    /// writer's shape.
+    #[test]
+    fn test_feed_gap_audit_ilp_http_conf_bounds_a_failed_flush() {
+        let cfg = QuestDbConfig {
+            host: "tv-questdb".to_string(),
+            http_port: 9000,
+            pg_port: 8812,
+            ilp_port: 9009,
+        };
+        let conf = feed_gap_audit_ilp_http_conf(&cfg);
+        assert_eq!(
+            conf,
+            "http::addr=tv-questdb:9000;protocol_version=1;retry_timeout=0;request_timeout=5000;"
+        );
+        assert!(!conf.contains("9009"), "must target the HTTP port: {conf}");
+        assert!(
+            Sender::from_conf(&conf).is_ok(),
+            "the conf must parse: {conf}"
+        );
     }
 
     #[test]
