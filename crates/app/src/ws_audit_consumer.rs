@@ -383,9 +383,14 @@ fn spawn_feed_gap_audit_consumer(
     tx
 }
 
-/// Drains gap rows into `feed_gap_audit`: ensure the table once, then append
-/// and flush each row. A failure is AUDIT-WS-01 (the same forensic class as
-/// `ws_event_audit`), never a recovery-path failure.
+/// Drains gap rows into `feed_gap_audit`: ensure the table once, then
+/// append each row (and any rows already queued behind it, up to
+/// [`AUDIT_BATCH_MAX_ROWS`]) and flush the batch once. A failure is
+/// AUDIT-WS-01 (the same forensic class as `ws_event_audit`), never a
+/// recovery-path failure. After a failed flush the rows stay buffered and the
+/// next flush waits for [`FlushBackoff`] (5 s doubling to 60 s), whether or
+/// not more rows arrive, so an outage costs one request per backoff step
+/// instead of one per gap.
 async fn run_feed_gap_audit_consumer(
     mut rx: tokio::sync::mpsc::Receiver<tickvault_storage::feed_gap_audit_persistence::FeedGapRow>,
     questdb_cfg: tickvault_common::config::QuestDbConfig,
@@ -397,35 +402,63 @@ async fn run_feed_gap_audit_consumer(
 
     ensure_feed_gap_audit_table(&questdb_cfg).await;
     let mut writer = FeedGapAuditWriter::new(&questdb_cfg);
-    while let Some(row) = rx.recv().await {
-        if let Err(err) = writer.append_row(&row) {
-            error!(
-                code = ErrorCode::AuditWs01EventWriteFailed.code_str(),
-                ws_type = row.ws_type.as_str(),
-                connection_index = row.connection_index,
-                ?err,
-                "feed_gap_audit: append failed"
-            );
-            metrics::counter!("tv_feed_gap_audit_write_errors_total", "stage" => "append")
-                .increment(1);
-            continue;
+    let mut backoff = FlushBackoff::new();
+    let mut tally: LabelTally<&'static str> = LabelTally::new();
+    loop {
+        let (first, closed) = next_audit_row(&mut rx, backoff.wait_until(writer.pending())).await;
+        let batch = first
+            .into_iter()
+            .chain(std::iter::from_fn(|| rx.try_recv().ok()));
+        for row in batch.take(AUDIT_BATCH_MAX_ROWS) {
+            if let Err(err) = writer.append_row(&row) {
+                error!(
+                    code = ErrorCode::AuditWs01EventWriteFailed.code_str(),
+                    ws_type = row.ws_type.as_str(),
+                    connection_index = row.connection_index,
+                    ?err,
+                    "feed_gap_audit: append failed"
+                );
+                metrics::counter!("tv_feed_gap_audit_write_errors_total", "stage" => "append")
+                    .increment(1);
+            } else {
+                tally.add(row.ws_type.as_str());
+            }
         }
-        // A blocking ILP-over-HTTP round trip (the questdb-rs default retry
-        // loop applies, so it can take seconds against a stalled database):
-        // run it off the shared tokio worker (O(1) sweep, 2026-10-03).
-        if let Err(err) = crate::order_observability::blocking_flush(|| writer.flush()) {
-            error!(
-                code = ErrorCode::AuditWs01EventWriteFailed.code_str(),
-                ws_type = row.ws_type.as_str(),
-                connection_index = row.connection_index,
-                ?err,
-                "feed_gap_audit: flush failed"
-            );
-            metrics::counter!("tv_feed_gap_audit_write_errors_total", "stage" => "flush")
-                .increment(1);
-        } else {
-            metrics::counter!("tv_feed_gap_audit_rows_total", "ws_type" => row.ws_type.as_str())
-                .increment(1);
+        let pending = writer.pending();
+        // A blocking ILP-over-HTTP round trip: run it off the shared tokio
+        // worker (O(1) sweep, 2026-10-03).
+        match flush_step(
+            std::time::Instant::now(),
+            pending,
+            closed,
+            &mut backoff,
+            || crate::order_observability::blocking_flush(|| writer.flush()),
+        ) {
+            FlushStep::Flushed => {
+                tally.drain(|ws_type, n| {
+                    metrics::counter!("tv_feed_gap_audit_rows_total", "ws_type" => ws_type)
+                        .increment(n);
+                });
+            }
+            FlushStep::Failed { err, retry_in_secs } => {
+                error!(
+                    code = ErrorCode::AuditWs01EventWriteFailed.code_str(),
+                    pending,
+                    retry_in_secs,
+                    ?err,
+                    "feed_gap_audit: flush failed; rows kept for the next try"
+                );
+                metrics::counter!("tv_feed_gap_audit_write_errors_total", "stage" => "flush")
+                    .increment(1);
+                if writer.pending() == 0 {
+                    // The bounded buffer discarded them (counted by ilp_overflow).
+                    tally.clear();
+                }
+            }
+            FlushStep::Skipped => {}
+        }
+        if closed {
+            break;
         }
     }
     info!("feed_gap_audit consumer: all producers dropped — exiting");
@@ -684,49 +717,391 @@ async fn run_ws_event_audit_consumer(
         crate::candle_ddl_boot::spawn_audit_ensure_until_keyed_once(&questdb_cfg);
     }
     let mut writer = WsEventAuditWriter::new(&questdb_cfg);
-    while let Some(row) = rx.recv().await {
-        if let Err(err) = writer.append_row(&row) {
-            error!(
-                code = ErrorCode::AuditWs01EventWriteFailed.code_str(),
-                ws_type = row.ws_type.as_str(),
-                connection_index = row.connection_index,
-                event_kind = row.event_kind.as_str(),
-                ?err,
-                "ws_event_audit: append failed"
-            );
-            metrics::counter!("tv_ws_event_audit_write_errors_total", "stage" => "append")
-                .increment(1);
-            continue;
+    let mut backoff = FlushBackoff::new();
+    let mut tally: LabelTally<(&'static str, &'static str)> = LabelTally::new();
+    loop {
+        let (first, closed) = next_audit_row(&mut rx, backoff.wait_until(writer.pending())).await;
+        let batch = first
+            .into_iter()
+            .chain(std::iter::from_fn(|| rx.try_recv().ok()));
+        for row in batch.take(AUDIT_BATCH_MAX_ROWS) {
+            if let Err(err) = writer.append_row(&row) {
+                error!(
+                    code = ErrorCode::AuditWs01EventWriteFailed.code_str(),
+                    ws_type = row.ws_type.as_str(),
+                    connection_index = row.connection_index,
+                    event_kind = row.event_kind.as_str(),
+                    ?err,
+                    "ws_event_audit: append failed"
+                );
+                metrics::counter!("tv_ws_event_audit_write_errors_total", "stage" => "append")
+                    .increment(1);
+            } else {
+                tally.add((row.ws_type.as_str(), row.event_kind.as_str()));
+            }
         }
-        // A blocking ILP-over-HTTP round trip (the questdb-rs default retry
-        // loop applies, so it can take seconds against a stalled database):
-        // run it off the shared tokio worker (O(1) sweep, 2026-10-03).
-        if let Err(err) = crate::order_observability::blocking_flush(|| writer.flush()) {
-            error!(
-                code = ErrorCode::AuditWs01EventWriteFailed.code_str(),
-                ws_type = row.ws_type.as_str(),
-                connection_index = row.connection_index,
-                event_kind = row.event_kind.as_str(),
-                ?err,
-                "ws_event_audit: flush failed"
-            );
-            metrics::counter!("tv_ws_event_audit_write_errors_total", "stage" => "flush")
-                .increment(1);
-        } else {
-            metrics::counter!(
-                "tv_ws_event_audit_rows_total",
-                "ws_type" => row.ws_type.as_str(),
-                "event_kind" => row.event_kind.as_str(),
-            )
-            .increment(1);
+        let pending = writer.pending();
+        // A blocking ILP-over-HTTP round trip: run it off the shared tokio
+        // worker (O(1) sweep, 2026-10-03).
+        match flush_step(
+            std::time::Instant::now(),
+            pending,
+            closed,
+            &mut backoff,
+            || crate::order_observability::blocking_flush(|| writer.flush()),
+        ) {
+            FlushStep::Flushed => {
+                tally.drain(|(ws_type, event_kind), n| {
+                    metrics::counter!(
+                        "tv_ws_event_audit_rows_total",
+                        "ws_type" => ws_type,
+                        "event_kind" => event_kind,
+                    )
+                    .increment(n);
+                });
+            }
+            FlushStep::Failed { err, retry_in_secs } => {
+                error!(
+                    code = ErrorCode::AuditWs01EventWriteFailed.code_str(),
+                    pending,
+                    retry_in_secs,
+                    ?err,
+                    "ws_event_audit: flush failed; rows kept for the next try"
+                );
+                metrics::counter!("tv_ws_event_audit_write_errors_total", "stage" => "flush")
+                    .increment(1);
+                if writer.pending() == 0 {
+                    // The bounded buffer discarded them (counted by ilp_overflow).
+                    tally.clear();
+                }
+            }
+            FlushStep::Skipped => {}
+        }
+        if closed {
+            break;
         }
     }
     info!("ws_event_audit consumer: all producers dropped — exiting");
 }
 
+// ---------------------------------------------------------------------------
+// Batched flush with backoff (2026-11-23, the open half of the 2026-10-30
+// O(1) sweep note on these two writers)
+// ---------------------------------------------------------------------------
+
+/// Most rows appended before one flush. Rows already queued behind the one
+/// just received go into the same request, so a reconnect storm costs one
+/// round trip per batch instead of one per event. A bound, so one flush never
+/// waits on an unbounded drain of the channel.
+const AUDIT_BATCH_MAX_ROWS: usize = 256;
+
+/// First wait after a failed flush. Doubles on each further failure.
+const AUDIT_FLUSH_RETRY_FIRST_SECS: u64 = 5;
+
+/// Longest wait between flush attempts while QuestDB keeps refusing.
+const AUDIT_FLUSH_RETRY_MAX_SECS: u64 = 60;
+
+/// When a failed audit flush may be tried again.
+///
+/// Before this, each consumer flushed after every event, so during a QuestDB
+/// outage every event re-sent every retained row: O(retained rows) per event,
+/// one request per event. Now a failure sets a retry time; rows that arrive
+/// before it are appended to the buffer and wait, and the retry fires at that
+/// time whether or not more rows came. O(1) per call.
+#[derive(Debug)]
+struct FlushBackoff {
+    retry_at: Option<std::time::Instant>,
+    delay_secs: u64,
+}
+
+impl FlushBackoff {
+    const fn new() -> Self {
+        Self {
+            retry_at: None,
+            delay_secs: AUDIT_FLUSH_RETRY_FIRST_SECS,
+        }
+    }
+
+    /// Whether a flush may run now.
+    fn may_flush(&self, now: std::time::Instant) -> bool {
+        self.retry_at.is_none_or(|at| now >= at)
+    }
+
+    /// The retry time the consumer must wake for: set only while a failure
+    /// is waiting and rows are buffered.
+    fn wait_until(&self, pending: usize) -> Option<std::time::Instant> {
+        if pending == 0 { None } else { self.retry_at }
+    }
+
+    /// Record a failed flush; returns the wait it set, in seconds.
+    fn on_failure(&mut self, now: std::time::Instant) -> u64 {
+        let wait = self.delay_secs;
+        self.retry_at = Some(now + std::time::Duration::from_secs(wait));
+        self.delay_secs = wait.saturating_mul(2).min(AUDIT_FLUSH_RETRY_MAX_SECS);
+        wait
+    }
+
+    fn on_success(&mut self) {
+        self.retry_at = None;
+        self.delay_secs = AUDIT_FLUSH_RETRY_FIRST_SECS;
+    }
+}
+
+/// What one pass of the flush decision did.
+#[derive(Debug)]
+enum FlushStep {
+    /// Nothing buffered, or a backoff wait is still running.
+    Skipped,
+    /// The buffered rows were sent and acknowledged.
+    Flushed,
+    /// The flush failed; the rows stay buffered (bounded by the writer) and
+    /// the next try waits `retry_in_secs`.
+    Failed {
+        err: anyhow::Error,
+        retry_in_secs: u64,
+    },
+}
+
+/// Flush the buffered rows if any are buffered and the backoff allows it.
+/// `closing` (every producer dropped) ignores the backoff: it is the last
+/// chance to send the rows before the task exits.
+fn flush_step(
+    now: std::time::Instant,
+    pending: usize,
+    closing: bool,
+    backoff: &mut FlushBackoff,
+    flush: impl FnOnce() -> anyhow::Result<()>,
+) -> FlushStep {
+    if pending == 0 || !(closing || backoff.may_flush(now)) {
+        return FlushStep::Skipped;
+    }
+    match flush() {
+        Ok(()) => {
+            backoff.on_success();
+            FlushStep::Flushed
+        }
+        Err(err) => FlushStep::Failed {
+            err,
+            retry_in_secs: backoff.on_failure(now),
+        },
+    }
+}
+
+/// Wait for the next audit row, or for the backoff retry time when one is
+/// set. Returns the row (if one came) and whether every producer has gone.
+async fn next_audit_row<T>(
+    rx: &mut tokio::sync::mpsc::Receiver<T>,
+    retry_at: Option<std::time::Instant>,
+) -> (Option<T>, bool) {
+    match retry_at {
+        Some(at) => tokio::select! {
+            maybe = rx.recv() => match maybe {
+                Some(row) => (Some(row), false),
+                None => (None, true),
+            },
+            () = tokio::time::sleep_until(tokio::time::Instant::from_std(at)) => (None, false),
+        },
+        None => match rx.recv().await {
+            Some(row) => (Some(row), false),
+            None => (None, true),
+        },
+    }
+}
+
+/// Rows appended since the last acknowledged flush, per counter label, so
+/// the "rows written" counters move only when QuestDB has the rows.
+///
+/// O(distinct labels) per row: a linear scan over a set bounded by the label
+/// enums (5 socket kinds, and 5 x the event kinds for `ws_event_audit`),
+/// not by the number of rows. Allocates only when a label is first seen.
+#[derive(Debug)]
+struct LabelTally<K> {
+    counts: Vec<(K, u64)>,
+}
+
+impl<K: Copy + PartialEq> LabelTally<K> {
+    const fn new() -> Self {
+        Self { counts: Vec::new() }
+    }
+
+    fn add(&mut self, key: K) {
+        if let Some(slot) = self.counts.iter_mut().find(|(k, _)| *k == key) {
+            slot.1 = slot.1.saturating_add(1);
+        } else {
+            self.counts.push((key, 1));
+        }
+    }
+
+    /// Hand every label's count to `emit`, then forget them.
+    fn drain(&mut self, mut emit: impl FnMut(K, u64)) {
+        for (key, n) in self.counts.drain(..) {
+            emit(key, n);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.counts.clear();
+    }
+
+    #[cfg(test)]
+    fn total(&self) -> u64 {
+        self.counts.iter().map(|(_, n)| n).sum()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- batched flush with backoff (2026-11-23) ------------------------
+
+    #[test]
+    fn test_flush_backoff_doubles_to_the_cap_and_resets_on_success() {
+        let t0 = std::time::Instant::now();
+        let mut b = FlushBackoff::new();
+        assert!(b.may_flush(t0));
+        assert_eq!(b.wait_until(3), None, "no failure yet: wait on rows only");
+        let waits: Vec<u64> = (0..6).map(|_| b.on_failure(t0)).collect();
+        assert_eq!(
+            waits,
+            [5, 10, 20, 40, 60, 60],
+            "doubles, then holds at the cap"
+        );
+        assert!(!b.may_flush(t0));
+        assert!(b.may_flush(t0 + std::time::Duration::from_secs(60)));
+        assert_eq!(b.wait_until(0), None, "nothing buffered: no timer");
+        assert!(
+            b.wait_until(1).is_some(),
+            "rows buffered: wake at the retry time"
+        );
+        b.on_success();
+        assert!(b.may_flush(t0));
+        assert_eq!(b.on_failure(t0), 5, "a success resets the ladder");
+    }
+
+    #[test]
+    fn test_flush_step_skips_when_nothing_is_buffered() {
+        let mut b = FlushBackoff::new();
+        let mut called = false;
+        let step = flush_step(std::time::Instant::now(), 0, true, &mut b, || {
+            called = true;
+            Ok(())
+        });
+        assert!(matches!(step, FlushStep::Skipped));
+        assert!(!called, "an empty buffer never costs a request");
+    }
+
+    #[test]
+    fn test_flush_step_waits_out_the_backoff_but_not_at_close() {
+        let t0 = std::time::Instant::now();
+        let mut b = FlushBackoff::new();
+        let step = flush_step(t0, 2, false, &mut b, || Err(anyhow::anyhow!("down")));
+        assert!(matches!(
+            step,
+            FlushStep::Failed {
+                retry_in_secs: 5,
+                ..
+            }
+        ));
+        let mut calls = 0;
+        let step = flush_step(
+            t0 + std::time::Duration::from_secs(1),
+            3,
+            false,
+            &mut b,
+            || {
+                calls += 1;
+                Ok(())
+            },
+        );
+        assert!(matches!(step, FlushStep::Skipped), "inside the 5 s wait");
+        assert_eq!(calls, 0);
+        let step = flush_step(
+            t0 + std::time::Duration::from_secs(1),
+            3,
+            true,
+            &mut b,
+            || {
+                calls += 1;
+                Ok(())
+            },
+        );
+        assert!(
+            matches!(step, FlushStep::Flushed),
+            "the last chance ignores the wait"
+        );
+        assert_eq!(calls, 1);
+        assert!(b.may_flush(t0), "a success clears the wait");
+    }
+
+    /// The point of the change: a storm of events during an outage costs a
+    /// few requests, not one per event (before: 100 requests here).
+    #[test]
+    fn test_an_outage_storm_costs_a_few_requests_not_one_per_event() {
+        let t0 = std::time::Instant::now();
+        let mut b = FlushBackoff::new();
+        let mut requests = 0_u32;
+        let mut pending = 0_usize;
+        for i in 0..100_u64 {
+            pending += 1;
+            let now = t0 + std::time::Duration::from_millis(i * 100);
+            let _ = flush_step(now, pending, false, &mut b, || {
+                requests += 1;
+                Err(anyhow::anyhow!("questdb down"))
+            });
+        }
+        // 10 s of events: tries at 0 s, 5 s (then the wait is 10 s, past the storm).
+        assert_eq!(requests, 2, "one request per backoff step");
+    }
+
+    #[test]
+    fn test_label_tally_counts_per_label_and_drains_once() {
+        let mut t: LabelTally<(&str, &str)> = LabelTally::new();
+        t.add(("main_feed", "connected"));
+        t.add(("main_feed", "connected"));
+        t.add(("depth_20", "disconnected"));
+        assert_eq!(t.total(), 3);
+        let mut seen = Vec::new();
+        t.drain(|k, n| seen.push((k, n)));
+        assert_eq!(
+            seen,
+            [
+                (("main_feed", "connected"), 2),
+                (("depth_20", "disconnected"), 1)
+            ]
+        );
+        assert_eq!(t.total(), 0, "drained counts are not emitted twice");
+        t.add(("main_feed", "connected"));
+        t.clear();
+        assert_eq!(t.total(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_next_audit_row_returns_rows_then_reports_close() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<u8>(4);
+        tx.try_send(7).ok();
+        assert_eq!(next_audit_row(&mut rx, None).await, (Some(7), false));
+        drop(tx);
+        assert_eq!(next_audit_row(&mut rx, None).await, (None, true));
+    }
+
+    #[tokio::test]
+    async fn test_next_audit_row_wakes_for_the_retry_time_with_no_row() {
+        let (_tx, mut rx) = tokio::sync::mpsc::channel::<u8>(4);
+        let at = std::time::Instant::now() + std::time::Duration::from_millis(20);
+        assert_eq!(next_audit_row(&mut rx, Some(at)).await, (None, false));
+        assert!(std::time::Instant::now() >= at);
+    }
+
+    #[tokio::test]
+    async fn test_next_audit_row_with_a_retry_time_still_takes_a_row_and_a_close() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<u8>(4);
+        let far = std::time::Instant::now() + std::time::Duration::from_secs(600);
+        tx.try_send(3).ok();
+        assert_eq!(next_audit_row(&mut rx, Some(far)).await, (Some(3), false));
+        drop(tx);
+        assert_eq!(next_audit_row(&mut rx, Some(far)).await, (None, true));
+    }
 
     /// A QuestDB config pointing at a port nothing listens on.
     ///
@@ -780,6 +1155,22 @@ mod tests {
             .count();
         let all = production.matches("writer.flush()").count();
         assert_eq!(wrapped, 2, "both consumers must flush off the worker");
+        // 2026-11-23: both consumers batch queued rows and back off after a
+        // failed flush, never flush once per received row.
+        assert_eq!(
+            production
+                .matches("batch.take(AUDIT_BATCH_MAX_ROWS)")
+                .count(),
+            2
+        );
+        assert_eq!(
+            production
+                .matches("next_audit_row(&mut rx, backoff.wait_until(")
+                .count(),
+            2
+        );
+        assert_eq!(production.matches("match flush_step(").count(), 2);
+        assert!(!production.contains("while let Some(row) = rx.recv().await"));
         assert_eq!(
             all, wrapped,
             "a bare writer.flush() sits on the tokio worker"
