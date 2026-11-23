@@ -189,6 +189,14 @@ inline (PR2, PR8, PR14).
     inside the single transition function (enter-active +1, enter-terminal −1) plus a
     per-`(security_id, segment)` active index; the existing scan stays as a `debug_assert`
     cross-check. Public signatures unchanged, so exit-order callers are not edited.
+  - Progress 2026-11-23 (count half only; the item stays open): the order map is
+    `crates/trading/src/oms/engine/order_book.rs::OrderBook`, with the non-terminal count kept
+    beside it (inserts, clears and an `OrderMut` drop guard on every `get_mut`), so
+    `active_order_count()` is O(1); the old scan runs as a `debug_assert` in it. Tests:
+    test_insert_counts_only_non_terminal_orders, test_insert_replacing_an_order_corrects_the_count,
+    test_get_mut_guard_corrects_the_count_on_drop, test_clear_resets_the_count,
+    proptest_active_count_equals_the_scan. Still open: the per-`(security_id, segment)` active
+    index (so `active_orders()` and `rebuild_pending_paper` stop scanning).
 - [ ] **PR7 — benches for the paths with none.** (`trading`, `storage`)
   - Criterion benches: `MultiTfAggregator::consume_tick` (hit, new slot, seal-crossing),
     seal ring push/pop, tick ILP append, candle ILP append. Budgets added to
