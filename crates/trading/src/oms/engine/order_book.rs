@@ -264,6 +264,20 @@ mod tests {
         assert!(book.map().is_empty());
     }
 
+    #[test]
+    fn test_accessors_with_capacity_map_values_len_get_contains_key_is_empty() {
+        let mut book = OrderBook::with_capacity(2);
+        assert!(book.is_empty());
+        book.insert("a".to_owned(), order("a", OrderStatus::Pending));
+        book.insert("b".to_owned(), order("b", OrderStatus::Rejected));
+        assert_eq!(book.len(), 2);
+        assert_eq!(book.map().len(), 2);
+        assert_eq!(book.values().count(), 2);
+        assert!(book.contains_key("a"));
+        assert_eq!(book.get("b").map(|o| o.status), Some(OrderStatus::Rejected));
+        assert_eq!(book.active_count(), scan(&book));
+    }
+
     proptest! {
         /// The O(1) count equals the old full scan after every step of a
         /// random sequence of inserts, replacements, status changes and
