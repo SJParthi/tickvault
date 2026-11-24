@@ -179,6 +179,14 @@ const ALLOWED_IGNORED: &[(&str, &str)] = &[
         "crates/core/tests/socket_to_wal_tail_harness.rs",
         "socket_to_wal_stage_cost_with_parked_consumers",
     ),
+    // Added 2026-11-24 (plan item US1-B): the same harness file times the
+    // frame drain's short wait before sleeping, spin off against on, over
+    // four gap shapes. Prints only; the behaviour is pinned by the ordinary
+    // tests in `crates/core/src/websocket/frame_ring.rs`.
+    (
+        "crates/core/tests/socket_to_wal_tail_harness.rs",
+        "ring_wake_with_and_without_spin",
+    ),
     // Added 2026-10-11 with the real-SIGKILL chaos test (audit TEST-1): these
     // two are the CHILD halves of `chaos_wal_real_sigkill.rs`. Each parent
     // test re-runs its own test binary with `--ignored --exact <child>`,

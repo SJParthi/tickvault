@@ -8241,3 +8241,41 @@ Unchanged counters (`tv_seal_writer_drain_total{kind="rescued_spill"|"rescued_dl
 ### Per-Item Guarantee Matrix
 
 See `per-wave-guarantee-matrix.md` (15-row and 7-row matrices apply as written; no new tick-drop path, no hot-path allocation: both changes run off the drain or inside the existing fold).
+
+## ITEM US1-B — short wait before sleeping on the frame drain (2026-11-24, owner card "Short wait before sleeping (Recommended)")
+
+Owner, 2026-11-24: "fix the belt step wake too dude", then the card: keep checking for the next frame for up to ~50 µs before the drain sleeps; measure on the test machine first, ship behind an on/off switch, check the live numbers tomorrow.
+
+- [x] US1-B Adaptive spin before park on the frame ring (crates/core, crates/common, crates/app)
+  - Files: crates/core/src/websocket/frame_ring.rs, crates/common/src/config.rs, config/base.toml, crates/app/src/dhan_feed_stack.rs, crates/app/src/dhan_feed_stack/frame_ring_spin.rs, crates/app/src/main.rs, crates/core/tests/socket_to_wal_tail_harness.rs, CLAUDE.md
+  - Tests: test_spin_before_park_defaults_to_zero_and_parks_at_once, test_set_spin_before_park_caps_at_the_maximum, test_spin_that_times_out_parks_with_the_flag_cleared_and_is_woken, test_frame_pushed_during_the_spin_is_taken_with_no_wake, test_spin_returns_none_once_every_sender_is_gone, proptest_spin_before_park_never_strands_or_repeats_a_frame, test_spin_stats_count_hits_misses_and_time, test_spin_disarms_after_a_miss_and_rearms_after_a_short_sleep, test_frame_drain_spin_us_defaults_to_off_and_base_ships_fifty, test_configure_sets_the_spin_from_microseconds_and_zero_turns_it_off, test_publish_reads_the_ring_stats_without_panicking, test_effective_spin_us_is_off_for_an_own_thread_drain, test_regression_a_quick_wake_after_a_missed_spin_does_not_rearm, test_regression_a_stale_permit_wake_does_not_rearm, test_spin_disarms_after_the_consecutive_hit_cap
+
+### Design (Item US1-B)
+
+`FrameRingReceiver::recv`, on an empty ring and only while armed, sets the busy-poll flag and checks the ring for up to `spin_before_park` (one clock read per 32 checks) before the unchanged clear, register and re-check. A frame caught in the spin costs no wake on either side (the reader skips `notify_one`, the drain is not rescheduled). Adaptive: a spin that runs out disarms it; a sleep shorter than the spin re-arms it (two clock reads per sleep, spin on only). Capped at `FRAME_RING_SPIN_MAX` (1 ms). Switch `[dhan_feed] frame_drain_spin_us` (serde default 0 = off; base.toml 50).
+
+Review round (2026-11-24, 3 reviewers, 2 refuters per finding), fixed before merge: (a) a sleep right after a missed spin no longer re-arms (it started one budget late, so gaps of one to two budgets spun and still paid the wake); (b) only a wake that finds a frame re-arms (a stale `Notify` permit re-armed it); (c) after `FRAME_RING_SPIN_MAX_CONSECUTIVE_HITS` (64) catches in a row the ring sleeps once, so the drain's timer and idle arms run during a rush; (d) the spin runs only when the drain shares the main runtime: with its own thread on the readers' core (the production unit, `TICKVAULT_DRAIN_THREAD=on`) it is forced off, because at equal priority it holds the core the reader needs, and at real-time priority every frame delivered mid-spin counts as drain CPU wait in the daily capacity verdict. Refuted (0/2): the kernel real-time throttle tripping at real frame rates.
+
+### Edge Cases (Item US1-B)
+
+Zero spin (old path, no clock read); spin larger than the cap; last sender dropped during the spin (returns None at once); frame pushed during the spin; frame pushed just after it ends (the SeqCst clear before the re-check, argued at `set_busy_polling`); the recv future dropped inside `select!` mid-spin or mid-sleep (flag left set only until the next recv clears it, as for the existing busy-poll path); the cooperative budget (unchanged wrapper).
+
+### Failure Modes (Item US1-B)
+
+The spin holds the drain's worker for up to the budget: measured CPU on the x86 dev container, adaptive, 20,000 frames per shape: steady 400 µs gaps 0.0%, exponential mean 400 µs 1.5-1.6%, mean 100 µs 19.4-19.5%, bursts of mean 20 µs 87-88% (the drain stays awake through the burst). Before adaptive the same plain spin cost 12% at steady 400 µs gaps and caught almost nothing. Off-hours: one spin, then disarmed.
+
+### Test Plan (Item US1-B)
+
+Unit and property tests listed above (`cargo test -p tickvault-core --lib websocket::frame_ring`, `-p tickvault-common`, `-p tickvault-app --lib frame_ring_spin`); `#[ignore]`d harness `ring_wake_with_and_without_spin` (four gap shapes, spin 0 and 50 µs).
+
+### Rollback (Item US1-B)
+
+Set `frame_drain_spin_us = 0` (config only, next restart), or revert the commit. No storage, table or format change.
+
+### Observability (Item US1-B)
+
+`tv_frame_ring_spin_hits_total`, `tv_frame_ring_spin_misses_total`, `tv_frame_ring_spin_nanos_total` (local `/metrics` only, published on the drain's every-1,024-frames report; no alarm, filter or EMF name). Effect read on the existing `receipt_to_fold` and `ring_dwell` stages in `hot_path_latency_minute`.
+
+### Per-Item Guarantee Matrix (Item US1-B)
+
+See `per-wave-guarantee-matrix.md`; no new tick-drop path (every frame still reaches the drain, pinned by the never-strands proptest), no allocation on the recv path.

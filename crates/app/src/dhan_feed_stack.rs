@@ -109,6 +109,7 @@ pub mod mid_session_exit;
 // Plan item PR23 (2026-11-23): the day's last bars are sealed at the close.
 pub mod close_seal;
 // 2026-11-15 audit (live-5): the WAL replay is paced on a non-trading day.
+mod frame_ring_spin;
 mod replay_pace;
 // 2026-11-17: the 30 s silence arm's per-report tally.
 mod inline_depth_sample;
@@ -7782,6 +7783,7 @@ async fn run_frame_drain(
                 }
                 if seen.is_multiple_of(DRAIN_REPORT_EVERY) {
                     publish_fold_depth(&ingest);
+                    frame_ring_spin::publish(&rx);
                 }
                 // B3 (2026-11-13): the frame arm's work after the fold (the
                 // stamping above, the size-trigger and unbacked hand-offs, the
@@ -12056,6 +12058,8 @@ pub struct DhanFeedStackParams {
     pub frame_silence_fast_path: FrameSilenceFastPath,
     /// `[dhan_feed] ltt_utc_autocorrect` (scope lock 2026-11-20).
     pub ltt_utc_autocorrect: tickvault_common::config::LttUtcAutocorrect,
+    /// `[dhan_feed] frame_drain_spin_us` (US1-B): see `frame_ring_spin`.
+    pub frame_drain_spin_us: u32,
     pub questdb: QuestDbConfig,
     /// The process-wide write-ahead log every captured frame lands in BEFORE
     /// it is visible to the fold. `None` refuses the lane: capture-at-receipt
@@ -18942,7 +18946,8 @@ async fn run_dhan_feed_stack(mut params: DhanFeedStackParams) {
         }
     }
 
-    let (frame_tx, frame_rx) = frame_ring(FRAME_RING_CAPACITY);
+    let (frame_tx, mut frame_rx) = frame_ring(FRAME_RING_CAPACITY);
+    frame_ring_spin::configure(&mut frame_rx, params.frame_drain_spin_us);
     // TWO properties, merged rather than picked between (2026-08-15).
     //
     // origin/main SPLIT the ring budget by endpoint so a 512 KiB depth frame
@@ -22257,6 +22262,7 @@ mod tests {
             subscribe_reconcile_auto_resubscribe: false,
             frame_silence_fast_path: FrameSilenceFastPath::default(),
             ltt_utc_autocorrect: tickvault_common::config::LttUtcAutocorrect::Off,
+            frame_drain_spin_us: 0,
             dhan_enabled: false,
             instance_lock_held: Arc::new(AtomicBool::new(false)),
             // A disabled lane never reaches the re-fold, which is exactly why
@@ -27022,7 +27028,7 @@ mod tests {
              helper was inlined back into the drain or a drain flush bypassed it"
         );
         let drain_wiring_at = production_half
-            .find("let (frame_tx, frame_rx)")
+            .find("let (frame_tx, mut frame_rx)")
             .expect("the drain's channel wiring must exist — it is the boot/drain boundary");
         for (idx, _) in production_half.match_indices("blocking_flush(|| ingest.flush())") {
             let in_helper = idx > helper_start && idx < helper_end;

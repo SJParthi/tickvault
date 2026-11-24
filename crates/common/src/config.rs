@@ -1620,6 +1620,13 @@ pub struct DhanFeedConfig {
     /// `"act"` (default), `"shadow"` or `"off"`.
     #[serde(default)]
     pub ltt_utc_autocorrect: LttUtcAutocorrect,
+    /// How long the frame drain keeps checking an empty frame ring before it
+    /// sleeps, in microseconds (plan item US1-B, 2026-11-24). A frame that
+    /// lands inside it is taken with no thread wake on either side. `0`
+    /// (the serde default) sleeps at once, the behaviour before. Capped at
+    /// 1,000 µs by the ring. Cost: up to this much CPU per gap between frames.
+    #[serde(default)]
+    pub frame_drain_spin_us: u32,
 }
 
 const fn default_main_feed_backup_top_n() -> usize {
@@ -5739,6 +5746,28 @@ mod tests {
         assert!(
             section.contains("ltt_utc_autocorrect = \"act\""),
             "base.toml must ship the Dhan trade-time correction in act mode"
+        );
+    }
+
+    /// US1-B: absent means off (0); base.toml ships 50 µs.
+    #[test]
+    fn test_frame_drain_spin_us_defaults_to_off_and_base_ships_fifty() {
+        let absent: DhanFeedConfig = toml::from_str("").expect("empty section parses");
+        assert_eq!(
+            absent.frame_drain_spin_us, 0,
+            "absent: off, the old behaviour"
+        );
+        let set: DhanFeedConfig = toml::from_str("frame_drain_spin_us = 50\n").expect("parses");
+        assert_eq!(set.frame_drain_spin_us, 50);
+        let base = include_str!("../../../config/base.toml");
+        let section = base
+            .split("\n[dhan_feed]")
+            .nth(1)
+            .and_then(|rest| rest.split("\n[").next())
+            .expect("base.toml has [dhan_feed]");
+        assert!(
+            section.contains("frame_drain_spin_us = 50"),
+            "base ships 50 µs"
         );
     }
 

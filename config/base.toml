@@ -205,6 +205,12 @@ max_websocket_connections = 5
 # correction back is a code change behind a fresh dated quote.
 [dhan_feed]
 ltt_utc_autocorrect = "act"
+# Short wait before sleeping (plan item US1-B, 2026-11-24, owner card "Short
+# wait before sleeping (Recommended)"): after the frame drain finds the ring
+# empty it keeps checking for this many microseconds before it sleeps, so the
+# next frame is taken with no thread wake. 0 turns it off. Cost: up to this much
+# CPU per gap between frames (read `tv_frame_ring_spin_nanos_total`).
+frame_drain_spin_us = 50
 
 [questdb]
 host = "tv-questdb"
