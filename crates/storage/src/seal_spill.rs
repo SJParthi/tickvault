@@ -1020,7 +1020,17 @@ impl SealSpillWriter {
     /// Production constructor. Uses `data/spill/`.
     #[must_use]
     pub fn new() -> Self {
-        Self::in_dir(PathBuf::from(SEAL_SPILL_DIR))
+        let writer = Self::in_dir(PathBuf::from(SEAL_SPILL_DIR));
+        // Plan item US1-C: the production writer maps its ledger table at
+        // boot, so the first rescue of an outage pays no page fault per bar.
+        writer.prefault_ledger();
+        writer
+    }
+
+    /// Maps the ledger table now ([`SpillLedger::prefault`], plan item US1-C).
+    /// Returns the slots touched. O(capacity) once; called by [`Self::new`].
+    pub(crate) fn prefault_ledger(&self) -> usize {
+        self.lock_state().ledger.prefault()
     }
 
     fn in_dir(spill_dir: PathBuf) -> Self {

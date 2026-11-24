@@ -350,6 +350,39 @@ impl SealDiskFloor {
     }
 }
 
+/// Most seals one batch rescue writes in a single spill `write(2)` (plan item
+/// US1-C, 2026-11-24). Equal to main.rs `SEAL_MAX_DRAIN_PER_CYCLE`, the most a
+/// live flush can hand over at once, so a failed live cycle is always one
+/// batch; the shutdown ring rescue ([`crate::seal_writer_task::rescue_ring`])
+/// is cut into chunks of this size. 16,384 × 128 B = 2 MiB of record bytes.
+pub const RESCUE_BATCH_MAX_SEALS: usize = 16_384;
+
+/// The per-seal results of one [`SealAbsorptionPipeline::rescue_in_flight_batch`]
+/// call, in the same four classes [`SubmitOutcome`] reports one by one.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RescueBatchOutcome {
+    /// Kept by the spill (written, or a fuller copy was already held).
+    pub spilled: usize,
+    /// Written to the dead-letter files.
+    pub dlq_written: usize,
+    /// Refused by both tiers (the caller pages AGGREGATOR-DROP-01).
+    pub dropped: usize,
+    /// Refused at the seal disk floor, nothing written (also in `dropped`).
+    pub dropped_below_floor: usize,
+}
+
+/// Reused buffers of the batch rescue (plan item US1-C). Cold path: they grow
+/// on the first failed flush and keep that capacity for the runner's life.
+#[derive(Debug, Default)]
+struct RescueScratch {
+    /// The run, converted to the spill's record type.
+    serialized: Vec<SerializedSeal>,
+    /// The run's record bytes, one `write(2)`.
+    bytes: Vec<u8>,
+    /// Seals popped from the ring at shutdown, one chunk at a time.
+    popped: Vec<BufferedSeal>,
+}
+
 /// Edge latch for one failing escalation tier (2026-10-30 O(1) sweep).
 ///
 /// A tier-2 spill write that fails (EIO, read-only volume, quota) used to log
@@ -425,6 +458,10 @@ pub struct SealAbsorptionPipeline {
     spill_failure: FailureEpisode,
     /// Tier-3 (DLQ) failure episode, latched the same way.
     dlq_failure: FailureEpisode,
+    /// Reused buffers for [`Self::rescue_in_flight_batch`] (plan item US1-C).
+    /// Empty until the first rescue; cleared, never shrunk, after each use,
+    /// so they hold at most one chunk ([`RESCUE_BATCH_MAX_SEALS`] seals).
+    rescue_scratch: RescueScratch,
 }
 
 impl SealAbsorptionPipeline {
@@ -440,6 +477,7 @@ impl SealAbsorptionPipeline {
             dlq: Arc::new(SealDlqWriter::new()),
             spill_failure: FailureEpisode::default(),
             dlq_failure: FailureEpisode::default(),
+            rescue_scratch: RescueScratch::default(),
         };
         pipeline.prefault_ring();
         pipeline
@@ -457,6 +495,7 @@ impl SealAbsorptionPipeline {
             dlq: Arc::new(SealDlqWriter::with_dlq_dir_for_test(dlq_dir)),
             spill_failure: FailureEpisode::default(),
             dlq_failure: FailureEpisode::default(),
+            rescue_scratch: RescueScratch::default(),
         }
     }
 
@@ -477,6 +516,7 @@ impl SealAbsorptionPipeline {
             dlq: Arc::new(SealDlqWriter::with_dlq_dir_for_test(dlq_dir)),
             spill_failure: FailureEpisode::default(),
             dlq_failure: FailureEpisode::default(),
+            rescue_scratch: RescueScratch::default(),
         }
     }
 
@@ -544,6 +584,179 @@ impl SealAbsorptionPipeline {
     /// nothing written).
     pub fn rescue_in_flight(&self, seal: BufferedSeal, now_unix_secs: i64) -> SubmitOutcome {
         self.escalate_evicted(seal, now_unix_secs)
+    }
+
+    /// [`Self::rescue_in_flight`] for a whole run of seals with ONE spill
+    /// `write(2)` (plan item US1-C, 2026-11-24). Drains `seals`, keeping its
+    /// capacity; at most [`RESCUE_BATCH_MAX_SEALS`] per call is the intended
+    /// size (a longer run is still written, in one larger write).
+    ///
+    /// Same tiers, same records, same `Ok` contract as the per-seal path:
+    /// when it returns, every seal counted `spilled` is in the page cache.
+    /// - The disk floor is checked ONCE for the whole run. If the run does not
+    ///   fit above the floor, every seal takes the per-seal path instead, so
+    ///   behaviour near the floor is exactly the old one.
+    /// - The spill's batch append applies the same ledger rule per seal (a
+    ///   copy older than one the spill or the database holds is not written
+    ///   and counts as kept), files the run under the IST day of
+    ///   `now_unix_secs`, and on a failed write keeps the whole leading
+    ///   records that landed and cuts any torn tail.
+    /// - Seals after the kept ones go to the DLQ one record each; one the DLQ
+    ///   also refuses is `dropped`.
+    ///
+    /// Two differences from calling [`Self::rescue_in_flight`] per seal.
+    /// First, the spill judges the whole run against what it held BEFORE the
+    /// run, so when one run holds a fuller copy of a bar and then an emptier
+    /// copy of the same bar, both are written (the per-seal path skipped the
+    /// emptier one). Every reader keeps the fullest copy per bar whatever the
+    /// order (Z6), so the database ends on the same rows; the spill file can
+    /// hold one extra, older record. Second, after
+    /// a failed spill write, the per-seal path retried the spill for the next
+    /// seal (a reopen per seal); here the rest of the run goes straight to
+    /// the DLQ, the choice the escalation thread made in deep audit DA-14 so a
+    /// failing disk is not paid once per seal. Every seal is still accounted.
+    ///
+    /// # Complexity
+    /// O(seals) to convert and copy (128 bytes each), one floor check, one
+    /// `write(2)` when the spill takes the run, plus one DLQ append per seal
+    /// it does not keep. Cold path: runs only after a candle flush failed, or
+    /// at shutdown. No allocation once the scratch buffers hold one run.
+    pub fn rescue_in_flight_batch(
+        &mut self,
+        seals: &mut Vec<BufferedSeal>,
+        now_unix_secs: i64,
+    ) -> RescueBatchOutcome {
+        let mut outcome = RescueBatchOutcome::default();
+        if seals.is_empty() {
+            return outcome;
+        }
+        if seals.len() == 1 {
+            // One seal: the per-seal path is cheaper (no batch `fstat`), and
+            // its result is the same by definition. Measured 1.3-1.4 µs
+            // against 1.9-2.1 µs through the batch (`us1c_rescue_cost_per_seal`).
+            for seal in seals.drain(..) {
+                Self::tally(&mut outcome, &self.escalate_evicted(seal, now_unix_secs));
+            }
+            return outcome;
+        }
+        let run_bytes = (seals.len() as u64).saturating_mul(SEAL_SPILL_RECORD_SIZE as u64);
+        if !self.has_room_to_escalate(run_bytes, now_unix_secs) {
+            // Near the floor: the exact per-seal behaviour, seal by seal.
+            for seal in seals.drain(..) {
+                Self::tally(&mut outcome, &self.escalate_evicted(seal, now_unix_secs));
+            }
+            return outcome;
+        }
+        self.floor.note_cleared();
+
+        // Moved out for the call so `self` stays free to borrow; put back below.
+        let mut serialized = std::mem::take(&mut self.rescue_scratch.serialized);
+        let mut bytes = std::mem::take(&mut self.rescue_scratch.bytes);
+        serialized.clear();
+        serialized.extend(seals.iter().map(SerializedSeal::from));
+        let kept = match self
+            .spill
+            .append_seals(serialized.iter(), &mut bytes, now_unix_secs)
+        {
+            Ok(()) => serialized.len(),
+            Err(failure) => {
+                let kept = failure.kept.min(serialized.len());
+                if kept > 0 {
+                    // The leading records landed, as the per-seal path would
+                    // have reported before the first failure.
+                    self.close_spill_episode(
+                        "the spill accepted a seal (written, or already held in a fuller copy)",
+                    );
+                    self.close_dlq_episode("the spill accepted a seal, so the DLQ is not reached");
+                }
+                // One failed write, counted once: the rest of the run was not
+                // tried against the spill, so it is not counted as failing it.
+                if self.spill_failure.open() {
+                    let (security_id, exchange_segment_code) = seals
+                        .get(kept)
+                        .map_or((0, 0), |s| (s.security_id, s.exchange_segment_code));
+                    warn!(
+                        spill_err = ?failure.error,
+                        source = "seal_spill_failed",
+                        security_id,
+                        exchange_segment_code,
+                        run = serialized.len(),
+                        kept,
+                        "tier-2 spill batch failed — escalating the rest of the run to the \
+                         tier-3 DLQ; later spill failures of this episode are counted, not \
+                         logged, until the spill accepts a seal or a nonempty live candle \
+                         flush is accepted over HTTP"
+                    );
+                }
+                kept
+            }
+        };
+        outcome.spilled = kept;
+        if kept == serialized.len() {
+            self.close_spill_episode(
+                "the spill accepted a seal (written, or already held in a fuller copy)",
+            );
+            self.close_dlq_episode("the spill accepted a seal, so the DLQ is not reached");
+        }
+        for (index, record) in serialized.iter().enumerate().skip(kept) {
+            let dlq_record = SealDlqRecord::from(record);
+            match self.dlq.append_record(&dlq_record, now_unix_secs) {
+                Ok(()) => {
+                    self.close_dlq_episode("a DLQ write succeeded");
+                    // Z6, as in the per-seal path.
+                    self.spill.note_dead_lettered(record);
+                    outcome.dlq_written += 1;
+                }
+                Err(dlq_err) => {
+                    if self.dlq_failure.open() {
+                        let seal = &seals[index];
+                        warn!(
+                            ?dlq_err,
+                            source = "seal_dlq_failed",
+                            security_id = seal.security_id,
+                            exchange_segment_code = seal.exchange_segment_code,
+                            "tier-3 DLQ also failed — caller MUST fire AGGREGATOR-DROP-01; \
+                             later DLQ failures of this episode are counted, not logged, until \
+                             the episode ends (one info line then gives the count)"
+                        );
+                    }
+                    outcome.dropped += 1;
+                }
+            }
+        }
+        serialized.clear();
+        bytes.clear();
+        self.rescue_scratch.serialized = serialized;
+        self.rescue_scratch.bytes = bytes;
+        seals.clear();
+        outcome
+    }
+
+    /// Adds one per-seal result to a batch tally.
+    fn tally(outcome: &mut RescueBatchOutcome, result: &SubmitOutcome) {
+        match result {
+            SubmitOutcome::Spilled => outcome.spilled += 1,
+            SubmitOutcome::DlqWritten => outcome.dlq_written += 1,
+            SubmitOutcome::Dropped(_) => outcome.dropped += 1,
+            SubmitOutcome::DroppedBelowFloor(_) => {
+                outcome.dropped += 1;
+                outcome.dropped_below_floor += 1;
+            }
+            // The rescue path skips the ring, so this cannot happen.
+            SubmitOutcome::Buffered => {}
+        }
+    }
+
+    /// Takes the reused shutdown chunk buffer (empty, capacity kept); hand it
+    /// back with [`Self::return_rescue_chunk`].
+    pub(crate) fn take_rescue_chunk(&mut self) -> Vec<BufferedSeal> {
+        std::mem::take(&mut self.rescue_scratch.popped)
+    }
+
+    /// Gives back the chunk buffer taken by [`Self::take_rescue_chunk`].
+    pub(crate) fn return_rescue_chunk(&mut self, mut chunk: Vec<BufferedSeal>) {
+        chunk.clear();
+        self.rescue_scratch.popped = chunk;
     }
 
     /// Audit PR41a: after a live flush committed `committed`, append to the
@@ -2156,5 +2369,331 @@ mod tests {
             u64::MAX,
             "the pipeline's own probe of a missing spill folder must not be blind"
         );
+    }
+
+    // ---- plan item US1-C: the batch rescue ---------------------------------
+
+    /// A seal with a chosen tick count, so the spill ledger's "fuller copy"
+    /// rule has something to compare.
+    fn us1c_seal(sid: u64, bucket: u32, ticks: u32, close: f64) -> BufferedSeal {
+        let mut seal = mk_buffered_seal(sid, 1, TfIndex::M1, bucket, close);
+        seal.state.tick_count = ticks;
+        seal.state.volume = u64::from(ticks) * 10;
+        seal
+    }
+
+    fn us1c_bytes(writer_dir: &Path, now: i64) -> Vec<[u8; SEAL_SPILL_RECORD_SIZE]> {
+        SealSpillWriter::with_spill_dir_for_test(writer_dir.to_path_buf())
+            .read_all(now)
+            .expect("read spill")
+            .iter()
+            .map(SerializedSeal::to_bytes)
+            .collect()
+    }
+
+    /// The fullest copy of each bar, as every reader resolves it (Z6).
+    fn us1c_fullest(
+        records: &[[u8; SEAL_SPILL_RECORD_SIZE]],
+    ) -> std::collections::BTreeMap<(u64, u8, u8, u32), (u32, u64, [u8; SEAL_SPILL_RECORD_SIZE])>
+    {
+        let mut best = std::collections::BTreeMap::new();
+        for bytes in records {
+            let crate::seal_spill::SpillRecordRead::Seal(s) =
+                crate::seal_spill::decode_spill_record(bytes)
+            else {
+                panic!("a record this test wrote must decode");
+            };
+            let key = (
+                s.security_id,
+                s.exchange_segment_code,
+                s.tf_ordinal,
+                s.bucket_start_ist_secs,
+            );
+            let entry = best.entry(key).or_insert((s.tick_count, s.volume, *bytes));
+            if (s.tick_count, s.volume) > (entry.0, entry.1) {
+                *entry = (s.tick_count, s.volume, *bytes);
+            }
+        }
+        best
+    }
+
+    fn us1c_per_seal(
+        p: &SealAbsorptionPipeline,
+        seals: &[BufferedSeal],
+        now: i64,
+    ) -> RescueBatchOutcome {
+        let mut outcome = RescueBatchOutcome::default();
+        for seal in seals {
+            SealAbsorptionPipeline::tally(&mut outcome, &p.rescue_in_flight(*seal, now));
+        }
+        outcome
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(64))]
+        /// On a healthy disk the batch gives the same per-seal results as one
+        /// rescue per seal, writes every record the per-seal path writes, in
+        /// the same order, and the fullest copy of every bar on disk is the
+        /// same. The one allowed difference: when ONE batch holds a fuller copy
+        /// of a bar followed by an emptier one, the batch writes both (the
+        /// spill batch path judges the run against what was on disk before
+        /// it), where the per-seal path skipped the emptier one. Every reader
+        /// keeps the fullest copy per bar whatever the order (Z6), so the
+        /// database ends on the same rows.
+        #[test]
+        fn test_us1c_batch_rescue_writes_the_same_bytes_and_outcomes_as_per_seal(
+            raw in proptest::collection::vec((1u64..4, 0u32..3, 1u32..9, 90.0f64..110.0), 1..40)
+        ) {
+            let (spill_a, dlq_a) = temp_pair("us1c-eq-a");
+            let (spill_b, dlq_b) = temp_pair("us1c-eq-b");
+            let now = jan1_noon_utc();
+            let seals: Vec<BufferedSeal> = raw
+                .iter()
+                .map(|&(sid, b, ticks, close)| us1c_seal(sid, 1_716_023_700 + b * 60, ticks, close))
+                .collect();
+            let mut a = SealAbsorptionPipeline::with_dirs_for_test(spill_a.clone(), dlq_a.clone());
+            a.set_free_probe_for_test(|_| Some(HIGH_FREE));
+            let mut b = SealAbsorptionPipeline::with_dirs_for_test(spill_b.clone(), dlq_b.clone());
+            b.set_free_probe_for_test(|_| Some(HIGH_FREE));
+
+            let expected = us1c_per_seal(&a, &seals, now);
+            let mut batch = seals.clone();
+            let got = b.rescue_in_flight_batch(&mut batch, now);
+
+            proptest::prop_assert_eq!(got, expected);
+            proptest::prop_assert!(batch.is_empty(), "the batch is drained");
+            let per_seal = us1c_bytes(&spill_a, now);
+            let batched = us1c_bytes(&spill_b, now);
+            // Every per-seal record is in the batch, in the same order.
+            let mut cursor = batched.iter();
+            for record in &per_seal {
+                proptest::prop_assert!(cursor.any(|r| r == record), "a per-seal record is missing or out of order");
+            }
+            proptest::prop_assert_eq!(us1c_fullest(&batched), us1c_fullest(&per_seal));
+            proptest::prop_assert!(b.spill_handle().disk_writes_for_test() <= 1, "one write at most");
+            cleanup(&spill_a, &dlq_a);
+            cleanup(&spill_b, &dlq_b);
+        }
+    }
+
+    /// A partial write keeps the whole records that landed (counted
+    /// `spilled`, readable in the spill) and sends only the rest to the DLQ.
+    #[test]
+    fn test_us1c_batch_rescue_partial_write_keeps_landed_records_and_dead_letters_the_rest() {
+        let (spill, dlq) = temp_pair("us1c-partial");
+        let now = jan1_noon_utc();
+        let mut p = SealAbsorptionPipeline::with_dirs_for_test(spill.clone(), dlq.clone());
+        p.set_free_probe_for_test(|_| Some(HIGH_FREE));
+        // 3 whole records and part of a fourth land, then the disk is full.
+        p.spill_handle()
+            .fail_batch_writes_after_for_test(3 * SEAL_SPILL_RECORD_SIZE as u64 + 40);
+        let mut seals: Vec<BufferedSeal> = (0..10)
+            .map(|i| us1c_seal(100 + i, 1_716_023_700, 5, 100.0))
+            .collect();
+        let got = p.rescue_in_flight_batch(&mut seals, now);
+        assert_eq!(
+            got,
+            RescueBatchOutcome {
+                spilled: 3,
+                dlq_written: 7,
+                dropped: 0,
+                dropped_below_floor: 0
+            }
+        );
+        let on_disk = us1c_bytes(&spill, now);
+        assert_eq!(on_disk.len(), 3, "the torn fourth record was cut back");
+        let dlq_writer = SealDlqWriter::with_dlq_dir_for_test(dlq.clone());
+        let dead: Vec<u64> = dlq_writer
+            .read_all(now)
+            .expect("read dlq")
+            .iter()
+            .map(|r| r.security_id)
+            .collect();
+        assert_eq!(
+            dead,
+            (103..110).collect::<Vec<u64>>(),
+            "only the seals after the kept ones"
+        );
+        assert!(
+            p.spill_failure.failing.load(Ordering::Relaxed),
+            "the spill episode opened"
+        );
+        assert_eq!(
+            p.spill_failure.failed_in_episode.load(Ordering::Relaxed),
+            1,
+            "one failed write, counted once"
+        );
+        cleanup(&spill, &dlq);
+    }
+
+    /// When the run does not fit above the disk floor but single seals do,
+    /// the batch falls back to the per-seal path: the old behaviour exactly.
+    #[test]
+    fn test_us1c_batch_rescue_below_floor_falls_back_to_per_seal() {
+        fn three_records_above_the_floor(_: &Path) -> Option<u64> {
+            Some(SEAL_ESCALATION_MIN_FREE_BYTES + 3 * SEAL_SPILL_RECORD_SIZE as u64)
+        }
+        let (spill, dlq) = temp_pair("us1c-floor");
+        let now = jan1_noon_utc();
+        let mut p = SealAbsorptionPipeline::with_dirs_for_test(spill.clone(), dlq.clone());
+        p.set_free_probe_for_test(three_records_above_the_floor);
+        let mut seals: Vec<BufferedSeal> = (0..10)
+            .map(|i| us1c_seal(200 + i, 1_716_023_700, 5, 100.0))
+            .collect();
+        let got = p.rescue_in_flight_batch(&mut seals, now);
+        assert_eq!(
+            got.spilled, 10,
+            "each single seal still fits above the floor"
+        );
+        assert_eq!(
+            p.spill_handle().disk_writes_for_test(),
+            10,
+            "the per-seal path ran: one write per seal"
+        );
+        // Below the floor for single seals too: every seal refused, as before.
+        p.set_free_probe_for_test(|_| Some(LOW_FREE));
+        let later = now + SEAL_DISK_PROBE_INTERVAL_SECS;
+        let mut more: Vec<BufferedSeal> = (0..4)
+            .map(|i| us1c_seal(300 + i, 1_716_023_760, 5, 100.0))
+            .collect();
+        let got = p.rescue_in_flight_batch(&mut more, later);
+        assert_eq!(
+            got,
+            RescueBatchOutcome {
+                spilled: 0,
+                dlq_written: 0,
+                dropped: 4,
+                dropped_below_floor: 4
+            }
+        );
+        cleanup(&spill, &dlq);
+    }
+
+    /// An empty run writes nothing and touches no episode.
+    #[test]
+    fn test_us1c_batch_rescue_of_nothing_is_a_no_op() {
+        let (spill, dlq) = temp_pair("us1c-empty");
+        let mut p = SealAbsorptionPipeline::with_dirs_for_test(spill.clone(), dlq.clone());
+        let mut none: Vec<BufferedSeal> = Vec::new();
+        assert_eq!(
+            p.rescue_in_flight_batch(&mut none, jan1_noon_utc()),
+            RescueBatchOutcome::default()
+        );
+        assert_eq!(p.spill_handle().disk_writes_for_test(), 0);
+        cleanup(&spill, &dlq);
+    }
+
+    /// As in production: the ledger table mapped at boot (`SealSpillWriter::new`)
+    /// and the day file already open from an earlier spill of the outage.
+    fn us1c_warm(p: &SealAbsorptionPipeline, now: i64) {
+        p.spill_handle().prefault_ledger();
+        let opener = SerializedSeal::from(&us1c_seal(9_999_999, 1_000_000_000, 1, 1.0));
+        p.spill_handle()
+            .append_seal(&opener, now)
+            .expect("open the day file");
+    }
+
+    /// Wall-clock harness, `#[ignore]`d so a timing never becomes a flaky CI
+    /// gate (plan item US1-C). Prints the rescue cost per seal, one write per
+    /// seal against one batch write, at four run sizes. Run with
+    /// `cargo test -p tickvault-storage --release --lib us1c_rescue_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn us1c_rescue_cost_per_seal_old_and_new() {
+        const ROUNDS: usize = 15;
+        for run in [1usize, 64, 1_024, RESCUE_BATCH_MAX_SEALS] {
+            let mut old_ns = Vec::with_capacity(ROUNDS);
+            let mut new_ns = Vec::with_capacity(ROUNDS);
+            for round in 0..ROUNDS {
+                let now = jan1_noon_utc();
+                let seals: Vec<BufferedSeal> = (0..run)
+                    .map(|i| {
+                        let i = u32::try_from(i).expect("fits");
+                        us1c_seal(
+                            1 + u64::from(i),
+                            1_716_023_700 + u32::try_from(round).expect("fits") * 60,
+                            5,
+                            100.0,
+                        )
+                    })
+                    .collect();
+                let (spill_a, dlq_a) = temp_pair("us1c-cost-old");
+                let mut a =
+                    SealAbsorptionPipeline::with_dirs_for_test(spill_a.clone(), dlq_a.clone());
+                a.set_free_probe_for_test(|_| Some(HIGH_FREE));
+                us1c_warm(&a, now);
+                let started = std::time::Instant::now();
+                let _ = us1c_per_seal(&a, &seals, now);
+                old_ns.push(started.elapsed().as_nanos() as f64 / run as f64);
+                cleanup(&spill_a, &dlq_a);
+
+                let (spill_b, dlq_b) = temp_pair("us1c-cost-new");
+                let mut b =
+                    SealAbsorptionPipeline::with_dirs_for_test(spill_b.clone(), dlq_b.clone());
+                b.set_free_probe_for_test(|_| Some(HIGH_FREE));
+                us1c_warm(&b, now);
+                let mut batch = seals.clone();
+                let started = std::time::Instant::now();
+                let _ = b.rescue_in_flight_batch(&mut batch, now);
+                new_ns.push(started.elapsed().as_nanos() as f64 / run as f64);
+                cleanup(&spill_b, &dlq_b);
+            }
+            old_ns.sort_by(f64::total_cmp);
+            new_ns.sort_by(f64::total_cmp);
+            let pick = |v: &[f64], q: f64| v[((v.len() - 1) as f64 * q).round() as usize];
+            tracing::info!(run, "us1c");
+            #[allow(clippy::print_stderr)] // APPROVED: ignored timing harness output
+            {
+                eprintln!(
+                    "US1C run={run:>6}  per-seal path: median {:>9.0} ns/seal max {:>9.0}  |  batch: median {:>7.0} ns/seal max {:>7.0}",
+                    pick(&old_ns, 0.5),
+                    pick(&old_ns, 1.0),
+                    pick(&new_ns, 0.5),
+                    pick(&new_ns, 1.0)
+                );
+            }
+        }
+    }
+
+    /// Wall-clock split of the batch rescue cost (plan item US1-C), ignored.
+    #[test]
+    #[ignore]
+    fn us1c_rescue_cost_split() {
+        let run = 1_024usize;
+        let now = jan1_noon_utc();
+        let seals: Vec<BufferedSeal> = (0..run)
+            .map(|i| us1c_seal(1 + i as u64, 1_716_023_700, 5, 100.0))
+            .collect();
+        let t = std::time::Instant::now();
+        let ser: Vec<SerializedSeal> = seals.iter().map(SerializedSeal::from).collect();
+        let from_ns = t.elapsed().as_nanos() as f64 / run as f64;
+        let t = std::time::Instant::now();
+        let mut sum = 0u64;
+        for s in &ser {
+            sum = sum.wrapping_add(u64::from(s.to_bytes()[0]));
+        }
+        let bytes_ns = t.elapsed().as_nanos() as f64 / run as f64;
+        let (spill, dlq) = temp_pair("us1c-split");
+        let w = SealSpillWriter::with_spill_dir_for_test(spill.clone());
+        let mut scratch = Vec::new();
+        // Warm: open the day file once with an unrelated bar.
+        let warm = SerializedSeal::from(&us1c_seal(999_999, 1_716_000_000, 5, 1.0));
+        w.append_seals(std::iter::once(&warm), &mut scratch, now)
+            .expect("warm");
+        let t = std::time::Instant::now();
+        w.append_seals(ser.iter(), &mut scratch, now)
+            .expect("batch");
+        let append_ns = t.elapsed().as_nanos() as f64 / run as f64;
+        let t = std::time::Instant::now();
+        w.append_seals(ser.iter(), &mut scratch, now)
+            .expect("batch again (ledger warm, all superseded? no: equal copies)");
+        let append2_ns = t.elapsed().as_nanos() as f64 / run as f64;
+        #[allow(clippy::print_stderr)] // APPROVED: ignored timing harness output
+        {
+            eprintln!(
+                "US1C-SPLIT from {from_ns:.0} ns/seal, to_bytes {bytes_ns:.0} ns/seal, append_seals (file open) {append_ns:.0} ns/seal, again {append2_ns:.0} ns/seal ({sum})"
+            );
+        }
+        cleanup(&spill, &dlq);
     }
 }

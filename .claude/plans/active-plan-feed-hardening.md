@@ -8202,3 +8202,44 @@ Resolved source checkpoint: 535 locked packages became 537, with only the reques
 ## LF-6b notes (2026-11-12) — live paper fill chain
 
 - LF-6b is tracked under LF-6 in `.claude/plans/active-plan-audit-2026-10-20.md` (not ticked; ticked only when its PR merges). It touches the frame drain (`crates/app/src/dhan_feed_stack.rs`, one tap call in the `IngestOutcome::Folded` arm behind the live-socket and not-replaying gates) and the order runtime (`crates/app/src/order_runtime.rs`, one `select!` arm, dry-run only). Off by default (`[live_fill] enabled = false`) and idle until an approved brutex strategy engine exists.
+
+## ITEM US1 — the last steps over 1 µs (2026-11-24, owner cards "Batch the writes (Recommended)", "Look ahead one price (Recommended)", "Measure live first (Recommended)", "Medium: ~8 agents (Recommended)")
+
+Owner, 2026-11-24: "go ahead and fix the 4 steps over 1 µs dude" / "fix and resoleve evryhtign entirley dude okay?". Of the four, the candle row write is already under 1 µs in production (`config/production.toml` `own_ilp_encoder = true`, p99 780–825 ns); the socket wake waits on a live measurement (no read access to the metrics log group from this session); two items below change code.
+
+- [ ] US1-C Batch the seal rescue writes (crates/storage)
+  - Files: crates/storage/src/seal_absorption.rs, crates/storage/src/seal_writer_task.rs
+  - Tests: test_us1c_batch_rescue_writes_the_same_bytes_and_outcomes_as_per_seal, test_us1c_batch_rescue_partial_write_keeps_landed_records_and_dead_letters_the_rest, test_us1c_batch_rescue_below_floor_falls_back_to_per_seal, test_us1c_flush_failure_rescue_makes_one_disk_write, test_us1c_rescue_ring_batches_in_bounded_chunks
+- [ ] US1-A Warm the next packet's candle slot before folding the current one (crates/app, crates/trading)
+  - Files: crates/app/src/dhan_feed_stack.rs, crates/trading/src/candles/multi_tf_aggregator.rs
+  - Tests: an old-vs-new identical-output proptest, a multi-packet cold-fold harness
+
+### Design
+
+US1-C. When a candle flush fails, `drain_once_reusing` sends each popped seal through `rescue_in_flight`, one spill `write(2)` per seal (up to 16,384 a cycle) under the spill lock. New `SealAbsorptionPipeline::rescue_in_flight_batch` serialises the run into a reused buffer and calls the existing `SealSpillWriter::append_seals` once (the escalation thread's DA-14 path): one floor check for the run, one write, the ledger checks unchanged, and on a failed write the kept leading records stay in the spill and only the rest go to the DLQ one record each. `rescue_ring` (shutdown) uses it in chunks of at most `RESCUE_BATCH_MAX_SEALS` (16,384). Same `Ok` contract as `append_seal`: when it returns, every kept record is in the page cache. Not byte-identical: a run holding a fuller copy of a bar and then an emptier one writes both (the spill batch path judges the run against what was on disk before it); readers keep the fullest copy per bar (Z6), so the database rows are the same. Scratch buffers live in the pipeline, cleared, never shrunk, bounded by the chunk size.
+
+US1-A. In the frame walk, resolve the next tick packet's fold slot and touch its open buckets before folding the current packet, so the two packets' cache misses overlap. Output unchanged.
+
+### Edge Cases
+
+Empty batch; one seal; a run where every copy is superseded by the ledger (no write, all `Spilled`); a run that does not fit above the disk floor (falls back to the per-seal path, exact old behaviour); a partial write (k whole records land); a write that lands nothing; DLQ also failing (Dropped, page unchanged); IST midnight (the rescue run uses one `now`, one day file, as before); shutdown ring larger than one chunk. US1-A: single-packet frame, last packet of a frame, a non-tick packet next, an unknown instrument next, a frame cut short by a bad packet.
+
+### Failure Modes
+
+US1-C: a flaky (not full) disk: before, seal i+1 retried the spill after seal i failed; now the rest of the run goes to the DLQ. Same choice the escalation thread made (DA-14); every seal is still Spilled, DlqWritten or a counted Dropped. A failed batch opens the spill failure episode once (one coded line, as before). US1-A: the warm-up only reads; a wrong guess costs one wasted load, never a wrong bar.
+
+### Test Plan
+
+Unit tests listed above, run with `cargo test -p tickvault-storage`; an `#[ignore]`d harness that prints the per-seal rescue cost at 1, 64, 1,024 and 16,384 seals, old and new; US1-A proptest and harness in the app crate; the existing seal chaos and DHAT tests unchanged and green.
+
+### Rollback
+
+Revert the commit. No on-disk format change, no config, no table change.
+
+### Observability
+
+Unchanged counters (`tv_seal_writer_drain_total{kind="rescued_spill"|"rescued_dlq"|"rescued_dropped"}`, the floor counter, the episode lines). The spill write count per failed cycle drops from N to 1.
+
+### Per-Item Guarantee Matrix
+
+See `per-wave-guarantee-matrix.md` (15-row and 7-row matrices apply as written; no new tick-drop path, no hot-path allocation: both changes run off the drain or inside the existing fold).
