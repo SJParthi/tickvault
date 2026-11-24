@@ -52,8 +52,9 @@ use super::{
 };
 
 /// Detector slots one idle step visits. At the measured 97 to 436 µs per
-/// full 20,000-instrument arm this is Assumed about 5 to 22 µs per step,
-/// to be measured by the `silence_arm_cost` harness (not measured yet).
+/// full 20,000-instrument arm, one step MEASURED 9.5 µs warm and 22.5 µs
+/// cold (medians, release `silence_arm_cost` harness, x86 dev container,
+/// 2026-11-24); not measured on the prod host.
 pub const SILENCE_SWEEP_STEP_SLOTS: u32 = 1_024;
 
 /// Counter: 30 s timer fires that found the previous silence sweep still
