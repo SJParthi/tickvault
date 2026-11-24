@@ -603,9 +603,10 @@ fn the_workflow_runs_the_re_measure_only_on_a_regression_and_regates() {
         gate.find(needle)
             .unwrap_or_else(|| panic!("gate step lost: {needle}"))
     };
+    assert!(gate.contains("BENCH_RECORD_VERDICT: '1'"));
     let first = find("bash scripts/bench-gate.sh | tee gate-output.log && rc=0 || rc=$?");
     let tool = find(
-        "if [ \"$rc\" = 2 ] && cargo run -q --profile bench -p tickvault-common --bin bench_ab_recheck",
+        "if [ \"$rc\" = 2 ] && grep -Fxq 'measured_rc=2' \"$GITHUB_OUTPUT\" && cargo run -q --profile bench -p tickvault-common --bin bench_ab_recheck",
     );
     let regate =
         find("then rc=0; bash scripts/bench-gate.sh | tee -a gate-output.log || rc=$?; fi");
@@ -672,6 +673,61 @@ fn the_step_summary_says_when_no_baseline_was_restored() {
 }
 
 #[test]
+fn only_completed_measurements_report_a_cacheable_verdict() {
+    let temp = TempDir::new("cache-verdict");
+    let criterion = temp.0.join("criterion");
+    let outputs = temp.0.join("github-output");
+    let check = |verdict| {
+        let run = Command::new("bash")
+            .arg("scripts/bench-gate.sh")
+            .arg(&criterion)
+            .current_dir(repo_root())
+            .env("BENCH_RECORD_VERDICT", "1")
+            .env("BENCH_BUDGET_MULTIPLIER", "1")
+            .env("GITHUB_OUTPUT", &outputs)
+            .output()
+            .expect("bench-gate.sh runs"); // APPROVED: test
+        let history = std::fs::read_to_string(&outputs).expect("read step outputs"); // APPROVED: test
+        assert_eq!(history.lines().last(), Some(verdict), "{run:?}");
+        run.status.code().expect("gate exited normally") // APPROVED: test
+    };
+    assert_eq!(check("measured_rc=unmeasured"), 3);
+    let id = "registry/get_hit";
+    // Zero elapsed time and a signed improvement have valid finite estimates.
+    // Estimates carry no throughput metadata for this per-call benchmark.
+    write_bench(&criterion, id, 0.0, -0.15, -0.21);
+    assert_eq!(check("measured_rc=0"), 0);
+    write_bench(&criterion, id, 100_000.0, 0.0, 0.0);
+    assert_eq!(check("measured_rc=1"), 1);
+    write_bench(&criterion, id, 100_000.0, 1.0, 0.9);
+    assert_eq!(check("measured_rc=2"), 2);
+    // A parsing failure can return the same status as an absolute breach.
+    // The last output must invalidate the previous measured verdict.
+    std::fs::write(criterion.join(id).join("new/estimates.json"), "{}").expect("write"); // APPROVED: test
+    assert_eq!(check("measured_rc=unmeasured"), 1);
+    let new_estimate = criterion.join(id).join("new/estimates.json");
+    for bad in ["-1", "-1e9999", "1e9999", "NaN", "null", r#""2""#] {
+        let json = format!(r#"{{"median":{{"point_estimate":{bad}}}}}"#);
+        std::fs::write(&new_estimate, json).expect("write"); // APPROVED: test
+        assert_ne!(check("measured_rc=unmeasured"), 0, "{bad}");
+    }
+    write_bench(&criterion, id, 2.0, 0.0, 0.0);
+    let change_estimate = criterion.join(id).join("change/estimates.json");
+    for bad in [
+        r#"{"mean":{"point_estimate":1e9999}}"#,
+        r#"{"mean":{"point_estimate":0,"confidence_interval":{"lower_bound":-1e9999}}}"#,
+        "{} {}",
+        "",
+    ] {
+        std::fs::write(&change_estimate, bad).expect("write"); // APPROVED: test
+        assert_ne!(check("measured_rc=unmeasured"), 0, "{bad}");
+    }
+    // Invalid JSON reaches jq's parser, which exits with its parse-error code.
+    std::fs::write(criterion.join(id).join("new/estimates.json"), "{").expect("write"); // APPROVED: test
+    assert_ne!(check("measured_rc=unmeasured"), 0);
+}
+
+#[test]
 fn the_baseline_is_saved_only_with_a_verdict_from_a_gate_step_that_finished() {
     let wf = std::fs::read_to_string(repo_root().join(".github/workflows/bench.yml"))
         .expect("bench.yml"); // APPROVED: test
@@ -684,7 +740,9 @@ fn the_baseline_is_saved_only_with_a_verdict_from_a_gate_step_that_finished() {
         "steps.bench.outcome == 'success'",
         "steps.gate.outcome != 'cancelled'",
         "steps.gate.outputs.gate_rc != ''",
-        "steps.gate.outputs.gate_rc != '2'",
+        "steps.gate.outputs.measured_rc == steps.gate.outputs.gate_rc &&",
+        "steps.gate.outputs.gate_rc == '0' || steps.gate.outputs.gate_rc == '1' ||",
+        "(steps.gate.outputs.gate_rc == '2' && github.event_name == 'workflow_dispatch' && inputs.reset_baseline == true)",
     ] {
         assert!(
             save.contains(needed),

@@ -23,9 +23,10 @@
 //! | restart edge | Tue 09:15:05 / 09:15:06 | no at a 5 s gap; yes (6 s) at 6 s | not driven |
 //! | Muhurat Sunday | Sun 2026-11-08 15:00:00 | yes, 14:05 to 15:00 (3,300 s) | Sun, at 15:45 |
 //! | weekday holiday | Mon 2026-11-09 11:00:00 | no (a holiday) | none on Mon; Tue at 15:45 |
+//! | WAL lag | Tue/Wed 15:44:55 | none | two missing rows on the first count; exact after catch-up or unverified after three reads |
 //!
-//! The last two run on `session_calendar` (one Muhurat Sunday at the 2026
-//! session times, one weekday holiday); the rest on `weekday_calendar`. B3
+//! The Muhurat and holiday scenarios use `session_calendar` (one Muhurat Sunday
+//! at the 2026 session times, one weekday holiday); the rest use `weekday_calendar`. B3
 //! review (2026-11-13): the task gated on `is_trading_day`, false for a
 //! Muhurat session on a weekend, so a Muhurat day got no row; a Muhurat
 //! session is a session day (operator Quote 49) and these two pin both sides.
@@ -35,7 +36,7 @@
 //! pinned to the exported constants below, so a moved check time or session
 //! edge fails here by name instead of drifting silently.
 //!
-//! Every daily row reads `verdict=partial`, `reason=process_started_mid_day`
+//! Except for the WAL lag scenarios, every daily row reads `verdict=partial`, `reason=process_started_mid_day`
 //! (the process start is never before 09:00 on the checked day) and
 //! `db_tick_rows=10i` (5 + 5 over the two tables), read once, or twice when
 //! the first read timed out under the paused clock (see `assert_daily_row`).
@@ -145,6 +146,16 @@ impl Scenario {
                 (200, r#"{"ddl":"OK"}"#.to_owned())
             }
         }));
+        Self::start_with_server(calendar, start, previous_utc_nanos, process_start, srv)
+    }
+
+    fn start_with_server(
+        calendar: Arc<tickvault_common::trading_calendar::TradingCalendar>,
+        start: NaiveDateTime,
+        previous_utc_nanos: Option<i64>,
+        process_start: NaiveDateTime,
+        srv: FakeQuestDb,
+    ) -> Self {
         // The clock below is anchored at this same paused instant, so
         // `start + (now - t0)` is exactly what it reads later.
         let t0 = tokio::time::Instant::now();
@@ -270,6 +281,54 @@ fn assert_edges_match_production() {
     assert_eq!(SESSION_OPEN_SECS * NANOS_PER_SEC, MARKET_OPEN_IST_NANOS);
     assert_eq!(SESSION_CLOSE_SECS * NANOS_PER_SEC, MARKET_CLOSE_IST_NANOS);
     assert_eq!(RESTART_GAP_SECS * NANOS_PER_SEC, PROCESS_DOWN_MIN_GAP_NANOS);
+}
+
+async fn assert_wal_lag_retries() {
+    // A process-wide rescue tally can cover missing rows even when replay
+    // never lands them. Both full-day checks start with an empty database.
+    let ledger = tickvault_storage::tick_conservation_ledger::ledger();
+    ledger.note_rows_not_landed(2);
+    for (day, catches_up) in [((2026, 11, 10), true), ((2026, 11, 11), false)] {
+        let start = ist(day, (15, 44, 55));
+        ledger.note_row_appended(ist_nanos_of(start));
+        ledger.note_row_appended(ist_nanos_of(start));
+        let ticks_reads = std::sync::atomic::AtomicUsize::new(0);
+        let srv = FakeQuestDb::start(Arc::new(move |q| {
+            if q.contains("from ticks where") {
+                let read = ticks_reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let visible = if catches_up && read > 0 { 2 } else { 0 };
+                (200, format!(r#"{{"dataset":[[{visible}]]}}"#))
+            } else if q.contains("from tick_quotes where") {
+                (200, r#"{"dataset":[[0]]}"#.to_owned())
+            } else {
+                (200, r#"{"ddl":"OK"}"#.to_owned())
+            }
+        }));
+        let s =
+            Scenario::start_with_server(weekday_calendar(), start, None, ist(day, (8, 0, 0)), srv);
+        s.until_daily(Duration::from_secs(15 * 60)).await;
+        let rows = s.daily();
+        assert_eq!(rows.len(), 1, "one audit row after WAL retries: {rows:?}");
+        let row = &rows[0];
+        assert!(row.contains("accepted_rows=2i"), "{row}");
+        assert!(row.contains("not_landed_rows=2i"), "{row}");
+        if catches_up {
+            assert!(row.contains("verdict=match,reason=exact"), "{row}");
+            assert!(row.contains("db_tick_rows=2i"), "{row}");
+            assert!(
+                row.contains("count_reads=2i") || row.contains("count_reads=3i"),
+                "{row}"
+            );
+        } else {
+            assert!(
+                row.contains("verdict=unverified,reason=within_counted_losses"),
+                "{row}"
+            );
+            assert!(row.contains("db_tick_rows=0i"), "{row}");
+            assert!(row.contains("count_reads=3i"), "{row}");
+        }
+        s.finish("WAL lag").await;
+    }
 }
 
 #[tokio::test(start_paused = true)]
@@ -465,6 +524,8 @@ async fn test_tick_conservation_spawn_tick_conservation_writes_rows_the_clock_ca
         assert_daily_row("weekday holiday", &s.daily(), tue_date, s.clock_now_ist());
         s.finish("weekday holiday").await;
     }
+
+    assert_wal_lag_retries().await;
 
     drop(cwd);
 }

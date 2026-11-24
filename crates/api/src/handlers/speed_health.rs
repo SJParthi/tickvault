@@ -18,7 +18,7 @@
 //! | Database catch-up queue, feed sockets delivering data now | read in process: the WAL watcher's last apply-lag and stopped-table reading (`ingest_shed::wal_apply_lag_max`, `wal_suspended_tables`), used only while under 150 s old, and each socket's last-frame stamp (`pool_supervisor::snapshot_frame_activity`, the feed's own "delivered in the last 10 s" evidence) |
 //! | Worst step in the last 75 s, bytes kept on disk until confirmed, reconnects, candle overflow | the app's own metrics page (`[observability]` address), read once per refresh |
 //! | Ticks per minute | QuestDB `ticks` and `tick_quotes`, the last 15 full minutes |
-//! | Every tick accounted for | QuestDB `tick_conservation_audit`, the last 14 days |
+//! | Daily tick counts | QuestDB `tick_conservation_audit`, the last 14 days |
 //! | Connection gaps closed today | QuestDB `feed_gap_audit`, since IST midnight (a gap is written when it closes) |
 //! | Per-minute speed record | QuestDB `hot_path_latency_minute` when that table exists; "not yet available" when it does not |
 //!
@@ -822,24 +822,30 @@ fn ticks_section(inputs: &Inputs) -> Section {
     }
 }
 
-/// The verdict for one daily tick-accounting row.
-pub(crate) fn conservation_light(verdict: &str) -> Light {
-    match verdict {
-        "match" => Light::Green,
-        "partial" | "unverified" => Light::Amber,
-        "mismatch" => Light::Red,
-        _ => Light::Grey,
-    }
-}
-
-/// Plain-English word for a stored verdict.
-pub(crate) fn conservation_word(verdict: &str) -> &'static str {
-    match verdict {
-        "match" => "every tick counted",
-        "partial" => "partly checked (app restarted mid-day)",
-        "unverified" => "could not be checked",
-        "mismatch" => "ticks missing",
-        _ => "unknown result",
+/// Historical writers stored covered shortfalls as `match`; the audit reason
+/// and the two row counts distinguish those records from exact count parity.
+fn conservation_result(
+    verdict: &str,
+    reason: &str,
+    accepted: Option<i64>,
+    database: Option<i64>,
+    shortfall: Option<i64>,
+) -> (&'static str, Light) {
+    match (verdict, reason) {
+        ("match" | "unverified", "within_counted_losses") => {
+            ("database shortfall still unverified", Light::Amber)
+        }
+        ("match", "exact")
+            if accepted.is_some_and(|n| n > 0) && accepted == database && shortfall == Some(0) =>
+        {
+            ("row counts agree", Light::Green)
+        }
+        ("match" | "unverified", _) => ("count agreement unverified", Light::Amber),
+        ("partial", _) => ("partial session counts", Light::Amber),
+        ("mismatch", "extra_db_rows") => ("extra database rows", Light::Red),
+        ("mismatch", "unexplained_shortfall") => ("fewer database rows than expected", Light::Red),
+        ("mismatch", _) => ("row counts differ", Light::Red),
+        _ => ("unknown result", Light::Grey),
     }
 }
 
@@ -889,32 +895,23 @@ fn conservation_section(outcome: &QueryOutcome, ist_now: i64) -> Section {
                         .and_then(Value::as_str)
                         .map_or("unknown day", |d| d.get(..10).unwrap_or(d));
                     let feed = cell("feed").and_then(Value::as_str).unwrap_or("unknown");
-                    let number = |name: &str| {
-                        cell(name)
-                            .and_then(Value::as_i64)
-                            .map_or_else(|| "unknown".to_string(), format_signed)
-                    };
-                    let db = match cell("db_tick_rows").and_then(Value::as_i64) {
-                        Some(n) if n >= 0 => format_signed(n),
-                        _ => "unknown".to_string(),
-                    };
-                    Tile::new(
-                format!("{day} · {}", short_text(feed)),
-                conservation_word(verdict),
-                conservation_light(verdict),
-            )
-            .with_detail(format!(
-                "received {} · in the database {db} · not landed {} · short by {} · reason {}",
-                number("accepted_rows"),
-                number("not_landed_rows"),
-                number("shortfall"),
-                short_text(
-                    &cell("reason")
-                        .and_then(Value::as_str)
-                        .unwrap_or("none")
-                        .replace('_', " ")
-                ),
-            ))
+                    let reason = cell("reason").and_then(Value::as_str).unwrap_or("unknown");
+                    let count = |name| cell(name).and_then(Value::as_i64).filter(|n| *n >= 0);
+                    let accepted = count("accepted_rows");
+                    let database = count("db_tick_rows");
+                    // The writer uses zero as a placeholder for an unreadable count.
+                    let shortfall = database.and_then(|_| cell("shortfall")?.as_i64());
+                    let (value, status) = conservation_result(verdict, reason, accepted, database, shortfall);
+                    let number = |value: Option<i64>| value.map_or_else(|| "unknown".to_string(), format_signed);
+                    Tile::new(format!("{day} · {}", short_text(feed)), value, status)
+                        .with_detail(format!(
+                            "accepted {} · in the database {} · spill, failure or deferral counter {} · difference {} · reason {}",
+                            number(accepted),
+                            number(database),
+                            number(count("not_landed_rows")),
+                            number(shortfall),
+                            short_text(&reason.replace('_', " ")),
+                        ))
                 }))
                 .collect()
         }
@@ -928,8 +925,8 @@ fn conservation_section(outcome: &QueryOutcome, ist_now: i64) -> Section {
         ],
     };
     Section {
-        title: "Every tick accounted for",
-        note: "The 15:45 daily check: ticks the app received against ticks in the database."
+        title: "Daily tick counts",
+        note: "The 15:45 check compares accepted tick rows with rows counted in the database."
             .to_string(),
         tiles,
     }
@@ -2304,8 +2301,7 @@ garbage line without a number x
     }
 
     #[test]
-    fn test_apply_lag_light_pinned_bytes_light_reconnects_light_conservation_light_conservation_word()
-     {
+    fn test_apply_lag_light_pinned_bytes_light_reconnects_light() {
         assert_eq!(apply_lag_light(0), Light::Green);
         assert_eq!(apply_lag_light(10), Light::Green);
         assert_eq!(apply_lag_light(11), Light::Amber);
@@ -2321,13 +2317,6 @@ garbage line without a number x
         assert_eq!(reconnects_light(0.0), Light::Green);
         assert_eq!(reconnects_light(5.0), Light::Amber);
         assert_eq!(reconnects_light(6.0), Light::Red);
-        assert_eq!(conservation_light("match"), Light::Green);
-        assert_eq!(conservation_light("partial"), Light::Amber);
-        assert_eq!(conservation_light("unverified"), Light::Amber);
-        assert_eq!(conservation_light("mismatch"), Light::Red);
-        assert_eq!(conservation_light(""), Light::Grey);
-        assert_eq!(conservation_word("mismatch"), "ticks missing");
-        assert_eq!(conservation_word("weird"), "unknown result");
     }
 
     #[test]
@@ -2348,7 +2337,7 @@ garbage line without a number x
                     json_str("2026-10-29T00:00:00.000000Z"),
                     json_str("dhan"),
                     json_str("match"),
-                    json_str("counted"),
+                    json_str("exact"),
                     Value::from(64_349_753),
                     Value::from(64_349_753),
                     Value::from(0),
@@ -2372,12 +2361,12 @@ garbage line without a number x
         assert_eq!(section.tiles[0].value, "1 day ago");
         assert_eq!(section.tiles[0].status, Light::Green);
         assert_eq!(section.tiles[1].label, "2026-10-29 · dhan");
-        assert_eq!(section.tiles[1].value, "every tick counted");
+        assert_eq!(section.tiles[1].value, "row counts agree");
         assert_eq!(section.tiles[1].status, Light::Green);
-        assert!(section.tiles[1].detail.contains("received 64,349,753"));
+        assert!(section.tiles[1].detail.contains("accepted 64,349,753"));
         assert_eq!(section.tiles[2].status, Light::Amber);
         assert!(section.tiles[2].detail.contains("in the database unknown"));
-        assert!(section.tiles[2].detail.contains("short by -3"));
+        assert!(section.tiles[2].detail.contains("difference unknown"));
         assert!(section.tiles[2].detail.contains("reason db unreadable"));
 
         // The same rows read eight days later: old greens, so the freshness
@@ -2391,6 +2380,66 @@ garbage line without a number x
         assert_eq!(none.tiles[0].status, Light::Grey);
         let down = conservation_section(&QueryOutcome::Unreachable, IST_0930_25);
         assert_eq!(down.tiles[0].status, Light::Grey);
+    }
+
+    #[test]
+    fn test_conservation_result_renders_historical_and_current_audits_from_stored_fields() {
+        let columns = [
+            "verdict",
+            "reason",
+            "accepted_rows",
+            "db_tick_rows",
+            "shortfall",
+        ];
+        let render = |sample: Value| {
+            let row = sample.as_array().expect("audit row").clone();
+            let section = conservation_section(&rows(&columns, vec![row]), IST_0930_25);
+            let result = &section.tiles[1];
+            (result.value.clone(), result.status)
+        };
+        for verdict in ["match", "unverified"] {
+            let row = serde_json::json!([verdict, "within_counted_losses", 100, 0, 100]);
+            assert_eq!(
+                render(row),
+                ("database shortfall still unverified".into(), Light::Amber)
+            );
+        }
+        for row in [
+            serde_json::json!(["match", "exact", 100, 99, 0]),
+            serde_json::json!(["match", "exact", 100, 100, 1]),
+            serde_json::json!(["match", "exact", null, null, null]),
+            serde_json::json!(["match", "exact", 0, 0, 0]),
+            serde_json::json!(["match", null, 99, 99, 0]),
+        ] {
+            assert_eq!(
+                render(row),
+                ("count agreement unverified".into(), Light::Amber)
+            );
+        }
+        for (row, label, status) in [
+            (
+                serde_json::json!(["mismatch", "extra_db_rows", 100, 101, -1]),
+                "extra database rows",
+                Light::Red,
+            ),
+            (
+                serde_json::json!(["mismatch", null, 100, null, null]),
+                "row counts differ",
+                Light::Red,
+            ),
+            (
+                serde_json::json!(["partial", "process_started_mid_day", 1, 2, -1]),
+                "partial session counts",
+                Light::Amber,
+            ),
+            (
+                serde_json::json!([null, null, null, null, null]),
+                "unknown result",
+                Light::Grey,
+            ),
+        ] {
+            assert_eq!(render(row), (label.into(), status));
+        }
     }
 
     #[test]
@@ -2791,7 +2840,7 @@ garbage line without a number x
         if request_line.contains("tick_conservation_audit") {
             return (
                 "application/json",
-                r#"{"columns":[{"name":"trading_date_ist"},{"name":"feed"},{"name":"verdict"},{"name":"reason"},{"name":"accepted_rows"},{"name":"db_tick_rows"},{"name":"not_landed_rows"},{"name":"shortfall"}],"dataset":[["2026-10-29T00:00:00.000000Z","dhan","mismatch","short",100,90,0,10]]}"#,
+                r#"{"columns":[{"name":"trading_date_ist"},{"name":"feed"},{"name":"verdict"},{"name":"reason"},{"name":"accepted_rows"},{"name":"db_tick_rows"},{"name":"not_landed_rows"},{"name":"shortfall"}],"dataset":[["2026-10-29T00:00:00.000000Z","dhan","mismatch","unexplained_shortfall",100,90,0,10]]}"#,
             );
         }
         if request_line.contains("feed_gap_audit") {
@@ -2863,7 +2912,7 @@ garbage line without a number x
         let parsed: Value = serde_json::from_slice(&body).expect("json");
         let text = parsed.to_string();
         assert!(
-            text.contains("ticks missing"),
+            text.contains("fewer database rows than expected"),
             "conservation row read: {text}"
         );
         assert!(text.contains("1.0 GB"), "metrics page read: {text}");

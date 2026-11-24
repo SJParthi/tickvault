@@ -20,25 +20,25 @@ window closes at 15:40), on its own task, it compares:
 
 | Input | Source |
 |---|---|
-| accepted | `ticks` rows the Dhan writer appended for today (one relaxed add per row, in process) |
-| database | `select count() from ticks where ts in '<today>' and feed = 'dhan'` (30 s timeout) |
+| accepted | Dhan `ticks` and `tick_quotes` rows appended for today (one relaxed add per row, in process) |
+| database | Sum of today's Dhan row counts from `ticks` and `tick_quotes` (30 s timeout per query). Both must be readable. |
 | not landed | rows counted as spilled, failed or handed to the WAL replay (the sites that increment `tv_ticks_dropped_total`) |
 
 and writes one row to `tick_conservation_audit` (DEDUP `ts, trading_date_ist, feed`).
 
 | verdict | reason | meaning |
 |---|---|---|
-| `match` | `exact` | every accepted row is in the table |
-| `match` | `within_counted_losses` | the shortfall is no larger than the rows already counted as not landed |
+| `match` | `exact` | the positive accepted and database counts agree for the full day |
+| `unverified` | `within_counted_losses` | fewer rows are visible than accepted. The process-wide spill, failure and deferral count could cover the difference. Earlier versions stored this reason with verdict `match`. |
 | `mismatch` | `unexplained_shortfall` | more rows are missing than every counted loss explains |
 | `mismatch` | `extra_db_rows` | the table holds more of today's Dhan rows than this process accepted |
 | `unverified` | `count_unreadable` | the count query failed, timed out or returned a bad body; never a mismatch |
 | `unverified` | `no_rows` | nothing accepted and nothing stored; a zero baseline proves nothing |
 | `partial` | `process_started_mid_day` | this process started at or after 09:00 IST (or on another day); it knows only its own rows, so no mismatch is claimed |
 
-A `mismatch` or `unverified` read is retried up to 3 times, 120 s apart,
-because a row QuestDB has acknowledged is countable only once its WAL is
-applied.
+For a mismatch, an unreadable count or a shortfall within counted losses, the
+check makes at most three reads in total, 120 s apart. QuestDB counts a row
+after its WAL is applied. A `no_rows` baseline settles immediately.
 
 ## TICK-CONSERVE-01 — the day did not reconcile
 
@@ -73,9 +73,10 @@ only pre-v3 records), or for a gap of 5 s or less. A failed write is a coded
 
 ## Honest limits
 
-- The not-landed total is per process and can include `feed_aux_packets`
-  rows that shared a rescued batch: a tolerance, not an exact term. A real
-  loss smaller than the counted spills reads as `match`.
+- The not-landed total spans the life of the process and can include
+  `feed_aux_packets` from a rescued batch. It cannot identify which of today's
+  rows are missing. Check WAL apply and replay progress when a shortfall
+  remains after the last read. Even equal counts do not verify row identities.
 - Frames lost before the drain folded them (`tv_ticks_lost_total`) were never
   accepted, so this check cannot see them; the WAL and its own counters do.
 - The previous process's last receipt is the receipt of the record with the

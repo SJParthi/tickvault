@@ -11,26 +11,17 @@
 #
 # Env:
 #   BENCH_BUDGET_MULTIPLIER (float, default 1.0) — scales the ABSOLUTE ns
-#   budgets from quality/benchmark-budgets.toml for slower runner classes
-#   (the "runner-class multiplier" remediation documented in bench.yml's
-#   header). The TOML values stay the dev-hardware truth and are NEVER
-#   edited; the multiplier is the explicit, logged hardware adjustment.
-#   It does NOT touch the regression arm (max_regression_pct is unchanged).
+#   budgets from quality/benchmark-budgets.toml. It does not affect regression checks.
+#   BENCH_RECORD_VERDICT=1 writes the measured return code to GITHUB_OUTPUT.
 #
-# Exit codes (consumed by .github/workflows/bench.yml baseline-ratchet logic):
-#   0 = clean — all benchmarks within budget, no confident regression
-#   1 = absolute-budget breach ONLY (per-element ns budget exceeded)
-#   2 = regression breach (>max_regression_pct, CI-lower-bound confident) —
-#       wins over 1 when both breach, so a regressed run can never be
-#       mistaken for a mere hardware-calibration misfit.
-#   3 = NOTHING WAS MEASURED (2026-08-24, fail-closed) — either no Criterion
-#       estimates were found at all, or none of the benches found matched a
-#       budget key, so ZERO absolute latency budgets were enforced. Distinct
-#       from 1 and 2 so the bench.yml baseline-ratchet condition
-#       (gate_rc != 2) is unchanged, while the run still fails loudly.
-#       Both shapes previously exited 0 and printed a success line — the
-#       false-OK class audit-findings Rule 11 forbids. Bite-proven in both
-#       directions by scripts/bench-gate.selftest.sh cases H and I.
+# Measured verdicts are 0 (clean), 1 (absolute budget breached), and
+# 2 (confident regression, including when absolute budgets also fail).
+# Exit 3 means the directory, estimates, or budget matches were missing.
+# Input and tool errors can also return nonzero, so CI requires a verdict
+# from the evaluator before allowing its data to become a baseline.
+# A measured 1 can advance a baseline on a slower runner; a measured 2
+# needs an explicit reset. Cases H and I in the self-test cover missing
+# estimates and zero budget matches, which used to quietly pass.
 #
 # Regression semantics: a benchmark FAILS the regression arm only when the
 # LOWER bound of Criterion's 95% confidence interval for the mean change
@@ -101,6 +92,11 @@ HARDWARE_DRIFT_SPREAD_PCT=15    # INTERQUARTILE RANGE (Q3-Q1) of the regressions
                                 # single-handedly veto a textbook drift shape
                                 # (live: IQR 2.6 pts vs max-min 88.0 pts).
 
+# Clear a previous verdict before a same-runner recheck can fail partway.
+if [[ ${BENCH_RECORD_VERDICT:-} == 1 ]]; then
+  echo 'measured_rc=unmeasured' >> "${GITHUB_OUTPUT:?}"
+fi
+
 # Validate the multiplier early and loudly: digits and at most one dot only
 # (rejects empty, negative, and non-numeric garbage before it reaches the evaluator).
 case "$BENCH_BUDGET_MULTIPLIER" in
@@ -111,9 +107,8 @@ case "$BENCH_BUDGET_MULTIPLIER" in
 esac
 
 if [ ! -d "$CRITERION_DIR" ]; then
-  echo "INFO: No criterion results found at $CRITERION_DIR — skipping bench gate."
-  echo "  Run 'cargo bench --workspace' first to generate benchmark data."
-  exit 0
+  echo "ERROR: Missing Criterion directory: $CRITERION_DIR. Zero budgets measured." >&2
+  exit 3
 fi
 
 if [ ! -f "$BUDGETS_FILE" ]; then
@@ -154,6 +149,9 @@ trap 'rm -f "$RECORDS_FILE"' EXIT
 
 # N <tab> <rel-root> <tab> <median_ns>            (from */new/estimates.json)
 # C <tab> <rel-root> <tab> <point> <tab> <lb|NA>  (from */change/estimates.json)
+criterion_filter='def finite_number: type == "number" and isfinite and (isnan | not);
+  def estimate: if length == 1 and (.[0] | type) == "object" then .[0]
+                else error("expected one Criterion estimate object") end;'
 while IFS= read -r f; do
   [ -n "$f" ] || continue
   rel="${f#"$CRITERION_DIR"/}"
@@ -163,10 +161,10 @@ while IFS= read -r f; do
   # explicit JSON null into 0ns — a corrupt estimates.json silently PASSED
   # every budget. The old evaluator raised TypeError there (exit 1); restore
   # that fail-closed contract with a named error instead of a stack trace.
-  median=$(jq -r '(try .median.point_estimate catch null)
-                  | if type == "number" then . else "CORRUPT" end' "$f")
+  median=$(jq -sr "$criterion_filter"'estimate | (try .median.point_estimate catch null)
+                  | if finite_number and . >= 0 then . else "CORRUPT" end' "$f")
   if [ "$median" = "CORRUPT" ] || [ -z "$median" ]; then
-    echo "ERROR: $f: median.point_estimate is null/missing/non-numeric — corrupt Criterion output; refusing to treat it as 0ns (fail closed)" >&2
+    echo "ERROR: $f: median.point_estimate must be a finite, nonnegative duration in nanoseconds" >&2
     exit 1
   fi
   printf 'N\t%s\t%s\n' "$rel" "$median" >> "$RECORDS_FILE"
@@ -187,21 +185,21 @@ while IFS= read -r f; do
   # identical everywhere else: an ABSENT mean/point_estimate is still 0
   # (documented legacy-parity), and a null/absent lower_bound (or a
   # non-object confidence_interval) still takes the NA fallback.
-  vals=$(jq -r '[ ((.mean // {}) as $m
+  vals=$(jq -sr "$criterion_filter"'estimate | [ ((.mean // {}) as $m
                    | if ($m | type) == "object" and ($m | has("point_estimate"))
                      then ($m.point_estimate
-                           | if type == "number" then . else "CORRUPT" end)
+                           | if finite_number then . else "CORRUPT" end)
                      else 0 end),
                   ((.mean.confidence_interval // {}) as $ci
                    | if ($ci | type) == "object"
                      then ($ci.lower_bound as $lb
                            | if $lb == null then "NA"
-                             elif ($lb | type) == "number" then ($lb | tostring)
+                             elif ($lb | finite_number) then ($lb | tostring)
                              else "CORRUPT" end)
                      else "NA" end) ] | @tsv' "$f")
   case "$vals" in
     *CORRUPT*)
-      echo "ERROR: $f: mean.point_estimate or confidence_interval.lower_bound is present but non-numeric — corrupt Criterion output; refusing to coerce it to 0 (fail closed)" >&2
+      echo "ERROR: $f: mean.point_estimate or confidence_interval.lower_bound is present but is not a finite number" >&2
       exit 1
       ;;
   esac
@@ -366,9 +364,8 @@ END {
   # budget key. At zero, NO absolute latency budget was enforced, so the run
   # proves nothing. The pre-fix behaviour printed an INFO line and fell
   # through to exit 0 — a green verdict from an empty comparison. Exit 3 is
-  # deliberately distinct from 1 (absolute breach) and 2 (regression), so the
-  # bench.yml baseline-ratchet condition (gate_rc != 2) is unchanged while the
-  # run still fails loudly.
+  # distinct from a measured absolute breach (1) or regression (2). The
+  # workflow cannot save unmeasured results as a comparison baseline.
   if (checked == 0) {
     print "  ERROR: No benchmark matched any budget key in quality/benchmark-budgets.toml."
     print "         ZERO absolute latency budgets were enforced — this run proves nothing."
@@ -426,14 +423,16 @@ END {
   print ""
   if (reg_failed) {
     print "  Benchmark budget gate FAILED (confident regression)."
-    exit 2
+    rc = 2
   } else if (abs_failed) {
     print "  Benchmark budget gate FAILED (absolute budget breach)."
-    exit 1
+    rc = 1
   } else {
     print "  All benchmarks within budget."
-    exit 0
+    rc = 0
   }
+  if (ENVIRON["BENCH_RECORD_VERDICT"] == "1") print "measured_rc=" rc >> ENVIRON["GITHUB_OUTPUT"]
+  exit rc
 }
 ' "$BUDGETS_FILE" "$RECORDS_FILE"
 

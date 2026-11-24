@@ -22,13 +22,13 @@
 //!
 //! | verdict | when |
 //! |---|---|
-//! | `unverified` | the count could not be read (error, timeout, bad body), or nothing was accepted and nothing is stored (a zero baseline proves nothing) |
+//! | `unverified` | the count is unreadable, both counts are zero, or a positive shortfall is within the process-wide not-landed total |
 //! | `partial` | this process started after 09:00 IST today (or on another day): it only knows its own rows, so no mismatch is claimed |
-//! | `match` | `accepted == database`, or the shortfall is within the rows counted as not landed |
+//! | `match` | the full-day accepted and database counts are equal and positive |
 //! | `mismatch` | the database holds MORE rows than accepted, or the shortfall exceeds every counted loss |
 //!
-//! An `unverified` or `mismatch` read is retried up to
-//! [`TICK_CONSERVATION_MAX_READS`] times, [`TICK_CONSERVATION_READ_SPACING_SECS`]
+//! An `unverified` (except `no_rows`) or `mismatch` read is retried, up to
+//! [`TICK_CONSERVATION_MAX_READS`] reads in total, [`TICK_CONSERVATION_READ_SPACING_SECS`]
 //! apart, because an acknowledged row is only countable once QuestDB has
 //! applied its WAL. A final `mismatch` logs one coded `error!`
 //! (`TICK-CONSERVE-01`), log only: no CloudWatch filter, no EMF name, no
@@ -56,8 +56,9 @@
 //! ## Honest limits
 //!
 //! - The not-landed total is per process and can include `feed_aux_packets`
-//!   rows that shared a rescued batch, so it is a tolerance, not an exact
-//!   term; a real loss smaller than the counted spills reads as `match`.
+//!   rows that shared a rescued batch. It cannot establish which of this
+//!   day's missing rows were rescued. Even an exact count compares totals,
+//!   not row identities.
 //! - Rows the boot WAL replay of a mid-day restart re-appends would be counted
 //!   twice against a database that already holds them; that process is
 //!   `partial` by construction, which is why `partial` never claims a
@@ -124,11 +125,11 @@ const _: () = assert!(TICK_CONSERVATION_CHECK_SECS_OF_DAY_IST < 16 * 3600);
 /// The outcome of one daily check.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConservationVerdict {
-    /// Every accepted row is stored or counted as not landed.
+    /// The positive accepted and database counts are equal.
     Match,
     /// Rows are unaccounted for, or the database holds extra rows.
     Mismatch,
-    /// The database count was not read, or there was nothing to compare.
+    /// An unreadable count, empty baseline or possibly accounted-for shortfall.
     Unverified,
     /// This process did not cover the whole day; it never claims a mismatch.
     Partial,
@@ -179,7 +180,7 @@ pub const fn classify(i: ConservationInputs) -> (ConservationVerdict, &'static s
     if shortfall == 0 {
         (ConservationVerdict::Match, "exact")
     } else if shortfall <= i.not_landed_rows {
-        (ConservationVerdict::Match, "within_counted_losses")
+        (ConservationVerdict::Unverified, "within_counted_losses")
     } else {
         (ConservationVerdict::Mismatch, "unexplained_shortfall")
     }
@@ -523,9 +524,10 @@ fn report(row: &TickConservationRow, inputs: ConservationInputs) {
         "unverified" => warn!(
             reason = row.reason,
             accepted_rows = inputs.accepted_rows,
+            db_tick_rows = row.db_tick_rows,
+            not_landed_rows = inputs.not_landed_rows,
             count_reads = row.count_reads,
-            "tick conservation: today's check is unverified (the database count was not \
-             read, or there was nothing to compare)"
+            "tick conservation: today's accepted and stored counts could not be confirmed"
         ),
         _ => info!(
             verdict = row.verdict,
@@ -670,15 +672,16 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_shortfall_within_counted_losses_is_match() {
+    fn test_classify_shortfall_within_counted_losses_is_unverified() {
+        for (accepted, not_landed, db) in [(1_000, 40, 960), (1_000, 40, 999), (100, 100, 0)] {
+            assert_eq!(
+                classify(inputs(accepted, not_landed, Some(db))),
+                (ConservationVerdict::Unverified, "within_counted_losses")
+            );
+        }
         assert_eq!(
-            classify(inputs(1_000, 40, Some(960))),
-            (ConservationVerdict::Match, "within_counted_losses")
-        );
-        // Boundary: shortfall == not landed.
-        assert_eq!(
-            classify(inputs(1_000, 40, Some(960))).0,
-            ConservationVerdict::Match
+            classify(inputs(1_000, 40, Some(1_000))),
+            (ConservationVerdict::Match, "exact")
         );
     }
 
@@ -738,7 +741,7 @@ mod tests {
     fn test_classify_extremes_do_not_overflow() {
         assert_eq!(
             classify(inputs(u64::MAX, u64::MAX, Some(0))).0,
-            ConservationVerdict::Match
+            ConservationVerdict::Unverified
         );
         assert_eq!(
             classify(inputs(u64::MAX, 0, Some(0))).0,
