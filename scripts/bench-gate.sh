@@ -12,6 +12,7 @@
 # Env:
 #   BENCH_BUDGET_MULTIPLIER (float, default 1.0) — scales the ABSOLUTE ns
 #   budgets from quality/benchmark-budgets.toml. It does not affect regression checks.
+#   BENCH_REQUIRE_ALL_BUDGETS=1 requires a matching result for every budget key.
 #   BENCH_RECORD_VERDICT=1 writes the measured return code to GITHUB_OUTPUT.
 #
 # Measured verdicts are 0 (clean), 1 (absolute budget breached), and
@@ -122,15 +123,10 @@ echo "╚═══════════════════════�
 echo ""
 
 # Find all new/estimates.json files from Criterion
-ESTIMATE_FILES=$(find "$CRITERION_DIR" -name "estimates.json" -path "*/new/*" 2>/dev/null || true)
+ESTIMATE_FILES=$(find "$CRITERION_DIR" -type f -path "*/new/estimates.json" | sort)
+CHANGE_FILES=$(find "$CRITERION_DIR" -type f -path "*/change/estimates.json" | sort)
 
 if [ -z "$ESTIMATE_FILES" ]; then
-  # FAIL-CLOSED (2026-08-24, audit): an empty Criterion tree means the benches
-  # never ran or never produced output, so NO latency budget was enforced.
-  # Exiting 0 here reported success from a measurement that did not happen —
-  # the false-OK class audit-findings Rule 11 forbids. The sibling gate
-  # scripts/coverage-gate.sh was fixed this way on 2026-07-10 (adversarial
-  # review, HIGH) with self-test case 4; the fix was never propagated here.
   echo "ERROR: No benchmark estimates found under $CRITERION_DIR."
   echo "       ZERO latency budgets were enforced — this run proves nothing."
   echo "       Likely causes: cargo bench did not run, failed to build, or its"
@@ -168,24 +164,21 @@ while IFS= read -r f; do
     exit 1
   fi
   printf 'N\t%s\t%s\n' "$rel" "$median" >> "$RECORDS_FILE"
-done < <(printf '%s\n' "$ESTIMATE_FILES" | sort)
+done <<< "$ESTIMATE_FILES"
 
 while IFS= read -r f; do
   [ -n "$f" ] || continue
   rel="${f#"$CRITERION_DIR"/}"
   rel="${rel%/estimates.json}"
-  # mean.point_estimate defaults to 0 when absent; the CI lower bound is NA
-  # when confidence_interval is absent, not an object, or lower_bound is
-  # null (the evaluator's isinstance(ci, dict) + .get() semantics).
-  # FAIL CLOSED on a PRESENT null/non-numeric mean.point_estimate or a
-  # present NON-NULL non-numeric lower_bound (review round 2 fix,
-  # 2026-07-18): the previous `// 0` / awk `+0` coerced them to 0, so a
-  # real +30% regression with a corrupt lower_bound silently PASSED. The
-  # old evaluator crashed there (TypeError, exit 1). Parity kept byte-
-  # identical everywhere else: an ABSENT mean/point_estimate is still 0
-  # (documented legacy-parity), and a null/absent lower_bound (or a
-  # non-object confidence_interval) still takes the NA fallback.
-  vals=$(jq -sr "$criterion_filter"'estimate | [ ((.mean // {}) as $m
+  # Full-workspace changes must be real Criterion intervals. A cold run has
+  # no change file. Scoped historical records retain the point-only fallback.
+  vals=$(jq -sr "$criterion_filter"'estimate |
+      if env.BENCH_REQUIRE_ALL_BUDGETS == "1" then
+        .mean.confidence_interval as $ci |
+        if ([.mean.point_estimate, $ci.lower_bound, $ci.upper_bound] | all(finite_number))
+           and $ci.lower_bound <= $ci.upper_bound then .
+        else error("invalid Criterion change estimate or confidence interval") end
+      else . end | [ ((.mean // {}) as $m
                    | if ($m | type) == "object" and ($m | has("point_estimate"))
                      then ($m.point_estimate
                            | if finite_number then . else "CORRUPT" end)
@@ -204,7 +197,7 @@ while IFS= read -r f; do
       ;;
   esac
   printf 'C\t%s\t%s\n' "$rel" "$vals" >> "$RECORDS_FILE"
-done < <(find "$CRITERION_DIR" -name "estimates.json" -path "*/change/*" 2>/dev/null | sort)
+done <<< "$CHANGE_FILES"
 
 LC_ALL=C awk -F'\t' \
   -v budgets_file="$BUDGETS_FILE" \
@@ -313,6 +306,7 @@ $1 == "N" {
   }
 
   if (budget_found) {
+    if (index(bench, bkey[j]) > 0) measured_budget[j] = 1
     checked++
     unit = (n_elements > 1) ? sprintf(" (%.0fns / %d)", median_ns, n_elements) : ""
     effective_ns = budget_ns * multiplier
@@ -360,12 +354,15 @@ $1 == "C" {
 }
 END {
   if (died) exit 1
-  # FAIL-CLOSED (2026-08-24, audit): checked counts benches that matched a
-  # budget key. At zero, NO absolute latency budget was enforced, so the run
-  # proves nothing. The pre-fix behaviour printed an INFO line and fell
-  # through to exit 0 — a green verdict from an empty comparison. Exit 3 is
-  # distinct from a measured absolute breach (1) or regression (2). The
-  # workflow cannot save unmeasured results as a comparison baseline.
+  if (ENVIRON["BENCH_REQUIRE_ALL_BUDGETS"] == "1") {
+    for (j = 1; j <= nb; j++) {
+      if (!(j in measured_budget)) {
+        print "  ERROR: No current measurement for configured budget: " bkey[j]
+        incomplete = 1
+      }
+    }
+    if (incomplete) exit 3
+  }
   if (checked == 0) {
     print "  ERROR: No benchmark matched any budget key in quality/benchmark-budgets.toml."
     print "         ZERO absolute latency budgets were enforced — this run proves nothing."

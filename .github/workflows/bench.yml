@@ -124,18 +124,23 @@ jobs:
 
       # Restore the previous green run's Criterion baseline so this run's
       # `cargo bench` writes <id>/change/estimates.json (Criterion compares
-      # against the restored `new/` dirs) and bench-gate.sh can enforce the
+      # against the restored `base/` dirs) and bench-gate.sh can enforce the
       # 5% regression budget. restore-keys prefix-matches the most recent
       # saved baseline FOR THIS HARDWARE CLASS; an exact key hit is
       # impossible (run_id is unique), which is intentional — we always want
       # "latest previous same-hardware baseline".
       # The key ENDS IN THE COMMIT (2026-11-07) so the A/B re-measure in the
       # gate step knows which commit the restored baseline measured.
+      # Cache only comparison inputs. Changing these paths versions the cache;
+      # the first run on a hardware class can be absolute-only again. The scrub
+      # above already removed any old new/ or change/ from the build cache.
       - name: Restore Criterion baseline (previous same-hardware main run)
         id: restore
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
-          path: target/criterion
+          path: |
+            target/criterion/**/base
+            target/criterion/tv_ab_bins
           key: criterion-baseline-${{ steps.hw.outputs.fingerprint }}-${{ github.run_id }}-${{ github.sha }}
           restore-keys: |
             criterion-baseline-${{ steps.hw.outputs.fingerprint }}-
@@ -196,6 +201,7 @@ jobs:
         shell: bash
         env:
           BENCH_BUDGET_MULTIPLIER: '2.5'
+          BENCH_REQUIRE_ALL_BUDGETS: '1'
           BENCH_RECORD_VERDICT: '1'
           BENCH_AB_BASELINE_KEY: ${{ steps.restore.outputs.cache-matched-key }}
         run: |
@@ -232,7 +238,9 @@ jobs:
            (steps.gate.outputs.gate_rc == '2' && github.event_name == 'workflow_dispatch' && inputs.reset_baseline == true))
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
-          path: target/criterion
+          path: |
+            target/criterion/**/base
+            target/criterion/tv_ab_bins
           key: criterion-baseline-${{ steps.hw.outputs.fingerprint }}-${{ github.run_id }}-${{ github.sha }}
 
       # The p99 tail gates (seal_path, feed_drain) defer a miss to here under
