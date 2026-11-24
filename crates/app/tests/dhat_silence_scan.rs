@@ -15,7 +15,14 @@
 //! path. Valid cells alone would not prove it: the probe path re-fills the
 //! same cells and allocates nothing either (2026-11-17 review).
 //!
-//! One heap case per binary (DHAT's profiler is process-global).
+//! US1-D (2026-11-24): a second window drives the sliced sweep the drain
+//! now runs: `begin_silence_sweep`, every `step_silence_sweep` to the end
+//! (20 steps of `SILENCE_SWEEP_STEP_SLOTS` per sweep), and the finish, for
+//! 50 sweeps, i.e. 1,000 steps. Budget 0 blocks, 0 bytes; non-vacuity as
+//! above (fast-path hits rise by 20,000 per sweep) plus the step count.
+//!
+//! One heap case per binary (DHAT's profiler is process-global); the two
+//! windows run one after the other inside it.
 //! Run: `cargo test -p tickvault-app --test dhat_silence_scan`
 
 #[global_allocator]
@@ -23,7 +30,9 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
 
 use std::sync::Arc;
 
-use tickvault_app::dhan_feed_stack::{LiveIngest, SilentInstrument, WORST_SILENT_NAMED};
+use tickvault_app::dhan_feed_stack::{
+    LiveIngest, SILENCE_SWEEP_STEP_SLOTS, SilentInstrument, WORST_SILENT_NAMED,
+};
 use tickvault_app::subscribe_reconcile::SubscribeReconcile;
 use tickvault_common::feed::Feed;
 use tickvault_common::tick_types::ParsedTick;
@@ -33,6 +42,8 @@ use tickvault_storage::tick_persistence::TickWriter;
 
 const INSTRUMENTS: u64 = 20_000;
 const SCANS: usize = 1_000;
+/// Sliced sweeps in the second window (20 steps each at 20,000 instruments).
+const SLICED_SWEEPS: u64 = 50;
 /// Ticks per instrument: 9 ticks give 8 intervals, the detector's warm-up, so
 /// every instrument reads `Live`.
 const TICKS: u64 = 9;
@@ -112,6 +123,45 @@ fn silence_scan_with_reconcile_slot_cells_does_not_allocate() {
         (0, 0),
         "{SCANS} silence scans over {INSTRUMENTS} instruments allocated {} blocks / {} bytes; \
          the arm must not allocate (find it, do not raise the budget)",
+        stats.total_blocks,
+        stats.total_bytes
+    );
+
+    // The sliced sweep: begin, every step, finish.
+    let hits_before = book.fast_path_hits();
+    let profiler = dhat::Profiler::builder().testing().build();
+    let mut quiet = 0u64;
+    let mut steps = 0u64;
+    for _ in 0..SLICED_SWEEPS {
+        let mut done = ingest.begin_silence_sweep(now);
+        while done.is_none() {
+            steps += 1;
+            done = ingest.step_silence_sweep();
+        }
+        if let Some(done) = done {
+            quiet += done.silent + done.never + done.named as u64;
+        }
+    }
+    let stats = dhat::HeapStats::get();
+    drop(profiler);
+
+    assert_eq!(quiet, 0, "every instrument is Live");
+    assert_eq!(
+        steps,
+        SLICED_SWEEPS * INSTRUMENTS.div_ceil(u64::from(SILENCE_SWEEP_STEP_SLOTS)),
+        "each sweep took one step per {SILENCE_SWEEP_STEP_SLOTS} slots"
+    );
+    assert!(!ingest.idle_work_pending(), "every sweep finished");
+    assert_eq!(
+        book.fast_path_hits() - hits_before,
+        SLICED_SWEEPS * INSTRUMENTS,
+        "every report of every sliced sweep took the fast path"
+    );
+    assert_eq!(
+        (stats.total_blocks, stats.total_bytes),
+        (0, 0),
+        "{SLICED_SWEEPS} sliced sweeps ({steps} steps) allocated {} blocks / {} bytes; \
+         the sliced sweep must not allocate (find it, do not raise the budget)",
         stats.total_blocks,
         stats.total_bytes
     );

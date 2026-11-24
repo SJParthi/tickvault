@@ -916,18 +916,54 @@ impl TickGapDetector {
     ///
     /// Same loop, same reports, same order as `scan_silence` (which wraps
     /// this): **O(n) in tracked instruments**, zero allocation, one extra
-    /// `u32` per report.
-    pub fn scan_silence_slots<F>(&self, now_millis: u64, mut sink: F)
+    /// `u32` per report. It is [`Self::scan_silence_slot_range`] over every
+    /// tracked slot, so there is one copy of the loop body.
+    pub fn scan_silence_slots<F>(&self, now_millis: u64, sink: F)
     where
         F: FnMut(u32, SilenceReport),
     {
-        for (slot, state) in self.slots.iter().take(self.next_slot as usize).enumerate() {
+        let _ = self.scan_silence_slot_range(now_millis, 0, self.next_slot, self.next_slot, sink);
+    }
+
+    /// One slice of [`Self::scan_silence_slots`] (plan item US1-D,
+    /// 2026-11-24). Visits the slots in `[from, stop)` in ascending order,
+    /// where `stop = min(end, tracked slots, from + count)`, and hands the
+    /// sink the same `(slot, report)` pairs the full scan hands out for those
+    /// slots. Returns where it stopped: `stop`, or `from` when the range is
+    /// empty. The caller is done once the return value is at least
+    /// `min(end, tracked slots)`.
+    ///
+    /// Called over consecutive ranges with the same `now_millis` and no
+    /// change to the detector in between, the joined output equals one full
+    /// scan (proptest
+    /// `proptest_scan_silence_slot_range_chunks_equal_the_full_scan`).
+    ///
+    /// **O(stop - from)** per call, zero allocation, no virtual dispatch.
+    pub fn scan_silence_slot_range<F>(
+        &self,
+        now_millis: u64,
+        from: u32,
+        end: u32,
+        count: u32,
+        mut sink: F,
+    ) -> u32
+    where
+        F: FnMut(u32, SilenceReport),
+    {
+        let stop = end.min(self.next_slot).min(from.saturating_add(count));
+        if from >= stop {
+            return from;
+        }
+        // `stop <= next_slot <= slots.len()`, so the range is always in
+        // bounds; the empty fallback can never be reached.
+        let range = self.slots.get(from as usize..stop as usize).unwrap_or(&[]);
+        for (offset, state) in range.iter().enumerate() {
             if !state.used {
                 continue;
             }
-            // `next_slot` is a `u32`, so every index taken here fits; the
-            // saturating fallback can never be reached.
-            let slot = u32::try_from(slot).unwrap_or(u32::MAX);
+            // `offset < stop - from`, which fits a `u32`, so the conversion
+            // always fits; the saturating fallback can never be reached.
+            let slot = from.saturating_add(u32::try_from(offset).unwrap_or(u32::MAX));
             let silent_millis = now_millis.saturating_sub(state.last_seen_millis);
             // Plan PR AL-5: an NSE_FNO cadence is floored before it is
             // judged, and a freshly seeded instrument is not judged at all.
@@ -975,6 +1011,7 @@ impl TickGapDetector {
                 },
             );
         }
+        stop
     }
 
     /// Clears all learned state for a new session, retaining capacity.
@@ -2120,6 +2157,166 @@ mod tests {
             }
             check(&d, now)?;
         }
+
+        /// `scan_silence_slot_range` (plan item US1-D, 2026-11-24): scanning
+        /// in chunks of any size from 1 to past the slot count, each chunk
+        /// starting where the last one stopped, gives exactly the
+        /// `(slot, report)` sequence one `scan_silence_slots` call gives.
+        /// The detector holds seeded never-ticked slots, slots still warming,
+        /// live ones and (at a late `now`) exceeded ones, and runs across a
+        /// session reset. An `end` past the slot count is clamped.
+        #[test]
+        fn proptest_scan_silence_slot_range_chunks_equal_the_full_scan(
+            ops in prop::collection::vec(
+                (0u8..5, 0u64..10, 0u8..3, any::<u32>(), 0u32..10_000, 0u64..5_000_000),
+                0..400,
+            ),
+            now in 0u64..50_000_000,
+            chunk in 1u32..=18,
+            end_past in any::<bool>(),
+        ) {
+            const CAPACITY: usize = 16;
+            let mut d = TickGapDetector::with_capacity(CAPACITY, DetectorConfig::live_lane());
+            let segments = [ExchangeSegment::IdxI, ExchangeSegment::NseEquity, ExchangeSegment::NseFno];
+            for (op, sid, seg, ltt, vol, millis) in ops {
+                let key = (sid, segments[usize::from(seg)]);
+                match op {
+                    0 => {
+                        let _ = d.seed(key, millis);
+                    }
+                    1..=3 => {
+                        let _ = d.observe(obs(key, ltt, vol, vol, millis));
+                    }
+                    _ => {
+                        if sid == 0 {
+                            d.reset_session();
+                        }
+                    }
+                }
+            }
+            let mut full = Vec::new();
+            d.scan_silence_slots(now, |slot, r| full.push((slot, r)));
+
+            let tracked = u32::try_from(d.tracked_instruments()).unwrap_or(u32::MAX);
+            let end = if end_past { u32::MAX } else { tracked };
+            let mut chunked = Vec::new();
+            let mut from = 0u32;
+            let mut calls = 0u32;
+            loop {
+                let next = d.scan_silence_slot_range(now, from, end, chunk, |slot, r| {
+                    chunked.push((slot, r));
+                });
+                calls += 1;
+                if next >= tracked {
+                    prop_assert_eq!(next, tracked);
+                    break;
+                }
+                // A non-zero chunk always makes progress, by exactly the chunk.
+                prop_assert_eq!(next, from + chunk);
+                from = next;
+                prop_assert!(calls as usize <= CAPACITY + 1);
+            }
+            prop_assert_eq!(full, chunked);
+        }
+    }
+
+    #[test]
+    fn test_scan_silence_slot_range_clamps_end_to_next_slot() {
+        let mut d = TickGapDetector::with_capacity(8, DetectorConfig::live_lane());
+        for sid in 0..3 {
+            assert!(d.seed((sid, ExchangeSegment::NseFno), 1_000));
+        }
+        let mut seen = Vec::new();
+        // An end and a count far past the three tracked slots stop at 3.
+        let next = d.scan_silence_slot_range(60_000, 0, u32::MAX, u32::MAX, |slot, r| {
+            seen.push((slot, r.key.0));
+        });
+        assert_eq!(next, 3);
+        assert_eq!(seen, vec![(0, 0), (1, 1), (2, 2)]);
+        // An end below the slot count stops at the end.
+        seen.clear();
+        let next = d.scan_silence_slot_range(60_000, 0, 2, 100, |slot, r| {
+            seen.push((slot, r.key.0));
+        });
+        assert_eq!(next, 2);
+        assert_eq!(seen, vec![(0, 0), (1, 1)]);
+        // A start at or past the clamped end visits nothing and returns it.
+        let mut n = 0;
+        assert_eq!(
+            d.scan_silence_slot_range(60_000, 3, u32::MAX, 10, |_, _| n += 1),
+            3
+        );
+        assert_eq!(
+            d.scan_silence_slot_range(60_000, 7, u32::MAX, 10, |_, _| n += 1),
+            7
+        );
+        assert_eq!(n, 0);
+    }
+
+    /// The random proptest above is not certain to build every verdict in
+    /// one case, so this pins one detector that holds all four (never
+    /// ticked, warming, live, exceeded) and checks every chunk size.
+    #[test]
+    fn test_scan_silence_slot_range_chunks_cover_every_verdict() {
+        let seg = ExchangeSegment::NseEquity;
+        let mut d = TickGapDetector::with_capacity(8, DetectorConfig::live_lane());
+        assert!(d.seed((1, seg), 0));
+        let _ = d.observe(obs((2, seg), 1, 1, 1, 0));
+        for i in 0..20u32 {
+            let millis = u64::from(i) * 1_000;
+            let _ = d.observe(obs((3, seg), i + 1, i + 1, i + 1, millis));
+            let _ = d.observe(obs((4, seg), i + 1, i + 1, i + 1, millis));
+        }
+        for i in 0..20u32 {
+            let millis = 500_000 + u64::from(i) * 1_000;
+            let _ = d.observe(obs((3, seg), 100 + i, 100 + i, 100 + i, millis));
+        }
+        let now = 520_000;
+        let mut full = Vec::new();
+        d.scan_silence_slots(now, |slot, r| full.push((slot, r)));
+        let verdicts: Vec<_> = full.iter().map(|(_, r)| (r.key.0, r.verdict)).collect();
+        assert_eq!(
+            verdicts,
+            vec![
+                (1, SilenceVerdict::NeverTicked),
+                (2, SilenceVerdict::Warming),
+                (3, SilenceVerdict::Live),
+                (4, SilenceVerdict::Exceeded),
+            ]
+        );
+        for chunk in 1..=6u32 {
+            let mut chunked = Vec::new();
+            let mut from = 0;
+            while from < 4 {
+                from = d.scan_silence_slot_range(now, from, u32::MAX, chunk, |slot, r| {
+                    chunked.push((slot, r));
+                });
+            }
+            assert_eq!(full, chunked, "chunk {chunk}");
+        }
+    }
+
+    #[test]
+    fn test_scan_silence_slot_range_zero_count_returns_from() {
+        let mut d = TickGapDetector::with_capacity(8, DetectorConfig::live_lane());
+        for sid in 0..4 {
+            assert!(d.seed((sid, ExchangeSegment::NseEquity), 1_000));
+        }
+        let mut n = 0;
+        for from in 0..6 {
+            assert_eq!(
+                d.scan_silence_slot_range(60_000, from, u32::MAX, 0, |_, _| n += 1),
+                from
+            );
+        }
+        assert_eq!(n, 0);
+        // An empty detector returns the start too, whatever the count.
+        let empty = TickGapDetector::with_capacity(8, DetectorConfig::live_lane());
+        assert_eq!(
+            empty.scan_silence_slot_range(60_000, 0, u32::MAX, 5, |_, _| n += 1),
+            0
+        );
+        assert_eq!(n, 0);
     }
 
     // ======================================================================

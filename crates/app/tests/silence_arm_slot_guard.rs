@@ -13,7 +13,13 @@
 //! (`dhan_feed_stack/silence_slot_oracle_tests.rs`) and the DHAT gate
 //! `dhat_silence_scan.rs`.
 //!
-//! HONEST LIMIT: a text scan of one function body and two constants.
+//! US1-D (2026-11-24): the drain no longer runs `scan_silence_named_at`; the
+//! 30 s timer begins a sliced sweep and the idle arm steps it
+//! (`dhan_feed_stack/silence_sweep.rs`). The step function is held to the
+//! same rule (`the_sliced_silence_step_judges_reconcile_by_slot_not_by_probe`),
+//! and the one-go form stays pinned as the sliced sweep's oracle.
+//!
+//! HONEST LIMIT: a text scan of a few function bodies and two constants.
 
 use std::path::PathBuf;
 
@@ -36,10 +42,15 @@ fn strip_line_comments(src: &str) -> String {
 
 /// The body of `fn scan_silence_named_at` up to the next method.
 fn arm_body(stack: &str) -> &str {
-    let start = stack
-        .find("fn scan_silence_named_at(")
-        .expect("scan_silence_named_at must exist in dhan_feed_stack.rs");
-    let rest = &stack[start..];
+    fn_body(stack, "fn scan_silence_named_at(")
+}
+
+/// The body of the function that starts at `head`, up to the next method.
+fn fn_body<'a>(src: &'a str, head: &str) -> &'a str {
+    let start = src
+        .find(head)
+        .unwrap_or_else(|| panic!("`{head}` must exist"));
+    let rest = &src[start..];
     let end = rest[1..]
         .find("\n    fn ")
         .or_else(|| rest[1..].find("\n    pub fn "))
@@ -84,6 +95,44 @@ fn the_silence_arm_judges_reconcile_by_slot_not_by_probe() {
     assert!(
         !has_bare_note_call(body),
         "scan_silence_named_at went back to one reconcile hash probe per report (a `.note(` call)"
+    );
+}
+
+#[test]
+fn the_sliced_silence_step_judges_reconcile_by_slot_not_by_probe() {
+    let sweep = strip_line_comments(&read("src/dhan_feed_stack/silence_sweep.rs"));
+    let production = sweep
+        .split("#[cfg(test)]\nmod tests")
+        .next()
+        .unwrap_or(&sweep);
+    let scan = fn_body(production, "fn scan_silence_sweep_slots(");
+    assert!(
+        scan.contains("scan_silence_slot_range("),
+        "the silence step must scan its slice with scan_silence_slot_range"
+    );
+    assert!(
+        scan.contains("note_at_slot("),
+        "the silence step must judge reconcile with note_at_slot (slot cells, no probe)"
+    );
+    assert!(
+        !has_bare_note_call(production),
+        "the sliced silence sweep went back to one reconcile hash probe per report"
+    );
+    let step = fn_body(production, "pub fn step_silence_sweep(");
+    assert!(
+        step.contains("self.scan_silence_sweep_slots("),
+        "step_silence_sweep must step through scan_silence_sweep_slots"
+    );
+    // The drain begins the sliced sweep and never runs the one-go scan.
+    let stack = strip_line_comments(&read("src/dhan_feed_stack.rs"));
+    let stack_prod = stack.split("#[cfg(test)]").next().unwrap_or(&stack);
+    let drain = &stack_prod[stack_prod
+        .find("async fn run_frame_drain(")
+        .expect("run_frame_drain must exist")..];
+    assert!(drain.contains("ingest.begin_silence_sweep(now_millis)"));
+    assert!(
+        !drain.contains("scan_silence_named("),
+        "the drain went back to the one-go O(n) scan on its timer arm"
     );
 }
 

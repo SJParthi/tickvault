@@ -211,6 +211,16 @@ pub const RECONCILE_INSTRUMENTS_METRIC: &str = "tv_subscribe_reconcile_instrumen
 /// Gauge: expected instruments missing at the last sweep.
 pub const RECONCILE_MISSING_GAUGE: &str = "tv_subscribe_reconcile_missing";
 
+/// Counter: chunked sweeps whose book was changed by another lock taker
+/// between two chunks (a record, forget, finished round or one-go sweep), so
+/// the sweep planned no round (2026-11-24, plan item US1-D). Counted only
+/// when the sweep finished inside the reconcile window, where it could have
+/// planned one; an interrupt outside the window (boot records before 09:17)
+/// lost nothing and is not counted. Local `/metrics` only, registered at 0
+/// when the book is built.
+pub const RECONCILE_SWEEP_INTERRUPTED_METRIC: &str =
+    "tv_subscribe_reconcile_sweep_interrupted_total";
+
 /// Every `outcome` label of [`RECONCILE_ROUNDS_METRIC`], registered at 0.
 const ROUND_OUTCOMES: [&str; 16] = [
     "would_resubscribe",
@@ -297,9 +307,13 @@ struct Socket {
     last_round_at: Option<Instant>,
     /// A round for this socket is queued or running.
     in_flight: Option<u64>,
-    /// Expected instruments delivering now (`Live`, or a recent `Warming`) this
-    /// sweep.
+    /// Expected instruments delivering now (`Live`, or a recent `Warming`) at
+    /// the last finished sweep.
     delivering: u32,
+    /// The chunked sweep's running count of [`Self::delivering`]. Copied into
+    /// `delivering` only when the sweep finishes, so the executor never reads
+    /// a half sweep.
+    pending_delivering: u32,
     candidates: Vec<SubscribeInstrument>,
     silent_reported: bool,
 }
@@ -326,6 +340,58 @@ struct Inner {
     ist_day: i64,
     feed_silent_reported: bool,
     next_reservation: u64,
+    /// The chunked sweep in progress, if any: its accumulators live here
+    /// between chunks, so the drain holds no lock between them.
+    pending: Option<SweepAcc>,
+    /// Moves whenever another lock taker changes what a sweep judges against
+    /// (a record that changed something, a forget that removed something, a
+    /// finished round, a one-go sweep). A chunked sweep that sees it moved
+    /// between its begin and its finish plans no round.
+    epoch: u64,
+}
+
+/// One sweep's accumulators: kept in the one-go [`ReconcileSweep`], or in
+/// [`Inner::pending`] between the chunks of a chunked sweep.
+#[derive(Debug, Clone, Copy)]
+struct SweepAcc {
+    now: Instant,
+    missing: u32,
+    /// Instruments that used their last round in this sweep (the first
+    /// [`NAMED_IN_LOG`] are named in `Inner::exhausted_named`).
+    exhausted: u32,
+    /// Reports this sweep judged on the slot cell's fast path.
+    fast_hits: u32,
+    /// [`Inner::epoch`] when the sweep began.
+    epoch_at_begin: u64,
+}
+
+impl SweepAcc {
+    fn new(now: Instant, epoch_at_begin: u64) -> Self {
+        Self {
+            now,
+            missing: 0,
+            exhausted: 0,
+            fast_hits: 0,
+            epoch_at_begin,
+        }
+    }
+}
+
+/// Which per-socket count a note adds a delivering instrument to: the one-go
+/// sweep writes `delivering` directly (its lock is held to the end), the
+/// chunked sweep writes `pending_delivering` and publishes it at its finish.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeliverInto {
+    Published,
+    Pending,
+}
+
+fn count_delivering(socket: &mut Socket, into: DeliverInto) {
+    let count = match into {
+        DeliverInto::Published => &mut socket.delivering,
+        DeliverInto::Pending => &mut socket.pending_delivering,
+    };
+    *count = count.saturating_add(1);
 }
 
 /// One planned resend, handed to the executor.
@@ -385,6 +451,7 @@ impl SubscribeReconcile {
             counter!(RECONCILE_INSTRUMENTS_METRIC, "outcome" => outcome).increment(0);
         }
         gauge!(RECONCILE_MISSING_GAUGE).set(0.0);
+        counter!(RECONCILE_SWEEP_INTERRUPTED_METRIC).increment(0);
         let (rounds_tx, rounds_rx) = mpsc::channel(RECONCILE_EXECUTOR_QUEUE);
         let book = Self {
             inner: Mutex::new(Inner {
@@ -408,6 +475,8 @@ impl SubscribeReconcile {
                 ist_day: ist_day_now(),
                 feed_silent_reported: false,
                 next_reservation: 0,
+                pending: None,
+                epoch: 0,
             }),
             auto_resubscribe,
             rounds_tx,
@@ -453,11 +522,13 @@ impl SubscribeReconcile {
                     last_round_at: None,
                     in_flight: None,
                     delivering: 0,
+                    pending_delivering: 0,
                     // Pre-sized to the per-round cap, so `note` never grows
                     // it on the drain.
                     candidates: Vec::with_capacity(RECONCILE_MAX_PER_SOCKET_PER_ROUND),
                     silent_reported: false,
                 });
+                inner.epoch = inner.epoch.wrapping_add(1);
                 inner.sockets.len() - 1
             }
             None => {
@@ -484,6 +555,7 @@ impl SubscribeReconcile {
                     entry.reserved_round = None;
                     // The cached socket and record time are stale now.
                     release_cell(cells, entry);
+                    inner.epoch = inner.epoch.wrapping_add(1);
                 }
                 continue;
             }
@@ -505,6 +577,7 @@ impl SubscribeReconcile {
                     view_slot: VIEW_SLOT_NONE,
                 },
             );
+            inner.epoch = inner.epoch.wrapping_add(1);
         }
         if refused > 0 {
             counter!(RECONCILE_INSTRUMENTS_METRIC, "outcome" => "refused_untracked")
@@ -516,11 +589,15 @@ impl SubscribeReconcile {
     pub fn forget(&self, instruments: &[SubscribeInstrument]) {
         let mut inner = self.lock();
         let Inner {
-            expected, cells, ..
+            expected,
+            cells,
+            epoch,
+            ..
         } = &mut *inner;
         for instrument in instruments {
             if let Some(mut removed) = expected.remove(&key_of(instrument)) {
                 release_cell(cells, &mut removed);
+                *epoch = epoch.wrapping_add(1);
             }
         }
     }
@@ -544,10 +621,14 @@ impl SubscribeReconcile {
             });
             if owned {
                 let Inner {
-                    expected, cells, ..
+                    expected,
+                    cells,
+                    epoch,
+                    ..
                 } = &mut *inner;
                 if let Some(mut removed) = expected.remove(&key) {
                     release_cell(cells, &mut removed);
+                    *epoch = epoch.wrapping_add(1);
                 }
             }
         }
@@ -665,26 +746,117 @@ impl SubscribeReconcile {
 
     pub(crate) fn sweep_at(&self, now: Instant) -> ReconcileSweep<'_> {
         let mut inner = self.lock();
+        // A one-go pass clears and drains the candidate lists a chunked sweep
+        // may be filling, so a chunked sweep running across it plans no round.
+        inner.epoch = inner.epoch.wrapping_add(1);
         for socket in &mut inner.sockets {
             socket.delivering = 0;
             socket.candidates.clear();
         }
         inner.exhausted_named.clear();
+        let acc = SweepAcc::new(now, inner.epoch);
         ReconcileSweep {
             book: self,
             inner,
-            now,
-            missing: 0,
-            exhausted: 0,
-            fast_hits: 0,
+            acc,
         }
     }
 
+    /// Starts a chunked judging pass at `now` (2026-11-24, plan item US1-D):
+    /// the drain notes the silence reports in chunks through [`Self::chunk`],
+    /// taking the book's lock once per chunk, and ends with
+    /// [`Self::finish_chunked_at`]. With no other lock taker between the
+    /// chunks the result equals a one-go [`Self::sweep_at`] pass over the same
+    /// reports (pinned by `proptest_chunked_reconcile_sweep_matches_the_one_go_sweep`).
+    ///
+    /// Returns `false` and changes nothing when a chunked sweep is already
+    /// pending: the caller finishes (or abandons) that one first.
+    ///
+    /// O(sockets), no allocation (the lists are cleared, not shrunk).
+    pub(crate) fn begin_chunked_at(&self, now: Instant) -> bool {
+        let mut inner = self.lock();
+        if inner.pending.is_some() {
+            return false;
+        }
+        for socket in &mut inner.sockets {
+            socket.pending_delivering = 0;
+            socket.candidates.clear();
+        }
+        inner.exhausted_named.clear();
+        let epoch = inner.epoch;
+        inner.pending = Some(SweepAcc::new(now, epoch));
+        true
+    }
+
+    /// One chunk of the pending chunked sweep: the book's lock plus the
+    /// sweep's accumulators, until the chunk is dropped. `None` when no
+    /// chunked sweep is pending. O(1) to open and to close, no allocation.
+    pub(crate) fn chunk(&self) -> Option<ReconcileChunk<'_>> {
+        let mut inner = self.lock();
+        let acc = inner.pending.take()?;
+        Some(ReconcileChunk { inner, acc })
+    }
+
+    /// Ends the pending chunked sweep at `secs_of_day_ist` on IST day
+    /// `ist_day`. Publishes each socket's `pending_delivering` as its
+    /// `delivering`, then runs the same finish as
+    /// [`ReconcileSweep::finish_at`] and then the exhausted report its drop
+    /// makes, in that order.
+    ///
+    /// If another lock taker changed the book between the begin and this
+    /// finish, the sweep's judgement mixes two book states, so it plans no
+    /// round (neither an auto-mode dispatch nor a shadow `would_resubscribe`)
+    /// and counts [`RECONCILE_SWEEP_INTERRUPTED_METRIC`] when the reconcile
+    /// window is open; the next sweep plans it. The missing gauge and the day
+    /// reset still run.
+    ///
+    /// Honest limit: an interrupted finish still publishes `delivering` and
+    /// still moves the silent-socket and feed-silent latches, from counts that
+    /// mix the two book states (a delivering instrument forgotten after its
+    /// chunk still counts). Nothing is planned from them, and the next sweep
+    /// (30 s later) publishes and judges them afresh.
+    ///
+    /// With no sweep pending it does nothing and returns
+    /// [`SweepSummary::default`].
+    pub(crate) fn finish_chunked_at(&self, secs_of_day_ist: u32, ist_day: i64) -> SweepSummary {
+        let mut guard = self.lock();
+        let inner = &mut *guard;
+        let Some(mut acc) = inner.pending.take() else {
+            return SweepSummary::default();
+        };
+        for socket in &mut inner.sockets {
+            socket.delivering = std::mem::take(&mut socket.pending_delivering);
+        }
+        let plan_rounds = inner.epoch == acc.epoch_at_begin;
+        if !plan_rounds && reconcile_window_open(secs_of_day_ist) {
+            counter!(RECONCILE_SWEEP_INTERRUPTED_METRIC).increment(1);
+        }
+        let summary = finish_pass(self, inner, &mut acc, secs_of_day_ist, ist_day, plan_rounds);
+        report_exhausted(&acc, &inner.exhausted_named);
+        summary
+    }
+
+    /// Drops the pending chunked sweep (shutdown, or a timer overrun that
+    /// rescans at a fresh instant). It plans nothing and counts no interrupt,
+    /// but instruments its chunks already marked as having used their last
+    /// round are reported now (counter and named warn), as the one-go sweep's
+    /// drop did, because their entries are marked reported and no later sweep
+    /// would name them. Its partial candidate lists are cleared by the next
+    /// begin. O(1) plus the report.
+    pub(crate) fn abandon_chunked(&self) {
+        let mut inner = self.lock();
+        if let Some(acc) = inner.pending.take() {
+            report_exhausted(&acc, &inner.exhausted_named);
+        }
+    }
     /// The executor's report that this reserved round is over: its socket may
     /// plan again [`RECONCILE_ROUND_INTERVAL_SECS`] from now, and the
     /// instruments in `refund` get their matching current-day reservation back.
     fn round_finished(&self, round: &PlannedRound, refund: &[SubscribeInstrument], now: Instant) {
         let mut inner = self.lock();
+        // A finished round moves spacing, in-flight state and refunds, so a
+        // chunked sweep running across it plans no round.
+        inner.epoch = inner.epoch.wrapping_add(1);
         let same_day = inner.ist_day == round.ist_day;
         let Inner {
             sockets, expected, ..
@@ -777,13 +949,7 @@ fn reconcile_window_open(secs_of_day_ist: u32) -> bool {
 pub struct ReconcileSweep<'a> {
     book: &'a SubscribeReconcile,
     inner: MutexGuard<'a, Inner>,
-    now: Instant,
-    missing: u32,
-    /// Instruments that used their last round in this sweep (the first
-    /// [`NAMED_IN_LOG`] are named in `Inner::exhausted_named`).
-    exhausted: u32,
-    /// Reports this sweep judged on [`Self::note_at_slot`]'s fast path.
-    fast_hits: u32,
+    acc: SweepAcc,
 }
 
 impl ReconcileSweep<'_> {
@@ -791,64 +957,12 @@ impl ReconcileSweep<'_> {
     /// whether the book expects the report's key (`false` only on a miss), so
     /// [`Self::note_at_slot`] skips its second probe for a key it never holds.
     pub fn note(&mut self, report: &SilenceReport) -> bool {
-        let now = self.now;
-        let inner = &mut *self.inner;
-        let Some(entry) = inner.expected.get_mut(&report.key) else {
-            return false;
-        };
-        let Some(socket) = inner.sockets.get_mut(usize::from(entry.socket)) else {
-            return true;
-        };
-        match report.verdict {
-            SilenceVerdict::NeverTicked => {}
-            SilenceVerdict::Live => {
-                socket.delivering = socket.delivering.saturating_add(1);
-                mark_recovered(entry);
-                return true;
-            }
-            // Ticked, but too few gaps for a baseline. `Warming` never looks at
-            // how long it has been quiet, so a thin contract that ticked at
-            // 09:05 still reads `Warming` hours later: it counts as delivering
-            // only while its quiet stretch is inside the expected gap.
-            SilenceVerdict::Warming => {
-                if report.silent_millis <= report.expected_millis {
-                    socket.delivering = socket.delivering.saturating_add(1);
-                }
-                mark_recovered(entry);
-                return true;
-            }
-            // Ticked earlier, quiet now: neither delivering nor missing.
-            SilenceVerdict::Exceeded => {
-                mark_recovered(entry);
-                return true;
-            }
-        }
-        if now.saturating_duration_since(entry.recorded_at)
-            < Duration::from_secs(RECONCILE_DELTA_SECS)
-        {
-            return true;
-        }
-        self.missing = self.missing.saturating_add(1);
-        if entry.rounds >= RECONCILE_MAX_ROUNDS {
-            // The last round gets its full 120 s after it finished before it
-            // is judged spent.
-            let last_round_settled = socket.in_flight.is_none()
-                && socket.last_round_at.is_none_or(|at| {
-                    now.saturating_duration_since(at) >= Duration::from_secs(RECONCILE_DELTA_SECS)
-                });
-            if last_round_settled && !entry.exhausted_reported {
-                entry.exhausted_reported = true;
-                self.exhausted = self.exhausted.saturating_add(1);
-                if inner.exhausted_named.len() < NAMED_IN_LOG {
-                    inner.exhausted_named.push(entry.instrument);
-                }
-            }
-            return true;
-        }
-        if socket.candidates.len() < RECONCILE_MAX_PER_SOCKET_PER_ROUND {
-            socket.candidates.push(entry.instrument);
-        }
-        true
+        note_report(
+            &mut self.inner,
+            &mut self.acc,
+            report,
+            DeliverInto::Published,
+        )
     }
 
     /// [`Self::note`] for a report the silence detector handed out with its
@@ -880,107 +994,13 @@ impl ReconcileSweep<'_> {
     ///
     /// No allocation on either path (the candidate list is pre-sized).
     pub fn note_at_slot(&mut self, slot: u32, report: &SilenceReport) {
-        let now = self.now;
-        let inner = &mut *self.inner;
-        let cell = if inner.rounds_any {
-            None
-        } else {
-            usize::try_from(slot)
-                .ok()
-                .and_then(|index| inner.cells.get(index))
-                .copied()
-                .filter(|cell| {
-                    cell.socket != CELL_EMPTY
-                        && cell.security_id == report.key.0
-                        && cell.segment == report.key.1
-                })
-        };
-        if let Some(cell) = cell {
-            self.fast_hits = self.fast_hits.saturating_add(1);
-            let Some(socket) = inner.sockets.get_mut(usize::from(cell.socket)) else {
-                return;
-            };
-            match report.verdict {
-                SilenceVerdict::Live => {
-                    socket.delivering = socket.delivering.saturating_add(1);
-                }
-                SilenceVerdict::Warming => {
-                    if report.silent_millis <= report.expected_millis {
-                        socket.delivering = socket.delivering.saturating_add(1);
-                    }
-                }
-                SilenceVerdict::Exceeded => {}
-                SilenceVerdict::NeverTicked => {
-                    if now.saturating_duration_since(cell.recorded_at)
-                        < Duration::from_secs(RECONCILE_DELTA_SECS)
-                    {
-                        return;
-                    }
-                    self.missing = self.missing.saturating_add(1);
-                    if socket.candidates.len() < RECONCILE_MAX_PER_SOCKET_PER_ROUND {
-                        socket.candidates.push(SubscribeInstrument {
-                            security_id: cell.security_id,
-                            segment: cell.segment,
-                        });
-                    }
-                }
-            }
-            return;
-        }
-        // A key the book does not expect never gets a cell: one probe, not two.
-        if self.note(report) {
-            self.cache_slot(slot, report.key);
-        }
-    }
-
-    /// The slow path's second half: puts `key`'s entry in `slot`'s cell while
-    /// no round is reserved today. Keeps the invariant both ways: the cell the
-    /// entry held before is emptied, and an entry the cell held before loses
-    /// its slot. O(1), at most two probes.
-    fn cache_slot(&mut self, slot: u32, key: Key) {
-        let inner = &mut *self.inner;
-        if inner.rounds_any {
-            return;
-        }
-        let Some(index) = usize::try_from(slot)
-            .ok()
-            .filter(|index| *index < inner.cells.len())
-        else {
-            return;
-        };
-        let Inner {
-            expected, cells, ..
-        } = inner;
-        let Some(entry) = expected.get_mut(&key) else {
-            return;
-        };
-        let previous_slot = entry.view_slot;
-        entry.view_slot = slot;
-        let fresh = SlotCell {
-            security_id: key.0,
-            recorded_at: entry.recorded_at,
-            segment: key.1,
-            socket: entry.socket,
-        };
-        if previous_slot != VIEW_SLOT_NONE
-            && previous_slot != slot
-            && let Some(old) = usize::try_from(previous_slot)
-                .ok()
-                .and_then(|old| cells.get_mut(old))
-        {
-            old.socket = CELL_EMPTY;
-        }
-        let Some(cell) = cells.get_mut(index) else {
-            return;
-        };
-        if cell.socket != CELL_EMPTY
-            && (cell.security_id, cell.segment) != key
-            && let Some(other) = expected.get_mut(&(cell.security_id, cell.segment))
-            && other.view_slot == slot
-        {
-            other.view_slot = VIEW_SLOT_NONE;
-        }
-        *cell = fresh;
+        note_report_at_slot(
+            &mut self.inner,
+            &mut self.acc,
+            slot,
+            report,
+            DeliverInto::Published,
+        );
     }
 
     /// Ends the pass at the wall clock, with the trading-calendar session gate
@@ -992,151 +1012,15 @@ impl ReconcileSweep<'_> {
 
     /// Ends the pass at `secs_of_day_ist` on IST day `ist_day`.
     pub fn finish_at(mut self, secs_of_day_ist: u32, ist_day: i64) -> SweepSummary {
-        self.inner.fast_path_hits = self
-            .inner
-            .fast_path_hits
-            .saturating_add(u64::from(self.fast_hits));
-        let mut summary = SweepSummary {
-            missing: self.missing,
-            newly_exhausted: self.exhausted,
-            ..SweepSummary::default()
-        };
-        gauge!(RECONCILE_MISSING_GAUGE).set(f64::from(self.missing));
-        let inner = &mut *self.inner;
-        if inner.ist_day != ist_day {
-            // A new session: every instrument gets its rounds back. O(expected),
-            // once a day. A round still in flight keeps its socket's flag; the
-            // executor clears it.
-            inner.ist_day = ist_day;
-            inner.feed_silent_reported = false;
-            inner.rounds_any = false;
-            for entry in inner.expected.values_mut() {
-                entry.rounds = 0;
-                entry.reserved_round = None;
-                entry.missing_counted = false;
-                entry.exhausted_reported = false;
-                entry.recovered_reported = false;
-            }
-            for socket in &mut inner.sockets {
-                socket.last_round_at = None;
-                socket.silent_reported = false;
-            }
-            self.exhausted = 0;
-            inner.exhausted_named.clear();
-            summary.newly_exhausted = 0;
-        }
-        // The continuous session, and not its first 120 s: an instrument that has
-        // not traded since the open is not yet a lost subscription.
-        if !reconcile_window_open(secs_of_day_ist) {
-            return summary;
-        }
-        let feed_delivering: u64 = inner.sockets.iter().map(|s| u64::from(s.delivering)).sum();
-        if feed_delivering == 0 {
-            if summary.missing > 0 && !inner.feed_silent_reported {
-                inner.feed_silent_reported = true;
-                counter!(RECONCILE_ROUNDS_METRIC, "outcome" => "skipped_feed_silent").increment(1);
-                warn!(
-                    missing = summary.missing,
-                    "subscribe reconcile: no subscribed instrument is delivering now - this is a \
-                     halt or a dead feed, not a partial subscribe; nothing is resent"
-                );
-            }
-            return summary;
-        }
-        inner.feed_silent_reported = false;
-        let interval = Duration::from_secs(RECONCILE_ROUND_INTERVAL_SECS);
-        let auto = self.book.auto_resubscribe;
-        let Inner {
-            sockets,
-            expected,
-            next_reservation,
-            rounds_any,
-            ..
-        } = inner;
-        for (index, socket) in sockets.iter_mut().enumerate() {
-            if socket.candidates.is_empty() {
-                socket.silent_reported = false;
-                continue;
-            }
-            if socket.delivering == 0 {
-                if !socket.silent_reported {
-                    socket.silent_reported = true;
-                    counter!(RECONCILE_ROUNDS_METRIC, "outcome" => "skipped_silent_socket")
-                        .increment(1);
-                    warn!(
-                        socket = index,
-                        missing = socket.candidates.len(),
-                        "subscribe reconcile: a socket delivers nothing now for any of its \
-                         instruments - left to the frame-silence redial, nothing is resent"
-                    );
-                }
-                continue;
-            }
-            socket.silent_reported = false;
-            if socket.in_flight.is_some()
-                || socket
-                    .last_round_at
-                    .is_some_and(|at| self.now.saturating_duration_since(at) < interval)
-            {
-                continue;
-            }
-            // `drain` keeps the pre-sized buffer for the next sweep; the round
-            // takes one allocation, cold, at most once per socket per 120 s.
-            let instruments: Vec<SubscribeInstrument> = socket.candidates.drain(..).collect();
-            let count = instruments.len() as u64;
-            let first_seen = count_missing_once(expected, &instruments);
-            counter!(RECONCILE_INSTRUMENTS_METRIC, "outcome" => "missing_found")
-                .increment(first_seen);
-            if auto {
-                // One round spent per member, one hash probe each; refunded by
-                // the executor for any member it did not actually resend.
-                let Some(reservation) = next_reservation.checked_add(1) else {
-                    counter!(RECONCILE_ROUNDS_METRIC, "outcome" => "round_id_exhausted")
-                        .increment(1);
-                    continue;
-                };
-                *next_reservation = reservation;
-                reserve_round(expected, rounds_any, &instruments, reservation);
-                let round = PlannedRound {
-                    tx: socket.tx.clone(),
-                    socket: u8::try_from(index).unwrap_or(u8::MAX),
-                    instruments,
-                    reservation,
-                    ist_day,
-                };
-                match self.book.rounds_tx.try_send(round) {
-                    Ok(()) => {
-                        socket.in_flight = Some(reservation);
-                        summary.dispatched = summary.dispatched.saturating_add(1);
-                        counter!(RECONCILE_ROUNDS_METRIC, "outcome" => "dispatched").increment(1);
-                    }
-                    Err(
-                        mpsc::error::TrySendError::Full(round)
-                        | mpsc::error::TrySendError::Closed(round),
-                    ) => {
-                        // Not a spent round: the instruments get theirs back
-                        // and the socket keeps its spacing.
-                        refund_reservation(expected, &round.instruments, reservation);
-                        counter!(RECONCILE_ROUNDS_METRIC, "outcome" => "queue_full").increment(1);
-                        continue;
-                    }
-                }
-            } else {
-                // Shadow: spacing only, so the counter reads one decision per
-                // socket per 120 s; no round is spent.
-                socket.last_round_at = Some(self.now);
-                summary.would_resubscribe = summary.would_resubscribe.saturating_add(1);
-                counter!(RECONCILE_ROUNDS_METRIC, "outcome" => "would_resubscribe").increment(1);
-            }
-            info!(
-                socket = index,
-                instruments = count,
-                auto_resubscribe = auto,
-                "subscribe reconcile: instruments subscribed over 120 s ago have sent nothing \
-                 while the socket delivers others"
-            );
-        }
-        summary
+        let book = self.book;
+        finish_pass(
+            book,
+            &mut self.inner,
+            &mut self.acc,
+            secs_of_day_ist,
+            ist_day,
+            true,
+        )
     }
 }
 
@@ -1144,22 +1028,399 @@ impl Drop for ReconcileSweep<'_> {
     /// Reports instruments that used their last round, once each, whether or
     /// not the pass reached `finish` (a skipped gate must not hide them).
     fn drop(&mut self) {
-        if self.exhausted == 0 {
-            return;
-        }
-        let n = self.exhausted;
-        counter!(RECONCILE_INSTRUMENTS_METRIC, "outcome" => "exhausted").increment(u64::from(n));
-        warn!(
-            code = ErrorCode::WsGapSubscriptionBatching.code_str(),
-            source = "subscribe_reconcile_exhausted",
-            instruments = n,
-            first = %NamedInstruments(&self.inner.exhausted_named),
-            "subscribe reconcile: instruments still sent nothing after the last resend round - \
-             either they do not trade or the vendor is not serving them; not resent again today"
+        report_exhausted(&self.acc, &self.inner.exhausted_named);
+    }
+}
+
+/// One chunk of a chunked sweep (2026-11-24, plan item US1-D): the book's
+/// lock and the sweep's accumulators taken out of [`Inner::pending`]. Dropping
+/// it puts the accumulators back, with no log and no count; the exhausted
+/// report is made once, by [`SubscribeReconcile::finish_chunked_at`] or
+/// [`SubscribeReconcile::abandon_chunked`].
+#[derive(Debug)]
+pub(crate) struct ReconcileChunk<'a> {
+    inner: MutexGuard<'a, Inner>,
+    acc: SweepAcc,
+}
+
+impl ReconcileChunk<'_> {
+    /// [`ReconcileSweep::note_at_slot`] into the chunked sweep: the same fast
+    /// and slow paths, the same cells, except that a delivering instrument
+    /// counts on its socket's `pending_delivering`. O(1), no allocation.
+    pub(crate) fn note_at_slot(&mut self, slot: u32, report: &SilenceReport) {
+        note_report_at_slot(
+            &mut self.inner,
+            &mut self.acc,
+            slot,
+            report,
+            DeliverInto::Pending,
         );
     }
 }
 
+impl Drop for ReconcileChunk<'_> {
+    fn drop(&mut self) {
+        self.inner.pending = Some(self.acc);
+    }
+}
+
+/// The body of [`ReconcileSweep::note`], shared with the chunked sweep:
+/// expected O(1), one hash probe.
+fn note_report(
+    inner: &mut Inner,
+    acc: &mut SweepAcc,
+    report: &SilenceReport,
+    into: DeliverInto,
+) -> bool {
+    let now = acc.now;
+    let Some(entry) = inner.expected.get_mut(&report.key) else {
+        return false;
+    };
+    let Some(socket) = inner.sockets.get_mut(usize::from(entry.socket)) else {
+        return true;
+    };
+    match report.verdict {
+        SilenceVerdict::NeverTicked => {}
+        SilenceVerdict::Live => {
+            count_delivering(socket, into);
+            mark_recovered(entry);
+            return true;
+        }
+        // Ticked, but too few gaps for a baseline. `Warming` never looks at
+        // how long it has been quiet, so a thin contract that ticked at
+        // 09:05 still reads `Warming` hours later: it counts as delivering
+        // only while its quiet stretch is inside the expected gap.
+        SilenceVerdict::Warming => {
+            if report.silent_millis <= report.expected_millis {
+                count_delivering(socket, into);
+            }
+            mark_recovered(entry);
+            return true;
+        }
+        // Ticked earlier, quiet now: neither delivering nor missing.
+        SilenceVerdict::Exceeded => {
+            mark_recovered(entry);
+            return true;
+        }
+    }
+    if now.saturating_duration_since(entry.recorded_at) < Duration::from_secs(RECONCILE_DELTA_SECS)
+    {
+        return true;
+    }
+    acc.missing = acc.missing.saturating_add(1);
+    if entry.rounds >= RECONCILE_MAX_ROUNDS {
+        // The last round gets its full 120 s after it finished before it
+        // is judged spent.
+        let last_round_settled = socket.in_flight.is_none()
+            && socket.last_round_at.is_none_or(|at| {
+                now.saturating_duration_since(at) >= Duration::from_secs(RECONCILE_DELTA_SECS)
+            });
+        if last_round_settled && !entry.exhausted_reported {
+            entry.exhausted_reported = true;
+            acc.exhausted = acc.exhausted.saturating_add(1);
+            if inner.exhausted_named.len() < NAMED_IN_LOG {
+                inner.exhausted_named.push(entry.instrument);
+            }
+        }
+        return true;
+    }
+    if socket.candidates.len() < RECONCILE_MAX_PER_SOCKET_PER_ROUND {
+        socket.candidates.push(entry.instrument);
+    }
+    true
+}
+
+/// The body of [`ReconcileSweep::note_at_slot`], shared with the chunked
+/// sweep. See that method for the fast and slow paths.
+fn note_report_at_slot(
+    inner: &mut Inner,
+    acc: &mut SweepAcc,
+    slot: u32,
+    report: &SilenceReport,
+    into: DeliverInto,
+) {
+    let now = acc.now;
+    let cell = if inner.rounds_any {
+        None
+    } else {
+        usize::try_from(slot)
+            .ok()
+            .and_then(|index| inner.cells.get(index))
+            .copied()
+            .filter(|cell| {
+                cell.socket != CELL_EMPTY
+                    && cell.security_id == report.key.0
+                    && cell.segment == report.key.1
+            })
+    };
+    if let Some(cell) = cell {
+        acc.fast_hits = acc.fast_hits.saturating_add(1);
+        let Some(socket) = inner.sockets.get_mut(usize::from(cell.socket)) else {
+            return;
+        };
+        match report.verdict {
+            SilenceVerdict::Live => {
+                count_delivering(socket, into);
+            }
+            SilenceVerdict::Warming => {
+                if report.silent_millis <= report.expected_millis {
+                    count_delivering(socket, into);
+                }
+            }
+            SilenceVerdict::Exceeded => {}
+            SilenceVerdict::NeverTicked => {
+                if now.saturating_duration_since(cell.recorded_at)
+                    < Duration::from_secs(RECONCILE_DELTA_SECS)
+                {
+                    return;
+                }
+                acc.missing = acc.missing.saturating_add(1);
+                if socket.candidates.len() < RECONCILE_MAX_PER_SOCKET_PER_ROUND {
+                    socket.candidates.push(SubscribeInstrument {
+                        security_id: cell.security_id,
+                        segment: cell.segment,
+                    });
+                }
+            }
+        }
+        return;
+    }
+    // A key the book does not expect never gets a cell: one probe, not two.
+    if note_report(inner, acc, report, into) {
+        cache_slot(inner, slot, report.key);
+    }
+}
+
+/// The slow path's second half: puts `key`'s entry in `slot`'s cell while
+/// no round is reserved today. Keeps the invariant both ways: the cell the
+/// entry held before is emptied, and an entry the cell held before loses
+/// its slot. O(1), at most two probes.
+fn cache_slot(inner: &mut Inner, slot: u32, key: Key) {
+    if inner.rounds_any {
+        return;
+    }
+    let Some(index) = usize::try_from(slot)
+        .ok()
+        .filter(|index| *index < inner.cells.len())
+    else {
+        return;
+    };
+    let Inner {
+        expected, cells, ..
+    } = inner;
+    let Some(entry) = expected.get_mut(&key) else {
+        return;
+    };
+    let previous_slot = entry.view_slot;
+    entry.view_slot = slot;
+    let fresh = SlotCell {
+        security_id: key.0,
+        recorded_at: entry.recorded_at,
+        segment: key.1,
+        socket: entry.socket,
+    };
+    if previous_slot != VIEW_SLOT_NONE
+        && previous_slot != slot
+        && let Some(old) = usize::try_from(previous_slot)
+            .ok()
+            .and_then(|old| cells.get_mut(old))
+    {
+        old.socket = CELL_EMPTY;
+    }
+    let Some(cell) = cells.get_mut(index) else {
+        return;
+    };
+    if cell.socket != CELL_EMPTY
+        && (cell.security_id, cell.segment) != key
+        && let Some(other) = expected.get_mut(&(cell.security_id, cell.segment))
+        && other.view_slot == slot
+    {
+        other.view_slot = VIEW_SLOT_NONE;
+    }
+    *cell = fresh;
+}
+
+/// The body of [`ReconcileSweep::finish_at`], shared with
+/// [`SubscribeReconcile::finish_chunked_at`]. `plan_rounds` is `false` only
+/// for a chunked sweep another lock taker interrupted: the per-socket pass then
+/// stops before its spacing check, so no round is reserved, dispatched or
+/// counted as `would_resubscribe`, and no spacing moves.
+fn finish_pass(
+    book: &SubscribeReconcile,
+    inner: &mut Inner,
+    acc: &mut SweepAcc,
+    secs_of_day_ist: u32,
+    ist_day: i64,
+    plan_rounds: bool,
+) -> SweepSummary {
+    inner.fast_path_hits = inner
+        .fast_path_hits
+        .saturating_add(u64::from(acc.fast_hits));
+    let mut summary = SweepSummary {
+        missing: acc.missing,
+        newly_exhausted: acc.exhausted,
+        ..SweepSummary::default()
+    };
+    gauge!(RECONCILE_MISSING_GAUGE).set(f64::from(acc.missing));
+    if inner.ist_day != ist_day {
+        // A new session: every instrument gets its rounds back. O(expected),
+        // once a day. A round still in flight keeps its socket's flag; the
+        // executor clears it.
+        inner.ist_day = ist_day;
+        inner.feed_silent_reported = false;
+        inner.rounds_any = false;
+        for entry in inner.expected.values_mut() {
+            entry.rounds = 0;
+            entry.reserved_round = None;
+            entry.missing_counted = false;
+            entry.exhausted_reported = false;
+            entry.recovered_reported = false;
+        }
+        for socket in &mut inner.sockets {
+            socket.last_round_at = None;
+            socket.silent_reported = false;
+        }
+        acc.exhausted = 0;
+        inner.exhausted_named.clear();
+        summary.newly_exhausted = 0;
+    }
+    // The continuous session, and not its first 120 s: an instrument that has
+    // not traded since the open is not yet a lost subscription.
+    if !reconcile_window_open(secs_of_day_ist) {
+        return summary;
+    }
+    let feed_delivering: u64 = inner.sockets.iter().map(|s| u64::from(s.delivering)).sum();
+    if feed_delivering == 0 {
+        if summary.missing > 0 && !inner.feed_silent_reported {
+            inner.feed_silent_reported = true;
+            counter!(RECONCILE_ROUNDS_METRIC, "outcome" => "skipped_feed_silent").increment(1);
+            warn!(
+                missing = summary.missing,
+                "subscribe reconcile: no subscribed instrument is delivering now - this is a \
+                 halt or a dead feed, not a partial subscribe; nothing is resent"
+            );
+        }
+        return summary;
+    }
+    inner.feed_silent_reported = false;
+    let interval = Duration::from_secs(RECONCILE_ROUND_INTERVAL_SECS);
+    let auto = book.auto_resubscribe;
+    let now = acc.now;
+    let Inner {
+        sockets,
+        expected,
+        next_reservation,
+        rounds_any,
+        ..
+    } = inner;
+    for (index, socket) in sockets.iter_mut().enumerate() {
+        if socket.candidates.is_empty() {
+            socket.silent_reported = false;
+            continue;
+        }
+        if socket.delivering == 0 {
+            if !socket.silent_reported {
+                socket.silent_reported = true;
+                counter!(RECONCILE_ROUNDS_METRIC, "outcome" => "skipped_silent_socket")
+                    .increment(1);
+                warn!(
+                    socket = index,
+                    missing = socket.candidates.len(),
+                    "subscribe reconcile: a socket delivers nothing now for any of its \
+                     instruments - left to the frame-silence redial, nothing is resent"
+                );
+            }
+            continue;
+        }
+        socket.silent_reported = false;
+        // An interrupted chunked sweep judged its instruments against two
+        // book states: plan nothing from it; the next sweep plans it.
+        if !plan_rounds {
+            continue;
+        }
+        if socket.in_flight.is_some()
+            || socket
+                .last_round_at
+                .is_some_and(|at| now.saturating_duration_since(at) < interval)
+        {
+            continue;
+        }
+        // `drain` keeps the pre-sized buffer for the next sweep; the round
+        // takes one allocation, cold, at most once per socket per 120 s.
+        let instruments: Vec<SubscribeInstrument> = socket.candidates.drain(..).collect();
+        let count = instruments.len() as u64;
+        let first_seen = count_missing_once(expected, &instruments);
+        counter!(RECONCILE_INSTRUMENTS_METRIC, "outcome" => "missing_found").increment(first_seen);
+        if auto {
+            // One round spent per member, one hash probe each; refunded by
+            // the executor for any member it did not actually resend.
+            let Some(reservation) = next_reservation.checked_add(1) else {
+                counter!(RECONCILE_ROUNDS_METRIC, "outcome" => "round_id_exhausted").increment(1);
+                continue;
+            };
+            *next_reservation = reservation;
+            reserve_round(expected, rounds_any, &instruments, reservation);
+            let round = PlannedRound {
+                tx: socket.tx.clone(),
+                socket: u8::try_from(index).unwrap_or(u8::MAX),
+                instruments,
+                reservation,
+                ist_day,
+            };
+            match book.rounds_tx.try_send(round) {
+                Ok(()) => {
+                    socket.in_flight = Some(reservation);
+                    summary.dispatched = summary.dispatched.saturating_add(1);
+                    counter!(RECONCILE_ROUNDS_METRIC, "outcome" => "dispatched").increment(1);
+                }
+                Err(
+                    mpsc::error::TrySendError::Full(round)
+                    | mpsc::error::TrySendError::Closed(round),
+                ) => {
+                    // Not a spent round: the instruments get theirs back
+                    // and the socket keeps its spacing.
+                    refund_reservation(expected, &round.instruments, reservation);
+                    counter!(RECONCILE_ROUNDS_METRIC, "outcome" => "queue_full").increment(1);
+                    continue;
+                }
+            }
+        } else {
+            // Shadow: spacing only, so the counter reads one decision per
+            // socket per 120 s; no round is spent.
+            socket.last_round_at = Some(now);
+            summary.would_resubscribe = summary.would_resubscribe.saturating_add(1);
+            counter!(RECONCILE_ROUNDS_METRIC, "outcome" => "would_resubscribe").increment(1);
+        }
+        info!(
+            socket = index,
+            instruments = count,
+            auto_resubscribe = auto,
+            "subscribe reconcile: instruments subscribed over 120 s ago have sent nothing \
+             while the socket delivers others"
+        );
+    }
+    summary
+}
+
+/// Reports instruments that used their last round in one sweep, once each:
+/// the exhausted counter and one warn naming the first [`NAMED_IN_LOG`].
+/// Run by the one-go sweep's drop and by the chunked sweep's finish, after
+/// the finish's own logs. Nothing when none were exhausted.
+fn report_exhausted(acc: &SweepAcc, exhausted_named: &[SubscribeInstrument]) {
+    if acc.exhausted == 0 {
+        return;
+    }
+    let n = acc.exhausted;
+    counter!(RECONCILE_INSTRUMENTS_METRIC, "outcome" => "exhausted").increment(u64::from(n));
+    warn!(
+        code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+        source = "subscribe_reconcile_exhausted",
+        instruments = n,
+        first = %NamedInstruments(exhausted_named),
+        "subscribe reconcile: instruments still sent nothing after the last resend round - \
+         either they do not trade or the vendor is not serving them; not resent again today"
+    );
+}
 /// Empties the cell `entry` is cached in, if any, and clears its slot. Called
 /// under the book's lock wherever an entry's socket or record time changes or
 /// the entry leaves the expected set, so no cell ever serves a stale copy.
@@ -3715,7 +3976,7 @@ mod slot_cell_tests {
         // missing; the probe reads the new record time and does not.
         let mut sweep = book.sweep_at(again + Duration::from_secs(30));
         sweep.note_at_slot(7, &report(1, SilenceVerdict::NeverTicked));
-        assert_eq!(sweep.missing, 0);
+        assert_eq!(sweep.acc.missing, 0);
         drop(sweep);
         assert_eq!(book.cached_cells(), 1, "re-cached from the fresh entry");
         book.assert_cell_invariant();
@@ -3774,7 +4035,10 @@ mod slot_cell_tests {
         // reassigned slots). Past the delta, never ticked: the probe judges it.
         let mut sweep = book.sweep_at(t0 + delta());
         sweep.note_at_slot(3, &report(2, SilenceVerdict::NeverTicked));
-        assert_eq!(sweep.missing, 1, "judged by the probe, not by key 1's cell");
+        assert_eq!(
+            sweep.acc.missing, 1,
+            "judged by the probe, not by key 1's cell"
+        );
         drop(sweep);
         let inner = book.lock();
         assert_eq!(inner.cells[3].security_id, 2, "the cell now holds key 2");
@@ -4128,8 +4392,8 @@ mod slot_cell_tests {
                             let slot = slot_of(key, choice, random);
                             sa.note(&r);
                             sb.note_at_slot(slot, &r);
-                            prop_assert_eq!(sa.missing, sb.missing);
-                            prop_assert_eq!(sa.exhausted, sb.exhausted);
+                            prop_assert_eq!(sa.acc.missing, sb.acc.missing);
+                            prop_assert_eq!(sa.acc.exhausted, sb.acc.exhausted);
                         }
                         let summary_a = sa.finish_at(secs, day);
                         let summary_b = sb.finish_at(secs, day);
@@ -4182,7 +4446,7 @@ mod slot_cell_tests {
             // The count of fast-path decisions, not only valid cells: the slow
             // path re-fills the same cells, so `hits` alone cannot tell them apart.
             assert_eq!(
-                sb.fast_hits,
+                sb.acc.fast_hits,
                 if sweep_n == 0 { 0 } else { 50 },
                 "fast-path decisions, sweep {sweep_n}"
             );
@@ -4215,10 +4479,783 @@ mod slot_cell_tests {
             );
             assert!(sweep.note(&report(1, SilenceVerdict::Live)), "expected");
             sweep.note_at_slot(7, &report(7, SilenceVerdict::Live));
-            assert_eq!(sweep.fast_hits, 0, "an unexpected key never hits a cell");
+            assert_eq!(
+                sweep.acc.fast_hits, 0,
+                "an unexpected key never hits a cell"
+            );
             let _ = sweep.finish_at(IN_SESSION, DAY);
             assert_eq!(book.cached_cells(), 0, "an unexpected key gets no cell");
         }
         assert_eq!(book.fast_path_hits(), 0);
+    }
+
+    // --- Chunked sweep (2026-11-24, plan item US1-D) -------------------------
+
+    /// The next chunk length of a chunked sweep: a xorshift over the
+    /// proptest's seed, 0 to 4 reports a chunk (an empty chunk included).
+    fn next_chunk_len(state: &mut u64) -> usize {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        usize::try_from(*state % 5).unwrap_or(1)
+    }
+
+    /// A Prometheus recorder for one book, so a test reads that book's own
+    /// counters and gauges.
+    fn local_recorder() -> (
+        metrics_exporter_prometheus::PrometheusRecorder,
+        metrics_exporter_prometheus::PrometheusHandle,
+    ) {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        (recorder, handle)
+    }
+
+    /// The value of an unlabelled series in a rendered Prometheus text, or
+    /// `None` when it is absent.
+    fn series_value(rendered: &str, name: &str) -> Option<f64> {
+        rendered
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .find_map(|line| {
+                let mut parts = line.split_whitespace();
+                (parts.next()? == name).then_some(())?;
+                parts.next()?.parse().ok()
+            })
+    }
+
+    /// Every series line of a rendered Prometheus text, sorted: the exporter
+    /// renders its series in hash order, so two recorders holding the same
+    /// values can print them in different orders.
+    fn sorted_series(rendered: &str) -> Vec<String> {
+        let mut lines: Vec<String> = rendered
+            .lines()
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .map(str::to_owned)
+            .collect();
+        lines.sort();
+        lines
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
+
+        /// Book A sweeps one-go (`sweep_at` + `note_at_slot` + `finish_at`);
+        /// book B sweeps chunked (`begin_chunked_at` + `chunk().note_at_slot`
+        /// in random chunk sizes + `finish_chunked_at`), with no other lock
+        /// taker between B's chunks. Both see the same random records, closes,
+        /// forgets, finished rounds and sweeps as
+        /// `proptest_note_at_slot_matches_note`. They must agree on every
+        /// summary, the running missing/exhausted count at every chunk edge,
+        /// every round handed to the executor, every entry, socket and
+        /// exhausted name (`observe`, `test_fingerprint`), the cells and the
+        /// fast-path count, and every counter and gauge each book's own
+        /// recorder holds; and no chunked sweep may count as interrupted.
+        #[test]
+        fn proptest_chunked_reconcile_sweep_matches_the_one_go_sweep(
+            auto in any::<bool>(),
+            seed in any::<u64>(),
+            ops in prop::collection::vec(op_strategy(), 1..60),
+        ) {
+            let (rec_a, handle_a) = local_recorder();
+            let (rec_b, handle_b) = local_recorder();
+            let (a, mut a_rounds) = metrics::with_local_recorder(&rec_a, || SubscribeReconcile::new(auto));
+            let (b, mut b_rounds) = metrics::with_local_recorder(&rec_b, || SubscribeReconcile::new(auto));
+            let mut state = seed | 1;
+            let base = Instant::now();
+            let at = |ms: u64| base + Duration::from_millis(ms);
+            let mut sockets: Vec<(
+                mpsc::Sender<LiveSubscriptionCommand>,
+                Option<mpsc::Receiver<LiveSubscriptionCommand>>,
+            )> = (0..5)
+                .map(|_| {
+                    let (tx, rx) = socket();
+                    (tx, Some(rx))
+                })
+                .collect();
+            for op in ops {
+                match op {
+                    Op::Record { socket, keys, at_ms } => {
+                        let list = instruments(&keys);
+                        metrics::with_local_recorder(&rec_a, || {
+                            a.record_subscribed_at(&sockets[socket].0, &list, at(at_ms));
+                        });
+                        metrics::with_local_recorder(&rec_b, || {
+                            b.record_subscribed_at(&sockets[socket].0, &list, at(at_ms));
+                        });
+                    }
+                    Op::CloseSocket { socket } => {
+                        sockets[socket].1 = None;
+                        let (tx, rx) = self::socket();
+                        let old = std::mem::replace(&mut sockets[socket], (tx, Some(rx)));
+                        drop(old);
+                    }
+                    Op::Forget { keys } => {
+                        let list = instruments(&keys);
+                        a.forget(&list);
+                        b.forget(&list);
+                    }
+                    Op::ForgetOn { socket, keys } => {
+                        let list = instruments(&keys);
+                        a.forget_on(&sockets[socket].0, &list);
+                        b.forget_on(&sockets[socket].0, &list);
+                    }
+                    Op::FinishRounds { refund_mask, at_ms } => loop {
+                        let ra = a_rounds.try_recv();
+                        let rb = b_rounds.try_recv();
+                        match (ra, rb) {
+                            (Ok(ra), Ok(rb)) => {
+                                prop_assert_eq!(&ra.instruments, &rb.instruments);
+                                prop_assert_eq!(ra.socket, rb.socket);
+                                prop_assert_eq!(ra.reservation, rb.reservation);
+                                prop_assert_eq!(ra.ist_day, rb.ist_day);
+                                let refund: Vec<SubscribeInstrument> = ra
+                                    .instruments
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(i, _)| refund_mask & (1u8 << (i % 8)) != 0)
+                                    .map(|(_, x)| *x)
+                                    .collect();
+                                a.round_finished(&ra, &refund, at(at_ms));
+                                b.round_finished(&rb, &refund, at(at_ms));
+                            }
+                            (Err(_), Err(_)) => break,
+                            (ra, rb) => {
+                                prop_assert!(false, "rounds differ: {:?} vs {:?}", ra.is_ok(), rb.is_ok());
+                            }
+                        }
+                    },
+                    Op::Sweep { at_ms, secs, day, reports } => {
+                        let notes: Vec<(u32, SilenceReport)> = reports
+                            .into_iter()
+                            .map(|(key, verdict, silent, expected, choice, random)| {
+                                (
+                                    slot_of(key, choice, random),
+                                    SilenceReport {
+                                        key: KEYS[key],
+                                        silent_millis: silent,
+                                        expected_millis: expected,
+                                        baseline_millis: 0,
+                                        samples: 0,
+                                        verdict: verdict_of(verdict),
+                                        sparse: false,
+                                        warming_up: false,
+                                        alarm_sparse: false,
+                                    },
+                                )
+                            })
+                            .collect();
+                        // Book A, one go: the running counts after each report.
+                        let (summary_a, prefix) = metrics::with_local_recorder(&rec_a, || {
+                            let mut sweep = a.sweep_at(at(at_ms));
+                            let mut prefix = vec![(0u32, 0u32)];
+                            for (slot, r) in &notes {
+                                sweep.note_at_slot(*slot, r);
+                                prefix.push((sweep.acc.missing, sweep.acc.exhausted));
+                            }
+                            (sweep.finish_at(secs, day), prefix)
+                        });
+                        // Book B, chunked, no taker between the chunks.
+                        let (begun, summary_b, edges) = metrics::with_local_recorder(&rec_b, || {
+                            let begun = b.begin_chunked_at(at(at_ms));
+                            let mut edges: Vec<(usize, u32, u32)> = Vec::new();
+                            let mut next = 0usize;
+                            loop {
+                                let len = next_chunk_len(&mut state);
+                                let end = (next + len).min(notes.len());
+                                if let Some(mut chunk) = b.chunk() {
+                                    for (slot, r) in &notes[next..end] {
+                                        chunk.note_at_slot(*slot, r);
+                                    }
+                                    edges.push((end, chunk.acc.missing, chunk.acc.exhausted));
+                                }
+                                next = end;
+                                if next >= notes.len() {
+                                    break;
+                                }
+                            }
+                            (begun, b.finish_chunked_at(secs, day), edges)
+                        });
+                        prop_assert!(begun, "a chunked sweep began");
+                        prop_assert!(!edges.is_empty());
+                        for (end, missing, exhausted) in edges {
+                            prop_assert_eq!((missing, exhausted), prefix[end], "chunk edge {}", end);
+                        }
+                        prop_assert_eq!(summary_a, summary_b);
+                        prop_assert!(b.lock().pending.is_none(), "the sweep is finished");
+                        prop_assert!(
+                            b.lock().sockets.iter().all(|s| s.pending_delivering == 0),
+                            "pending counts are published, not left over"
+                        );
+                    }
+                }
+                b.assert_cell_invariant();
+                a.assert_cell_invariant();
+                prop_assert_eq!(observe(&a), observe(&b));
+                prop_assert_eq!(a.test_fingerprint(), b.test_fingerprint());
+                prop_assert_eq!(a.cached_cells(), b.cached_cells());
+                prop_assert_eq!(a.fast_path_hits(), b.fast_path_hits());
+            }
+            let rendered_a = handle_a.render();
+            let rendered_b = handle_b.render();
+            prop_assert_eq!(
+                series_value(&rendered_b, RECONCILE_SWEEP_INTERRUPTED_METRIC),
+                Some(0.0),
+                "no taker ran between chunks"
+            );
+            prop_assert_eq!(sorted_series(&rendered_a), sorted_series(&rendered_b));
+        }
+    }
+
+    /// A chunked sweep counts delivering instruments on `pending_delivering`
+    /// and copies them to `delivering` only at its finish, so the executor
+    /// (which reads `delivering`) never sees a half sweep.
+    #[test]
+    fn test_chunked_sweep_publishes_delivering_only_at_finish() {
+        let (book, _rounds) = SubscribeReconcile::new(false);
+        let (tx, _rx) = socket();
+        let t0 = Instant::now();
+        book.record_subscribed_at(&tx, &[si(1), si(2)], t0);
+        // The last finished sweep: two instruments delivering.
+        slot_sweep(
+            &book,
+            t0 + delta(),
+            &[
+                (1, report(1, SilenceVerdict::Live)),
+                (2, report(2, SilenceVerdict::Live)),
+            ],
+        );
+        assert_eq!(book.lock().sockets[0].delivering, 2);
+        assert!(book.begin_chunked_at(t0 + delta() + Duration::from_secs(30)));
+        {
+            let mut chunk = book.chunk().expect("pending"); // APPROVED: test
+            chunk.note_at_slot(1, &report(1, SilenceVerdict::Live));
+        }
+        {
+            let inner = book.lock();
+            assert_eq!(
+                inner.sockets[0].delivering, 2,
+                "mid-sweep, delivering still reads the last finished sweep"
+            );
+            assert_eq!(inner.sockets[0].pending_delivering, 1);
+        }
+        {
+            let mut chunk = book.chunk().expect("pending"); // APPROVED: test
+            chunk.note_at_slot(2, &report(2, SilenceVerdict::Exceeded));
+        }
+        assert_eq!(book.lock().sockets[0].delivering, 2, "still the old value");
+        let _ = book.finish_chunked_at(IN_SESSION, DAY);
+        let inner = book.lock();
+        assert_eq!(inner.sockets[0].delivering, 1, "published at the finish");
+        assert_eq!(inner.sockets[0].pending_delivering, 0);
+        assert!(inner.pending.is_none());
+    }
+
+    /// A lock taker between two chunks (here a forget) changes what the sweep
+    /// judges against, so the sweep plans no round (auto: nothing dispatched;
+    /// shadow: no `would_resubscribe`, no spacing) and counts as interrupted.
+    /// The next sweep, with no taker, plans the round.
+    #[test]
+    fn test_interrupted_chunked_sweep_plans_no_round() {
+        for auto in [true, false] {
+            let (recorder, handle) = local_recorder();
+            metrics::with_local_recorder(&recorder, || {
+                let (book, mut rounds) = SubscribeReconcile::new(auto);
+                let (tx, _rx) = socket();
+                let t0 = Instant::now();
+                book.record_subscribed_at(&tx, &[si(1), si(2), si(3)], t0);
+                let first = t0 + delta();
+                assert!(book.begin_chunked_at(first));
+                {
+                    let mut chunk = book.chunk().expect("pending"); // APPROVED: test
+                    chunk.note_at_slot(1, &report(1, SilenceVerdict::Live));
+                    chunk.note_at_slot(2, &report(2, SilenceVerdict::NeverTicked));
+                }
+                book.forget(&[si(3)]);
+                {
+                    let mut chunk = book.chunk().expect("pending"); // APPROVED: test
+                    chunk.note_at_slot(3, &report(3, SilenceVerdict::NeverTicked));
+                }
+                let interrupted = book.finish_chunked_at(IN_SESSION, DAY);
+                assert_eq!(interrupted.missing, 1, "the gauge's count still runs");
+                assert_eq!(interrupted.dispatched, 0, "auto={auto}");
+                assert_eq!(interrupted.would_resubscribe, 0, "auto={auto}");
+                assert!(rounds.try_recv().is_err(), "no round queued");
+                assert!(book.lock().sockets[0].last_round_at.is_none(), "no spacing");
+                assert!(
+                    !entry_counted(&book, 2),
+                    "missing_found waits for the next sweep"
+                );
+                assert_eq!(
+                    series_value(&handle.render(), RECONCILE_SWEEP_INTERRUPTED_METRIC),
+                    Some(1.0)
+                );
+                // The next sweep, nothing between its chunks: the round is planned.
+                let next = first + Duration::from_secs(30);
+                assert!(book.begin_chunked_at(next));
+                {
+                    let mut chunk = book.chunk().expect("pending"); // APPROVED: test
+                    chunk.note_at_slot(1, &report(1, SilenceVerdict::Live));
+                    chunk.note_at_slot(2, &report(2, SilenceVerdict::NeverTicked));
+                }
+                let planned = book.finish_chunked_at(IN_SESSION, DAY);
+                if auto {
+                    assert_eq!(planned.dispatched, 1);
+                    let round = rounds.try_recv().expect("a round"); // APPROVED: test
+                    assert_eq!(round.test_view().1, vec![si(2)]);
+                } else {
+                    assert_eq!(planned.would_resubscribe, 1);
+                }
+                assert!(entry_counted(&book, 2));
+                assert_eq!(
+                    series_value(&handle.render(), RECONCILE_SWEEP_INTERRUPTED_METRIC),
+                    Some(1.0),
+                    "the clean sweep is not counted"
+                );
+            });
+        }
+    }
+
+    fn entry_counted(book: &SubscribeReconcile, id: u64) -> bool {
+        book.lock().expected[&(id, ExchangeSegment::NseFno)].missing_counted
+    }
+
+    /// A forget that removes nothing changes nothing, so it does not
+    /// interrupt a chunked sweep.
+    #[test]
+    fn test_a_forget_that_removes_nothing_does_not_interrupt_a_chunked_sweep() {
+        let (book, mut rounds) = SubscribeReconcile::new(true);
+        let (tx, _rx) = socket();
+        let t0 = Instant::now();
+        book.record_subscribed_at(&tx, &[si(1), si(2)], t0);
+        assert!(book.begin_chunked_at(t0 + delta()));
+        {
+            let mut chunk = book.chunk().expect("pending"); // APPROVED: test
+            chunk.note_at_slot(1, &report(1, SilenceVerdict::Live));
+        }
+        book.forget(&[si(99)]);
+        {
+            let mut chunk = book.chunk().expect("pending"); // APPROVED: test
+            chunk.note_at_slot(2, &report(2, SilenceVerdict::NeverTicked));
+        }
+        assert_eq!(book.finish_chunked_at(IN_SESSION, DAY).dispatched, 1);
+        assert!(rounds.try_recv().is_ok());
+    }
+
+    /// A begin while a chunked sweep is pending changes nothing and says so.
+    #[test]
+    fn test_begin_chunked_at_refuses_while_pending() {
+        let (book, _rounds) = SubscribeReconcile::new(false);
+        let (tx, _rx) = socket();
+        let t0 = Instant::now();
+        book.record_subscribed_at(&tx, &[si(1), si(2)], t0);
+        let first = t0 + delta();
+        assert!(book.begin_chunked_at(first));
+        {
+            let mut chunk = book.chunk().expect("pending"); // APPROVED: test
+            chunk.note_at_slot(2, &report(2, SilenceVerdict::NeverTicked));
+        }
+        assert!(
+            !book.begin_chunked_at(first + Duration::from_secs(30)),
+            "refused while pending"
+        );
+        {
+            let inner = book.lock();
+            let acc = inner.pending.expect("still pending"); // APPROVED: test
+            assert_eq!(acc.now, first, "the pending sweep keeps its begin instant");
+            assert_eq!(acc.missing, 1, "and its counts");
+            assert_eq!(inner.sockets[0].candidates.len(), 1, "and its candidates");
+        }
+        assert_eq!(book.finish_chunked_at(IN_SESSION, DAY).missing, 1);
+        assert!(book.begin_chunked_at(first + Duration::from_secs(60)));
+    }
+
+    /// Abandoning drops the pending sweep and plans nothing (with nothing
+    /// exhausted it reports nothing); a later chunk or finish finds nothing,
+    /// and a new sweep can begin.
+    #[test]
+    fn test_abandon_chunked_leaves_no_pending() {
+        let (recorder, handle) = local_recorder();
+        metrics::with_local_recorder(&recorder, || {
+            let (book, mut rounds) = SubscribeReconcile::new(true);
+            let (tx, _rx) = socket();
+            let t0 = Instant::now();
+            book.record_subscribed_at(&tx, &[si(1), si(2)], t0);
+            assert!(book.begin_chunked_at(t0 + delta()));
+            {
+                let mut chunk = book.chunk().expect("pending"); // APPROVED: test
+                chunk.note_at_slot(1, &report(1, SilenceVerdict::Live));
+                chunk.note_at_slot(2, &report(2, SilenceVerdict::NeverTicked));
+            }
+            book.abandon_chunked();
+            assert!(book.lock().pending.is_none());
+            assert!(book.chunk().is_none());
+            assert_eq!(
+                book.finish_chunked_at(IN_SESSION, DAY),
+                SweepSummary::default()
+            );
+            assert!(
+                rounds.try_recv().is_err(),
+                "an abandoned sweep plans nothing"
+            );
+            assert_eq!(
+                series_value(&handle.render(), RECONCILE_SWEEP_INTERRUPTED_METRIC),
+                Some(0.0)
+            );
+            assert!(book.begin_chunked_at(t0 + delta() + Duration::from_secs(30)));
+        });
+    }
+
+    /// With no chunked sweep pending, a finish changes nothing: no day reset,
+    /// no gauge, no count, no round.
+    #[test]
+    fn test_finish_chunked_at_without_pending_is_a_no_op() {
+        let (recorder, handle) = local_recorder();
+        metrics::with_local_recorder(&recorder, || {
+            let (book, mut rounds) = SubscribeReconcile::new(true);
+            let (tx, _rx) = socket();
+            let t0 = Instant::now();
+            book.record_subscribed_at(&tx, &[si(1), si(2)], t0);
+            slot_sweep(
+                &book,
+                t0 + delta(),
+                &[
+                    (1, report(1, SilenceVerdict::Live)),
+                    (2, report(2, SilenceVerdict::NeverTicked)),
+                ],
+            );
+            assert!(
+                rounds.try_recv().is_ok(),
+                "the one-go sweep planned its round"
+            );
+            let before = book.test_fingerprint();
+            let rendered_before = sorted_series(&handle.render());
+            assert_eq!(
+                book.finish_chunked_at(IN_SESSION, DAY + 1),
+                SweepSummary::default()
+            );
+            assert_eq!(
+                book.test_fingerprint(),
+                before,
+                "no day reset, nothing moved"
+            );
+            assert_eq!(
+                sorted_series(&handle.render()),
+                rendered_before,
+                "no counter or gauge moved"
+            );
+            assert!(rounds.try_recv().is_err());
+        });
+    }
+
+    /// The exhausted report (counter and named warn) comes once, from the
+    /// chunked finish, exactly as the one-go sweep's drop makes it. The
+    /// proptest above rarely reaches three spent rounds, so this drives one
+    /// instrument there on purpose: book A one-go, book B chunked one report
+    /// a chunk, rounds finished between sweeps.
+    #[test]
+    fn test_chunked_sweep_reports_exhausted_once_like_the_one_go_sweep() {
+        let (rec_a, handle_a) = local_recorder();
+        let (rec_b, handle_b) = local_recorder();
+        let (a, mut a_rounds) =
+            metrics::with_local_recorder(&rec_a, || SubscribeReconcile::new(true));
+        let (b, mut b_rounds) =
+            metrics::with_local_recorder(&rec_b, || SubscribeReconcile::new(true));
+        let (tx, _rx) = socket();
+        let t0 = Instant::now();
+        a.record_subscribed_at(&tx, &[si(1), si(2)], t0);
+        b.record_subscribed_at(&tx, &[si(1), si(2)], t0);
+        let notes = [
+            (1, report(1, SilenceVerdict::Live)),
+            (2, report(2, SilenceVerdict::NeverTicked)),
+        ];
+        let mut at = t0 + delta();
+        let mut exhausted = 0;
+        // 30 s sweeps for 20 minutes; each round finishes right away.
+        for _ in 0..40 {
+            let summary_a = metrics::with_local_recorder(&rec_a, || slot_sweep(&a, at, &notes));
+            let summary_b = metrics::with_local_recorder(&rec_b, || {
+                assert!(b.begin_chunked_at(at));
+                for (slot, r) in &notes {
+                    let mut chunk = b.chunk().expect("pending"); // APPROVED: test
+                    chunk.note_at_slot(*slot, r);
+                }
+                b.finish_chunked_at(IN_SESSION, DAY)
+            });
+            assert_eq!(summary_a, summary_b);
+            exhausted += summary_b.newly_exhausted;
+            while let (Ok(ra), Ok(rb)) = (a_rounds.try_recv(), b_rounds.try_recv()) {
+                assert_eq!(ra.test_view(), rb.test_view());
+                a.round_finished(&ra, &[], at);
+                b.round_finished(&rb, &[], at);
+            }
+            assert_eq!(a.test_fingerprint(), b.test_fingerprint());
+            at += Duration::from_secs(30);
+        }
+        assert_eq!(exhausted, 1, "reported exhausted in exactly one sweep");
+        let rendered_b = handle_b.render();
+        assert_eq!(
+            sorted_series(&handle_a.render()),
+            sorted_series(&rendered_b)
+        );
+        assert!(
+            rendered_b
+                .contains("tv_subscribe_reconcile_instruments_total{outcome=\"exhausted\"} 1"),
+            "the exhausted counter moved once: {rendered_b}"
+        );
+        assert_eq!(
+            series_value(&rendered_b, RECONCILE_SWEEP_INTERRUPTED_METRIC),
+            Some(0.0),
+            "finished rounds between sweeps never interrupt one"
+        );
+    }
+
+    /// The sockets an interrupt case uses: `a` carries the instruments, `b`
+    /// is a second open socket, and `closed` has no receiver, so a record of
+    /// one of its keys onto another socket rebinds the key.
+    struct InterruptSockets {
+        a: mpsc::Sender<LiveSubscriptionCommand>,
+        b: mpsc::Sender<LiveSubscriptionCommand>,
+        closed: mpsc::Sender<LiveSubscriptionCommand>,
+        _rx_a: mpsc::Receiver<LiveSubscriptionCommand>,
+        _rx_b: mpsc::Receiver<LiveSubscriptionCommand>,
+    }
+
+    /// One chunked sweep at `at`: chunk 1 notes si(1) live, `taker` runs,
+    /// chunk 2 notes si(2) never-ticked, then the finish at `secs`.
+    fn chunked_with_taker(
+        book: &SubscribeReconcile,
+        at: Instant,
+        secs: u32,
+        taker: impl FnOnce(),
+    ) -> SweepSummary {
+        assert!(book.begin_chunked_at(at));
+        {
+            let mut chunk = book.chunk().expect("pending"); // APPROVED: test
+            chunk.note_at_slot(1, &report(1, SilenceVerdict::Live));
+        }
+        taker();
+        {
+            let mut chunk = book.chunk().expect("pending"); // APPROVED: test
+            chunk.note_at_slot(2, &report(2, SilenceVerdict::NeverTicked));
+        }
+        book.finish_chunked_at(secs, DAY)
+    }
+
+    /// Drives one interrupt case in auto mode. `setup` records what the case
+    /// needs and returns the sweep instant and a value for `taker`, which
+    /// runs between the two chunks. Without the epoch bump the interrupted
+    /// sweep would dispatch a round for si(2) (the second, clean sweep shows
+    /// it would). Pins: nothing dispatched, the interrupt counted once inside
+    /// the window, and the clean sweep 150 s later dispatches si(2).
+    fn interrupt_case<T>(
+        setup: impl FnOnce(
+            &SubscribeReconcile,
+            &InterruptSockets,
+            &mut mpsc::Receiver<PlannedRound>,
+        ) -> (Instant, T),
+        taker: impl FnOnce(&SubscribeReconcile, &InterruptSockets, T),
+    ) {
+        let (recorder, handle) = local_recorder();
+        metrics::with_local_recorder(&recorder, || {
+            let (book, mut rounds) = SubscribeReconcile::new(true);
+            let (a, rx_a) = socket();
+            let (b, rx_b) = socket();
+            let (closed, _) = socket();
+            let sockets = InterruptSockets {
+                a,
+                b,
+                closed,
+                _rx_a: rx_a,
+                _rx_b: rx_b,
+            };
+            let (at, value) = setup(&book, &sockets, &mut rounds);
+            let interrupted =
+                chunked_with_taker(&book, at, IN_SESSION, || taker(&book, &sockets, value));
+            assert_eq!(interrupted.dispatched, 0, "no round from a mixed book");
+            assert!(rounds.try_recv().is_err(), "no round queued");
+            assert_eq!(
+                series_value(&handle.render(), RECONCILE_SWEEP_INTERRUPTED_METRIC),
+                Some(1.0),
+                "counted once, inside the window"
+            );
+            let clean = chunked_with_taker(&book, at + Duration::from_secs(150), IN_SESSION, || {});
+            assert_eq!(clean.dispatched, 1, "the next sweep plans normally");
+            let round = rounds.try_recv().expect("a round"); // APPROVED: test
+            assert_eq!(round.test_view().1, vec![si(2)]);
+            assert_eq!(
+                series_value(&handle.render(), RECONCILE_SWEEP_INTERRUPTED_METRIC),
+                Some(1.0),
+                "the clean sweep is not counted"
+            );
+        });
+    }
+
+    /// A round finished between two chunks moves spacing, in-flight state
+    /// and reservations, so the sweep plans nothing.
+    #[test]
+    fn test_round_finished_between_chunks_interrupts_the_sweep() {
+        interrupt_case(
+            |book, s, rounds| {
+                let t0 = Instant::now();
+                book.record_subscribed_at(&s.a, &[si(1), si(2)], t0);
+                let first = t0 + delta();
+                let summary = chunked_with_taker(book, first, IN_SESSION, || {});
+                assert_eq!(summary.dispatched, 1, "a round in flight to finish");
+                let round = rounds.try_recv().expect("a round"); // APPROVED: test
+                (first + Duration::from_secs(150), (round, first))
+            },
+            // Finished at the first sweep's instant, so its spacing has
+            // passed by the interrupted sweep: only the epoch stops it.
+            |book, _, (round, first)| book.round_finished(&round, &[], first),
+        );
+    }
+
+    /// A refused offer forgotten on its own socket between two chunks.
+    #[test]
+    fn test_forget_on_between_chunks_interrupts_the_sweep() {
+        interrupt_case(
+            |book, s, _| {
+                let t0 = Instant::now();
+                book.record_subscribed_at(&s.a, &[si(1), si(2), si(3)], t0);
+                (t0 + delta(), ())
+            },
+            |book, s, ()| book.forget_on(&s.a, &[si(3)]),
+        );
+    }
+
+    /// A key whose socket closed, recorded onto another socket between two
+    /// chunks (a rebind).
+    #[test]
+    fn test_record_rebind_between_chunks_interrupts_the_sweep() {
+        interrupt_case(
+            |book, s, _| {
+                let t0 = Instant::now();
+                book.record_subscribed_at(&s.a, &[si(1), si(2)], t0);
+                book.record_subscribed_at(&s.closed, &[si(3)], t0);
+                (t0 + delta(), t0)
+            },
+            |book, s, t0| {
+                book.record_subscribed_at(&s.b, &[si(3)], t0);
+                let inner = book.lock();
+                let entry = inner.expected[&(3, ExchangeSegment::NseFno)];
+                assert!(
+                    inner.sockets[usize::from(entry.socket)]
+                        .tx
+                        .same_channel(&s.b),
+                    "si(3) was rebound"
+                );
+            },
+        );
+    }
+
+    /// A new key recorded between two chunks (an insert).
+    #[test]
+    fn test_record_insert_between_chunks_interrupts_the_sweep() {
+        interrupt_case(
+            |book, s, _| {
+                let t0 = Instant::now();
+                book.record_subscribed_at(&s.a, &[si(1), si(2)], t0);
+                (t0 + delta(), t0)
+            },
+            |book, s, t0| book.record_subscribed_at(&s.a, &[si(9)], t0),
+        );
+    }
+
+    /// A one-go sweep between two chunks (it clears the candidate lists).
+    #[test]
+    fn test_one_go_sweep_between_chunks_interrupts_the_sweep() {
+        interrupt_case(
+            |book, s, _| {
+                let t0 = Instant::now();
+                book.record_subscribed_at(&s.a, &[si(1), si(2)], t0);
+                (t0 + delta(), t0 + delta())
+            },
+            |book, _, at| drop(book.sweep_at(at)),
+        );
+    }
+
+    /// An interrupted sweep finished outside the reconcile window could not
+    /// have planned a round, so it is not counted (boot records before
+    /// 09:17 land in such sweeps).
+    #[test]
+    fn test_interrupt_outside_the_reconcile_window_is_not_counted() {
+        let (recorder, handle) = local_recorder();
+        metrics::with_local_recorder(&recorder, || {
+            let (book, mut rounds) = SubscribeReconcile::new(true);
+            let (tx, _rx) = socket();
+            let t0 = Instant::now();
+            book.record_subscribed_at(&tx, &[si(1), si(2)], t0);
+            let before_open = 9 * 3_600;
+            assert!(!reconcile_window_open(before_open));
+            let summary = chunked_with_taker(&book, t0 + delta(), before_open, || {
+                book.record_subscribed_at(&tx, &[si(9)], t0);
+            });
+            assert_eq!(summary.dispatched, 0);
+            assert!(rounds.try_recv().is_err());
+            assert_eq!(
+                series_value(&handle.render(), RECONCILE_SWEEP_INTERRUPTED_METRIC),
+                Some(0.0)
+            );
+        });
+    }
+
+    /// An instrument a chunk marked as having used its last round is reported
+    /// (counter and named warn) when the pass is abandoned, as the one-go
+    /// sweep's drop did, and once only: the next sweep does not report it
+    /// again.
+    #[test]
+    fn test_abandon_chunked_reports_exhausted() {
+        let (recorder, handle) = local_recorder();
+        metrics::with_local_recorder(&recorder, || {
+            let (book, mut rounds) = SubscribeReconcile::new(true);
+            let (tx, _rx) = socket();
+            let t0 = Instant::now();
+            book.record_subscribed_at(&tx, &[si(1), si(2)], t0);
+            let mut at = t0 + delta();
+            let mut abandoned = false;
+            // 30 s sweeps; each round finishes right away.
+            for _ in 0..40 {
+                assert!(book.begin_chunked_at(at));
+                {
+                    let mut chunk = book.chunk().expect("pending"); // APPROVED: test
+                    chunk.note_at_slot(1, &report(1, SilenceVerdict::Live));
+                    chunk.note_at_slot(2, &report(2, SilenceVerdict::NeverTicked));
+                }
+                let exhausted = book.lock().pending.map_or(0, |acc| acc.exhausted);
+                if exhausted > 0 {
+                    book.abandon_chunked();
+                    abandoned = true;
+                    break;
+                }
+                let _ = book.finish_chunked_at(IN_SESSION, DAY);
+                while let Ok(round) = rounds.try_recv() {
+                    book.round_finished(&round, &[], at);
+                }
+                at += Duration::from_secs(30);
+            }
+            assert!(abandoned, "the fixture reaches the last round");
+            let exhausted_line =
+                "tv_subscribe_reconcile_instruments_total{outcome=\"exhausted\"} 1";
+            let rendered = handle.render();
+            assert!(
+                rendered.contains(exhausted_line),
+                "reported on abandon: {rendered}"
+            );
+            assert!(book.lock().pending.is_none());
+            // The next sweep finds the entry already reported.
+            assert!(book.begin_chunked_at(at + Duration::from_secs(30)));
+            {
+                let mut chunk = book.chunk().expect("pending"); // APPROVED: test
+                chunk.note_at_slot(2, &report(2, SilenceVerdict::NeverTicked));
+            }
+            assert_eq!(book.finish_chunked_at(IN_SESSION, DAY).newly_exhausted, 0);
+            assert!(handle.render().contains(exhausted_line), "still one");
+            assert_eq!(
+                series_value(&handle.render(), RECONCILE_SWEEP_INTERRUPTED_METRIC),
+                Some(0.0),
+                "an abandon is no interrupt"
+            );
+        });
     }
 }

@@ -251,12 +251,17 @@ pub enum Stage {
     /// and, when a batch finishes there, its log line. The seeding itself
     /// runs in [`Stage::DrainArmIdle`]. Never paged.
     DrainArmSeed = 11,
-    /// The drain's 30 s SILENCE arm: the O(n) silence scan over tracked
-    /// instruments, the subscribe-reconcile note, the refusal deltas and
-    /// any logging the scan triggers. Never paged.
+    /// The drain's 30 s SILENCE arm: the refusal deltas, the liveness and
+    /// ring gauges, the cross-feed check and the O(1) start of a sliced
+    /// silence sweep. Since 2026-11-24 (plan item US1-D) the O(n) scan over
+    /// tracked instruments runs in [`Stage::DrainArmIdle`] steps; only when a
+    /// sweep is still pending as the timer fires (counted as an overrun) is
+    /// that stale sweep dropped and a fresh one scanned here, all at once,
+    /// with its page logging. Never paged.
     DrainArmSilence = 12,
-    /// One step of the drain's IDLE arm (the sliced catch-up seal and seed
-    /// steps, plus the log lines a finished step writes). It runs only when
+    /// One step of the drain's IDLE arm (the sliced seed, catch-up seal and,
+    /// since US1-D, silence-sweep steps of 1,024 slots, plus the log lines a
+    /// finished step writes, the silence page included). It runs only when
     /// no frame is ready, so a frame waits for at most one step. Never
     /// paged.
     DrainArmIdle = 13,
