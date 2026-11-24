@@ -2839,7 +2839,7 @@ mod tests {
     /// seal against one batch write, at four run sizes. Run with
     /// `cargo test -p tickvault-storage --release --lib us1c_rescue_cost -- --ignored --nocapture`.
     #[test]
-    #[ignore]
+    #[ignore = "measurement harness, not a gate — wall-clock timing, run in release on demand"]
     fn us1c_rescue_cost_per_seal_old_and_new() {
         const ROUNDS: usize = 15;
         for run in [1usize, 64, 1_024, RESCUE_BATCH_MAX_SEALS] {
@@ -2898,7 +2898,7 @@ mod tests {
 
     /// Wall-clock split of the batch rescue cost (plan item US1-C), ignored.
     #[test]
-    #[ignore]
+    #[ignore = "measurement harness, not a gate — wall-clock timing, run in release on demand"]
     fn us1c_rescue_cost_split() {
         let run = 1_024usize;
         let now = jan1_noon_utc();

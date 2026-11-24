@@ -295,6 +295,19 @@ const ALLOWED_IGNORED: &[(&str, &str)] = &[
         "crates/core/src/pipeline/tick_gap_detector.rs",
         "scan_silence_sweep_cost_at_the_authorized_ceiling",
     ),
+    // Added 2026-11-24 with plan item US1-C (the batch candle rescue): two
+    // wall-clock harnesses that print the per-seal rescue cost, one write per
+    // seal against one write per group, and its split. Same reason as the
+    // harnesses above: a timing on a shared CI runner is a flake. Run in
+    // release on demand; the behaviour is pinned by the us1c unit tests.
+    (
+        "crates/storage/src/seal_absorption.rs",
+        "us1c_rescue_cost_per_seal_old_and_new",
+    ),
+    (
+        "crates/storage/src/seal_absorption.rs",
+        "us1c_rescue_cost_split",
+    ),
     // Added 2026-08-26 with the defect-10 cost measurement it belongs to: the
     // same shape as the two harnesses above -- it times a full
     // select_depth_universe pass at the authorized 24,600-instrument ceiling
