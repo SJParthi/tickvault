@@ -12,7 +12,9 @@
 //!
 //! Prints one `MEASURE` line per phase (min / median / max over 15 rounds,
 //! WARM and COLD, COLD flushing 768 MiB of cache first) and one `PROBE` line
-//! per hash shape.
+//! per hash shape. US1-D (2026-11-24) adds (5), one 1,024-slot idle step
+//! of the sliced sweep (every step of each round, cold ones each after a
+//! cache flush), and (6), the whole sliced sweep from begin to finish.
 #[cfg(test)]
 mod tests {
     use super::super::*;
@@ -154,6 +156,9 @@ mod tests {
             let mut p2e = Vec::new();
             let mut p3 = Vec::new();
             let mut whole = Vec::new();
+            let mut step_one = Vec::new();
+            let mut step_last = Vec::new();
+            let mut sliced = Vec::new();
             for _ in 0..ROUNDS {
                 // (1) detector walk alone, closure only black-boxes the report.
                 if cold {
@@ -272,6 +277,39 @@ mod tests {
                     ingest.check_depth200_cross_feed(now_ms, configured_frame_silence_fast_path()),
                 );
                 whole.push(t.elapsed());
+
+                // (5) one idle step of the sliced sweep (US1-D), every step
+                // of the sweep; COLD flushes before each step. The step that
+                // reaches the end also runs the finish (reconcile finish,
+                // gauges, dead-class verdict), so it is timed apart (5b).
+                ingest.subscribe_reconcile = Some(Arc::clone(&book));
+                let mut done = ingest.begin_silence_sweep(now_ms);
+                while done.is_none() {
+                    if cold {
+                        flush(&mut flushbuf);
+                    }
+                    let t = Instant::now();
+                    done = ingest.step_silence_sweep();
+                    let took = t.elapsed();
+                    if done.is_some() {
+                        step_last.push(took);
+                    } else {
+                        step_one.push(took);
+                    }
+                }
+                black_box(done);
+
+                // (6) the whole sliced sweep, begin to finish, back to back.
+                if cold {
+                    flush(&mut flushbuf);
+                }
+                let t = Instant::now();
+                let mut done = ingest.begin_silence_sweep(now_ms);
+                while done.is_none() {
+                    done = ingest.step_silence_sweep();
+                }
+                black_box(done);
+                sliced.push(t.elapsed());
             }
             stats(
                 &format!("{tag} (1) detector.scan_silence, black_box closure"),
@@ -299,6 +337,20 @@ mod tests {
                 p3,
             );
             stats(&format!("{tag} (4) scan_named + publishes"), whole);
+            stats(
+                &format!(
+                    "{tag} (5) one sliced step ({SILENCE_SWEEP_STEP_SLOTS} slots), not the last"
+                ),
+                step_one,
+            );
+            stats(
+                &format!("{tag} (5b) the finishing sliced step (its slots + the finish)"),
+                step_last,
+            );
+            stats(
+                &format!("{tag} (6) whole sliced sweep, begin..finish"),
+                sliced,
+            );
         }
         drop(rxs);
     }

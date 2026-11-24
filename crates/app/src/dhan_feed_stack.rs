@@ -114,6 +114,9 @@ mod replay_pace;
 // 2026-11-17: the 30 s silence arm's per-report tally.
 mod inline_depth_sample;
 mod silence_tally;
+// US1-D (2026-11-24): the 30 s silence scan in idle steps, and its page.
+mod silence_sweep;
+pub use silence_sweep::{SILENCE_SWEEP_OVERRUN_COUNTER, SILENCE_SWEEP_STEP_SLOTS, SilenceDone};
 // Speed fix 4 (2026-11-17): the per-frame counter tally, its own file.
 mod frame_tally;
 // Scope lock 2026-11-20: the drain's side of the Dhan trade-time correction.
@@ -1753,6 +1756,8 @@ pub struct LiveIngest {
     /// Timer fires that found the previous catch-up sweep still running.
     catch_up_overruns: u64,
     catch_up_overrun_counter: metrics::Counter,
+    /// The 30 s silence sweep in progress and its overrun count (US1-D).
+    silence_sweep: silence_sweep::SilenceSweepSlot,
     /// Where a completed catch-up sweep is published (plan item 51d):
     /// [`CATCHUP_PROGRESS`] in production; a test points it at its own.
     catch_up_progress: &'static CatchUpProgress,
@@ -2235,6 +2240,7 @@ impl LiveIngest {
             catch_up: None,
             catch_up_overruns: 0,
             catch_up_overrun_counter: metrics::counter!(CATCHUP_SEAL_OVERRUN_COUNTER),
+            silence_sweep: silence_sweep::SilenceSweepSlot::new(),
             catch_up_progress: &CATCHUP_PROGRESS,
             close_plan: close_seal::ClosePlan::UNSET,
             replaying_wal: false,
@@ -3962,7 +3968,15 @@ impl LiveIngest {
     /// # Complexity
     /// O(n) in tracked instruments. The detector and ranking use stack state;
     /// configured subscription reconciliation may allocate one bounded candidate
-    /// list per socket per round. COLD — every [`SILENCE_SCAN_INTERVAL`], never per tick.
+    /// list per socket per round. Never per tick.
+    ///
+    /// # Callers
+    /// No production caller since US1-D (2026-11-24): the drain runs the
+    /// sliced sweep ([`Self::begin_silence_sweep`]). This one-go form is kept
+    /// for tests, the sliced sweep's oracle and the cost harness. Calling it
+    /// while a sliced sweep is pending interrupts that sweep: its reconcile
+    /// pass plans no round, and the gauges and the dead-class latch are
+    /// overwritten from this instant.
     pub fn scan_silence(&self, now_millis: u64) -> (u64, u64) {
         let mut discard = [SilentInstrument::EMPTY; WORST_SILENT_NAMED];
         let (silent, never, _) = self.scan_silence_named(now_millis, &mut discard);
@@ -4139,6 +4153,9 @@ impl LiveIngest {
     /// bounded insertion into a `WORST_SILENT_NAMED`-element array per
     /// alarm-worthy report, so it is O(n × K) with K = 8. The optional reconcile
     /// observer has the bounded cold-round allocation described by `scan_silence`.
+    ///
+    /// The one-go form, kept for tests, the oracle and the harness; see the
+    /// callers note on [`Self::scan_silence`].
     pub fn scan_silence_named(
         &self,
         now_millis: u64,
@@ -4147,6 +4164,8 @@ impl LiveIngest {
         self.scan_silence_named_at(now_millis, worst, Instant::now(), None)
     }
 
+    /// The one-go form: since US1-D (2026-11-24) the drain runs the sliced
+    /// sweep (`silence_sweep.rs`); this stays for tests and as its oracle.
     /// Inject the same monotonic instant for the whole cold sweep. Keeping this
     /// seam private lets tests age queued subscriptions without wall-clock sleeps.
     /// `reconcile_clock` is the reconcile's `(IST seconds of day, IST day)`;
@@ -4182,42 +4201,9 @@ impl LiveIngest {
                 None => sweep.finish_now(),
             };
         }
-        let silence_tally::SilenceTally {
-            silent,
-            never,
-            named,
-            classes,
-        } = tally;
-        metrics::gauge!(INSTRUMENTS_SILENT_GAUGE).set(silent as f64);
-        metrics::gauge!(INSTRUMENTS_NEVER_TICKED_GAUGE).set(never as f64);
-        // CORRECTED 2026-09-10: the class verdict is judged ONLY inside the
-        // continuous session. Until today this line ran unconditionally, and
-        // on 2026-09-10 it fired `RISK-GAP-03` for NSE_FNO at 08:33 IST and
-        // again at 09:00 IST: ~22,000 option contracts were seeded at the 08:31
-        // boot, their warmup elapsed, and — because NOTHING trades before the
-        // 09:15 bell — every one of them was still never-ticked. That is
-        // "dead" by construction, on every trading morning, and it drives the
-        // `errcode-risk-gap-03` log-filter alarm (noise lock §2.3a). The
-        // per-instrument silence PAGE on the 30 s arm has been session-gated
-        // since 2026-08-12; this rollup sat above that gate, inside the scan,
-        // and inherited none of it.
-        //
-        // Judged on `now_millis` — the same wall clock the scan itself uses —
-        // rather than a second clock read, so a test can drive both halves
-        // with one number. Outside the session the latch is CLEARED, not held:
-        // the pre-open must not carry a verdict into the bell, and a post-close
-        // latch would only ever be consulted by the next boot's fresh state.
-        let scan_secs = ist_secs_of_day_from_millis(now_millis);
-        if dead_class_verdict_is_due(
-            is_within_market_hours_ist(scan_secs),
-            silence_page_allowed_today(),
-        ) || muhurat_silence_check_due_now(scan_secs)
-        {
-            self.report_dead_classes(&classes);
-        } else {
-            self.stand_down_dead_class_report();
-        }
-        (silent, never, named)
+        // The gauges and the session-gated dead-class verdict, shared with
+        // the sliced sweep (US1-D, `silence_sweep.rs`) so they exist once.
+        self.finish_silence_tally(&tally, now_millis, silence_page_allowed_today())
     }
 
     /// Reports any instrument class that produced NOTHING, once per episode.
@@ -4649,12 +4635,14 @@ impl LiveIngest {
         });
     }
 
-    /// Whether any sliced idle work is queued: a catch-up seal (the
-    /// top-volume sweep that also ran here was removed 2026-10-22, plan item
-    /// 62) — the guard on the drain's idle arm.
+    /// Whether any sliced idle work is queued: a seed batch, a catch-up seal
+    /// or (US1-D) a silence sweep — the guard on the drain's idle arm. (The
+    /// top-volume sweep that also ran here was removed 2026-10-22, plan item 62.)
     #[must_use]
     pub fn idle_work_pending(&self) -> bool {
-        self.catch_up.is_some() || !self.seed_queue.batches.is_empty()
+        self.catch_up.is_some()
+            || !self.seed_queue.batches.is_empty()
+            || self.silence_sweep.is_pending()
     }
 
     /// Whether the seed queue can take one more batch (DT-A1). The drain's
@@ -4737,11 +4725,17 @@ impl LiveIngest {
     /// Runs ONE bounded step of the idle work: a queued seed batch first
     /// ([`SEED_STEP_INSTRUMENTS`] instruments; bounded in total, so a busy
     /// drain whose catch-up sweep is always running cannot starve it), then
-    /// the catch-up seal ([`CATCHUP_SEAL_STEP_SLOTS`] slots). (The top-volume
-    /// sweep that ran second was removed 2026-10-22, plan item 62.)
+    /// the catch-up seal ([`CATCHUP_SEAL_STEP_SLOTS`] slots) and (US1-D) the
+    /// silence sweep ([`SILENCE_SWEEP_STEP_SLOTS`] slots), taking turns step
+    /// by step while both are pending, so neither starves the other (a sweep
+    /// still pending at the next 30 s timer is dropped and rescanned there).
+    /// (The top-volume sweep that ran second was removed 2026-10-22, plan
+    /// item 62.)
     ///
     /// # Complexity
-    /// **O(one step)** per call — the bound on how long a queued frame waits.
+    /// **O(one step)** per call, the bound on how long a queued frame waits,
+    /// plus the silence finish on the step that ends a sweep (see
+    /// [`Self::step_silence_sweep`]).
     pub fn step_idle_work(&mut self) -> IdleStep {
         if !self.seed_queue.batches.is_empty() {
             return IdleStep {
@@ -4749,9 +4743,18 @@ impl LiveIngest {
                 ..IdleStep::default()
             };
         }
-        if self.catch_up.is_some() {
+        let silence = self.silence_sweep.is_pending();
+        let silence_now =
+            silence && (self.catch_up.is_none() || self.silence_sweep.take_idle_turn());
+        if self.catch_up.is_some() && !silence_now {
             return IdleStep {
                 catch_up_done: self.step_catch_up_seal(),
+                ..IdleStep::default()
+            };
+        }
+        if silence_now {
+            return IdleStep {
+                silence_done: self.step_silence_sweep(),
                 ..IdleStep::default()
             };
         }
@@ -6577,6 +6580,8 @@ struct CatchUpSweep {
 }
 
 /// What one call of [`LiveIngest::step_idle_work`] finished, if anything.
+/// Must be read: a dropped `silence_done` loses that sweep's page.
+#[must_use]
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct IdleStep {
     /// `(emitted, dropped)` totals of a catch-up sweep this step finished.
@@ -6584,6 +6589,8 @@ pub struct IdleStep {
     /// `(requested, seeded)` of a late-attach seed batch this step finished
     /// (DT-A1).
     pub seed_done: Option<SeedBatchDone>,
+    /// A silence sweep this step finished, for the drain's page (US1-D).
+    pub silence_done: Option<SilenceDone>,
 }
 
 /// How far BEHIND the watermark the catch-up cutoff sits.
@@ -7298,32 +7305,19 @@ async fn run_frame_drain(
     // stops ticking waits for the 15:30 close sweep — correct, but hours late.
     let mut catchup_timer = tokio::time::interval(CATCHUP_SEAL_INTERVAL);
     catchup_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // Deliberately its OWN timer rather than a counter on the flush arm: the
-    // scan is O(n) in tracked instruments and the flush arm runs at 500 ms.
+    // Deliberately its OWN timer rather than a counter on the flush arm: since
+    // US1-D the arm only begins a sweep (O(1)) that the idle arm steps, but an
+    // overrun rescans O(n) inline here, which the 500 ms arm must not carry.
     let mut silence_timer = tokio::time::interval(SILENCE_SCAN_INTERVAL);
     silence_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // Consecutive alarm-worthy scans, and whether we have already paged for
-    // this episode. Edge-triggered per audit Rule 4: the rising edge fires
-    // once, the falling edge logs recovery at info and re-arms.
     let mut feed_time_page = feed_time_page::FeedTimePage::start(); // §2.24
-    let mut silent_scans: u32 = 0;
-    let mut silence_reported = false;
-    // §2.19: an episode below the paging floor is logged once at `warn!`.
-    // A separate latch, so an episode that grows past the floor still pages.
-    let mut silence_logged = false;
-    // Never-ticked instruments are paged once per session; see
-    // `silence_scan_pending` for why this is a separate latch.
-    let mut never_reported = false;
+    // The silent-instrument page's latches (consecutive scans, per-episode,
+    // below-floor, never-ticked, cooldown); judged on each finished silence
+    // sweep (US1-D: begun by the 30 s timer, stepped by the idle arm).
+    let mut silence_pager = silence_sweep::SilencePager::default();
     // Latch for the detector-blindness report below. Once the slot table is
     // full it stays full, so this fires once per session rather than every 30s.
     let mut detector_blind_reported = false;
-    // Caller-owned storage for the named silent instruments, so the 30s scan
-    // stays allocation-free. Reused every scan; `named` bounds what is read.
-    let mut worst_silent = [SilentInstrument::EMPTY; WORST_SILENT_NAMED];
-    /// Shortest gap between two RISK-GAP-03 pages, however many separate
-    /// silence episodes occur inside it. See `last_silence_page` below.
-    const SILENCE_PAGE_COOLDOWN_SECS: u64 = 1_800;
-    let mut last_silence_page: Option<u64> = None;
     // Last reported aggregator-refusal totals, so the 30s arm can report a
     // DELTA rather than a cumulative that looks alarming forever after one
     // bad minute.
@@ -8055,10 +8049,9 @@ async fn run_frame_drain(
 
                 // Aggregator-refusal read-out. The refusal arm itself cannot
                 // log (per-tick path, flood risk), so this is where those
-                // counts become visible. Reported BEFORE the silence gate's
-                // market-hours `continue` below, because a refusal is a
-                // defect at any hour — unlike silence, which is normal after
-                // the close.
+                // counts become visible. Reported at any hour, because a
+                // refusal is a defect at any hour, unlike silence, whose page
+                // is session-gated (`SilencePager::judge`).
                 let now = ingest.refusals();
                 let d_price = now.0.saturating_sub(last_refusals.0);
                 let d_ts = now.1.saturating_sub(last_refusals.1);
@@ -8158,9 +8151,6 @@ async fn run_frame_drain(
                 // fired, so both blocks always report a true 30s delta instead
                 // of a figure that silently accumulated across quiet cycles.
                 last_refusals = now;
-
-                let (silent, never, named) =
-                    ingest.scan_silence_named(now_millis, &mut worst_silent);
 
                 // The detector's own blindness, reported ONCE per episode.
                 //
@@ -8303,197 +8293,25 @@ async fn run_frame_drain(
                     .set(main_pct);
                 metrics::gauge!("tv_dhan_feed_ring_resident_pct_by_pool", "pool" => "depth")
                     .set(depth_pct);
-                // Gauges publish unconditionally — a dashboard reading zero
-                // outside market hours is correct, and gating the gauge would
-                // make "no data" and "nothing wrong" indistinguishable.
-                // Only the PAGE is market-hours gated (audit Rule 3): the
-                // whole universe is legitimately silent after 15:30, and a
-                // detector that pages every evening gets muted by lunchtime.
-                //
-                // The TRADING-DAY half of that gate is just as load-bearing and
-                // was missing until 2026-08-14. EventBridge starts this box on
-                // `MON-FRI`, which includes NSE holidays, so on a weekday
-                // holiday the lane seeds the whole universe, receives nothing —
-                // correctly, the market is shut — and every seeded instrument
-                // crosses the silence floor at once. The page that follows says
-                // `silent=<universe>, never_ticked=<universe>`, which is
-                // indistinguishable from a total subscribe failure. Every
-                // sibling leg in this repo already gates on the calendar
-                // (`groww_contract_1m_boot`, `groww_option_chain_1m_boot`,
-                // `brutex_crossverify_boot`, `feed_scoreboard_boot`); the
-                // revived lane was the one regression.
-                let silence_secs = now_ist_secs_of_day();
-                // Audit L3: on a Muhurat day (an NSE holiday) the check runs
-                // in the Muhurat continuous session too.
-                if (!is_within_market_hours_ist(silence_secs) || !silence_page_allowed_today())
-                    && !muhurat_silence_check_due_now(silence_secs)
-                {
-                    silent_scans = 0;
-                    silence_reported = false;
-                    silence_logged = false;
-                    never_reported = false;
-                    continue;
-                }
-                if !silence_scan_pending(silent, never, never_reported) {
-                    if silence_reported {
-                        info!(
-                            silent,
-                            never_ticked = never,
-                            "Dhan live feed: every instrument that has ticked is ticking \
-                             again within its own expected cadence"
-                        );
-                    }
-                    silent_scans = 0;
-                    // Re-arm whenever the went-quiet episode clears, even
-                    // while never-ticked instruments remain: those were
-                    // reported once (`never_reported`) and cannot change
-                    // except by ticking. Until 2026-10-06 this re-armed only
-                    // at `never == 0`, which a never-traded far strike keeps
-                    // false all day, so the page fired once per session
-                    // (see `silence_scan_pending`).
-                    //
-                    // This gate alone is NOT what stops the page storm; see
-                    // the cooldown at the emit below, and the measured numbers
-                    // recorded there.
-                    silence_reported = false;
-                    silence_logged = false;
-                    continue;
-                }
-                silent_scans = silent_scans.saturating_add(1);
-                // A cooldown between PAGES, not between episodes.
-                //
-                // # What the 2026-08-14 session actually did
-                //
-                // 25 distinct RISK-GAP-03 emits in one trading day. The
-                // `silent` count oscillated the whole time — 4, 9, 1, 2, 1, 3,
-                // 208, 10 — clearing to zero between episodes and re-arming
-                // the latch each time, entirely legitimately: these are
-                // sparse-cadence instruments going quiet and coming back.
-                //
-                // So the per-episode latch was working exactly as designed and
-                // still produced ~25 pages, because the real world produced ~25
-                // episodes. `never_ticked` was 4 on the 09:15 emit and 0 on
-                // every one after it, so the feed WAS delivering — gating on
-                // never-ticked alone (above) would have suppressed almost none
-                // of this.
-                //
-                // That became a paging problem on 2026-08-15, when RISK-GAP-03
-                // gained a CloudWatch alarm: at a 5-minute window with a
-                // recovery page, 25 episodes is ~50 operator messages a day.
-                // Half an hour is chosen to sit above the observed inter-episode
-                // gap (two to five minutes through the afternoon) while staying
-                // far below the session, so a genuinely new problem hours later
-                // still pages.
-                //
-                // The counter is deliberately NOT gated — every episode still
-                // increments `tv_dhan_feed_instruments_silent`, so the
-                // suppressed ones remain countable on the dashboard. Only the
-                // page is rate-limited, and the log line says how many were
-                // folded in.
-                // `now_millis`, not `now` — the latter is bound to
-                // `ingest.refusals()` a few lines above, which is a COUNTER.
-                // Dividing it by 1,000 compiles and yields a plausible-looking
-                // small number that has nothing to do with time.
-                let now_secs = now_millis / 1_000;
-                let cooling =
-                    silence_page_is_cooling(last_silence_page, now_secs, SILENCE_PAGE_COOLDOWN_SECS);
-                // §2.19 (2026-11-11): below the floor the episode is logged, not paged.
-                let tracked_now = ingest.tracked_instruments() as u64;
-                let pages = silence_warrants_page(silent, never, never_reported, tracked_now);
-                if silent_scans >= SILENCE_SCANS_BEFORE_ALERT
-                    && !silence_reported
-                    && !silence_logged
-                    && !pages
-                {
-                    silence_logged = true;
-                    warn!(
-                        code = ErrorCode::RiskGapTickGap.code_str(),
-                        silent,
-                        never_ticked = never,
-                        tracked = tracked_now,
-                        page_floor = silence_page_floor(tracked_now),
-                        consecutive_scans = silent_scans,
-                        "Dhan live feed: {silent} subscribed instrument(s) are quiet beyond their \
-                         own learned cadence, below the paging floor (1% of tracked); logged and \
-                         counted, not paged"
-                    );
-                    for entry in worst_silent.iter().take(named) {
-                        warn!(
-                            code = ErrorCode::RiskGapTickGap.code_str(),
-                            security_id = entry.security_id,
-                            segment = entry.segment.as_str(),
-                            silent_millis = entry.silent_millis,
-                            expected_millis = entry.expected_millis,
-                            "quiet instrument named (below the paging floor)"
-                        );
-                    }
-                }
-                if silent_scans >= SILENCE_SCANS_BEFORE_ALERT && !silence_reported && !cooling && pages {
-                    silence_reported = true;
-                    if never > 0 {
-                        never_reported = true;
-                    }
-                    last_silence_page = Some(now_secs);
-                    error!(
-                        code = ErrorCode::RiskGapTickGap.code_str(),
-                        silent,
-                        never_ticked = never,
-                        tracked = ingest.tracked_instruments(),
-                        consecutive_scans = silent_scans,
-                        "Dhan live feed: {silent} subscribed instrument(s) are quiet beyond \
-                         their own learned cadence across {silent_scans} consecutive 30s scans, \
-                         of which {never} have produced NOTHING since being subscribed. A \
-                         never-ticked instrument usually means its subscribe did not take — \
-                         there is no other signal for that, because a stream that never \
-                         arrives leaves nothing to count or fail to parse. \
-                         Legitimately-sparse instruments are excluded from this count."
-                    );
-                    // NAME them. The line above says how many; these say WHICH.
-                    //
-                    // Until 2026-08-21 no `security_id` reached any log, metric
-                    // or table on this path, so "which instruments went silent
-                    // yesterday?" had no answer anywhere in the system — the
-                    // information was computed, counted, and thrown away. It is
-                    // also the one failure with no other evidence: a stream
-                    // that never arrives leaves nothing to count and nothing to
-                    // fail to parse, so absence against a seeded key is all
-                    // there is.
-                    //
-                    // One line per instrument rather than one line listing
-                    // them: each is greppable by `security_id`, each carries
-                    // its own cadence context, and no line needs a formatted
-                    // collection — so this stays allocation-free. Bounded by
-                    // `named` (<= WORST_SILENT_NAMED) and by the same
-                    // once-per-episode latch as the page above.
-                    for entry in worst_silent.iter().take(named) {
-                        error!(
-                            code = ErrorCode::RiskGapTickGap.code_str(),
-                            security_id = entry.security_id,
-                            segment = entry.segment.as_str(),
-                            silent_millis = entry.silent_millis,
-                            expected_millis = entry.expected_millis,
-                            never_ticked = entry.never_ticked,
-                            "silent instrument named: quiet for {}ms against an earned cadence \
-                             of {}ms{}",
-                            entry.silent_millis,
-                            entry.expected_millis,
-                            if entry.never_ticked {
-                                " — and it has produced NOTHING since being subscribed, which \
-                                 usually means the subscribe did not take"
-                            } else {
-                                ""
-                            }
-                        );
-                    }
+                // US1-D (2026-11-24): the O(n) scan no longer runs here. This
+                // starts a sweep (O(1)) that the idle arm below steps through
+                // SILENCE_SWEEP_STEP_SLOTS slots at a time; the page logic that
+                // stood here runs on the finished sweep (`SilencePager::judge`,
+                // unchanged). A sweep still pending is dropped as stale; the
+                // new one then runs to its end here at once and is judged
+                // (counted as an overrun), so each period judges fresh data.
+                if let Some(done) = ingest.begin_silence_sweep(now_millis) {
+                    silence_pager.judge(&done);
                 }
             }
             // The sliced idle work, one bounded step at a time (audit PR4,
             // 2026-09-26). LAST in this `biased` select and ready only while
             // a step is queued, so it runs only when no frame, timer or seed
             // is ready: a frame arriving mid-sweep waits for at most one step,
-            // never for the whole book. Since 2026-10-22 (plan item 62) the
-            // only work here is the catch-up seal; the top-volume sweep that
-            // this arm was built for is removed with `top_volume`.
+            // never for the whole book. The top-volume sweep this arm was
+            // built for is removed with `top_volume` (2026-10-22, plan item
+            // 62); it now steps the seed batches, the catch-up seal and
+            // (US1-D) the silence sweep, the last two taking turns.
             //
             // `consume_budget`, not `std::future::ready`: a ready future never
             // spends tokio's cooperative budget, so once the frame receiver
@@ -8512,6 +8330,9 @@ async fn run_frame_drain(
                 let step = ingest.step_idle_work();
                 if let Some((requested, added)) = step.seed_done {
                     log_seed_batch_done(&ingest, requested, added);
+                }
+                if let Some(done) = step.silence_done {
+                    silence_pager.judge(&done);
                 }
                 if let Some((emitted, dropped)) = step.catch_up_done {
                     if emitted > 0 || dropped > 0 {
@@ -8536,6 +8357,8 @@ async fn run_frame_drain(
         }
     }
 
+    // US1-D: a silence sweep still pending is dropped (the process exits).
+    ingest.abandon_silence_sweep();
     // Plan item J2 (2026-10-26): count what the ring still holds rather than
     // dropping it with the receiver. WAL-backed frames replay on the next
     // boot; frames the WAL refused existed only here and are lost, counted and
@@ -27246,13 +27069,21 @@ mod tests {
             .split_once("async fn run_frame_drain")
             .expect("the drain function must exist")
             .1;
+        // US1-D (2026-11-24): the timer begins a sweep, the idle arm steps
+        // it, and every finished sweep is judged by the pager. The session
+        // gate and the Muhurat arm now sit in `SilencePager::judge`, pinned by
+        // `test_risk_gap_03_page_is_rate_limited_across_episodes`.
+        let body = body
+            .split(concat!("#[cfg(", "test)]"))
+            .next()
+            .unwrap_or(body);
         for needle in [
             "silence_timer.tick()",
-            "ingest.scan_silence(",
-            "is_within_market_hours_ist(",
-            "SILENCE_SCANS_BEFORE_ALERT",
-            // Audit L3 (2026-10-26): the Muhurat arm of the session gate.
-            "muhurat_silence_check_due_now(",
+            // Bound, never discarded: `let _ = ingest.begin_silence_sweep(..)`
+            // would lose the overrun sweep's page.
+            "if let Some(done) = ingest.begin_silence_sweep(now_millis)",
+            "if let Some(done) = step.silence_done",
+            "ingest.abandon_silence_sweep()",
         ] {
             assert!(
                 body.contains(needle),
@@ -27261,6 +27092,15 @@ mod tests {
                  exactly the defect this scan was added to close"
             );
         }
+        // Exactly two judge sites, the timer arm (an overrun rescan or an
+        // empty detector) and the idle arm (a sweep that finished in steps):
+        // dropping either one loses those sweeps' pages.
+        assert_eq!(
+            body.matches("silence_pager.judge(&done)").count(),
+            2,
+            "run_frame_drain must judge finished silence sweeps in both the \
+             timer arm and the idle arm"
+        );
         // And the scan must NOT ride the 500 ms flush arm: it is O(n) in
         // tracked instruments, so at 25,000 instruments that would be a
         // 25,000-element sweep twice a second.
@@ -29809,9 +29649,21 @@ mod silence_latch_tests {
     /// one expression and its shape is the whole fix.
     #[test]
     fn test_risk_gap_03_page_is_rate_limited_across_episodes() {
-        let src = include_str!("dhan_feed_stack.rs");
-        let test_marker = concat!("#[cfg(", "test)]");
+        // US1-D (2026-11-24): the page logic moved unchanged into
+        // `SilencePager::judge`, so this reads that file.
+        let src = include_str!("dhan_feed_stack/silence_sweep.rs");
+        // The test MODULE, not the first `#[cfg(test)]` (a test-only setter
+        // sits above the production code that follows it).
+        let test_marker = concat!("#[cfg(", "test)]\nmod tests");
         let production = src.split(test_marker).next().unwrap_or(src);
+        for needle in [
+            "is_within_market_hours_ist(silence_secs)",
+            "SILENCE_SCANS_BEFORE_ALERT",
+            // Audit L3 (2026-10-26): the Muhurat arm of the session gate.
+            "muhurat_silence_check_due_now(silence_secs)",
+        ] {
+            assert!(production.contains(needle), "the page gate lost `{needle}`");
+        }
 
         assert!(
             production.contains("!silence_reported && !cooling"),
@@ -29828,14 +29680,20 @@ mod silence_latch_tests {
 
         // The suppressed episodes must stay COUNTABLE. Rate-limiting the page
         // while also gating the gauge would trade a noisy signal for no signal.
-        let scan_arm = production
-            .split("ingest.scan_silence_named(now_millis, &mut worst_silent);")
+        // The gauge publishes when the sweep finishes (`finish_silence_tally`,
+        // before the pager ever sees the result), never inside the page gate.
+        let finish = production
+            .split("fn finish_silence_sweep(")
             .nth(1)
             .unwrap_or_default();
-        let gauge = scan_arm
-            .find("tv_dhan_feed_instruments_silent")
-            .expect("the silent gauge must publish from the scan arm");
-        let cooldown = scan_arm.find("!cooling").unwrap_or(usize::MAX);
+        assert!(
+            finish.contains("self.finish_silence_tally("),
+            "a finished sweep must publish the gauges before it is judged"
+        );
+        let gauge = production
+            .find("metrics::gauge!(INSTRUMENTS_SILENT_GAUGE)")
+            .expect("the silent gauge must publish from the sweep's finish");
+        let cooldown = production.find("!cooling").unwrap_or(usize::MAX);
         assert!(
             gauge < cooldown,
             "the silent gauge publishes after the page gate, so a rate-limited \
@@ -29952,9 +29810,12 @@ mod silence_latch_tests {
              last emit; raising it again needs a further dated row"
         );
         let src = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/dhan_feed_stack.rs"),
+            // US1-D (2026-11-24): the page and its cooldown live in the
+            // silence sweep's module.
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src/dhan_feed_stack/silence_sweep.rs"),
         )
-        .expect("dhan_feed_stack.rs must be readable");
+        .expect("silence_sweep.rs must be readable");
         assert!(
             src.contains("const SILENCE_PAGE_COOLDOWN_SECS: u64 = 1_800;"),
             "the 30-minute RISK-GAP-03 emit cooldown changed. A 300 s alarm \
@@ -32846,7 +32707,36 @@ mod connection_delivery_tests {
     /// wiring, `a_weekday_holiday_never_judges_a_class_dead` pins the logic.
     #[test]
     fn the_dead_class_gate_consults_both_the_clock_and_the_calendar() {
-        let source = include_str!("dhan_feed_stack.rs");
+        // US1-D (2026-11-24): the gate lives in `finish_silence_tally`, shared
+        // by the one-go scan and the sliced sweep; it takes the trading-day
+        // flag as an argument, so both callers must pass the calendar's.
+        // Production half only: the needle below also appears in this test.
+        let stack = include_str!("dhan_feed_stack.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap_or_default();
+        assert!(
+            stack.contains(
+                "self.finish_silence_tally(&tally, now_millis, silence_page_allowed_today())"
+            ),
+            "the one-go scan must hand the dead-class gate the trading calendar"
+        );
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src/dhan_feed_stack/silence_sweep.rs"),
+        )
+        .expect("silence_sweep.rs must be readable");
+        let begin = source
+            .split_once("pub fn begin_silence_sweep(")
+            .expect("the sliced sweep's begin must exist")
+            .1;
+        let begin = begin.split_once("\n    }\n").map_or(begin, |(b, _)| b);
+        assert!(
+            begin.contains("silence_page_allowed_today()"),
+            "the sliced sweep must freeze the trading calendar's flag at its begin"
+        );
+        // Bounded at the report call, so the slice holds this gate only and
+        // never runs on into the pager's own session gate below it.
         let gate = source
             .split_once("if dead_class_verdict_is_due(")
             .expect(
@@ -32854,15 +32744,20 @@ mod connection_delivery_tests {
                  never a bare wall-clock `if`",
             )
             .1
-            .split_once(") {")
-            .expect("unterminated dead-class gate")
+            .split_once("self.report_dead_classes(")
+            .expect("the dead-class gate must lead to report_dead_classes")
             .0;
+        assert!(
+            gate.len() < 400,
+            "the dead-class gate slice ran past its own `if` ({} bytes)",
+            gate.len()
+        );
         assert!(
             gate.contains("is_within_market_hours_ist("),
             "the dead-class gate lost its wall-clock half"
         );
         assert!(
-            gate.contains("silence_page_allowed_today()"),
+            gate.contains("page_allowed_today)"),
             "the dead-class gate lost its TRADING-CALENDAR half — on a weekday \
              NSE holiday it will page RISK-GAP-03 for every seeded segment"
         );

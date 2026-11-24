@@ -10,7 +10,7 @@ use super::{ClassLiveness, SilenceVerdict, SilentInstrument, WORST_SILENT_NAMED,
 
 /// What one silence scan counts: silent, never-ticked, named, and the class
 /// rollup.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Copy)]
 pub(super) struct SilenceTally {
     pub(super) silent: u64,
     pub(super) never: u64,
