@@ -73,9 +73,16 @@ pub const FRAME_RING_SPIN_MAX: Duration = Duration::from_micros(FRAME_RING_SPIN_
 /// [`FRAME_RING_SPIN_MAX`] in microseconds.
 pub const FRAME_RING_SPIN_MAX_MICROS: u64 = 1_000;
 
+/// Spins in a row that may catch a frame before the ring takes one ordinary
+/// sleep. Without it a rush of frames closer than the spin keeps `recv`
+/// returning ready, and a `select!` that lists the ring first never polls its
+/// timer or idle arms until the rush ends (US1-B review, 2026-11-24).
+pub const FRAME_RING_SPIN_MAX_CONSECUTIVE_HITS: u32 = 64;
+
 /// Ring checks between two clock reads while spinning. A clock read costs
 /// about 20 to 30 ns and an empty check a few ns, so the spin can overrun
-/// its budget by at most this many checks (well under 1 µs).
+/// its budget by at most this many checks (Assumed well under 1 µs; the
+/// measured overrun is `spin_nanos - misses x budget`).
 const FRAME_RING_SPIN_CHECKS_PER_CLOCK_READ: u32 = 32;
 
 /// State shared by every handle of one ring.
@@ -137,6 +144,10 @@ pub struct FrameRingReceiver<T> {
     /// caught a frame or a sleep shorter than the spin, cleared after a spin
     /// that ran out (adaptive spinning, US1-B).
     spin_armed: bool,
+    /// Spins in a row that caught a frame. At
+    /// [`FRAME_RING_SPIN_MAX_CONSECUTIVE_HITS`] the spin disarms so the next
+    /// empty ring sleeps once and the caller's other `select!` arms are polled.
+    spin_hit_streak: u32,
 }
 
 /// What the short wait before sleeping did, since the ring was built. Read
@@ -180,6 +191,7 @@ pub fn frame_ring<T>(capacity: usize) -> (FrameRingSender<T>, FrameRingReceiver<
             spin_before_park: Duration::ZERO,
             spin_stats: FrameRingSpinStats::default(),
             spin_armed: true,
+            spin_hit_streak: 0,
         },
     )
 }
@@ -278,6 +290,10 @@ impl<T> FrameRingReceiver<T> {
     }
 
     async fn recv_uncharged(&mut self) -> Option<T> {
+        // Set by a sleep that began with no spin before it in the same pass
+        // and ended within the spin budget; consumed by the next check. Only
+        // a wake that then finds a frame re-arms the spin (US1-B review).
+        let mut quick_wake = false;
         loop {
             // Fast path (ITEM DT1, 2026-10-30): take a queued item WITHOUT
             // registering. Registering costs the drain a waiter-list lock to
@@ -288,10 +304,18 @@ impl<T> FrameRingReceiver<T> {
             // happens only once the queue looks empty, and the queue is
             // checked again after it (below), which is what keeps every wake.
             match self.rx.try_recv() {
-                Ok(item) => return Some(item),
+                Ok(item) => {
+                    if quick_wake {
+                        self.spin_armed = true;
+                    }
+                    return Some(item);
+                }
                 Err(TryRecvError::Disconnected) => return None,
                 Err(TryRecvError::Empty) => {}
             }
+            // A wake that found nothing (a stale `Notify` permit) re-arms
+            // nothing.
+            quick_wake = false;
             // Short wait before sleeping (plan item US1-B, 2026-11-24): keep
             // checking for up to `spin_before_park` with the busy-poll flag
             // set, so a frame that lands in that time is taken with no wake
@@ -299,14 +323,20 @@ impl<T> FrameRingReceiver<T> {
             // rescheduled). Off when zero. Ending the spin falls through to
             // the unchanged clear, register and re-check below, so no frame
             // pushed during the spin is stranded (see `set_busy_polling`).
-            // Adaptive: a spin that runs out disarms it, and only a sleep
-            // shorter than the spin re-arms it (below), so a slow feed pays
-            // one spin per lull, not one per frame.
+            // Adaptive: a spin that runs out disarms it. It is re-armed only by
+            // a later sleep with no spin before it that a frame ended within
+            // the budget (below), so a slow feed pays one spin per lull, not
+            // one per frame. A sleep right after a missed spin starts one
+            // budget late, so its length says nothing about the gap and never
+            // re-arms (US1-B review: gaps of one to two budgets re-armed it).
+            let mut spun = false;
             if self.spin_armed && !self.spin_before_park.is_zero() {
-                if let Some(item) = self.spin_for_next() {
+                spun = true;
+                let caught = self.spin_for_next();
+                self.note_spin_outcome(caught.is_some());
+                if let Some(item) = caught {
                     return item;
                 }
-                self.spin_armed = false;
             }
             // About to sleep: a busy-poll flag left set would let producers
             // skip the wake this sleep depends on. Clearing it here (the same
@@ -334,11 +364,12 @@ impl<T> FrameRingReceiver<T> {
             if self.spin_before_park.is_zero() {
                 notified.await;
             } else {
-                // Re-arm when the frame came soon enough that a spin would
-                // have caught it: two clock reads per sleep, spin on only.
+                // Two clock reads per sleep, spin on only. The measured time
+                // includes the wake itself, so it under-reports re-arms
+                // (keeps the spin off), never over-reports.
                 let parked_at = Instant::now();
                 notified.await;
-                self.spin_armed = parked_at.elapsed() < self.spin_before_park;
+                quick_wake = !spun && parked_at.elapsed() < self.spin_before_park;
             }
         }
     }
@@ -364,7 +395,7 @@ impl<T> FrameRingReceiver<T> {
     /// `recv` also clears the flag itself before it registers to sleep.
     ///
     /// O(1): one `SeqCst` store.
-    // WIRING-EXEMPT: called by the busy-poll drain (owner 2026-10-30, "Build it, test live on 2 cores"), built behind a default-off switch by the core-placement session; until then the flag stays false and nothing changes.
+    // WIRING-EXEMPT: called by the busy-poll drain (owner 2026-10-30, "Build it, test live on 2 cores"), built behind a default-off switch by the core-placement session; since 2026-11-24 (US1-B) `recv`'s short wait also sets the flag through `spin_for_next`.
     pub fn set_busy_polling(&self, on: bool) {
         self.shared.busy_polling.store(on, Ordering::SeqCst);
     }
@@ -415,6 +446,21 @@ impl<T> FrameRingReceiver<T> {
                 return None;
             }
         }
+    }
+
+    /// Arms or disarms the spin after one spin: a miss disarms it; a catch
+    /// keeps it armed until [`FRAME_RING_SPIN_MAX_CONSECUTIVE_HITS`] in a row,
+    /// then disarms it so the next empty ring sleeps once (a quick wake
+    /// re-arms it). O(1).
+    fn note_spin_outcome(&mut self, caught: bool) {
+        if caught {
+            self.spin_hit_streak = self.spin_hit_streak.saturating_add(1);
+            if self.spin_hit_streak < FRAME_RING_SPIN_MAX_CONSECUTIVE_HITS {
+                return;
+            }
+        }
+        self.spin_armed = false;
+        self.spin_hit_streak = 0;
     }
 
     /// Adds one spin to the stats. O(1), plain adds, no allocation.
@@ -996,7 +1042,13 @@ mod tests {
             let shared = Arc::clone(&rx.shared);
             let watcher = Arc::clone(&rx.shared);
             let producer = std::thread::spawn(move || {
-                while !watcher.busy_polling.load(Ordering::SeqCst) {
+                // Bounded: a round whose spin ended before this thread ran
+                // still sends, through the ordinary wake (review: an
+                // unbounded wait hung the test).
+                let deadline = std::time::Instant::now() + Duration::from_millis(20);
+                while !watcher.busy_polling.load(Ordering::SeqCst)
+                    && std::time::Instant::now() < deadline
+                {
                     std::hint::spin_loop();
                 }
                 tx.try_send(42).expect("room");
@@ -1160,5 +1212,80 @@ mod tests {
             }
         }
         assert!(rearmed, "a wake well under 1 ms must re-arm the spin");
+    }
+
+    /// Regression (US1-B review, 2026-11-24): a sleep right after a missed
+    /// spin starts one budget late, so a frame that ends it inside the
+    /// budget came one to two budgets after the gap began, where a spin can
+    /// never catch it. It must NOT re-arm the spin (before the fix it did,
+    /// so gaps of 50 to 100 µs paid a full spin AND the wake every time).
+    #[test]
+    fn test_regression_a_quick_wake_after_a_missed_spin_does_not_rearm() {
+        let counter = Arc::new(CountingWaker(std::sync::atomic::AtomicUsize::new(0)));
+        let waker = std::task::Waker::from(Arc::clone(&counter));
+        let mut cx = std::task::Context::from_waker(&waker);
+        let (tx, mut rx) = frame_ring::<u32>(4);
+        rx.set_spin_before_park(FRAME_RING_SPIN_MAX);
+        assert!(rx.spin_armed);
+        {
+            let mut fut = std::pin::pin!(rx.recv());
+            assert!(
+                fut.as_mut().poll(&mut cx).is_pending(),
+                "spun 1 ms, missed, parked"
+            );
+            tx.try_send(5).expect("room");
+            assert_eq!(fut.as_mut().poll(&mut cx), std::task::Poll::Ready(Some(5)));
+        }
+        assert_eq!(rx.spin_stats().misses, 1);
+        assert!(!rx.spin_armed, "the sleep after a miss never re-arms");
+    }
+
+    /// Regression (US1-B review, 2026-11-24): a stale `Notify` permit (a
+    /// push while the drain ran unregistered with the flag clear) ends the
+    /// next sleep at once with nothing queued. That empty wake must not
+    /// re-arm the spin.
+    #[test]
+    fn test_regression_a_stale_permit_wake_does_not_rearm() {
+        let counter = Arc::new(CountingWaker(std::sync::atomic::AtomicUsize::new(0)));
+        let waker = std::task::Waker::from(Arc::clone(&counter));
+        let mut cx = std::task::Context::from_waker(&waker);
+        let (tx, mut rx) = frame_ring::<u32>(4);
+        rx.set_spin_before_park(FRAME_RING_SPIN_MAX);
+        rx.spin_armed = false;
+        // Flag clear, nobody registered: this push stores a permit.
+        tx.try_send(1).expect("room");
+        assert_eq!(rx.try_recv(), Some(1), "taken without registering");
+        {
+            let mut fut = std::pin::pin!(rx.recv());
+            assert!(
+                fut.as_mut().poll(&mut cx).is_pending(),
+                "the stale permit wakes nothing up: parked again"
+            );
+        }
+        assert!(!rx.spin_armed, "an empty wake re-arms nothing");
+        assert_eq!(rx.spin_stats().misses, 0, "disarmed: no spin");
+    }
+
+    /// After `FRAME_RING_SPIN_MAX_CONSECUTIVE_HITS` catches in a row the spin
+    /// disarms, so the next empty ring sleeps once (the caller's other
+    /// `select!` arms are polled) instead of spinning through a whole rush.
+    #[test]
+    fn test_spin_disarms_after_the_consecutive_hit_cap() {
+        let (tx, mut rx) = frame_ring::<u32>(4);
+        rx.set_spin_before_park(Duration::from_micros(20));
+        for i in 0..FRAME_RING_SPIN_MAX_CONSECUTIVE_HITS {
+            assert!(rx.spin_armed, "armed before catch {i}");
+            tx.try_send(i).expect("room");
+            // The fast path would take a queued frame; go through the spin,
+            // then the same outcome rule `recv` applies.
+            let caught = rx.spin_for_next();
+            rx.note_spin_outcome(caught.is_some());
+            assert_eq!(caught, Some(Some(i)));
+        }
+        assert!(!rx.spin_armed, "the cap disarms the spin");
+        assert_eq!(
+            rx.spin_stats().hits,
+            u64::from(FRAME_RING_SPIN_MAX_CONSECUTIVE_HITS)
+        );
     }
 }
