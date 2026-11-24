@@ -721,3 +721,57 @@ fn test_idle_arm_keeps_seeding_queued_batches_after_the_seed_channel_closes() {
     assert_eq!(done, vec![(1_000, 1_000), (1, 1), (513, 513)]);
     assert_eq!(ingest.tracked_instruments(), sizes.iter().sum::<usize>());
 }
+
+/// US1-D: while the catch-up seal and a silence sweep are both pending the
+/// idle arm gives them alternate steps (catch-up first), so a catch-up seal
+/// that is begun again every 5 s can never starve the silence sweep, nor the
+/// other way round. Once one finishes, the other takes every step.
+#[test]
+fn test_step_idle_work_alternates_catch_up_and_silence() {
+    let instruments = (CATCHUP_SEAL_STEP_SLOTS * 3) as u32;
+    let mut ingest = catch_up_book(instruments).with_detector_capacity(AGGREGATOR_MAX_SLOTS);
+    for id in 0..10u64 {
+        assert!(ingest.seed(800_000 + id, ExchangeSegment::NseFno, 0));
+    }
+    ingest.silence_sweep.set_step_slots(2);
+    ingest.begin_catch_up_seal();
+    assert!(
+        ingest.catch_up.is_some(),
+        "the fixture begins a catch-up seal"
+    );
+    assert!(
+        ingest.begin_silence_sweep(10_000_000_000).is_none(),
+        "ten slots at two a step: the silence sweep stays pending"
+    );
+    let catch_up_steps = ingest.aggregator.len().div_ceil(CATCHUP_SEAL_STEP_SLOTS);
+    assert!(
+        catch_up_steps >= 3,
+        "the fixture needs several catch-up steps"
+    );
+    // `true` = this call stepped the catch-up seal.
+    let mut trace: Vec<bool> = Vec::new();
+    let mut silence_done = 0usize;
+    let mut catch_up_done = 0usize;
+    while ingest.idle_work_pending() {
+        let both = ingest.catch_up.is_some() && ingest.silence_sweep.is_pending();
+        let before = ingest.catch_up.map(|s| s.next_slot);
+        let step = ingest.step_idle_work();
+        let after = ingest.catch_up.map(|s| s.next_slot);
+        let stepped_catch_up = step.catch_up_done.is_some() || before != after;
+        if both {
+            trace.push(stepped_catch_up);
+        }
+        silence_done += usize::from(step.silence_done.is_some());
+        catch_up_done += usize::from(step.catch_up_done.is_some());
+        assert!(trace.len() < 100, "the idle work finishes");
+    }
+    assert_eq!((silence_done, catch_up_done), (1, 1), "each finishes once");
+    assert!(trace.len() >= 4, "both were pending for several steps");
+    for (i, stepped_catch_up) in trace.iter().enumerate() {
+        assert_eq!(
+            *stepped_catch_up,
+            i % 2 == 0,
+            "step {i} while both are pending: {trace:?}"
+        );
+    }
+}
