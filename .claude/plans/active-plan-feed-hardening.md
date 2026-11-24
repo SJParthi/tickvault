@@ -7939,3 +7939,39 @@ Set `frame_drain_spin_us = 0` (config only, next restart), or revert the commit.
 ### Per-Item Guarantee Matrix (Item US1-B)
 
 See `per-wave-guarantee-matrix.md`; no new tick-drop path (every frame still reaches the drain, pinned by the never-strands proptest), no allocation on the recv path.
+
+## ITEM US1-D — split the 30 s silence scan into idle-arm steps (2026-11-24, owner card "Split into small pieces (Recommended)")
+
+Owner, 2026-11-24, after the measured cost (release harness `silence_arm_cost_at_the_authorized_ceiling`, x86 dev container, 20,000 instruments: whole arm median 185 µs warm, 436 µs cold, one 1.95 ms max): "Split into small pieces (Recommended)" — the 30 s timer only starts the check, the drain does 1,024 instruments at a time in its quiet moments, same silent counts, same alerts; a leftover at the next timer is finished at once and counted.
+
+- [ ] US1-D Sliced silence sweep (crates/core, crates/app)
+  - Files: crates/core/src/pipeline/tick_gap_detector.rs, crates/app/src/subscribe_reconcile.rs, crates/app/src/dhan_feed_stack.rs, crates/app/src/dhan_feed_stack/silence_sweep.rs, crates/app/src/dhan_feed_stack/silence_arm_cost.rs, crates/app/tests/silence_arm_slot_guard.rs, crates/app/tests/dhat_silence_scan.rs, crates/storage/src/hot_path_telemetry.rs, CLAUDE.md
+  - Tests: proptest_scan_silence_slot_range_chunks_equal_the_full_scan, proptest_chunked_reconcile_sweep_matches_the_one_go_sweep, test_chunked_sweep_publishes_delivering_only_at_finish, test_interrupted_chunked_sweep_plans_no_round, proptest_sliced_silence_sweep_matches_the_one_go_scan, test_timer_overrun_finishes_the_pending_sweep_inline_and_counts, test_slots_added_mid_sweep_wait_for_the_next_sweep
+
+### Design (Item US1-D)
+
+Core: `TickGapDetector::scan_silence_slot_range(now_millis, from, end, count, sink) -> next` runs the existing loop body over `[from, min(end, next_slot, from + count))`; `scan_silence_slots` becomes the full range (same reports, same order). Reconcile: the per-sweep accumulators move into the book (`Inner.pending`), each chunk takes the lock once (`begin_chunked_at`, `note_chunk_at_slot` under a short guard, `finish_chunked_at(secs, day)`); per-socket counts go to `pending_delivering` and are published to `delivering` only at finish, so the executor never reads a half sweep; every other lock taker (record, forget, forget_on, round_finished) bumps an epoch, and a finish whose epoch moved plans no round that sweep (counted) and the next sweep plans it. The one-go `ReconcileSweep` stays for tests and the oracle. App: the timer arm keeps everything that does not read the scan (refusal read-out, gauges, cross-feed check, ring fill) and calls `begin_silence_sweep`, which freezes `now_millis`, the reconcile `Instant` and clock, the session-gate seconds, `silence_page_allowed_today()` and `end = tracked_instruments()`; `step_idle_work` runs one silence step of `SILENCE_SWEEP_STEP_SLOTS` (1,024) after seed and catch-up; the step that reaches `end` finishes the reconcile, the two gauges, the dead-class verdict and the page logic (moved unchanged into `silence_sweep.rs`, judged on the frozen values). If the timer fires with a sweep pending, the rest is scanned and finished inline before the new one begins, counted on `tv_silence_sweep_overrun_total`.
+
+### Edge Cases (Item US1-D)
+
+Empty detector (begin finishes at once); slots added mid-sweep (outside `end`, picked up 30 s later, as a one-go scan at the begin instant would); a tick on an unvisited slot between steps (judged at the begin instant on its newer state: `silent_millis` saturates to 0, it reads live, which it is); a re-seed of an unvisited never-ticked slot (same, reads newer state); out-of-session timer (the gate is judged on the frozen seconds at finish, latches cleared as today); day roll at a timer fire with a sweep pending (the pending sweep finishes inline first); no reconcile book (the reconcile part is skipped, as today); shutdown with a sweep pending (abandoned: no page, the process is exiting).
+
+### Failure Modes (Item US1-D)
+
+No quiet moment for 30 s (open burst): the next timer finishes the rest inline, so the worst case equals today's one-go stop, counted. A lock taker between chunks: the sweep's judgement mixes two book states for that one sweep, and no round is planned from it (auto mode only; production runs shadow). Per-step cost Assumed about 5 to 22 µs (1,024 of 20,000 at the measured 97 to 436 µs per full arm), to be measured by the harness.
+
+### Test Plan (Item US1-D)
+
+Core range proptest (random chunk sizes concatenate to the full scan). Reconcile chunked-vs-one-go proptest with no taker between chunks (identical summaries, fingerprints, cell invariant), plus delivering-publication and interrupted-sweep tests. App sliced-vs-one-go proptest over random detector states and step sizes with no frames between steps (identical counts, `worst`, gauges, dead-class latch, page decisions), overrun test, mid-sweep-slot test. Existing oracle and source guards re-pointed to the new functions. DHAT: zero allocation across begin, 1,000 steps and finish. Harness: per-step and whole-sweep cost, release, x86 dev container.
+
+### Rollback (Item US1-D)
+
+Revert the commit. No config, table or format change; the counts, gauges and pages are the same.
+
+### Observability (Item US1-D)
+
+`tv_silence_sweep_overrun_total` and `tv_subscribe_reconcile_sweep_interrupted_total` (local `/metrics` only, registered at 0; no alarm, filter or EMF name). Effect read on the existing `drain_arm_silence` and `drain_arm_idle` stages and on `ring_dwell` in `hot_path_latency_minute`.
+
+### Per-Item Guarantee Matrix (Item US1-D)
+
+See `per-wave-guarantee-matrix.md`; no new tick-drop path (the scan only reads), no allocation per step (DHAT), O(step) per idle step, O(1) begin, O(n) total per 30 s unchanged.
