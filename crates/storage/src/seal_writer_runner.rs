@@ -485,7 +485,10 @@ impl SealEscalationSink {
             // run is written: each seal is counted on the floor counter and
             // reported lost through `on_lost`, the AGGREGATOR-DROP-01 page.
             let run_bytes = (run.len() * crate::seal_spill::SEAL_SPILL_RECORD_SIZE) as u64;
-            if !self.floor.has_room(run_bytes, run[0].now_unix_secs) {
+            if !self
+                .floor
+                .has_room_for_seals(run_bytes, run.len() as u64, run[0].now_unix_secs)
+            {
                 for item in run {
                     self.floor
                         .note_refusal(item.seal.security_id, item.seal.exchange_segment_code);

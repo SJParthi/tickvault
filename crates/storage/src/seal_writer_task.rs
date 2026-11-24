@@ -53,7 +53,9 @@ use tracing::{error, info, warn};
 use tickvault_common::error_code::ErrorCode;
 use tickvault_trading::candles::BufferedSeal;
 
-use crate::seal_absorption::{SealAbsorptionPipeline, SubmitOutcome};
+use crate::seal_absorption::{
+    RESCUE_BATCH_MAX_SEALS, RescueBatchOutcome, SealAbsorptionPipeline, SubmitOutcome,
+};
 use crate::seal_dlq::SealDlqRecord;
 use crate::seal_spill::{
     SEAL_BOOT_WRITTEN_CAPACITY, SEAL_SPILL_FORMAT_VERSION, SEAL_SPILL_RECORD_SIZE, SerializedSeal,
@@ -303,9 +305,10 @@ pub fn drain_once_reusing(
                     "candle flush failed — rescuing in-flight seals to spill/DLQ"
                 );
             }
-            for seal in popped.drain(..) {
-                rescue_one(pipeline, &mut outcome, seal, now_unix_secs);
-            }
+            // Plan item US1-C: one spill write for the whole run, not one per
+            // seal (same records, same tiers, same counts).
+            let batch = pipeline.rescue_in_flight_batch(popped, now_unix_secs);
+            add_batch(&mut outcome, &batch);
             // Poison-buffer recovery (2026-07-06 hostile-review fix): the
             // popped seals are now durably parked in spill/DLQ (or counted as
             // Dropped — AGGREGATOR-DROP-01 fires at the loop), so the writer's
@@ -360,10 +363,34 @@ fn rescue_one(
 /// the writer. Cold path. O(ring), no allocation beyond the spill's own.
 pub fn rescue_ring(pipeline: &mut SealAbsorptionPipeline, now_unix_secs: i64) -> DrainOutcome {
     let mut outcome = DrainOutcome::default();
-    while let Some(seal) = pipeline.pop_oldest() {
-        rescue_one(pipeline, &mut outcome, seal, now_unix_secs);
+    // Plan item US1-C: chunks of at most RESCUE_BATCH_MAX_SEALS, one spill
+    // write each, through a buffer the pipeline keeps (allocated on the first
+    // rescue, then reused).
+    let mut chunk = pipeline.take_rescue_chunk();
+    loop {
+        while chunk.len() < RESCUE_BATCH_MAX_SEALS {
+            match pipeline.pop_oldest() {
+                Some(seal) => chunk.push(seal),
+                None => break,
+            }
+        }
+        if chunk.is_empty() {
+            break;
+        }
+        let batch = pipeline.rescue_in_flight_batch(&mut chunk, now_unix_secs);
+        add_batch(&mut outcome, &batch);
     }
+    pipeline.return_rescue_chunk(chunk);
     outcome
+}
+
+/// Adds a batch rescue result to the cycle counters, exactly as [`rescue_one`]
+/// counts each seal.
+fn add_batch(outcome: &mut DrainOutcome, batch: &RescueBatchOutcome) {
+    outcome.rescued_to_spill += batch.spilled;
+    outcome.rescued_to_dlq += batch.dlq_written;
+    outcome.rescued_dropped += batch.dropped;
+    outcome.rescued_dropped_below_floor += batch.dropped_below_floor;
 }
 
 // ---------------------------------------------------------------------------
@@ -6044,5 +6071,88 @@ mod tests {
             "marked before the seal writer's boot drain can run"
         );
         assert!(main.contains("spawn_supervised_wal_suspension_watcher("));
+    }
+
+    // ---- plan item US1-C: one spill write per failed cycle -----------------
+
+    /// A failed candle flush rescues the whole popped run with one spill
+    /// write, not one per seal, and every seal is still counted.
+    #[test]
+    fn test_us1c_flush_failure_rescue_makes_one_disk_write() {
+        let (spill, dlq) = temp_pair("us1c-one-write");
+        let mut pipeline =
+            SealAbsorptionPipeline::with_capacity_and_dirs_for_test(64, spill.clone(), dlq.clone());
+        pipeline.set_free_probe_for_test(|_| Some(64 * 1024 * 1024 * 1024));
+        let now = jan1_noon_utc();
+        for i in 0..40u32 {
+            pipeline.submit(
+                mk_seal(
+                    1_000 + u64::from(i),
+                    0,
+                    TfIndex::M1,
+                    1_716_023_700 + i * 60,
+                    100.0,
+                ),
+                now,
+            );
+        }
+        let mut writer = ShadowCandleWriter::for_test();
+        let outcome = drain_once(&mut pipeline, &mut writer, 64, now);
+        assert!(!outcome.flushed_ok, "the test writer has no server");
+        assert_eq!(outcome.ring_seals_popped, 40);
+        assert_eq!(outcome.rescued_to_spill, 40);
+        assert_eq!(outcome.rescued_to_dlq + outcome.rescued_dropped, 0);
+        assert_eq!(
+            pipeline.spill_handle().disk_writes_for_test(),
+            1,
+            "one write(2) for the whole failed cycle"
+        );
+        cleanup(&spill, &dlq);
+    }
+
+    /// The shutdown ring rescue writes in chunks of at most
+    /// `RESCUE_BATCH_MAX_SEALS`, oldest first, and loses nothing.
+    #[test]
+    fn test_us1c_rescue_ring_batches_in_bounded_chunks() {
+        let (spill, dlq) = temp_pair("us1c-ring-chunks");
+        let total = 2 * RESCUE_BATCH_MAX_SEALS + 5;
+        let mut pipeline = SealAbsorptionPipeline::with_capacity_and_dirs_for_test(
+            total + 10,
+            spill.clone(),
+            dlq.clone(),
+        );
+        pipeline.set_free_probe_for_test(|_| Some(64 * 1024 * 1024 * 1024));
+        let now = jan1_noon_utc();
+        for i in 0..total {
+            let i = u32::try_from(i).expect("fits");
+            pipeline.submit(
+                mk_seal(u64::from(i) + 1, 0, TfIndex::M1, 1_716_023_700, 100.0),
+                now,
+            );
+        }
+        let outcome = rescue_ring(&mut pipeline, now);
+        assert_eq!(outcome.rescued_to_spill, total);
+        assert_eq!(pipeline.ring_len(), 0);
+        assert_eq!(
+            pipeline.spill_handle().disk_writes_for_test(),
+            3,
+            "two full groups, then the 5 left over"
+        );
+        let ids: Vec<u64> = pipeline
+            .spill_handle()
+            .read_all(now)
+            .expect("read spill")
+            .iter()
+            .map(|s| s.security_id)
+            .collect();
+        assert_eq!(ids.len(), total);
+        assert!(
+            ids.windows(2).all(|w| w[0] < w[1]),
+            "oldest first, in order"
+        );
+        // The chunk buffer is kept for the next rescue, emptied.
+        let kept = pipeline.take_rescue_chunk();
+        assert!(kept.is_empty() && kept.capacity() >= RESCUE_BATCH_MAX_SEALS);
+        cleanup(&spill, &dlq);
     }
 }

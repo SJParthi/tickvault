@@ -213,3 +213,93 @@ fn socket_to_wal_stage_cost_with_parked_consumers() {
     let _ = std::fs::remove_dir_all(&wal_dir);
     let _ = std::fs::remove_dir_all(&sink_dir);
 }
+
+/// Deterministic exponential gaps (mean `mean_us`), so bursts and lulls mix
+/// as they do live. A fixed 64-bit LCG: same sequence every run.
+fn exponential_gaps(mean_us: f64, count: usize) -> Vec<Duration> {
+    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+    (0..count)
+        .map(|_| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let u = ((state >> 11) as f64 + 0.5) / (1_u64 << 53) as f64;
+            Duration::from_nanos((-u.ln() * mean_us * 1_000.0) as u64)
+        })
+        .collect()
+}
+
+/// US1-B (2026-11-24): the drain's short wait before sleeping. For each
+/// gap shape, with the spin off and on, times the reader's `try_send` and
+/// the push-to-drain latency (the drain reads the clock as it takes the
+/// frame), and reports how often the spin caught the frame and the CPU it
+/// spent. Run with
+/// `cargo test --release -p tickvault-core --test socket_to_wal_tail_harness -- --ignored --nocapture ring_wake_with_and_without_spin`.
+#[test]
+#[ignore = "wall-clock harness; run by hand with --ignored --nocapture"]
+fn ring_wake_with_and_without_spin() {
+    let frame = ticker_frame();
+    let shapes: [(&str, Vec<Duration>); 4] = [
+        ("steady 400us", vec![GAP; FRAMES]),
+        ("exponential mean 400us", exponential_gaps(400.0, FRAMES)),
+        ("exponential mean 100us", exponential_gaps(100.0, FRAMES)),
+        ("burst mean 20us", exponential_gaps(20.0, FRAMES)),
+    ];
+    for (shape, gaps) in &shapes {
+        for spin_us in [0_u64, 50] {
+            let (tx, mut rx) = frame_ring::<CapturedFrame>(RING_SLOTS);
+            rx.set_spin_before_park(Duration::from_micros(spin_us));
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("runtime");
+            let drain = rt.spawn(async move {
+                let mut lat = Vec::with_capacity(FRAMES);
+                while let Some(f) = rx.recv().await {
+                    lat.push(f.received_at.elapsed().as_nanos() as u64);
+                }
+                (lat, rx.spin_stats())
+            });
+            std::thread::sleep(Duration::from_millis(50));
+            let mut send = Vec::with_capacity(FRAMES);
+            let wall = Instant::now();
+            let mut next = Instant::now();
+            for (seq, gap) in gaps.iter().enumerate() {
+                next += *gap;
+                spin_until(next);
+                let started = Instant::now();
+                let _ = tx.try_send(CapturedFrame {
+                    seq: seq as u64,
+                    endpoint: DhanEndpointType::MainFeed,
+                    connection_index: 0,
+                    received_at: started,
+                    received_at_nanos: 0,
+                    wal_backed: true,
+                    bytes: frame.clone(),
+                });
+                send.push(started.elapsed().as_nanos() as u64);
+            }
+            let wall_nanos = wall.elapsed().as_nanos() as f64;
+            drop(tx);
+            let (lat, stats) = rt.block_on(drain).expect("drain");
+            assert_eq!(lat.len(), FRAMES, "every frame reached the drain");
+            let s = summarise(send);
+            let l = summarise(lat);
+            println!(
+                "{shape:<24} spin {spin_us:>2}us | send p50 {:>6} p99 {:>6} max {:>8} | \
+                 to-drain p50 {:>6} p99 {:>7} p99.9 {:>8} max {:>9} | hits {:>5} misses {:>5} cpu {:>5.1}%",
+                s.p50,
+                s.p99,
+                s.max,
+                l.p50,
+                l.p99,
+                l.p999,
+                l.max,
+                stats.hits,
+                stats.misses,
+                stats.spin_nanos as f64 * 100.0 / wall_nanos,
+            );
+        }
+    }
+}

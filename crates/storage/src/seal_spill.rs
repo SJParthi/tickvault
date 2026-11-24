@@ -1035,6 +1035,24 @@ impl SealSpillWriter {
         Self::in_dir(PathBuf::from(SEAL_SPILL_DIR))
     }
 
+    /// Maps the ledger table now ([`SpillLedger::prefault`], plan item US1-C).
+    /// Returns the slots touched. O(capacity) once; called by the production
+    /// pipeline constructor (`SealAbsorptionPipeline::new`) only, never by
+    /// the path-lookup helpers that also build a writer.
+    pub(crate) fn prefault_ledger(&self) -> usize {
+        self.lock_state().ledger.prefault()
+    }
+
+    /// `true` when the spill or the database already holds a fuller copy of
+    /// this bar, so writing `seal` is not needed: the case
+    /// [`Self::append_seal`] reports `Ok` for before any I/O. Read only, counts
+    /// nothing (the batch append already counted the copy it left out). Used
+    /// by the batch rescue for the seals after a failed write (plan item
+    /// US1-C). O(1): the append lock and one hash probe.
+    pub(crate) fn holds_a_fuller_copy(&self, seal: &SerializedSeal) -> bool {
+        self.lock_state().ledger.verdict(seal) == SpillVerdict::OlderNotWritten
+    }
+
     fn in_dir(spill_dir: PathBuf) -> Self {
         Self {
             spill_dir,
@@ -3114,6 +3132,30 @@ mod tests {
         assert_eq!(decoded, seal);
     }
 
+    /// Plan item US1-C: `holds_a_fuller_copy` answers true only for a copy
+    /// older than one already on disk, and counts nothing.
+    #[test]
+    fn test_holds_a_fuller_copy_only_for_an_older_copy_of_a_held_bar() {
+        let dir = temp_spill_dir("holds-fuller-copy");
+        let writer = SealSpillWriter::with_spill_dir_for_test(dir.clone());
+        let now = 1_716_000_000_i64;
+        let mut fuller = mk_seal(13, 2, 1, 1_716_000_900, 100.0);
+        fuller.tick_count = 6;
+        fuller.volume = 60;
+        let mut emptier = fuller;
+        emptier.tick_count = 2;
+        emptier.volume = 20;
+        let other_bar = mk_seal(13, 2, 1, 1_716_000_960, 100.0);
+        assert!(!writer.holds_a_fuller_copy(&emptier), "nothing held yet");
+        writer.append_seal(&fuller, now).expect("write fuller");
+        assert!(writer.holds_a_fuller_copy(&emptier));
+        assert!(
+            !writer.holds_a_fuller_copy(&fuller),
+            "an equal copy is written"
+        );
+        assert!(!writer.holds_a_fuller_copy(&other_bar), "another bar");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     #[test]
     fn test_read_all_refuses_every_older_version_but_drains_current_siblings() {
         // A daily spill file mixing records from EVERY older ordinal space

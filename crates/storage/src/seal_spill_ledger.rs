@@ -262,6 +262,36 @@ impl SpillLedger {
         }
     }
 
+    /// Touches every slot of the table once and leaves it empty (plan item
+    /// US1-C, 2026-11-24). The table is allocated at construction but the
+    /// kernel maps each page only when it is first written, so the first
+    /// rescue of a new bar paid a page fault about every insert: measured
+    /// 1.6 µs per seal on a fresh ledger against about 0.5 µs on a warm one
+    /// (`us1c_rescue_cost_split`, x86 dev container). Fills the table to its
+    /// capacity with placeholder keys, then clears it: nothing is left behind,
+    /// and no real bar is ever compared with a placeholder.
+    ///
+    /// # Cost
+    /// O(capacity) once (about 200,000 inserts, a few milliseconds), only in
+    /// the production writer. SPACE: the table becomes resident from boot,
+    /// which it becomes anyway once an outage has spilled that many bars.
+    pub(crate) fn prefault(&mut self) -> usize {
+        let slots = self.bars.capacity();
+        for index in 0..slots {
+            let key = BarKey {
+                security_id: u64::try_from(index).unwrap_or(u64::MAX),
+                bucket_start_ist_secs: 0,
+                segment: 0,
+                feed: 0,
+                tf_ordinal: 0,
+            };
+            self.bars.insert(key, BarEntry::EMPTY);
+        }
+        // `clear` keeps the allocation; the capacity must not have grown.
+        self.bars.clear();
+        slots
+    }
+
     /// `true` while the ledger holds anything or has overflowed.
     pub(crate) fn is_active(&self) -> bool {
         !self.bars.is_empty()
@@ -1290,5 +1320,26 @@ mod tests {
                 untracked: 1
             }
         );
+    }
+
+    /// Plan item US1-C: the prefault touches the whole table and leaves the
+    /// ledger exactly as a fresh one: empty, inactive, same capacity, and a
+    /// real bar is judged as on a fresh ledger.
+    #[test]
+    fn test_us1c_prefault_leaves_the_ledger_empty_with_its_capacity() {
+        let mut fresh = SpillLedger::with_capacity(4_096);
+        let mut warmed = SpillLedger::with_capacity(4_096);
+        let capacity = warmed.bars.capacity();
+        let touched = warmed.prefault();
+        assert_eq!(touched, capacity);
+        assert_eq!(warmed.bars.capacity(), capacity, "no growth");
+        assert!(warmed.bars.is_empty());
+        assert!(!warmed.is_active());
+        let s = copy_of(7, 1, TfIndex::M1, 1_716_023_700, 5, 50);
+        assert_eq!(warmed.verdict(&s), fresh.verdict(&s));
+        // A placeholder-shaped key (bucket 0) is not remembered either.
+        let placeholder = copy_of(3, 0, TfIndex::M1, 0, 5, 50);
+        assert_eq!(warmed.verdict(&placeholder), fresh.verdict(&placeholder));
+        let _ = (&mut fresh, &mut warmed);
     }
 }

@@ -7862,3 +7862,78 @@ Resolved source checkpoint: 535 locked packages became 537, with only the reques
 ## LF-6b notes (2026-11-12) — live paper fill chain
 
 - LF-6b is tracked under LF-6 in `.claude/plans/active-plan-audit-2026-10-20.md` (not ticked; ticked only when its PR merges). It touches the frame drain (`crates/app/src/dhan_feed_stack.rs`, one tap call in the `IngestOutcome::Folded` arm behind the live-socket and not-replaying gates) and the order runtime (`crates/app/src/order_runtime.rs`, one `select!` arm, dry-run only). Off by default (`[live_fill] enabled = false`) and idle until an approved brutex strategy engine exists.
+
+## ITEM US1 — the last steps over 1 µs (2026-11-24, owner cards "Batch the writes (Recommended)", "Look ahead one price (Recommended)", "Measure live first (Recommended)", "Medium: ~8 agents (Recommended)")
+
+Owner, 2026-11-24: "go ahead and fix the 4 steps over 1 µs dude" / "fix and resoleve evryhtign entirley dude okay?". Of the four, the candle row write is already under 1 µs in production (`config/production.toml` `own_ilp_encoder = true`, p99 780–825 ns); the socket wake waits on a live measurement (no read access to the metrics log group from this session); two items below change code.
+
+- [x] US1-C Batch the seal rescue writes (crates/storage)
+  - Files: crates/storage/src/seal_absorption.rs, crates/storage/src/seal_writer_task.rs
+  - Tests: test_us1c_batch_rescue_writes_the_same_bytes_and_outcomes_as_per_seal, test_us1c_batch_rescue_partial_write_keeps_landed_records_and_dead_letters_the_rest, test_us1c_batch_rescue_below_floor_falls_back_to_per_seal, test_us1c_flush_failure_rescue_makes_one_disk_write, test_us1c_rescue_ring_batches_in_bounded_chunks
+- [x] US1-A REJECTED on measurement, nothing shipped. Prototype (`warm_slot_for`, next tick's slot warmed before folding the current one), cold run, 12 tables x 25,000 slots, 200,000 ticks, interleaved blocks, x86 dev container: plain p50 507-558 ns / p99 825-901 ns / p99.9 1.1-1.3 us; look-ahead p50 591-604 / p99 996-1,010 / p99.9 2.6-5.2 us. Slower, so reverted. The plain fold already measures under 1 us at p99 on this code (the 1.5-1.7 us figure was 2026-11-06).
+
+### Design
+
+US1-C. When a candle flush fails, `drain_once_reusing` sends each popped seal through `rescue_in_flight`, one spill `write(2)` per seal (up to 16,384 a cycle) under the spill lock. New `SealAbsorptionPipeline::rescue_in_flight_batch` serialises the run into a reused buffer and calls the existing `SealSpillWriter::append_seals` once (the escalation thread's DA-14 path): one floor check for the run, one write, the ledger checks unchanged, and on a failed write the kept leading records stay in the spill and only the rest go to the DLQ one record each. `rescue_ring` (shutdown) uses it in chunks of at most `RESCUE_BATCH_MAX_SEALS` (16,384). Same `Ok` contract as `append_seal`: when it returns, every kept record is in the page cache. Written in groups of at most 512 seals (bounds the spill-lock hold the frame drain's inline fallback can wait on). A group of one seal, a group holding two copies of one bar, and a group below the disk floor take the per-seal path, so the records written are byte-identical to the per-seal path (review 2026-11-24: one batch write of a fuller then an emptier copy would write both, and the mid-session replay can end on the last copy it reads). Scratch buffers live in the pipeline, cleared, never shrunk, bounded by the chunk size.
+
+US1-A. In the frame walk, resolve the next tick packet's fold slot and touch its open buckets before folding the current packet, so the two packets' cache misses overlap. Output unchanged.
+
+### Edge Cases
+
+Empty batch; one seal; a run where every copy is superseded by the ledger (no write, all `Spilled`); a run that does not fit above the disk floor (falls back to the per-seal path, exact old behaviour); a partial write (k whole records land); a write that lands nothing; DLQ also failing (Dropped, page unchanged); IST midnight (the rescue run uses one `now`, one day file, as before); shutdown ring larger than one chunk. US1-A: single-packet frame, last packet of a frame, a non-tick packet next, an unknown instrument next, a frame cut short by a bad packet.
+
+### Failure Modes
+
+US1-C: a flaky (not full) disk: before, seal i+1 retried the spill after seal i failed; now the rest of the run goes to the DLQ. Same choice the escalation thread made (DA-14); every seal is still Spilled, DlqWritten or a counted Dropped. A failed batch opens the spill failure episode once (one coded line, as before). US1-A: the warm-up only reads; a wrong guess costs one wasted load, never a wrong bar.
+
+### Test Plan
+
+Unit tests listed above, run with `cargo test -p tickvault-storage`; an `#[ignore]`d harness that prints the per-seal rescue cost at 1, 64, 1,024 and 16,384 seals, old and new; US1-A proptest and harness in the app crate; the existing seal chaos and DHAT tests unchanged and green.
+
+### Rollback
+
+Revert the commit. No on-disk format change, no config, no table change.
+
+### Observability
+
+Unchanged counters (`tv_seal_writer_drain_total{kind="rescued_spill"|"rescued_dlq"|"rescued_dropped"}`, the floor counter, the episode lines). The spill write count per failed cycle drops from N to 1.
+
+### Per-Item Guarantee Matrix
+
+See `per-wave-guarantee-matrix.md` (15-row and 7-row matrices apply as written; no new tick-drop path, no hot-path allocation: both changes run off the drain or inside the existing fold).
+
+## ITEM US1-B — short wait before sleeping on the frame drain (2026-11-24, owner card "Short wait before sleeping (Recommended)")
+
+Owner, 2026-11-24: "fix the belt step wake too dude", then the card: keep checking for the next frame for up to ~50 µs before the drain sleeps; measure on the test machine first, ship behind an on/off switch, check the live numbers tomorrow.
+
+- [x] US1-B Adaptive spin before park on the frame ring (crates/core, crates/common, crates/app)
+  - Files: crates/core/src/websocket/frame_ring.rs, crates/common/src/config.rs, config/base.toml, crates/app/src/dhan_feed_stack.rs, crates/app/src/dhan_feed_stack/frame_ring_spin.rs, crates/app/src/main.rs, crates/core/tests/socket_to_wal_tail_harness.rs
+  - Tests: test_spin_before_park_defaults_to_zero_and_parks_at_once, test_set_spin_before_park_caps_at_the_maximum, test_spin_that_times_out_parks_with_the_flag_cleared_and_is_woken, test_frame_pushed_during_the_spin_is_taken_with_no_wake, test_spin_returns_none_once_every_sender_is_gone, proptest_spin_before_park_never_strands_or_repeats_a_frame, test_spin_stats_count_hits_misses_and_time, test_spin_disarms_after_a_miss_and_rearms_after_a_short_sleep, test_frame_drain_spin_us_defaults_to_off_and_base_ships_fifty, test_configure_sets_the_spin_from_microseconds_and_zero_turns_it_off, test_live_lane_configures_and_publishes_the_spin
+
+### Design (Item US1-B)
+
+`FrameRingReceiver::recv`, on an empty ring and only while armed, sets the busy-poll flag and checks the ring for up to `spin_before_park` (one clock read per 32 checks) before the unchanged clear, register and re-check. A frame caught in the spin costs no wake on either side (the reader skips `notify_one`, the drain is not rescheduled). Adaptive: a spin that runs out disarms it; a sleep shorter than the spin re-arms it (two clock reads per sleep, spin on only). Capped at `FRAME_RING_SPIN_MAX` (1 ms). Switch `[dhan_feed] frame_drain_spin_us` (serde default 0 = off; base.toml 50).
+
+### Edge Cases (Item US1-B)
+
+Zero spin (old path, no clock read); spin larger than the cap; last sender dropped during the spin (returns None at once); frame pushed during the spin; frame pushed just after it ends (the SeqCst clear before the re-check, argued at `set_busy_polling`); the recv future dropped inside `select!` mid-spin or mid-sleep (flag left set only until the next recv clears it, as for the existing busy-poll path); the cooperative budget (unchanged wrapper).
+
+### Failure Modes (Item US1-B)
+
+The spin holds the drain's worker for up to the budget: measured CPU on the x86 dev container, adaptive, 20,000 frames per shape: steady 400 µs gaps 0.0%, exponential mean 400 µs 1.5-1.6%, mean 100 µs 19.4-19.5%, bursts of mean 20 µs 87-88% (the drain stays awake through the burst). Before adaptive the same plain spin cost 12% at steady 400 µs gaps and caught almost nothing. Off-hours: one spin, then disarmed.
+
+### Test Plan (Item US1-B)
+
+Unit and property tests listed above (`cargo test -p tickvault-core --lib websocket::frame_ring`, `-p tickvault-common`, `-p tickvault-app --lib frame_ring_spin`); `#[ignore]`d harness `ring_wake_with_and_without_spin` (four gap shapes, spin 0 and 50 µs).
+
+### Rollback (Item US1-B)
+
+Set `frame_drain_spin_us = 0` (config only, next restart), or revert the commit. No storage, table or format change.
+
+### Observability (Item US1-B)
+
+`tv_frame_ring_spin_hits_total`, `tv_frame_ring_spin_misses_total`, `tv_frame_ring_spin_nanos_total` (local `/metrics` only, published on the drain's every-1,024-frames report; no alarm, filter or EMF name). Effect read on the existing `receipt_to_fold` and `ring_dwell` stages in `hot_path_latency_minute`.
+
+### Per-Item Guarantee Matrix (Item US1-B)
+
+See `per-wave-guarantee-matrix.md`; no new tick-drop path (every frame still reaches the drain, pinned by the never-strands proptest), no allocation on the recv path.
