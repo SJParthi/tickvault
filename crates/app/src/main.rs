@@ -3864,6 +3864,7 @@ async fn async_main() -> Result<()> {
             // Frame-silence fast paths (scope lock 2026-10-10): shadow by default.
             frame_silence_fast_path: config.dhan_universe.frame_silence_fast_path,
             ltt_utc_autocorrect: config.dhan_feed.ltt_utc_autocorrect, // scope lock 2026-11-20
+            frame_drain_spin_us: config.dhan_feed.frame_drain_spin_us, // US1-B
             dhan_enabled: config.feeds.dhan_enabled,
             instance_lock_held: std::sync::Arc::clone(&dhan_instance_lock_held),
             // Frames a previous session captured but died before folding. The
