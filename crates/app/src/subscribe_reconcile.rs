@@ -5120,7 +5120,18 @@ mod slot_cell_tests {
                 book.record_subscribed_at(&s.a, &[si(1), si(2), si(3)], t0);
                 (t0 + delta(), ())
             },
-            |book, s, ()| book.forget_on(&s.a, &[si(3)]),
+            |book, s, ()| {
+                let before = book.lock().epoch;
+                book.forget_on(&s.a, &[si(3)]);
+                assert_ne!(book.lock().epoch, before, "the forget moved the epoch");
+                assert!(
+                    !book
+                        .lock()
+                        .expected
+                        .contains_key(&(3, ExchangeSegment::NseFno)),
+                    "si(3) was forgotten"
+                );
+            },
         );
     }
 
@@ -5158,7 +5169,17 @@ mod slot_cell_tests {
                 book.record_subscribed_at(&s.a, &[si(1), si(2)], t0);
                 (t0 + delta(), t0)
             },
-            |book, s, t0| book.record_subscribed_at(&s.a, &[si(9)], t0),
+            |book, s, t0| {
+                let before = book.lock().epoch;
+                book.record_subscribed_at(&s.a, &[si(9)], t0);
+                assert_ne!(book.lock().epoch, before, "the insert moved the epoch");
+                assert!(
+                    book.lock()
+                        .expected
+                        .contains_key(&(9, ExchangeSegment::NseFno)),
+                    "si(9) was inserted"
+                );
+            },
         );
     }
 
@@ -5171,7 +5192,15 @@ mod slot_cell_tests {
                 book.record_subscribed_at(&s.a, &[si(1), si(2)], t0);
                 (t0 + delta(), t0 + delta())
             },
-            |book, _, at| drop(book.sweep_at(at)),
+            |book, _, at| {
+                let before = book.lock().epoch;
+                drop(book.sweep_at(at));
+                assert_ne!(
+                    book.lock().epoch,
+                    before,
+                    "the one-go sweep moved the epoch"
+                );
+            },
         );
     }
 
