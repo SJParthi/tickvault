@@ -242,7 +242,23 @@ impl SealDiskFloor {
     /// that exists nowhere else, so one failed free-space probe must never be able to
     /// start discarding candles. Depth can afford the opposite default
     /// because a depth row is a record, not a decision input.
+    /// [`Self::has_room`] for a group of `seals` records written together
+    /// (plan item US1-C): a write made with no free-space answer is counted
+    /// once per seal it carries, as the per-seal path counted it. O(1).
+    pub(crate) fn has_room_for_seals(
+        &self,
+        payload_len: u64,
+        seals: u64,
+        now_unix_secs: i64,
+    ) -> bool {
+        self.has_room_counting(payload_len, seals, now_unix_secs)
+    }
+
     pub(crate) fn has_room(&self, payload_len: u64, now_unix_secs: i64) -> bool {
+        self.has_room_counting(payload_len, 1, now_unix_secs)
+    }
+
+    fn has_room_counting(&self, payload_len: u64, seals: u64, now_unix_secs: i64) -> bool {
         let free = self.free_bytes_throttled(now_unix_secs);
         match classify_spill_floor(
             free,
@@ -257,7 +273,8 @@ impl SealDiskFloor {
                 // A literal label value (2026-10-30 O(1) sweep): the `SEAL_BLIND_PROBE_TIER`
                 // const took the macro's allocating label arm on every call.
                 // Pinned equal to the const by a test.
-                metrics::counter!("tv_spill_free_probe_blind_total", "tier" => "seal").increment(1);
+                metrics::counter!("tv_spill_free_probe_blind_total", "tier" => "seal")
+                    .increment(seals);
                 true
             }
             SpillFloorVerdict::RefuseNoRoom | SpillFloorVerdict::RefuseProbeFailed => false,
@@ -351,11 +368,14 @@ impl SealDiskFloor {
 }
 
 /// Most seals one batch rescue writes in a single spill `write(2)` (plan item
-/// US1-C, 2026-11-24). Equal to main.rs `SEAL_MAX_DRAIN_PER_CYCLE`, the most a
-/// live flush can hand over at once, so a failed live cycle is always one
-/// batch; the shutdown ring rescue ([`crate::seal_writer_task::rescue_ring`])
-/// is cut into chunks of this size. 16,384 × 128 B = 2 MiB of record bytes.
-pub const RESCUE_BATCH_MAX_SEALS: usize = 16_384;
+/// US1-C, 2026-11-24): 512 × 128 B = 64 KiB per write. Small enough that the
+/// spill lock, which the frame drain's inline fallback also takes, is held for
+/// about 0.2 ms per group (review finding: a 16,384-seal write held it for
+/// milliseconds); large enough that the per-seal cost is near its floor
+/// (`us1c_rescue_cost_per_seal`). The shutdown ring rescue
+/// ([`crate::seal_writer_task::rescue_ring`]) pops the ring in groups of this
+/// size too.
+pub const RESCUE_BATCH_MAX_SEALS: usize = 512;
 
 /// The per-seal results of one [`SealAbsorptionPipeline::rescue_in_flight_batch`]
 /// call, in the same four classes [`SubmitOutcome`] reports one by one.
@@ -381,6 +401,8 @@ struct RescueScratch {
     bytes: Vec<u8>,
     /// Seals popped from the ring at shutdown, one chunk at a time.
     popped: Vec<BufferedSeal>,
+    /// The bars of the current group, to find a bar written twice.
+    bars: std::collections::HashSet<(u64, u8, usize, usize, u32)>,
 }
 
 /// Edge latch for one failing escalation tier (2026-10-30 O(1) sweep).
@@ -480,6 +502,10 @@ impl SealAbsorptionPipeline {
             rescue_scratch: RescueScratch::default(),
         };
         pipeline.prefault_ring();
+        // Plan item US1-C: map the spill ledger table now, so the first rescue
+        // of an outage pays no page fault per bar. Here, not in
+        // `SealSpillWriter::new`, which path-lookup helpers also call.
+        pipeline.spill.prefault_ledger();
         pipeline
     }
 
@@ -586,66 +612,83 @@ impl SealAbsorptionPipeline {
         self.escalate_evicted(seal, now_unix_secs)
     }
 
-    /// [`Self::rescue_in_flight`] for a whole run of seals with ONE spill
-    /// `write(2)` (plan item US1-C, 2026-11-24). Drains `seals`, keeping its
-    /// capacity; at most [`RESCUE_BATCH_MAX_SEALS`] per call is the intended
-    /// size (a longer run is still written, in one larger write).
+    /// [`Self::rescue_in_flight`] for a run of seals, one spill `write(2)` per
+    /// group of at most [`RESCUE_BATCH_MAX_SEALS`] (plan item US1-C,
+    /// 2026-11-24). Drains `seals`, keeping its capacity.
     ///
-    /// Same tiers, same records, same `Ok` contract as the per-seal path:
-    /// when it returns, every seal counted `spilled` is in the page cache.
-    /// - The disk floor is checked ONCE for the whole run. If the run does not
-    ///   fit above the floor, every seal takes the per-seal path instead, so
-    ///   behaviour near the floor is exactly the old one.
-    /// - The spill's batch append applies the same ledger rule per seal (a
-    ///   copy older than one the spill or the database holds is not written
-    ///   and counts as kept), files the run under the IST day of
-    ///   `now_unix_secs`, and on a failed write keeps the whole leading
-    ///   records that landed and cuts any torn tail.
-    /// - Seals after the kept ones go to the DLQ one record each; one the DLQ
-    ///   also refuses is `dropped`.
+    /// Same tiers, same records, same counts, same `Ok` contract as the
+    /// per-seal path: when it returns, every seal counted `spilled` is in the
+    /// page cache. Per group:
+    /// - A group of one seal, a group holding two copies of the same bar, and
+    ///   a group that does not fit above the disk floor take the per-seal path
+    ///   unchanged. Two copies of a bar in one write would both be judged
+    ///   against the ledger as it stood before the write, so an emptier copy
+    ///   after a fuller one would be written where the per-seal path skipped
+    ///   it, and the mid-session replay can end on the LAST copy it reads
+    ///   (review finding, 2026-11-24). So the batch only ever writes groups
+    ///   whose bars are distinct, and writes exactly the records the per-seal
+    ///   path writes.
+    /// - Otherwise one floor check for the group, then
+    ///   [`SealSpillWriter::append_seals`]: the same ledger rule per seal,
+    ///   the group filed under the IST day of `now_unix_secs`, and on a failed
+    ///   write the whole leading records that landed are kept and a torn tail
+    ///   is cut.
+    /// - A seal after the kept ones whose bar the spill already holds a fuller
+    ///   copy of is counted `spilled` with no write, as the per-seal path
+    ///   reports it. Every other one goes to the DLQ, one record each; one the
+    ///   DLQ also refuses is `dropped`.
     ///
-    /// Two differences from calling [`Self::rescue_in_flight`] per seal.
-    /// First, the spill judges the whole run against what it held BEFORE the
-    /// run, so when one run holds a fuller copy of a bar and then an emptier
-    /// copy of the same bar, both are written (the per-seal path skipped the
-    /// emptier one). Every reader keeps the fullest copy per bar whatever the
-    /// order (Z6), so the database ends on the same rows; the spill file can
-    /// hold one extra, older record. Second, after
-    /// a failed spill write, the per-seal path retried the spill for the next
-    /// seal (a reopen per seal); here the rest of the run goes straight to
-    /// the DLQ, the choice the escalation thread made in deep audit DA-14 so a
-    /// failing disk is not paid once per seal. Every seal is still accounted.
+    /// One difference from the per-seal path: after a failed group write the
+    /// rest of THAT group goes to the DLQ instead of retrying the spill once
+    /// per seal (deep audit DA-14's choice for the escalation thread); the
+    /// next group tries the spill again. Every seal is still accounted.
+    ///
+    /// The group size bounds how long the spill lock is held: the frame
+    /// drain's inline fallback takes the same lock, and a 16,384-seal write
+    /// would hold it for milliseconds. 512 seals measured about 0.2 ms.
     ///
     /// # Complexity
-    /// O(seals) to convert and copy (128 bytes each), one floor check, one
-    /// `write(2)` when the spill takes the run, plus one DLQ append per seal
-    /// it does not keep. Cold path: runs only after a candle flush failed, or
-    /// at shutdown. No allocation once the scratch buffers hold one run.
+    /// O(seals): per seal one conversion, one 128-byte copy and one set
+    /// insert; one floor check and one `write(2)` per group; one DLQ append
+    /// per seal the spill does not keep. Cold path: runs only after a candle
+    /// flush failed, or at shutdown. No allocation once the scratch buffers
+    /// hold one group.
     pub fn rescue_in_flight_batch(
         &mut self,
         seals: &mut Vec<BufferedSeal>,
         now_unix_secs: i64,
     ) -> RescueBatchOutcome {
         let mut outcome = RescueBatchOutcome::default();
-        if seals.is_empty() {
-            return outcome;
+        for group in seals.chunks(RESCUE_BATCH_MAX_SEALS) {
+            self.rescue_group(group, now_unix_secs, &mut outcome);
         }
-        if seals.len() == 1 {
-            // One seal: the per-seal path is cheaper (no batch `fstat`), and
-            // its result is the same by definition. Measured 1.3-1.4 µs
-            // against 1.9-2.1 µs through the batch (`us1c_rescue_cost_per_seal`).
-            for seal in seals.drain(..) {
-                Self::tally(&mut outcome, &self.escalate_evicted(seal, now_unix_secs));
+        seals.clear();
+        outcome
+    }
+
+    /// One group of [`Self::rescue_in_flight_batch`].
+    fn rescue_group(
+        &mut self,
+        group: &[BufferedSeal],
+        now_unix_secs: i64,
+        outcome: &mut RescueBatchOutcome,
+    ) {
+        if group.len() < 2 || self.group_repeats_a_bar(group) {
+            for seal in group {
+                Self::tally(outcome, &self.escalate_evicted(*seal, now_unix_secs));
             }
-            return outcome;
+            return;
         }
-        let run_bytes = (seals.len() as u64).saturating_mul(SEAL_SPILL_RECORD_SIZE as u64);
-        if !self.has_room_to_escalate(run_bytes, now_unix_secs) {
+        let run_bytes = (group.len() as u64).saturating_mul(SEAL_SPILL_RECORD_SIZE as u64);
+        if !self
+            .floor
+            .has_room_for_seals(run_bytes, group.len() as u64, now_unix_secs)
+        {
             // Near the floor: the exact per-seal behaviour, seal by seal.
-            for seal in seals.drain(..) {
-                Self::tally(&mut outcome, &self.escalate_evicted(seal, now_unix_secs));
+            for seal in group {
+                Self::tally(outcome, &self.escalate_evicted(*seal, now_unix_secs));
             }
-            return outcome;
+            return;
         }
         self.floor.note_cleared();
 
@@ -653,7 +696,7 @@ impl SealAbsorptionPipeline {
         let mut serialized = std::mem::take(&mut self.rescue_scratch.serialized);
         let mut bytes = std::mem::take(&mut self.rescue_scratch.bytes);
         serialized.clear();
-        serialized.extend(seals.iter().map(SerializedSeal::from));
+        serialized.extend(group.iter().map(SerializedSeal::from));
         let kept = match self
             .spill
             .append_seals(serialized.iter(), &mut bytes, now_unix_secs)
@@ -669,10 +712,10 @@ impl SealAbsorptionPipeline {
                     );
                     self.close_dlq_episode("the spill accepted a seal, so the DLQ is not reached");
                 }
-                // One failed write, counted once: the rest of the run was not
-                // tried against the spill, so it is not counted as failing it.
+                // One failed write, counted once: the rest of the group was
+                // not tried against the spill again.
                 if self.spill_failure.open() {
-                    let (security_id, exchange_segment_code) = seals
+                    let (security_id, exchange_segment_code) = group
                         .get(kept)
                         .map_or((0, 0), |s| (s.security_id, s.exchange_segment_code));
                     warn!(
@@ -680,9 +723,9 @@ impl SealAbsorptionPipeline {
                         source = "seal_spill_failed",
                         security_id,
                         exchange_segment_code,
-                        run = serialized.len(),
+                        group = serialized.len(),
                         kept,
-                        "tier-2 spill batch failed — escalating the rest of the run to the \
+                        "tier-2 spill batch failed — escalating the rest of the group to the \
                          tier-3 DLQ; later spill failures of this episode are counted, not \
                          logged, until the spill accepts a seal or a nonempty live candle \
                          flush is accepted over HTTP"
@@ -691,7 +734,7 @@ impl SealAbsorptionPipeline {
                 kept
             }
         };
-        outcome.spilled = kept;
+        outcome.spilled += kept;
         if kept == serialized.len() {
             self.close_spill_episode(
                 "the spill accepted a seal (written, or already held in a fuller copy)",
@@ -699,6 +742,13 @@ impl SealAbsorptionPipeline {
             self.close_dlq_episode("the spill accepted a seal, so the DLQ is not reached");
         }
         for (index, record) in serialized.iter().enumerate().skip(kept) {
+            // A copy older than one the spill or the database already holds
+            // needs no write: the per-seal path reports it `Spilled` before
+            // any I/O, so it must never reach the DLQ or count as dropped.
+            if self.spill.holds_a_fuller_copy(record) {
+                outcome.spilled += 1;
+                continue;
+            }
             let dlq_record = SealDlqRecord::from(record);
             match self.dlq.append_record(&dlq_record, now_unix_secs) {
                 Ok(()) => {
@@ -709,7 +759,7 @@ impl SealAbsorptionPipeline {
                 }
                 Err(dlq_err) => {
                     if self.dlq_failure.open() {
-                        let seal = &seals[index];
+                        let seal = &group[index];
                         warn!(
                             ?dlq_err,
                             source = "seal_dlq_failed",
@@ -728,10 +778,24 @@ impl SealAbsorptionPipeline {
         bytes.clear();
         self.rescue_scratch.serialized = serialized;
         self.rescue_scratch.bytes = bytes;
-        seals.clear();
-        outcome
     }
 
+    /// `true` when two seals of `group` are copies of the same bar (same
+    /// instrument, segment, feed, timeframe and bucket). O(group), one set
+    /// insert per seal into a set reused across calls.
+    fn group_repeats_a_bar(&mut self, group: &[BufferedSeal]) -> bool {
+        let seen = &mut self.rescue_scratch.bars;
+        seen.clear();
+        group.iter().any(|seal| {
+            !seen.insert((
+                seal.security_id,
+                seal.exchange_segment_code,
+                seal.feed.index(),
+                seal.tf.as_ordinal(),
+                seal.state.bucket_start_ist_secs,
+            ))
+        })
+    }
     /// Adds one per-seal result to a batch tally.
     fn tally(outcome: &mut RescueBatchOutcome, result: &SubmitOutcome) {
         match result {
@@ -809,7 +873,7 @@ impl SealAbsorptionPipeline {
                 failed,
                 ended_by,
                 "sealed-candle spill failure episode ended; spill writes that failed in \
-                 the episode: failed (each was sent on to the DLQ; see the DLQ episode \
+                 the episode: failed (the seals of each were sent on to the DLQ; see the DLQ episode \
                  line and the dropped count for any that did not land)"
             );
         }
@@ -1070,6 +1134,26 @@ mod tests {
         assert!(
             body.contains("pipeline.prefault_ring();"),
             "new() no longer prefaults the ring"
+        );
+    }
+
+    /// Plan item US1-C (review finding): the spill ledger is mapped by the
+    /// production PIPELINE constructor only, never by `SealSpillWriter::new`,
+    /// which path-lookup helpers call every few seconds.
+    #[test]
+    fn test_us1c_ledger_prefault_lives_in_the_pipeline_constructor_only() {
+        let src = include_str!("seal_absorption.rs");
+        let start = src.find("    pub fn new() -> Self {").expect("new()");
+        let end = start + src[start..].find("\n    }\n").expect("end of new()");
+        assert!(src[start..end].contains("pipeline.spill.prefault_ledger();"));
+        let spill = include_str!("seal_spill.rs");
+        let start = spill
+            .find("    pub fn new() -> Self {")
+            .expect("SealSpillWriter::new()");
+        let end = start + spill[start..].find("\n    }\n").expect("end of new()");
+        assert!(
+            !spill[start..end].contains("prefault"),
+            "SealSpillWriter::new must not prefault: path helpers build writers"
         );
     }
 
@@ -2312,6 +2396,26 @@ mod tests {
         cleanup(&spill, &dlq);
     }
 
+    /// Plan item US1-C: a group fits above the floor only if all of it does;
+    /// a free-space answer at exactly floor + group passes, one byte less
+    /// refuses.
+    #[test]
+    fn test_has_room_for_seals_needs_room_for_the_whole_group() {
+        fn exact(_: &Path) -> Option<u64> {
+            Some(SEAL_ESCALATION_MIN_FREE_BYTES + 512 * SEAL_SPILL_RECORD_SIZE as u64)
+        }
+        let (spill, dlq) = temp_pair("floor-group");
+        let mut floor = SealDiskFloor::new(spill.clone());
+        floor.set_free_probe_for_test(exact);
+        let group = 512 * SEAL_SPILL_RECORD_SIZE as u64;
+        assert!(floor.has_room_for_seals(group, 512, 5_000));
+        assert!(!floor.has_room_for_seals(group + 1, 512, 5_000));
+        floor.set_free_probe_for_test(|_| None);
+        // A blind probe lets the group through (fail open), as one seal.
+        assert!(floor.has_room_for_seals(group, 512, 5_000 + SEAL_DISK_PROBE_INTERVAL_SECS));
+        cleanup(&spill, &dlq);
+    }
+
     /// Audit PR L, L2: the floor as its own type opens an episode on the
     /// first refusal and closes it on the next pass, and caches its probe.
     #[test]
@@ -2391,32 +2495,6 @@ mod tests {
             .collect()
     }
 
-    /// The fullest copy of each bar, as every reader resolves it (Z6).
-    fn us1c_fullest(
-        records: &[[u8; SEAL_SPILL_RECORD_SIZE]],
-    ) -> std::collections::BTreeMap<(u64, u8, u8, u32), (u32, u64, [u8; SEAL_SPILL_RECORD_SIZE])>
-    {
-        let mut best = std::collections::BTreeMap::new();
-        for bytes in records {
-            let crate::seal_spill::SpillRecordRead::Seal(s) =
-                crate::seal_spill::decode_spill_record(bytes)
-            else {
-                panic!("a record this test wrote must decode");
-            };
-            let key = (
-                s.security_id,
-                s.exchange_segment_code,
-                s.tf_ordinal,
-                s.bucket_start_ist_secs,
-            );
-            let entry = best.entry(key).or_insert((s.tick_count, s.volume, *bytes));
-            if (s.tick_count, s.volume) > (entry.0, entry.1) {
-                *entry = (s.tick_count, s.volume, *bytes);
-            }
-        }
-        best
-    }
-
     fn us1c_per_seal(
         p: &SealAbsorptionPipeline,
         seals: &[BufferedSeal],
@@ -2432,14 +2510,9 @@ mod tests {
     proptest::proptest! {
         #![proptest_config(proptest::prelude::ProptestConfig::with_cases(64))]
         /// On a healthy disk the batch gives the same per-seal results as one
-        /// rescue per seal, writes every record the per-seal path writes, in
-        /// the same order, and the fullest copy of every bar on disk is the
-        /// same. The one allowed difference: when ONE batch holds a fuller copy
-        /// of a bar followed by an emptier one, the batch writes both (the
-        /// spill batch path judges the run against what was on disk before
-        /// it), where the per-seal path skipped the emptier one. Every reader
-        /// keeps the fullest copy per bar whatever the order (Z6), so the
-        /// database ends on the same rows.
+        /// rescue per seal and writes exactly the same records in the same
+        /// order, repeated bars and superseded copies included (a group that
+        /// repeats a bar takes the per-seal path).
         #[test]
         fn test_us1c_batch_rescue_writes_the_same_bytes_and_outcomes_as_per_seal(
             raw in proptest::collection::vec((1u64..4, 0u32..3, 1u32..9, 90.0f64..110.0), 1..40)
@@ -2462,15 +2535,11 @@ mod tests {
 
             proptest::prop_assert_eq!(got, expected);
             proptest::prop_assert!(batch.is_empty(), "the batch is drained");
-            let per_seal = us1c_bytes(&spill_a, now);
-            let batched = us1c_bytes(&spill_b, now);
-            // Every per-seal record is in the batch, in the same order.
-            let mut cursor = batched.iter();
-            for record in &per_seal {
-                proptest::prop_assert!(cursor.any(|r| r == record), "a per-seal record is missing or out of order");
-            }
-            proptest::prop_assert_eq!(us1c_fullest(&batched), us1c_fullest(&per_seal));
-            proptest::prop_assert!(b.spill_handle().disk_writes_for_test() <= 1, "one write at most");
+            proptest::prop_assert_eq!(us1c_bytes(&spill_b, now), us1c_bytes(&spill_a, now));
+            proptest::prop_assert!(
+                b.spill_handle().disk_writes_for_test() <= a.spill_handle().disk_writes_for_test(),
+                "never more writes than the per-seal path"
+            );
             cleanup(&spill_a, &dlq_a);
             cleanup(&spill_b, &dlq_b);
         }
@@ -2571,7 +2640,7 @@ mod tests {
 
     /// An empty run writes nothing and touches no episode.
     #[test]
-    fn test_us1c_batch_rescue_of_nothing_is_a_no_op() {
+    fn test_rescue_in_flight_batch_of_nothing_is_a_no_op() {
         let (spill, dlq) = temp_pair("us1c-empty");
         let mut p = SealAbsorptionPipeline::with_dirs_for_test(spill.clone(), dlq.clone());
         let mut none: Vec<BufferedSeal> = Vec::new();
@@ -2583,14 +2652,146 @@ mod tests {
         cleanup(&spill, &dlq);
     }
 
+    /// A group holding two copies of one bar takes the per-seal path: the
+    /// fuller copy is written, the emptier one after it is not (review
+    /// finding: one batch write would have written both, and the mid-session
+    /// replay can end on the last copy it reads).
+    #[test]
+    fn test_us1c_a_group_repeating_a_bar_writes_only_the_fuller_copy() {
+        let (spill, dlq) = temp_pair("us1c-repeat");
+        let now = jan1_noon_utc();
+        let mut p = SealAbsorptionPipeline::with_dirs_for_test(spill.clone(), dlq.clone());
+        p.set_free_probe_for_test(|_| Some(HIGH_FREE));
+        let fuller = us1c_seal(7, 1_716_023_700, 6, 101.0);
+        let other = us1c_seal(8, 1_716_023_700, 3, 99.0);
+        let emptier = us1c_seal(7, 1_716_023_700, 1, 100.0);
+        let mut group = vec![fuller, other, emptier];
+        let got = p.rescue_in_flight_batch(&mut group, now);
+        assert_eq!(
+            got.spilled, 3,
+            "the emptier copy is kept by the fuller one, as before"
+        );
+        let on_disk: Vec<(u64, u32)> = SealSpillWriter::with_spill_dir_for_test(spill.clone())
+            .read_all(now)
+            .expect("read spill")
+            .iter()
+            .map(|s| (s.security_id, s.tick_count))
+            .collect();
+        assert_eq!(
+            on_disk,
+            vec![(7, 6), (8, 3)],
+            "the emptier copy is not written"
+        );
+        assert_eq!(
+            p.spill_handle().disk_writes_for_test(),
+            2,
+            "the per-seal path ran"
+        );
+        cleanup(&spill, &dlq);
+    }
+
+    /// After a failed group write, a seal whose fuller copy is already on
+    /// disk counts `spilled` with no write (the per-seal path reports it so),
+    /// never DLQ or dropped; the seal that did need writing goes to the DLQ.
+    #[test]
+    fn test_us1c_a_superseded_seal_after_a_failed_write_counts_spilled() {
+        let (spill, dlq) = temp_pair("us1c-superseded-after-fail");
+        let now = jan1_noon_utc();
+        let mut p = SealAbsorptionPipeline::with_dirs_for_test(spill.clone(), dlq.clone());
+        p.set_free_probe_for_test(|_| Some(HIGH_FREE));
+        assert_eq!(
+            p.rescue_in_flight(us1c_seal(7, 1_716_023_700, 6, 101.0), now),
+            SubmitOutcome::Spilled
+        );
+        p.spill_handle().fail_batch_writes_after_for_test(0);
+        let mut group = vec![
+            us1c_seal(9, 1_716_023_700, 2, 98.0),
+            us1c_seal(7, 1_716_023_700, 1, 100.0),
+        ];
+        let got = p.rescue_in_flight_batch(&mut group, now);
+        assert_eq!(
+            got,
+            RescueBatchOutcome {
+                spilled: 1,
+                dlq_written: 1,
+                dropped: 0,
+                dropped_below_floor: 0
+            }
+        );
+        let dead: Vec<u64> = SealDlqWriter::with_dlq_dir_for_test(dlq.clone())
+            .read_all(now)
+            .expect("read dlq")
+            .iter()
+            .map(|r| r.security_id)
+            .collect();
+        assert_eq!(dead, vec![9], "only the seal that needed a write");
+        cleanup(&spill, &dlq);
+    }
+
+    /// The spill write fails and the DLQ refuses too: every seal of the group
+    /// is `dropped` (the caller pages AGGREGATOR-DROP-01), each DLQ failure is
+    /// counted on the DLQ episode, and the spill episode counts one write.
+    #[test]
+    fn test_us1c_dlq_failing_after_a_failed_spill_write_counts_every_seal_dropped() {
+        let (spill, dlq) = temp_pair("us1c-dlq-fails");
+        // The DLQ folder is a plain file, so every DLQ append fails.
+        std::fs::remove_dir_all(&dlq).expect("remove dlq dir");
+        std::fs::write(&dlq, b"not a folder").expect("block dlq");
+        let now = jan1_noon_utc();
+        let mut p = SealAbsorptionPipeline::with_dirs_for_test(spill.clone(), dlq.clone());
+        p.set_free_probe_for_test(|_| Some(HIGH_FREE));
+        p.spill_handle().fail_batch_writes_after_for_test(0);
+        let mut group: Vec<BufferedSeal> = (0..3)
+            .map(|i| us1c_seal(400 + i, 1_716_023_700, 4, 100.0))
+            .collect();
+        let got = p.rescue_in_flight_batch(&mut group, now);
+        assert_eq!(
+            got,
+            RescueBatchOutcome {
+                spilled: 0,
+                dlq_written: 0,
+                dropped: 3,
+                dropped_below_floor: 0
+            }
+        );
+        assert_eq!(p.spill_failure.failed_in_episode.load(Ordering::Relaxed), 1);
+        assert_eq!(p.dlq_failure.failed_in_episode.load(Ordering::Relaxed), 3);
+        let _ = std::fs::remove_file(&dlq);
+        cleanup(&spill, &dlq);
+    }
+
+    /// A run longer than one group is written one group at a time, and a
+    /// failed group does not stop the next group from trying the spill.
+    #[test]
+    fn test_us1c_a_long_run_is_written_in_groups() {
+        let (spill, dlq) = temp_pair("us1c-groups");
+        let now = jan1_noon_utc();
+        let mut p = SealAbsorptionPipeline::with_dirs_for_test(spill.clone(), dlq.clone());
+        p.set_free_probe_for_test(|_| Some(HIGH_FREE));
+        let total = 2 * RESCUE_BATCH_MAX_SEALS + 7;
+        let mut run: Vec<BufferedSeal> = (0..total)
+            .map(|i| us1c_seal(1 + i as u64, 1_716_023_700, 4, 100.0))
+            .collect();
+        let got = p.rescue_in_flight_batch(&mut run, now);
+        assert_eq!(got.spilled, total);
+        assert_eq!(p.spill_handle().disk_writes_for_test(), 3);
+        assert!(
+            run.is_empty() && run.capacity() >= total,
+            "drained, capacity kept"
+        );
+        cleanup(&spill, &dlq);
+    }
+
     /// As in production: the ledger table mapped at boot (`SealSpillWriter::new`)
     /// and the day file already open from an earlier spill of the outage.
-    fn us1c_warm(p: &SealAbsorptionPipeline, now: i64) {
+    /// The batch rescue's reused buffers are sized by one earlier group, as
+    /// in a running process (production keeps one pipeline for its life).
+    fn us1c_warm(p: &mut SealAbsorptionPipeline, now: i64) {
         p.spill_handle().prefault_ledger();
-        let opener = SerializedSeal::from(&us1c_seal(9_999_999, 1_000_000_000, 1, 1.0));
-        p.spill_handle()
-            .append_seal(&opener, now)
-            .expect("open the day file");
+        let mut warm: Vec<BufferedSeal> = (0..RESCUE_BATCH_MAX_SEALS)
+            .map(|i| us1c_seal(9_000_000 + i as u64, 1_000_000_000, 1, 1.0))
+            .collect();
+        let _ = p.rescue_in_flight_batch(&mut warm, now);
     }
 
     /// Wall-clock harness, `#[ignore]`d so a timing never becomes a flaky CI
@@ -2621,7 +2822,7 @@ mod tests {
                 let mut a =
                     SealAbsorptionPipeline::with_dirs_for_test(spill_a.clone(), dlq_a.clone());
                 a.set_free_probe_for_test(|_| Some(HIGH_FREE));
-                us1c_warm(&a, now);
+                us1c_warm(&mut a, now);
                 let started = std::time::Instant::now();
                 let _ = us1c_per_seal(&a, &seals, now);
                 old_ns.push(started.elapsed().as_nanos() as f64 / run as f64);
@@ -2631,7 +2832,7 @@ mod tests {
                 let mut b =
                     SealAbsorptionPipeline::with_dirs_for_test(spill_b.clone(), dlq_b.clone());
                 b.set_free_probe_for_test(|_| Some(HIGH_FREE));
-                us1c_warm(&b, now);
+                us1c_warm(&mut b, now);
                 let mut batch = seals.clone();
                 let started = std::time::Instant::now();
                 let _ = b.rescue_in_flight_batch(&mut batch, now);

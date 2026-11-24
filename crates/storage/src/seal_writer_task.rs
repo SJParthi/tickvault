@@ -6113,7 +6113,7 @@ mod tests {
     #[test]
     fn test_us1c_rescue_ring_batches_in_bounded_chunks() {
         let (spill, dlq) = temp_pair("us1c-ring-chunks");
-        let total = RESCUE_BATCH_MAX_SEALS + 5;
+        let total = 2 * RESCUE_BATCH_MAX_SEALS + 5;
         let mut pipeline = SealAbsorptionPipeline::with_capacity_and_dirs_for_test(
             total + 10,
             spill.clone(),
@@ -6133,8 +6133,8 @@ mod tests {
         assert_eq!(pipeline.ring_len(), 0);
         assert_eq!(
             pipeline.spill_handle().disk_writes_for_test(),
-            2,
-            "one full chunk, then the 5 left over"
+            3,
+            "two full groups, then the 5 left over"
         );
         let ids: Vec<u64> = pipeline
             .spill_handle()
