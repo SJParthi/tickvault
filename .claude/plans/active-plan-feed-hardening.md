@@ -8207,7 +8207,7 @@ Resolved source checkpoint: 535 locked packages became 537, with only the reques
 
 Owner, 2026-11-24: "go ahead and fix the 4 steps over 1 µs dude" / "fix and resoleve evryhtign entirley dude okay?". Of the four, the candle row write is already under 1 µs in production (`config/production.toml` `own_ilp_encoder = true`, p99 780–825 ns); the socket wake waits on a live measurement (no read access to the metrics log group from this session); two items below change code.
 
-- [ ] US1-C Batch the seal rescue writes (crates/storage)
+- [x] US1-C Batch the seal rescue writes (crates/storage)
   - Files: crates/storage/src/seal_absorption.rs, crates/storage/src/seal_writer_task.rs
   - Tests: test_us1c_batch_rescue_writes_the_same_bytes_and_outcomes_as_per_seal, test_us1c_batch_rescue_partial_write_keeps_landed_records_and_dead_letters_the_rest, test_us1c_batch_rescue_below_floor_falls_back_to_per_seal, test_us1c_flush_failure_rescue_makes_one_disk_write, test_us1c_rescue_ring_batches_in_bounded_chunks
 - [x] US1-A REJECTED on measurement, nothing shipped. Prototype (`warm_slot_for`, next tick's slot warmed before folding the current one), cold run, 12 tables x 25,000 slots, 200,000 ticks, interleaved blocks, x86 dev container: plain p50 507-558 ns / p99 825-901 ns / p99.9 1.1-1.3 us; look-ahead p50 591-604 / p99 996-1,010 / p99.9 2.6-5.2 us. Slower, so reverted. The plain fold already measures under 1 us at p99 on this code (the 1.5-1.7 us figure was 2026-11-06).
