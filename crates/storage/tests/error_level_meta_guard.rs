@@ -433,6 +433,14 @@ const REVIEWED_WARN_SITES: &[(&str, &str, &str)] = &[
         "tier-2 spill failed",
         "escalates to the tier-3 dead-letter queue; if that fails too the caller fires AGGREGATOR-DROP-01",
     ),
+    // Plan item US1-C (2026-11-24): the batch rescue's twin of the line
+    // above. Same outcome: the rest of the group goes to the DLQ, and a seal
+    // the DLQ also refuses is counted dropped and paged by the caller.
+    (
+        "crates/storage/src/seal_absorption.rs",
+        "tier-2 spill batch failed",
+        "escalates the rest of the group to the tier-3 dead-letter queue; if that fails too the caller fires AGGREGATOR-DROP-01",
+    ),
 ];
 
 #[test]
