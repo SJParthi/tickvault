@@ -2396,6 +2396,46 @@ mod tests {
         cleanup(&spill, &dlq);
     }
 
+    /// Plan item US1-C: the shutdown chunk buffer is handed out empty and
+    /// taken back emptied, keeping its capacity for the next rescue.
+    #[test]
+    fn test_take_rescue_chunk_and_return_rescue_chunk_keep_the_capacity() {
+        let (spill, dlq) = temp_pair("rescue-chunk");
+        let mut p = SealAbsorptionPipeline::with_dirs_for_test(spill.clone(), dlq.clone());
+        let mut chunk = p.take_rescue_chunk();
+        assert!(chunk.is_empty());
+        chunk.push(us1c_seal(1, 1_716_023_700, 1, 100.0));
+        chunk.reserve(64);
+        let capacity = chunk.capacity();
+        p.return_rescue_chunk(chunk);
+        let again = p.take_rescue_chunk();
+        assert!(again.is_empty(), "returned emptied");
+        assert_eq!(again.capacity(), capacity, "capacity kept");
+        cleanup(&spill, &dlq);
+    }
+
+    /// Plan item US1-C: `prefault_ledger` touches the whole ledger table and
+    /// leaves the writer as a fresh one (a later bar is still written).
+    #[test]
+    fn test_prefault_ledger_touches_the_table_and_changes_no_answer() {
+        let (spill, dlq) = temp_pair("prefault-ledger");
+        let p = SealAbsorptionPipeline::with_dirs_for_test(spill.clone(), dlq.clone());
+        assert!(
+            p.spill_handle().prefault_ledger() >= crate::seal_spill::SEAL_SPILL_LEDGER_CAPACITY
+        );
+        let seal = SerializedSeal::from(&us1c_seal(5, 1_716_023_700, 3, 100.0));
+        assert!(!p.spill_handle().holds_a_fuller_copy(&seal));
+        p.spill_handle()
+            .append_seal(&seal, jan1_noon_utc())
+            .expect("write");
+        assert_eq!(
+            p.spill_handle().disk_writes_for_test(),
+            1,
+            "written, not skipped"
+        );
+        cleanup(&spill, &dlq);
+    }
+
     /// Plan item US1-C: a group fits above the floor only if all of it does;
     /// a free-space answer at exactly floor + group passes, one byte less
     /// refuses.
