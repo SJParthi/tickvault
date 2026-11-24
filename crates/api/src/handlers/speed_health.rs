@@ -851,8 +851,9 @@ fn conservation_result(
 
 /// How old the newest daily tick check is. Green within
 /// [`CONSERVATION_STALE_DAYS`] days, amber older (a check went missing, so the
-/// older green rows below it say nothing about the last trading days), grey
-/// when its day cannot be read. `rows` come newest first.
+/// older green rows below it say nothing about the last trading days), amber
+/// on a future trading day, and grey when its day cannot be read. `rows`
+/// come newest first.
 pub(crate) fn conservation_freshness_tile(
     columns: &[String],
     rows: &[Vec<Value>],
@@ -867,9 +868,13 @@ pub(crate) fn conservation_freshness_tile(
     match newest {
         None => Tile::new(LABEL, "unknown day", Light::Grey),
         Some(day) => {
-            let age_days = (ist_day_at(ist_now, 0) - ist_day_at(day, 0)).div_euclid(SECS_PER_DAY);
+            let age_days = ist_now.div_euclid(SECS_PER_DAY) - day.div_euclid(SECS_PER_DAY);
             let value = match age_days {
-                d if d <= 0 => "today".to_string(),
+                ..0 => {
+                    return Tile::new(LABEL, "future trading date", Light::Amber)
+                        .with_detail("check the recorded trading date and the system clock");
+                }
+                0 => "today".to_string(),
                 1 => "1 day ago".to_string(),
                 d => format!("{d} days ago"),
             };
@@ -2600,6 +2605,23 @@ garbage line without a number x
         assert_eq!(
             (four.value.as_str(), four.status),
             ("4 days ago", Light::Green)
+        );
+    }
+
+    #[test]
+    fn test_conservation_freshness_tile_flags_future_date_at_midnight() {
+        let columns = vec!["trading_date_ist".to_string()];
+        let rows = vec![vec![json_str("2026-10-31T00:00:00.000000Z")]];
+        let midnight = parse_ts_secs("2026-10-31T00:00:00.000000Z").expect("fixture timestamp");
+        let future = conservation_freshness_tile(&columns, &rows, midnight - 1);
+        assert_eq!(
+            (future.value.as_str(), future.status),
+            ("future trading date", Light::Amber)
+        );
+        let today = conservation_freshness_tile(&columns, &rows, midnight);
+        assert_eq!(
+            (today.value.as_str(), today.status),
+            ("today", Light::Green)
         );
     }
 

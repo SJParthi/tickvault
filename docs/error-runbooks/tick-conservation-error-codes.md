@@ -73,6 +73,12 @@ only pre-v3 records), or for a gap of 5 s or less. A failed write is a coded
 
 ## Honest limits
 
+The daily task makes one final attempt to write the audit row. If the append
+or flush fails, it logs `STORAGE-GAP-03` with stage
+`tick_conservation_audit_write` and does not queue the row for replay. After
+QuestDB recovers and its WAL catches up, look up the audit row by trading date
+and feed, then compare the stored verdict and counts with the check's log.
+
 - The not-landed total spans the life of the process and can include
   `feed_aux_packets` from a rescued batch. It cannot identify which of today's
   rows are missing. Check WAL apply and replay progress when a shortfall

@@ -83,13 +83,24 @@ use tickvault_storage::feed_scoreboard_persistence::{
 // still covers `rest_spot_1m` under `DAY_PARTITIONED_TABLES`. What is gone
 // is the last thing that READ it from this process.
 
-/// Parses the QuestDB `/exec` count response (`{"dataset":[[N]]}`). Pure.
-/// Relocated 2026-07-18 from the retired `tick_conservation_boot` module
-/// (dead-WS sweep follow-up) — this module is the sole surviving consumer.
+/// Reads the single nonnegative LONG returned by a QuestDB count query.
+/// The optional envelope `count` is the number of result rows, even when
+/// the aggregate itself is zero.
 #[must_use]
 pub fn parse_questdb_count(body: &str) -> Option<i64> {
-    let v: serde_json::Value = serde_json::from_str(body).ok()?;
-    v.get("dataset")?.get(0)?.get(0)?.as_i64()
+    let response: serde_json::Value = serde_json::from_str(body).ok()?;
+    if response.get("error").is_some()
+        || response.get("count").is_some_and(|n| n.as_u64() != Some(1))
+    {
+        return None;
+    }
+    let [row] = response.get("dataset")?.as_array()?.as_slice() else {
+        return None;
+    };
+    let [value] = row.as_array()?.as_slice() else {
+        return None;
+    };
+    value.as_i64().filter(|n| *n >= 0)
 }
 
 /// IST seconds-of-day of the DETERMINISTIC daily-row timestamp (15:45:00).
@@ -3768,14 +3779,39 @@ mod tests {
 
     #[test]
     fn test_parse_questdb_count() {
-        // Relocated 2026-07-18 with the fn from the retired
-        // tick_conservation_boot module.
         assert_eq!(
-            parse_questdb_count(r#"{"dataset":[[42]],"count":1}"#),
+            parse_questdb_count(
+                r#"{"columns":[{"name":"count","type":"LONG"}],"dataset":[[42]],"count":1}"#
+            ),
             Some(42)
         );
-        assert_eq!(parse_questdb_count(r#"{"dataset":[]}"#), None);
-        assert_eq!(parse_questdb_count("not json"), None);
+        assert_eq!(
+            parse_questdb_count(r#"{"dataset":[[0]],"count":1}"#),
+            Some(0)
+        );
+        assert_eq!(
+            parse_questdb_count(r#"{"dataset":[[9223372036854775807]]}"#),
+            Some(i64::MAX)
+        );
+        for invalid in [
+            "not json",
+            "{}",
+            r#"{"dataset":[]}"#,
+            r#"{"dataset":[[]]}"#,
+            r#"{"dataset":[[42],[0]]}"#,
+            r#"{"dataset":[[42,0]]}"#,
+            r#"{"dataset":[[null]]}"#,
+            r#"{"dataset":[[-1]]}"#,
+            r#"{"dataset":[[42.0]]}"#,
+            r#"{"dataset":[["42"]]}"#,
+            r#"{"dataset":[[9223372036854775808]]}"#,
+            r#"{"dataset":[[42]],"count":0}"#,
+            r#"{"dataset":[[42]],"count":null}"#,
+            r#"{"dataset":[[42]],"error":"unavailable"}"#,
+            r#"{"error":null,"dataset":[[42]]}"#,
+        ] {
+            assert_eq!(parse_questdb_count(invalid), None, "{invalid}");
+        }
     }
 
     const DAY: u64 = 20_644; // an arbitrary IST day number
