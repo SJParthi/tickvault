@@ -4296,9 +4296,42 @@ mod tests {
         let hex: String = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(
             hex,
-            "952e667b16bafc3522c8f57cef9dffd73a901633025c2109bdc3f1435c9121d1"
+            "938119626a2337a77b6bdc19e169e0053f86ae2cbcab92b62c2b8275b4a3befb"
         );
-        assert_eq!(CONSOLE_HTML.len(), 103_109);
+        assert_eq!(CONSOLE_HTML.len(), 103_091);
+    }
+
+    #[test]
+    fn stocks_freshness_counts_elapsed_time_across_browser_sleep() {
+        // The monotonic clock may stop during sleep. A wall-clock rollback must
+        // never make a snapshot younger, including while a refresh is pending.
+        let elapsed = CONSOLE_HTML
+            .split_once("function moversElapsed(){")
+            .and_then(|(_, body)| body.split_once('}'))
+            .expect("Stocks elapsed-time helper")
+            .0;
+        for clock in [
+            "moversElapsedHigh=Math.max(moversElapsedHigh,",
+            "(performance.now()-moversStart)/1000",
+            "(Date.now()-moversWall)/1000",
+        ] {
+            assert!(
+                elapsed.contains(clock),
+                "missing elapsed-time guard {clock}"
+            );
+        }
+        assert!(
+            CONSOLE_HTML.contains(
+                "moversStart=moversLastAttempt;moversWall=wallStart;moversElapsedHigh=0;"
+            )
+        );
+        assert!(
+            CONSOLE_HTML
+                .contains("moversObserved+2+moversElapsed()>=moversReply.valid_until_epoch_secs")
+        );
+        assert!(
+            CONSOLE_HTML.contains("moversObserved-reply.captured_at_epoch_secs)+2+moversElapsed()")
+        );
     }
 
     #[test]
