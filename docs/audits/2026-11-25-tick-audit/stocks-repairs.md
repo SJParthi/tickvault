@@ -1,0 +1,33 @@
+# Stocks and audit recovery, November 25
+
+The live Stocks page ran `9ccd99e7` during the midday check. The fixes and the five dependency upgrades are together in draft PR #2300. The dependency PR was closed after GitHub confirmed its exact head was an ancestor and its Cargo lockfile matched the one in the integration branch.
+
+[Download the narrated walkthrough, comparison table and verification records](stocks-repair-evidence.zip) · [Integration PR](https://github.com/SJParthi/tickvault/pull/2300) · [Earlier audit verification](repair-verification.md)
+
+## What the live checks showed
+
+| Check | What happened | What changed in the PR |
+| --- | --- | --- |
+| Stocks filters | A browser on the production page recorded F&O gainers and losers and Nifty 50 gainers and losers. All 65 displayed row appearances matched their membership, direction and ordering. | Filters share a published snapshot for up to two seconds within a warm Lambda. The selector ranks only the requested page after filtering. |
+| F&O denominator | At 12:43 IST, the daily artifact held 236 symbols. The 218 quoted stocks exactly matched the intersection of the official NSE derivatives lot file and listed equities. All 18 unpriced symbols followed the exchange dummy naming convention. | Both Stocks readers exclude numbered NSE test symbols after validating the daily list. Real numeric stock names remain eligible. Feed subscriptions are independent of the display list. |
+| Quote age | An isolated QuestDB replay showed that a future tick could mask a company's valid price. Fractional timestamps could also cross a display cutoff when parsed. | Both readers enforce the full time interval before selecting the latest row for each security. |
+| Index strip | The existing authenticated read action returned all five mapped reference indices with stored exchange timestamps in 1.41 s. | A refresh on the Stocks tab displays those prices and times. Expired, missing and unsupported quotes have their own states. The screenshot marked local replay shows the PR version. |
+| Traded value | All 65 displayed row appearances lacked authoritative turnover. Dhan's stored volume and average price cannot supply exact turnover. | The value column continues to show unavailable. |
+| Disk | At 12:30 IST, AWS reported 62.45% root disk utilization and 56.37 GiB free for spill files. The high-usage and low-free-space alarms both reported OK. Recent archive rows showed verified partitions followed by local retirement. | The panel uses neutral states on missing or failed reads and shows the 20 GiB and 90% boundaries. No retention setting or volume size changed. |
+| Feed | Forty five-minute samples showed five live Dhan sockets and zero reported application tick drops. Three later socket samples found 359 cumulative kernel packet drops, unchanged over those samples. Four sockets had a 1 MiB receive buffer and one had 2,036,232 bytes. | The order-update connection has a deadline for its initial login write. Neither counter identifies lost market ticks. The socket observations cover a short interval. |
+| Daily audit | Against QuestDB 9.3.5 the confirmed catalog path took 41.612 ms at p99 versus 123.225 ms with repeated DDL on this runner, 1,000 healthy calls per path. After restarting the database, all 2,064 measured and warmup receipts and their fields were present. | The writer verifies the live schema, deduplication keys and WAL progress. It retains the journal if it cannot confirm safe delivery. Thirteen real database recovery scenarios passed. |
+| Dependencies | The independent fuzz lockfile had 13 RustSec findings. After the refresh, both lockfiles passed the configured audit and all 12 fuzz binaries compiled. | Main CI and the scheduled security workflow audit both lockfiles. Private GitHub Dependabot alert counts still require access to the repository's security alerts. |
+
+The paired ranking comparison matched 19,530 full replies byte for byte. At 1,000 input rows the F&O gainers p99 fell from 804 to 676 µs on the shared runner. The out-of-range-page timing worsened from 1.50 to 13.93 ms, despite eliminating its rank comparisons. Producing multiple rows requires work proportional to the result size. The repository-wide coverage figure of 84.32% belongs to the earlier hosted audit revision. The latest CI in the PR gives the result for a later head.
+
+[NSE derivatives lot file](https://nsearchives.nseindia.com/content/fo/fo_mktlots.csv) · [NSE equity listing](https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv) · [NSE dummy-symbol circular](https://nsearchives.nseindia.com/content/circulars/CMTR67144.pdf)
+
+## Continue in Claude Code
+
+> Open SJParthi/tickvault PR #2300 and fetch its current head and main. Preserve local-only refs and worktrees. Review the combined changes, the latest exact-head CI and the attached evidence archive. Fix failing checks through the normal repository workflow. Inspect the branch dispositions before reintroducing any historical feature. After review and merge, use the project's guarded after-close deployment for both the application and operator Lambda. Read the live portal's main, binary and portal SHAs, test F&O and Nifty 50 in both directions, and compare the displayed stock denominator with that day's recorded list. Verify live disk, WAL health and paper-mode startup records. Keep Depth20, Depth200 and live orders off. Record the timestamps and distinguish deployment, local fixture evidence, kernel packet drops and confirmed tick-level loss. Preserve missing or unknown measurements as unknown.
+
+The archive contains a five-chapter narrated MP4, captions, the original browser recording, an offline comparison, exact query results and local replay evidence. The name shortlist contains 100 new suggestions. The earlier list itself was absent from the recovered files. No domain was selected or registered.
+
+The November 1 object `a9b0e89c` remains missing from the accessible Git history. PR #2187 contains the replacement Stocks page. The 2027 NSE holiday calendar still requires an official circular. The branch inventory records outstanding per-socket validation and per-segment WAL replay provenance. Live source-to-database tick identity and end-to-end sub-microsecond performance remain unproven.
+
+[Replacement Stocks PR](https://github.com/SJParthi/tickvault/pull/2187) · [NSE trading calendar](https://www.nseindia.com/resources/exchange-communication-holidays)
