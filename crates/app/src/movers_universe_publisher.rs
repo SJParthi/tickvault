@@ -713,7 +713,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn daily_mtf_master_reaches_published_stocks_and_replacement_drops_unverified_terms() {
+    async fn test_write_mtf_mapping_fixture_through_daily_publisher_preserves_dated_eligibility() {
         use figment::providers::{Format, Toml};
         use tickvault_common::operator_movers_universe::select;
         use tickvault_common::operator_movers_wire::SourceStatus;
