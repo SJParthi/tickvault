@@ -171,11 +171,12 @@ while IFS= read -r f; do
   rel="${f#"$CRITERION_DIR"/}"
   rel="${rel%/estimates.json}"
   # Full-workspace changes must be real Criterion intervals. A cold run has
-  # no change file. Scoped historical records retain the point-only fallback.
+  # no change file. Criterion reports new/old - 1, whose minimum is -1.
+  # Scoped historical records retain the point-only fallback.
   vals=$(jq -sr "$criterion_filter"'estimate |
       if env.BENCH_REQUIRE_ALL_BUDGETS == "1" then
         .mean.confidence_interval as $ci |
-        if ([.mean.point_estimate, $ci.lower_bound, $ci.upper_bound] | all(finite_number))
+        if ([.mean.point_estimate, $ci.lower_bound, $ci.upper_bound] | all(finite_number and . >= -1))
            and $ci.lower_bound <= $ci.upper_bound then .
         else error("invalid Criterion change estimate or confidence interval") end
       else . end | [ ((.mean // {}) as $m

@@ -706,10 +706,23 @@ fn a_full_workspace_gate_requires_current_measurements_for_every_budget_family()
     );
     let token = criterion.join("token_handle/load");
     let change = token.join("change/estimates.json");
+    for improvement in [-0.5, -1.0] {
+        write_bench(
+            &criterion,
+            "token_handle/load",
+            1.0,
+            improvement,
+            improvement,
+        );
+        assert!(check(true).status.success(), "valid change {improvement}");
+    }
     for invalid in [
         "{}",
         r#"{"mean":{"point_estimate":0}}"#,
         r#"{"mean":{"point_estimate":0,"confidence_interval":{"lower_bound":0.2,"upper_bound":0.1}}}"#,
+        r#"{"mean":{"point_estimate":-2,"confidence_interval":{"lower_bound":-1,"upper_bound":0}}}"#,
+        r#"{"mean":{"point_estimate":0,"confidence_interval":{"lower_bound":-2,"upper_bound":0}}}"#,
+        r#"{"mean":{"point_estimate":-2,"confidence_interval":{"lower_bound":-2,"upper_bound":-2}}}"#,
     ] {
         std::fs::write(&change, invalid).expect("bad comparison"); // APPROVED: test
         assert!(!check(true).status.success(), "{invalid}");
