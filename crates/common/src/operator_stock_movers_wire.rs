@@ -26,6 +26,19 @@ pub enum Direction {
     Losers,
 }
 
+/// Additional selections in the Stocks market view. An absent
+/// category keeps the original LTP versus previous-close Price Movers view.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MoversCategory {
+    /// The full mapped NSE universe is selected on initial entry. Uses the
+    /// same previous-close daily move as the Price Movers view.
+    Intraday,
+    /// `Gainers` selects open = day low, `Losers` selects open = day high.
+    /// Signed changes measure LTP relative to that session's open.
+    ExtremeOpenings,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SortColumn {
@@ -51,6 +64,8 @@ pub struct Filter {
     pub index: Option<String>,
     pub search: String,
     pub direction: Direction,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<MoversCategory>,
     pub offset: usize,
     /// Both absent keeps the earlier change-% ordering for existing clients.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -88,6 +103,7 @@ impl Default for Filter {
             index: None,
             search: String::new(),
             direction: Direction::All,
+            category: None,
             offset: 0,
             sort_by: None,
             sort_order: None,
@@ -142,8 +158,12 @@ impl Filter {
             .contains(&self.search.to_uppercase())
             && match self.direction {
                 Direction::All => true,
-                Direction::Gainers => stock.change_pct.is_some_and(|n| n > 0.0),
-                Direction::Losers => stock.change_pct.is_some_and(|n| n < 0.0),
+                Direction::Gainers => stock.change_pct.is_some_and(|n| {
+                    n > 0.0 || (n == 0.0 && self.category == Some(MoversCategory::ExtremeOpenings))
+                }),
+                Direction::Losers => stock.change_pct.is_some_and(|n| {
+                    n < 0.0 || (n == 0.0 && self.category == Some(MoversCategory::ExtremeOpenings))
+                }),
             }
     }
 
@@ -230,6 +250,8 @@ pub struct Snapshot {
     pub data_age_secs: Option<i64>,
     pub universe_total: usize,
     pub universe_available: bool,
+    /// Stocks with usable prices for this view. Extreme Openings requires
+    /// a consistent session open, high and low on the same captured quote.
     pub stocks_priced: usize,
     pub matching_total: usize,
     pub selection_limit: usize,

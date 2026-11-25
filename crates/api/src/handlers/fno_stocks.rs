@@ -15,7 +15,7 @@
 //! | previous close | `ticks.close` of that row: on a Quote/Full packet Dhan carries the PREVIOUS session's close there (Ticket #5525125, `docs/dhan-ref/03-live-market-feed-websocket.md` §7.3). NULL on a row without it, and then change is `null` |
 //! | change, change % | `ltp − prev_close`, `change / prev_close × 100`, only when both are finite and positive |
 //! | volume | `ticks.volume`, the day's cumulative volume |
-//! | value (Cr.) | an ESTIMATE, `volume × ticks.avg_price ÷ 1 crore`. Dhan's reference does not define its "Value" column, so the page labels this a turnover estimate |
+//! | value (Cr.) | an ESTIMATE, `volume × ticks.avg_price ÷ 1 crore`. The feed stores a rounded average price, so this endpoint labels the result as a turnover estimate. The Stocks page requires actual traded value |
 //!
 //! The live spot universe is NOT only F&O stocks (config subscribes the Nifty
 //! Total Market list), so the F&O list is the filter, not the `NSE_EQ`
@@ -408,7 +408,7 @@ pub(super) fn build_fno_stocks_sql(
 ) -> String {
     let id_list = ids.iter().map(u64::to_string).collect::<Vec<_>>().join(",");
     format!(
-        "SELECT security_id, segment, ltp, close, volume, avg_price, ts FROM ticks \
+        "SELECT security_id, segment, ltp, close, volume, avg_price, ts, open, high, low FROM ticks \
          WHERE segment = '{}' AND feed = '{FNO_STOCKS_FEED}' AND ts >= '{}' AND ts <= '{}' \
          AND security_id IN ({id_list}) \
          LATEST ON ts PARTITION BY security_id, segment LIMIT {row_limit}",
@@ -425,6 +425,9 @@ pub(super) struct TickRow {
     pub(super) segment_code: u8,
     pub(super) ltp: f64,
     pub(super) close: Option<f64>,
+    pub(super) session_open: Option<f64>,
+    pub(super) session_high: Option<f64>,
+    pub(super) session_low: Option<f64>,
     pub(super) volume: Option<u64>,
     pub(super) avg_price: Option<f64>,
     pub(super) ts: chrono::NaiveDateTime,
@@ -446,6 +449,9 @@ fn parse_tick_row(row: &[serde_json::Value]) -> Option<TickRow> {
         segment_code: segment_str_to_code(row.get(1)?.as_str()?)?,
         ltp: row.get(2)?.as_f64()?,
         close: row.get(3).and_then(serde_json::Value::as_f64),
+        session_open: row.get(7).and_then(serde_json::Value::as_f64),
+        session_high: row.get(8).and_then(serde_json::Value::as_f64),
+        session_low: row.get(9).and_then(serde_json::Value::as_f64),
         volume: row.get(4).and_then(serde_json::Value::as_u64),
         avg_price: row.get(5).and_then(serde_json::Value::as_f64),
         ts,

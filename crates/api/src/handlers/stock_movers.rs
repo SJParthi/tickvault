@@ -275,6 +275,9 @@ fn assemble_universe(
                     segment_code: r.segment_code,
                     ltp: r.ltp,
                     prev_close: r.close.filter(|p| p.is_finite() && *p > 0.0),
+                    session_open: r.session_open.filter(|p| p.is_finite() && *p > 0.0),
+                    session_high: r.session_high.filter(|p| p.is_finite() && *p > 0.0),
+                    session_low: r.session_low.filter(|p| p.is_finite() && *p > 0.0),
                     volume: r.volume,
                     ts_ist_secs: r.ts.and_utc().timestamp(),
                 })
@@ -947,6 +950,31 @@ mod tests {
             Outcome::Snapshot { snapshot } => *snapshot,
             other => panic!("expected snapshot, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_historical_extreme_opening_uses_the_day_range_at_the_selected_cutoff() {
+        use tickvault_common::operator_stock_movers_wire::MoversCategory;
+        let f = Fixture::new(6);
+        let rows = json!({"dataset": [
+            [2,"NSE_EQ",90.0,100.0,1,120.0,"2026-10-30T10:00:00Z",100.0,100.0,89.0],
+            [4,"NSE_EQ",130.0,100.0,1,120.0,"2026-10-30T10:00:00Z",0.0,131.0,100.0],
+            [6,"NSE_EQ",130.0,100.0,1,120.0,"2026-10-30T10:00:00.001Z",135.0,135.0,100.0],
+        ]});
+        let url = http("200 OK", rows.to_string()).await;
+        let filter = Filter {
+            category: Some(MoversCategory::ExtremeOpenings),
+            direction: Direction::Losers,
+            as_of: Some("2026-10-30T10:00".into()),
+            ..Filter::default()
+        };
+        let answer = snapshot(run(&f.0, &url, true, filter).await);
+        assert_eq!((answer.stocks_priced, answer.matching_total), (1, 1));
+        let row = &answer.rows[0].price;
+        assert_eq!(
+            (row.security_id, row.ltp, row.change, row.change_pct),
+            (2, 90.0, Some(-10.0), Some(-10.0))
+        );
     }
 
     #[tokio::test]
@@ -1970,6 +1998,9 @@ mod tests {
             segment_code: EXCHANGE_SEGMENT_NSE_EQ,
             ltp: 110.0,
             close: Some(100.0),
+            session_open: None,
+            session_high: None,
+            session_low: None,
             volume: Some(5),
             avg_price: None,
             ts: at("2026-10-30 15:29:00"),
@@ -2129,6 +2160,9 @@ mod select_equivalence {
             segment_code: if seg == 0 { 0 } else { EXCHANGE_SEGMENT_NSE_EQ },
             ltp,
             close,
+            session_open: None,
+            session_high: None,
+            session_low: None,
             volume,
             avg_price: Some(101.0),
             ts: base + chrono::Duration::seconds(offset),
@@ -2189,6 +2223,7 @@ mod select_equivalence {
                 n => Some(INDEX_LABELS[usize::from(n - 2)].into()),
             },
             search: ["", "STOCK1", "stock0", "DUP", "q"][usize::from(search)].into(),
+            category: None,
             direction: [Direction::All, Direction::Gainers, Direction::Losers]
                 [usize::from(direction)],
             offset: usize::from(offset) * 20,

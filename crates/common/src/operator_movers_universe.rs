@@ -40,7 +40,7 @@ use crate::operator_movers_wire::{
 };
 use crate::operator_stock_movers_wire::{
     Direction, FILTERED_PROTOCOL_VERSION, Filter, MAX_INDEX_NAME_BYTES, MAX_INDEX_NAMES,
-    MemberStock, MembershipStatus, Outcome, Reply, Snapshot,
+    MemberStock, MembershipStatus, MoversCategory, Outcome, Reply, Snapshot,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -62,6 +62,8 @@ pub const UNIVERSE_NSE_EQ_SEGMENT: &str = "NSE_EQ";
 pub const UNIVERSE_IST_OFFSET_SECS: i64 = 19_800;
 /// 09:00 IST, seconds of day. Pinned to `constants::TICK_PERSIST_START_SECS_OF_DAY_IST`.
 pub const UNIVERSE_SESSION_START_SECS_OF_DAY_IST: i64 = 32_400;
+/// 09:15 IST, the regular cash-market open. Pinned to `MARKET_OPEN_IST_NANOS`.
+pub const UNIVERSE_CASH_OPEN_SECS_OF_DAY_IST: i64 = 33_300;
 /// 15:40 IST, seconds of day. Pinned to `constants::TICK_PERSIST_END_SECS_OF_DAY_IST`.
 pub const UNIVERSE_SESSION_END_SECS_OF_DAY_IST: i64 = 56_400;
 /// Newest row at most this old reads `live` (the API's `FNO_STOCKS_LIVE_MAX_AGE_SECS`).
@@ -223,6 +225,13 @@ pub struct PriceRow {
     pub ltp: f64,
     /// Previous session's close, only when finite and positive.
     pub prev_close: Option<f64>,
+    /// Exchange-reported opening price of this session. Earlier universes omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_open: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_high: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_low: Option<f64>,
     /// Day's cumulative volume as stored (zero kept; the view drops it).
     pub volume: Option<u64>,
     /// Exchange time of the row, IST seconds since the epoch (naive IST).
@@ -333,6 +342,10 @@ impl MoversUniverse {
                         r.ltp.is_finite()
                             && r.ltp > 0.0
                             && r.prev_close.is_none_or(|p| p.is_finite() && p > 0.0)
+                            && [r.session_open, r.session_high, r.session_low]
+                                .into_iter()
+                                .flatten()
+                                .all(|p| p.is_finite() && p > 0.0)
                     })
             }
             _ => true,
@@ -466,6 +479,7 @@ impl<'a> MembershipView<'a> {
 }
 
 struct PricedStock {
+    qualifies: bool,
     security_id: u64,
     name: String,
     ltp: f64,
@@ -505,7 +519,7 @@ impl PriceView {
 }
 
 /// The price engine over the selected names (the API's `compute_for_list`).
-fn price_view(universe: &MoversUniverse, names: &HashMap<Key, &str>) -> PriceView {
+fn price_view(universe: &MoversUniverse, names: &HashMap<Key, &str>, filter: &Filter) -> PriceView {
     let total = names.len();
     let open = universe.market_open;
     let now = universe.observed_at_epoch_secs;
@@ -521,6 +535,15 @@ fn price_view(universe: &MoversUniverse, names: &HashMap<Key, &str>) -> PriceVie
         }
         UniversePrices::Rows { rows } => rows,
     };
+    let at = universe.read_at_ist_secs;
+    let session_start = at
+        .saturating_sub(at.rem_euclid(SECONDS_PER_DAY))
+        .saturating_add(UNIVERSE_CASH_OPEN_SECS_OF_DAY_IST);
+    let session_end = if open {
+        at.saturating_add(UNIVERSE_MAX_FUTURE_SKEW_SECS)
+    } else {
+        at
+    };
     let mut newest: Option<i64> = None;
     let mut stocks = Vec::with_capacity(rows.len().min(total));
     for row in rows {
@@ -530,10 +553,40 @@ fn price_view(universe: &MoversUniverse, names: &HashMap<Key, &str>) -> PriceVie
         if !row.ltp.is_finite() || row.ltp <= 0.0 {
             continue;
         }
-        newest = Some(newest.map_or(row.ts_ist_secs, |n| n.max(row.ts_ist_secs)));
         let prev_close = row.prev_close.filter(|p| p.is_finite() && *p > 0.0);
-        let (change, change_pct) = change_against(row.ltp, prev_close);
+        let (change, change_pct, qualifies) =
+            if filter.category == Some(MoversCategory::ExtremeOpenings) {
+                // Compare the high and low reported on this quote at its timestamp.
+                // A pre-open or out-of-session quote can carry another day's OHLC.
+                if !(session_start..=session_end).contains(&row.ts_ist_secs) {
+                    continue;
+                }
+                let (Some(open), Some(high), Some(low)) =
+                    (row.session_open, row.session_high, row.session_low)
+                else {
+                    continue;
+                };
+                let range = low..=high;
+                if !range.contains(&open) || !range.contains(&row.ltp) {
+                    continue;
+                }
+                let (change, pct) = change_against(row.ltp, Some(open));
+                if !pct.is_some_and(f64::is_finite) {
+                    continue;
+                }
+                let qualifies = match filter.direction {
+                    Direction::Gainers => open == low,
+                    Direction::Losers => open == high,
+                    Direction::All => open == low || open == high,
+                };
+                (change, pct, qualifies)
+            } else {
+                let (change, pct) = change_against(row.ltp, prev_close);
+                (change, pct, true)
+            };
+        newest = Some(newest.map_or(row.ts_ist_secs, |n| n.max(row.ts_ist_secs)));
         stocks.push(PricedStock {
+            qualifies,
             security_id: row.security_id,
             name: (*name).to_string(),
             ltp: row.ltp,
@@ -651,7 +704,7 @@ fn finish(
         if !price.valid() || !ids.insert(price.security_id) {
             return Reply::error(BridgeError::InvalidResponse, observed);
         }
-        if !filter.matches_price(&price) {
+        if !row.qualifies || !filter.matches_price(&price) {
             continue;
         }
         let key = (price.security_id, UNIVERSE_NSE_EQ_SEGMENT_CODE);
@@ -778,7 +831,7 @@ pub fn select(universe: &MoversUniverse, filter: &Filter) -> Reply {
         return finish_empty(closed_or(SourceStatus::NoData));
     }
     finish(
-        price_view(universe, &names),
+        price_view(universe, &names, filter),
         filter,
         membership.as_ref(),
         fno.as_ref(),
@@ -830,6 +883,9 @@ mod tests {
             security_id: id,
             segment_code: UNIVERSE_NSE_EQ_SEGMENT_CODE,
             ltp,
+            session_open: None,
+            session_high: None,
+            session_low: None,
             prev_close: Some(100.0),
             volume: Some(1_000 + id),
             ts_ist_secs: ist(OBSERVED) - age,
@@ -840,6 +896,131 @@ mod tests {
             Outcome::Snapshot { snapshot } => *snapshot,
             Outcome::Error { code } => panic!("expected snapshot, got {code:?}"),
         }
+    }
+
+    #[test]
+    fn extreme_openings_match_the_reported_day_extreme_and_keep_zero_recovery() {
+        let quote = |id, ltp, open, high, low| PriceRow {
+            session_open: Some(open),
+            session_high: Some(high),
+            session_low: Some(low),
+            ..row(id, ltp, 1)
+        };
+        let mut stocks = universe(vec![
+            quote(2, 99.0, 90.0, 110.0, 90.0),
+            quote(4, 110.0, 125.0, 125.0, 100.0),
+            quote(6, 100.0, 100.0, 100.0, 100.0),
+            quote(8, 130.0, 110.0, 140.0, 105.0),
+        ]);
+        for (direction, expected) in [
+            (Direction::Gainers, vec![(2, 10.0), (6, 0.0)]),
+            (Direction::Losers, vec![(4, -12.0), (6, 0.0)]),
+        ] {
+            let filter = Filter {
+                category: Some(MoversCategory::ExtremeOpenings),
+                direction,
+                ..Filter::default()
+            };
+            let reply = select(&stocks, &filter);
+            assert!(reply.valid_at(OBSERVED, &filter));
+            let s = snapshot(reply);
+            assert_eq!((s.stocks_priced, s.matching_total), (4, 2));
+            assert_eq!(
+                s.rows
+                    .iter()
+                    .map(|r| (r.price.security_id, r.price.change_pct.unwrap()))
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+        // A subsequent low below the open removes a stock from Open = Low.
+        let UniversePrices::Rows { rows } = &mut stocks.prices else {
+            unreachable!()
+        };
+        rows[0].session_low = Some(89.0);
+        let low = Filter {
+            category: Some(MoversCategory::ExtremeOpenings),
+            direction: Direction::Gainers,
+            ..Filter::default()
+        };
+        assert_eq!(snapshot(select(&stocks, &low)).matching_total, 1);
+        // Intraday and Price Movers share the daily previous-close measure.
+        let intraday = Filter {
+            category: Some(MoversCategory::Intraday),
+            ..Filter::default()
+        };
+        let daily = snapshot(select(&stocks, &Filter::default()));
+        assert_eq!(snapshot(select(&stocks, &intraday)).rows, daily.rows);
+    }
+
+    #[test]
+    fn old_missing_or_inconsistent_session_ranges_and_out_of_session_ticks_are_unavailable() {
+        let legacy:PriceRow=serde_json::from_value(serde_json::json!({"security_id":2,"segment_code":1,"ltp":100.0,"prev_close":90.0,"volume":10,"ts_ist_secs":ist(OBSERVED)})).unwrap();
+        let full = PriceRow {
+            session_open: Some(100.0),
+            session_high: Some(110.0),
+            session_low: Some(100.0),
+            ..row(4, 100.0, 0)
+        };
+        let midnight = ist(OBSERVED).div_euclid(SECONDS_PER_DAY) * SECONDS_PER_DAY;
+        let samples = [
+            legacy,
+            PriceRow {
+                session_low: None,
+                ..full.clone()
+            },
+            PriceRow {
+                session_low: Some(101.0),
+                ..full.clone()
+            },
+            PriceRow {
+                ts_ist_secs: midnight + UNIVERSE_CASH_OPEN_SECS_OF_DAY_IST - 1,
+                ..full.clone()
+            },
+            PriceRow {
+                ts_ist_secs: ist(OBSERVED) - SECONDS_PER_DAY,
+                ..full.clone()
+            },
+            PriceRow {
+                ts_ist_secs: ist(OBSERVED) + UNIVERSE_MAX_FUTURE_SKEW_SECS + 1,
+                ..full
+            },
+        ];
+        let filter = Filter {
+            category: Some(MoversCategory::ExtremeOpenings),
+            ..Filter::default()
+        };
+        assert_eq!(
+            Filter::from_hex(&filter.to_hex().unwrap()),
+            Some(filter.clone())
+        );
+        for sample in samples {
+            let s = snapshot(select(&universe(vec![sample]), &filter));
+            assert_eq!(
+                (s.status, s.stocks_priced, s.matching_total),
+                (SourceStatus::NoData, 0, 0)
+            );
+        }
+        let mut u = universe(vec![]);
+        u.prices = UniversePrices::QueryFailed;
+        assert_eq!(
+            snapshot(select(&u, &filter)).status,
+            SourceStatus::QueryFailed
+        );
+        u.prices = UniversePrices::Unreachable;
+        assert_eq!(
+            snapshot(select(&u, &filter)).status,
+            SourceStatus::Unreachable
+        );
+        u.membership = None;
+        let index = Filter {
+            index: Some("Nifty 50".into()),
+            ..filter
+        };
+        assert_eq!(
+            snapshot(select(&u, &index)).status,
+            SourceStatus::NoIndexList
+        );
     }
 
     #[test]

@@ -1648,6 +1648,8 @@ fn count_write_failure(endpoint: DhanEndpointType, kind: WireWriteKind, reason: 
 pub struct DhanFeedSocketImpl<T: FeedTokenSource> {
     params: DhanSocketParams,
     token: T,
+    receive_buffer_slot: Option<u8>,
+    receive_buffer: Option<super::receive_buffer::Registration>,
     /// The READ half of the live socket. `None` before the first dial and
     /// after every close, so a stale stream can never be read.
     ///
@@ -1693,6 +1695,8 @@ impl<T: FeedTokenSource> DhanFeedSocketImpl<T> {
         Self {
             params,
             token,
+            receive_buffer_slot: None,
+            receive_buffer: None,
             stream: None,
             writer: None,
             generation: 0,
@@ -1701,6 +1705,13 @@ impl<T: FeedTokenSource> DhanFeedSocketImpl<T> {
             pending_close: None,
         }
     }
+    /// Use the planner’s global slot for this session’s read-only kernel gauge.
+    #[must_use]
+    pub const fn with_receive_buffer_slot(mut self, global_index: u8) -> Self {
+        self.receive_buffer_slot = Some(global_index);
+        self
+    }
+
     /// The endpoint type this socket serves.
     #[must_use]
     pub const fn endpoint(&self) -> DhanEndpointType {
@@ -2039,6 +2050,9 @@ impl<T: FeedTokenSource> DhanFeedSocket for DhanFeedSocketImpl<T> {
                     max_frame_bytes = max_frame_bytes(endpoint),
                     "Dhan feed socket connected"
                 );
+                self.receive_buffer = self.receive_buffer_slot.and_then(|slot| {
+                    super::receive_buffer::Registration::attach(slot, stream.get_ref().get_ref())
+                });
                 // Split: the read half stays here, the write half moves into
                 // the writer task (plan item 44f). The read half's own
                 // `poll_next` still flushes the automatic pong — tungstenite's
@@ -2285,6 +2299,7 @@ impl<T: FeedTokenSource> DhanFeedSocket for DhanFeedSocketImpl<T> {
     where
         F: FnMut(Bytes) + Send,
     {
+        self.receive_buffer = None;
         // A close owed by this connection is handed back, not wiped (audit
         // PR L1, 2026-10-26): the caller classifies it. Until then a stacked
         // 805 owed here was erased when a failed write closed the socket first.

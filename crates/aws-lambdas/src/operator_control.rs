@@ -912,7 +912,10 @@ pub fn avg_ns(sum_v: &str, count_v: &str) -> Option<f64> {
 fn sec_to_ms(s: &str) -> String {
     s.trim()
         .parse::<f64>()
-        .map(|f| format!("{:.1}", f * 1000.0))
+        .ok()
+        .map(|seconds| seconds * 1000.0)
+        .filter(|milliseconds| milliseconds.is_finite())
+        .map(|milliseconds| format!("{milliseconds:.1}"))
         .unwrap_or_default()
 }
 
@@ -967,6 +970,8 @@ fn parse_ws_lag_rows(raw: &[String]) -> Vec<Value> {
         instruments: Option<f64>,
         frames: Option<f64>,
         tick_age_secs: Option<f64>,
+        never_received: bool,
+        receive_buffer_bytes: Option<u32>,
     }
     let mut per_conn: BTreeMap<u32, Conn> = BTreeMap::new();
 
@@ -996,10 +1001,17 @@ fn parse_ws_lag_rows(raw: &[String]) -> Vec<Value> {
             entry.instruments = Some(value);
         } else if line.starts_with("tv_dhan_ws_conn_frames") {
             entry.frames = Some(value);
+        } else if line.starts_with("tv_dhan_ws_receive_buffer_bytes{") {
+            // Linux SO_RCVBUF returns a positive signed integer, or the
+            // emitter reports -1 when the socket cannot be sampled.
+            entry.receive_buffer_bytes =
+                (value >= 1.0 && value <= f64::from(i32::MAX) && value.fract() == 0.0)
+                    .then_some(value as u32);
         } else if line.starts_with("tv_dhan_ws_conn_tick_age_secs") {
             // The drain publishes -1 for "never delivered"; that is an
             // absence, not a negative age, and must not render as a number.
-            entry.tick_age_secs = (value >= 0.0).then_some(value);
+            entry.never_received = value == -1.0;
+            entry.tick_age_secs = (value.is_finite() && value >= 0.0).then_some(value);
         }
     }
 
@@ -1009,7 +1021,11 @@ fn parse_ws_lag_rows(raw: &[String]) -> Vec<Value> {
         // zero-count histogram with nothing else is a series the exporter
         // pre-registered, not a socket that exists.
         .filter(|(_, c)| {
-            c.count > 0.0 || c.instruments.is_some() || c.frames.is_some() || c.endpoint.is_some()
+            c.count > 0.0
+                || c.instruments.is_some()
+                || c.frames.is_some()
+                || c.endpoint.is_some()
+                || c.receive_buffer_bytes.is_some()
         })
         .map(|(slot, c)| {
             // Sort by numeric bound; `+Inf` sorts last by construction.
@@ -1062,6 +1078,8 @@ fn parse_ws_lag_rows(raw: &[String]) -> Vec<Value> {
                 "instruments": c.instruments,
                 "frames": c.frames,
                 "tick_age_secs": c.tick_age_secs,
+                "never_received": c.never_received,
+                "receive_buffer_bytes": c.receive_buffer_bytes,
                 "samples": count,
                 "p50_ms": quantile(0.50),
                 "p99_ms": quantile(0.99),
@@ -1112,6 +1130,14 @@ pub fn parse_latency(stdout: &str) -> Value {
             fields.insert(k.trim().to_string(), v.trim().to_string());
         }
     }
+    let questdb_ms = fields
+        .get("QDB_PROBE")
+        .and_then(|body| serde_json::from_str::<Value>(body).ok())
+        .filter(|reply| reply.get("error").is_none() && reply["dataset"] == json!([[1]]))
+        .and_then(|_| fields.get("QDB"))
+        .filter(|seconds| seconds.parse::<f64>().is_ok_and(|value| value >= 0.0))
+        .map(|seconds| sec_to_ms(seconds))
+        .unwrap_or_default();
     let order_avg = avg_ns(
         metrics
             .get("tv_order_placement_duration_ns_sum")
@@ -1131,7 +1157,7 @@ pub fn parse_latency(stdout: &str) -> Value {
         // ticks (feed off, box stopped, or /metrics unreachable) — the page
         // says that rather than showing a comforting zero.
         "ws_latency": parse_ws_lag_rows(&ws_raw),
-        "questdb_ms": sec_to_ms(fields.get("QDB").map_or("", String::as_str)),
+        "questdb_ms": questdb_ms,
         "clock_skew_ms": sec_to_ms(fields.get("SKEW").map_or("", String::as_str)),
         "order_place_avg_ns": order_avg.map(round1),
     })
@@ -3472,6 +3498,9 @@ mod tests {
             window_secs: UNIVERSE_DEFAULT_WINDOW_SECS,
             prices: UniversePrices::Rows {
                 rows: vec![PriceRow {
+                    session_open: None,
+                    session_high: None,
+                    session_low: None,
                     security_id: 2,
                     segment_code: UNIVERSE_NSE_EQ_SEGMENT_CODE,
                     ltp: 110.0,
@@ -3533,6 +3562,37 @@ mod tests {
         let universe: MoversUniverse =
             serde_json::from_slice(&published_universe(now, weekday_session_open_at(now))).unwrap();
         serde_json::to_string(&select(&universe, filter)).unwrap()
+    }
+
+    #[tokio::test]
+    async fn opening_views_refuse_an_older_box_reply_that_ignores_the_requested_category() {
+        use crate::operator_movers_wire::BridgeError;
+        use crate::operator_stock_movers::read;
+        use crate::operator_stock_movers_wire::{Filter, MoversCategory, Outcome};
+        for as_of in [None, Some("2026-11-03T15:29".to_owned())] {
+            let daily = Filter {
+                as_of,
+                ..Filter::default()
+            };
+            let mut shell = box_shell(Err("no published artifact".into()));
+            shell.sync_output = healthy_box_reply(shell.now, &daily);
+            for category in [MoversCategory::Intraday, MoversCategory::ExtremeOpenings] {
+                let request = Filter {
+                    category: Some(category),
+                    ..daily.clone()
+                };
+                assert_eq!(
+                    read(&shell, &request).await.outcome,
+                    Outcome::Error {
+                        code: BridgeError::InvalidResponse
+                    }
+                );
+            }
+            assert!(matches!(
+                read(&shell, &daily).await.outcome,
+                Outcome::Snapshot { .. }
+            ));
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -4209,9 +4269,9 @@ mod tests {
         let hex: String = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(
             hex,
-            "7c9c475798c777dd12f9edb366b78baf10cdd8606d9f0ebc37504933e4952877"
+            "701681ff70fdf6c70eb57454e0c70864760a7ff63c9372a63a37040ecf6151be"
         );
-        assert_eq!(CONSOLE_HTML.len(), 88_877);
+        assert_eq!(CONSOLE_HTML.len(), 100_006);
     }
 
     #[test]
@@ -4976,6 +5036,7 @@ mod tests {
             "tv_order_placement_duration_ns_sum 5000\n",
             "tv_order_placement_duration_ns_count 10\n",
             "METRICS_END\n",
+            "QDB_PROBE={\"dataset\":[[1]]}\n",
             "QDB=0.0021\n",
             "SKEW=0.000123\n",
             "RESTLAT_ROW=\"dhan\",\"chain_1m\",374,1300.0,2100.0\n",
@@ -4988,6 +5049,52 @@ mod tests {
             out.get("rest_latency").is_none(),
             "a stale RESTLAT_ROW= line must not resurrect the retired field"
         );
+    }
+
+    #[test]
+    fn latency_requires_a_completed_query_with_the_expected_result() {
+        for probe in [
+            "",
+            "invalid",
+            "{}",
+            r#"{"dataset":[]}"#,
+            r#"{"dataset":[[0]]}"#,
+            r#"{"dataset":[[1]],"error":"unavailable"}"#,
+        ] {
+            let output = parse_latency(&format!("QDB_PROBE={probe}\nQDB=0.001\n"));
+            assert_eq!(output["questdb_ms"], "", "{probe}");
+        }
+        for invalid in ["-0.1", "NaN", "inf", "1e308"] {
+            let output = parse_latency(&format!(
+                "QDB_PROBE={{\"dataset\":[[1]]}}\nQDB={invalid}\nSKEW=NaN"
+            ));
+            assert_eq!(output["questdb_ms"], "", "{invalid}");
+            assert_eq!(output["clock_skew_ms"], "");
+        }
+    }
+
+    #[test]
+    fn receive_buffer_bytes_require_a_current_positive_kernel_reading() {
+        let lines = [
+            r#"tv_dhan_ws_receive_buffer_bytes{connection="0"} 1048576"#,
+            r#"tv_dhan_ws_conn_frames{connection="1"} 0"#,
+            r#"tv_dhan_ws_conn_tick_age_secs{connection="1"} -1"#,
+            r#"tv_dhan_ws_receive_buffer_bytes{connection="1"} -1"#,
+            r#"tv_dhan_ws_conn_frames{connection="2"} 1"#,
+            r#"tv_dhan_ws_receive_buffer_bytes{connection="3"} NaN"#,
+            r#"tv_dhan_ws_receive_buffer_bytes{connection="4"} 0"#,
+            r#"tv_dhan_ws_receive_buffer_bytes{connection="5"} 12.5"#,
+            r#"tv_dhan_ws_receive_buffer_bytes{connection="6"} 2147483648"#,
+        ];
+        let raw = lines.map(str::to_owned);
+        let rows = parse_ws_lag_rows(&raw);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0]["receive_buffer_bytes"], 1048576);
+        assert_eq!(rows[0]["never_received"], false);
+        assert!(rows[0]["frames"].is_null());
+        assert!(rows[1]["receive_buffer_bytes"].is_null());
+        assert_eq!(rows[1]["never_received"], true);
+        assert!(rows[2]["receive_buffer_bytes"].is_null());
     }
 
     #[test]

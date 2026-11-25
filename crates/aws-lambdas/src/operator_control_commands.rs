@@ -69,7 +69,9 @@ pub const LATENCY_COMMANDS: [&str; 7] = [
     r#"echo "METRICS_BEGIN""#,
     r"curl -fsS --max-time 3 http://127.0.0.1:9091/metrics 2>/dev/null | grep -E '^tv_order_placement_duration_ns' || echo none",
     r#"echo "METRICS_END""#,
-    r#"echo "QDB=$(curl -o /dev/null -s -w '%{time_total}' --max-time 3 'http://127.0.0.1:9000/exec?query=SELECT%201' 2>/dev/null)""#,
+    // A failed curl also emits time_total. Only forward completed HTTP requests,
+    // and keep the SQL result so the reader can verify what the server returned.
+    r#"if qdb=$(curl -fsS --max-time 3 -w '\nQDB=%{time_total}' 'http://127.0.0.1:9000/exec?query=SELECT%201' 2>/dev/null); then printf 'QDB_PROBE=%s\n' "$qdb"; fi"#,
     r#"echo "SKEW=$(chronyc tracking 2>/dev/null | awk '/Last offset/{print $4}')""#,
     // 2026-09-17: the `RESTLAT_ROW=` curl is REMOVED (8 -> 7).
     //
@@ -109,7 +111,7 @@ pub const LATENCY_COMMANDS: [&str; 7] = [
     // held on the wire, data-bearing frames, and seconds since the last one —
     // so the console can show all sixteen sockets, not only the ones whose
     // lag histogram happened to have samples.
-    r"curl -fsS --max-time 3 http://127.0.0.1:9091/metrics 2>/dev/null | grep -E '^tv_dhan_ws_(lag_ms_(bucket|count|sum)|conn_[a-z_]+)' | sed 's/^/WSLAT_RAW=/' || true",
+    r"curl -fsS --max-time 3 http://127.0.0.1:9091/metrics 2>/dev/null | grep -E '^tv_dhan_ws_(lag_ms_(bucket|count|sum)|conn_[a-z_]+|receive_buffer_bytes)' | sed 's/^/WSLAT_RAW=/' || true",
 ];
 
 /// legacy: `_STORAGE_COMMANDS` (handler.py:591-595).
