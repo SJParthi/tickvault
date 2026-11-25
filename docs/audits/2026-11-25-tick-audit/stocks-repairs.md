@@ -1,5 +1,32 @@
 # Stocks and audit recovery, November 25
 
+## November 25 follow-up
+
+The production portal remained on `9ccd99e7` during these checks. The candidate uses the existing authenticated Stocks action for watchlist lookup and filtering. Its revised page is demonstrated in the downloadable video.
+
+[Download the narrated walkthrough, offline comparison and verification files](stocks-followup.zip)
+
+| Question | Finding |
+| --- | --- |
+| Can I maintain several lists while viewing F&O gainers? | The sidebar has six numbered lists. The original saved list opens in slot 1. An explicit lookup on the candidate page retrieved INFY from the live AWS action and added it to slot 2 while the main table stayed on F&O Gainers. |
+| How do the categories differ? | Price Movers uses the selected universe. Intraday Movers starts with all mapped NSE equities and measures change from the previous close. Extreme Openings compares the open with the day’s high or low on the same tick and shows movement from the open. Timestamped historical views reject later ticks and responses for a different category. |
+| Which stocks qualify for MTF? | The Stocks selector uses the dated leverage multiple in Dhan’s detailed instrument master. On November 25, all 1,924 positive NSE cash-equity ISINs matched the broker’s published MTF list, including 162 with a 1.00× multiple. The production parser found 2,803 NSE EQ terms, including 879 explicit zeros. The wider cash-ISIN comparison found 8,178 zeros, all absent from the published list. Missing terms, an older artifact or a cutoff before the retained observation show unavailable. A same-day restart can replace that day’s observation and leave an earlier cutoff unavailable. |
+| Did the source actually contain an opening extreme? | At 14:51 IST on November 25, a bounded read from production QuestDB found NSE security 547 opened at its day low of 4,850.90 and traded at 5,017. Security 48 opened at its high of 294 and traded at 288.95. The included recording labels candidate screens and controlled test rows. |
+| Can the database dashboard look healthy when the database is down? | Previously a refused connection produced a displayed time of 0.557 ms in a loopback control. The new probe requires the expected SQL row before publishing a time. A real QuestDB 9.3.5 query passed. HTTP failure, refused connection, SQL error, wrong row and malformed reply all showed unavailable. |
+| What does the receive-buffer column show? | On an established feed connection, a separate worker samples the effective kernel setting every 30 seconds. Closure and replacement invalidate the old reading. Loopback tests checked peer EOF and confirmed that the observer leaves socket settings alone. Missing readings display a dash. |
+| Can a restore or a prune discard the wrong WAL file? | The old code overwrote an older file on a same-name collision and pruned same-size bytes using another capture’s verification marker. The candidate held both colliding files and checked the SHA-256 of the selected bytes before deleting them. |
+| What happens if an audit write fails? | Committed Rust regressions exercise catalog lag, bounded wait exhaustion, complete schema repair, HTTP refusal, dropped transport, replay, and cleanup failure after acknowledgement. The earlier real QuestDB restart evidence remains available below. |
+
+[Dhan instruments](https://dhanhq.co/docs/v2/instruments/) · [Dhan MTF list](https://dhan.co/mtf-stocks-list/) · [Dhan Stock Movers definitions](https://options-trader.co/market-movers/stocks/) · [Dhan product announcement](https://madefortrade.in/t/introducing-all-new-options-trader-app-by-dhan-glass-edition/19050)
+
+The verified-prune log records the segment name, digest, S3 key and archive decision. The on-file decision uses a local extended attribute and can be missing for legacy archives or if the attribute write failed. An early-uploaded S3 object keeps its original metadata. The structured application log can be searched subject to delivery and retention.
+
+The candle benchmark now verifies complete output rows outside the timed interval. Injecting a filtered candle made both the median and p99 benchmark entry points fail. Two experimental production optimizations worsened tail times in paired tests and were discarded. Hashing a WAL file selected for deletion scales with the bytes verified. Returning a page of stocks also has a cost proportional to its result size. Over 500 measured local selections per input size, MTF p99 was 3.305 µs for one stock, 99.988 µs for 100 and 844.641 µs for 1,000. These timings exclude the database, network and browser.
+
+Outperformers still needs a documented benchmark and its dated return. Breakouts needs an authoritative 52-week range and By Value needs actual traded turnover. All three controls explain their unavailable data. Depth20, Depth200 and live orders stay off.
+
+## Earlier midday verification
+
 The live Stocks page ran `9ccd99e7` during the midday check. The fixes and the five dependency upgrades are together in draft PR #2300. The dependency PR was closed after GitHub confirmed its exact head was an ancestor and its Cargo lockfile matched the one in the integration branch.
 
 [Download the narrated walkthrough, comparison table and verification records](stocks-repair-evidence.zip) · [Integration PR](https://github.com/SJParthi/tickvault/pull/2300) · [Earlier audit verification](repair-verification.md)
@@ -25,7 +52,7 @@ The paired ranking comparison matched 19,530 full replies byte for byte. At 1,00
 
 ## Continue in Claude Code
 
-> Open SJParthi/tickvault PR #2300 and fetch its current head and main. Preserve local-only refs and worktrees. Review the combined changes, the latest exact-head CI and the attached evidence archive. Fix failing checks through the normal repository workflow. Inspect the branch dispositions before reintroducing any historical feature. After review and merge, use the project's guarded after-close deployment for both the application and operator Lambda. Read the live portal's main, binary and portal SHAs, test F&O and Nifty 50 in both directions, and compare the displayed stock denominator with that day's recorded list. Verify live disk, WAL health and paper-mode startup records. Keep Depth20, Depth200 and live orders off. Record the timestamps and distinguish deployment, local fixture evidence, kernel packet drops and confirmed tick-level loss. Preserve missing or unknown measurements as unknown.
+> Open SJParthi/tickvault PR #2300 and fetch its current head and main. Preserve local-only refs and worktrees. Review the combined changes, the latest exact-head CI and the attached evidence archive. Fix failing checks through the normal repository workflow. Inspect the branch dispositions before reintroducing any historical feature. After review and merge, use the project's guarded after-close deployment for both the application and operator Lambda. Read the live portal's main, binary and portal SHAs, test F&O and Nifty 50 in both directions, and compare the displayed stock denominator with that day's recorded list. Check all six watchlists, Intraday Movers, Extreme Openings against same-tick OHLC and MTF against current Dhan evidence, including 1.00× and a historical cutoff before observation. Check the receive-buffer gauges on connected and closed sockets, QuestDB probe results, live disk, the WAL archive decisions and paper-mode startup records. Use isolated test databases and WAL directories for failure injection. Keep Depth20, Depth200 and live orders off. Record the timestamps and distinguish deployment, local fixture evidence, kernel packet drops and confirmed tick-level loss. Preserve missing or unknown measurements as unknown. Record the exact numerator, denominator and skip count for test coverage, and measure each latency at its actual boundary.
 
 The archive contains a five-chapter narrated MP4, captions, the original browser recording, an offline comparison, exact query results and local replay evidence. The name shortlist contains 100 new suggestions. The earlier list itself was absent from the recovered files. No domain was selected or registered.
 
