@@ -102,7 +102,12 @@ echo "  [3/11] cargo test..." >&2
 # 1288.604s overall. The old 300s can expire even with a warm cache.
 # Fixed 30-minute allowance; a slow or failing run still blocks the push.
 WORKSPACE_TEST_TIMEOUT_SECS=1800
-TEST_OUT=$(timeout "$WORKSPACE_TEST_TIMEOUT_SECS" cargo test --workspace --locked 2>&1)
+# Git exports repository paths to hooks. Cargo starts each test in its crate,
+# where an inherited GIT_DIR can make Git treat that crate as the worktree root.
+# Let tests (including those that create temporary repositories) discover Git
+# from their own directories. The hook's own Git commands keep their context.
+TEST_ENV=(env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_INDEX_FILE)
+TEST_OUT=$("${TEST_ENV[@]}" timeout "$WORKSPACE_TEST_TIMEOUT_SECS" cargo test --workspace --locked 2>&1)
 TEST_EXIT=$?
 if [ "$TEST_EXIT" -eq 124 ]; then
   echo "  FAIL: cargo test timed out (${WORKSPACE_TEST_TIMEOUT_SECS}s); full verification incomplete" >&2
@@ -234,7 +239,7 @@ for crate in $HOT_CRATES; do
     LOOM_FOUND=true
     echo "  Running loom tests for crates/$crate ($LOOM_TARGET_FLAGS)..." >&2
     # shellcheck disable=SC2086
-    LOOM_OUT=$(timeout 300 cargo test --locked -p "tickvault-$crate" --features loom $LOOM_TARGET_FLAGS 2>&1)
+    LOOM_OUT=$("${TEST_ENV[@]}" timeout 300 cargo test --locked -p "tickvault-$crate" --features loom $LOOM_TARGET_FLAGS 2>&1)
     LOOM_EXIT=$?
     if [ "$LOOM_EXIT" -eq 124 ]; then
       echo "  FAIL: Loom tests timed out (300s) for $crate" >&2

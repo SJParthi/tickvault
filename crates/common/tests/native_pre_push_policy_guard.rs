@@ -153,6 +153,10 @@ exit 0
             .arg(self.0.join("hook"))
             .current_dir(&self.0)
             .env("PATH", std::env::join_paths(paths).expect("fixture PATH"))
+            .env("GIT_DIR", self.0.join("linked-worktree-git-dir"))
+            .env("GIT_WORK_TREE", &self.0)
+            .env("GIT_COMMON_DIR", self.0.join("common-git-dir"))
+            .env("GIT_INDEX_FILE", self.0.join("linked-worktree-index"))
             .env("NATIVE_PUSH_CARGO_LOG", self.0.join("cargo.log"))
             .env("NATIVE_PUSH_TIMEOUT_LOG", self.0.join("timeout.log"))
             .env("NATIVE_PUSH_GUARD_LOG", self.0.join("guards.log"))
@@ -390,6 +394,33 @@ fn successful_native_push_runs_all_checks_and_only_then_writes_its_receipt() {
     }
     assert!(read(&fixture.0.join(".claude/hooks/.last-quality-pass")).starts_with(HEAD));
     assert!(observed.output.contains("ALL 11 GATES PASSED"));
+}
+
+#[test]
+fn workspace_and_loom_tests_discover_the_checkout_from_their_own_directory() {
+    let fixture = Fixture::new();
+    fixture.executable(
+        "bin/cargo",
+        r#"#!/bin/bash -p
+printf '%s\n' "$*" >> "$NATIVE_PUSH_CARGO_LOG"
+bindings="${GIT_DIR+x}${GIT_WORK_TREE+x}${GIT_COMMON_DIR+x}${GIT_INDEX_FILE+x}"
+if [ "$1" = test ]; then
+    test -z "$bindings"
+else
+    test "$bindings" = xxxx
+fi
+"#,
+    );
+    let observed = fixture.run(None, "", "", false);
+    assert!(observed.status.success(), "{}", observed.output);
+    assert_eq!(
+        observed
+            .cargo
+            .lines()
+            .filter(|l| l.starts_with("test "))
+            .count(),
+        3
+    );
 }
 
 #[test]
