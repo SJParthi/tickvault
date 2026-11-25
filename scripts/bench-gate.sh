@@ -47,25 +47,9 @@
 #   (which would blind the gate to real 30% regressions) and than resetting the
 #   baseline (which re-breaks on the next rotation).
 #
-# Spread re-calibration (2026-08-07, SAME DAY — the drift fix did not fire):
-#   The suppressor above shipped with spread = max - min, and then FAILED to
-#   suppress the very next rotation. Live on main @026c7b63 (bench run
-#   31182757999 attempt 2): 31 of 31 benches regressed, share 100%, every
-#   absolute budget passed — yet drift was NOT declared, because ONE outlier
-#   (ws_reader_dispatch_ticker, a 13ns bench, +111.6%) dragged max-min to
-#   88.0 pts against the 15 pt bar. The other 30 sat between +23.6% and
-#   +42.9%. max-min is a WORST-CASE statistic: a single noisy sub-30ns
-#   benchmark destroys it, which is exactly the population this gate measures.
-#   Same commit, minutes earlier (attempt 1), only 1 of 31 "regressed" — the
-#   two attempts differed by RUNNER, not by code (the merge touched zero files
-#   under crates/core, where the attempt-1 bench lives).
-#   Fix: spread is now the INTERQUARTILE RANGE (Q3-Q1) of the regressions —
-#   a robust statistic that ignores the tails by construction. On the live
-#   failing data IQR = 2.6 pts (vs max-min 88.0). The threshold, the count and
-#   share rules, and the absolute arm are all UNCHANGED; only the estimator
-#   changed. Case C of the self-test (8 benches genuinely fanned +6%..+80%,
-#   IQR 24 pts) still FAILS, so the discriminating power is preserved, and the
-#   full min..max range is still PRINTED for the operator.
+# Spread uses the interquartile range: in run 31182757999 attempt 2 (026c7b63),
+# a single noisy 13ns bench gave a full range of 88 points while the IQR was
+# 2.6. Case C of the self-test covers a genuine 24-point IQR and still fails.
 #
 # Regression noise floor (2026-10-11): sub-10ns benches failed the relative arm
 # on noise (oms_invalid_transition ~3ns, CI lower bound +10.6% = 0.3ns). A
@@ -132,6 +116,22 @@ if [ -z "$ESTIMATE_FILES" ]; then
   echo "       Likely causes: cargo bench did not run, failed to build, or its"
   echo "       Criterion output was not restored into the expected directory."
   exit 3
+fi
+
+# A failed comparison can still leave a fresh median and a successful Criterion
+# exit. Only prior benchmarks that ran again must produce a change estimate.
+if [[ -n ${BENCH_BASELINE_MANIFEST:-} && -n ${BENCH_AB_BASELINE_KEY:-} ]]; then
+  if [[ ! -s "$BENCH_BASELINE_MANIFEST" ]]; then
+    echo "ERROR: No benchmarks listed for the restored baseline: $BENCH_BASELINE_MANIFEST" >&2
+    exit 3
+  fi
+  while IFS= read -r baseline; do
+    bench_dir="$CRITERION_DIR/${baseline%/base}"
+    if [[ -f "$bench_dir/new/estimates.json" && ! -f "$bench_dir/change/estimates.json" ]]; then
+      echo "ERROR: Missing comparison with restored baseline: ${baseline%/base}" >&2
+      exit 3
+    fi
+  done < "$BENCH_BASELINE_MANIFEST"
 fi
 
 

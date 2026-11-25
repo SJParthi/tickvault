@@ -119,8 +119,7 @@ jobs:
         run: |
           cpu_model=$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | xargs || true)
           hw_hash=$(printf '%s' "${cpu_model:-unknown}" | sha256sum | cut -c1-12)
-          echo "fingerprint=$hw_hash" >> "$GITHUB_OUTPUT"
-          echo "Runner CPU: ${cpu_model:-unknown} (fingerprint: $hw_hash)"
+          echo "fingerprint=$hw_hash" | tee -a "$GITHUB_OUTPUT"
 
       # Restore the previous green run's Criterion baseline so this run's
       # `cargo bench` writes <id>/change/estimates.json (Criterion compares
@@ -144,6 +143,14 @@ jobs:
           key: criterion-baseline-${{ steps.hw.outputs.fingerprint }}-${{ github.run_id }}-${{ github.sha }}
           restore-keys: |
             criterion-baseline-${{ steps.hw.outputs.fingerprint }}-
+
+      # Criterion replaces base/ even when reading its old sample failed. Record
+      # which benchmarks had a baseline while that information is still available.
+      - name: Record restored Criterion baselines
+        if: steps.restore.outputs.cache-matched-key != ''
+        shell: bash
+        run: |
+          find target/criterion -mindepth 2 -type d -name base -printf '%P\n' | sort > "$RUNNER_TEMP/criterion-baselines"
 
       # `--bench '*'` builds and runs the Criterion bench targets only. Plain
       # `cargo bench --workspace` also builds every library and binary as a
@@ -204,6 +211,7 @@ jobs:
           BENCH_REQUIRE_ALL_BUDGETS: '1'
           BENCH_RECORD_VERDICT: '1'
           BENCH_AB_BASELINE_KEY: ${{ steps.restore.outputs.cache-matched-key }}
+          BENCH_BASELINE_MANIFEST: ${{ runner.temp }}/criterion-baselines
         run: |
           bash scripts/bench-gate.sh | tee gate-output.log && rc=0 || rc=$?
           echo "gate_rc=$rc" >> "$GITHUB_OUTPUT"

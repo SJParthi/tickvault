@@ -737,6 +737,50 @@ fn a_full_workspace_gate_requires_current_measurements_for_every_budget_family()
 }
 
 #[test]
+fn restored_and_remeasured_benchmarks_must_produce_comparisons() {
+    let temp = TempDir::new("restored-comparisons");
+    let criterion = temp.0.join("criterion");
+    let manifest = temp.0.join("restored");
+    let outputs = temp.0.join("outputs");
+    let quality = temp.0.join("quality");
+    std::fs::create_dir_all(&quality).expect("quality dir"); // APPROVED: test
+    std::fs::write(
+        quality.join("benchmark-budgets.toml"),
+        "[budgets]\nregistry_get = 50\n",
+    )
+    .expect("test budgets"); // APPROVED: test
+    let run = |cache_key: &str, expected_rc, measured| {
+        let output = Command::new("bash")
+            .current_dir(&temp.0)
+            .arg(repo_root().join("scripts/bench-gate.sh"))
+            .arg(&criterion)
+            .env("BENCH_REQUIRE_ALL_BUDGETS", "1")
+            .env("BENCH_RECORD_VERDICT", "1")
+            .env("GITHUB_OUTPUT", &outputs)
+            .env("BENCH_BASELINE_MANIFEST", &manifest)
+            .env("BENCH_AB_BASELINE_KEY", cache_key)
+            .output()
+            .expect("gate"); // APPROVED: test
+        assert_eq!(output.status.code(), Some(expected_rc), "{output:?}");
+        let marks = std::fs::read_to_string(&outputs).expect("gate outputs"); // APPROVED: test
+        assert_eq!(marks.lines().last(), Some(measured), "{output:?}");
+    };
+    let id = "registry/get_hit";
+    write_bench(&criterion, id, 2.0, 0.0, 0.0);
+    std::fs::remove_file(criterion.join(id).join("change/estimates.json")).expect("cold bench"); // APPROVED: test
+    run("", 0, "measured_rc=0");
+    run("warm", 3, "measured_rc=unmeasured");
+    std::fs::write(&manifest, "").expect("empty manifest"); // APPROVED: test
+    run("warm", 3, "measured_rc=unmeasured");
+    std::fs::write(&manifest, "retired/bench/base\n").expect("retired bench"); // APPROVED: test
+    run("warm", 0, "measured_rc=0");
+    std::fs::write(&manifest, format!("{id}/base\nretired/bench/base\n")).expect("warm manifest"); // APPROVED: test
+    run("warm", 3, "measured_rc=unmeasured");
+    write_bench(&criterion, id, 2.0, 0.0, 0.0);
+    run("warm", 0, "measured_rc=0");
+}
+
+#[test]
 fn only_completed_measurements_report_a_cacheable_verdict() {
     let temp = TempDir::new("cache-verdict");
     let criterion = temp.0.join("criterion");
