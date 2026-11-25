@@ -4385,13 +4385,9 @@ pub const WAL_REPLAY_RSS_STOP_PCT: u64 = 60;
 /// Counter: segments `replay_all` deferred to the next boot for the budget.
 pub const WAL_REPLAY_DEFERRED_COUNTER: &str = "tv_wal_replay_deferred_segments_total";
 
-/// Counter: DEFERRED segments `replay_all` could not restore out of the replay
-/// staging area back to the live directory.
-///
-/// Non-zero means captured frames are sitting where the confirm step archives
-/// them unread -- the single path by which WAL recovery can lose data. It is
-/// incremented unconditionally (by zero on a clean boot) so the series exists
-/// before the first real occurrence.
+/// Counts skipped or deferred staged segments that could not return to the
+/// live directory. Replay holds the failed pass for a later retry. The first
+/// clean boot publishes zero so the series exists before its first failure.
 pub const WAL_REPLAY_RESTORE_FAILED_COUNTER: &str = "tv_wal_replay_restore_failed_total";
 
 /// Neither of the two counters below is EMF-selected, and that is deliberate
@@ -4915,8 +4911,8 @@ pub fn replay_all_with_report_guarded<P: AsRef<Path>, R: Fn() -> Option<u64>>(
     // A rename that fails leaves the segment a `*.wal`; the next pass skips
     // it again, so nothing applied is ever re-read by accident of this.
     // O(1) EXEMPT: begin — one rename per skipped segment, boot replay cold path
-    // Restores that fail, here and for DEFERRED segments below: both leave a
-    // segment in `replaying/`, where the confirm archives it unread.
+    // Either failed restore holds the pass: confirming by glob would archive
+    // the unread segment that remains in `replaying/`.
     let mut restore_failures = 0usize;
     for (path, next_kept) in &pending_skips {
         if *next_kept > consumed {
@@ -4928,17 +4924,15 @@ pub fn replay_all_with_report_guarded<P: AsRef<Path>, R: Fn() -> Option<u64>>(
                 && let Some(name) = path.file_name()
                 && let Err(err) = std::fs::rename(path, wal_dir.join(name))
             {
-                // Coded and counted like the deferred restore below (review
-                // round 7): archived unread, it hides the gap it leaves.
+                // Withhold confirm even for a skipped segment past the stop;
+                // the next pass still needs to see its gap.
                 restore_failures = restore_failures.saturating_add(1);
                 error!(
                     code = ErrorCode::WsSpill02FrameDropped.code_str(),
                     segment = ?path,
                     error = %err,
                     "WAL replay could not return a SKIPPED staged segment to the live \
-                     directory. The confirm step will archive it, and the next pass will \
-                     not see the gap it leaves, so bars across that gap may be rebuilt \
-                     from part of their ticks."
+                     directory. Refusing this pass so its gap remains visible on retry."
                 );
             }
             continue;
@@ -4993,11 +4987,9 @@ pub fn replay_all_with_report_guarded<P: AsRef<Path>, R: Fn() -> Option<u64>>(
     // segments this boot actually read, which is exactly what that function
     // assumes. It needs no signature change and no manifest file.
     //
-    // A failed restore is LOUD, never silent: the segment stays in
-    // `replaying/` and would be archived unread, so it is the one residual
-    // and it gets a coded error plus a counter rather than a shrug. Both
-    // renames are within one filesystem between sibling directories, so a
-    // failure here means the staging renames below are failing too.
+    // A failed restore leaves an unread segment in the directory a boot confirm
+    // would glob. Refuse the entire pass before it can stage or return frames.
+    // A later pass re-lists both directories, including any successful restores.
     // K2: a leftover this pass could not READ goes back the same way, so the
     // confirm cannot archive it unread.
     // O(1) EXEMPT: begin — boot replay restore, cold path, one pass over the segment list
@@ -5021,10 +5013,8 @@ pub fn replay_all_with_report_guarded<P: AsRef<Path>, R: Fn() -> Option<u64>>(
                 segment = ?path,
                 error = %err,
                 "WAL replay could not restore a DEFERRED staged segment to the \
-                 live directory. It is still in the replay staging area, where \
-                 the confirm step archives everything it finds -- so these \
-                 captured frames may be archived without ever being replayed. \
-                 This is the one path by which recovery can lose data."
+                 live directory. Refusing this pass so its captured frames stay \
+                 available for retry."
             );
         }
     }
@@ -5034,6 +5024,12 @@ pub fn replay_all_with_report_guarded<P: AsRef<Path>, R: Fn() -> Option<u64>>(
     // first occurrence is the only one you get.
     // APPROVED: cast -- restore_failures is O(segments) <= u64 always.
     metrics::counter!(WAL_REPLAY_RESTORE_FAILED_COUNTER).increment(restore_failures as u64);
+
+    if restore_failures != 0 {
+        anyhow::bail!(
+            "WAL replay: {restore_failures} staged segment(s) could not be restored; holding the pass for retry"
+        );
+    }
 
     let deferred = segments.len().saturating_sub(consumed);
     if deferred > 0 {

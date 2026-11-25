@@ -472,3 +472,41 @@ fn test_b1_a_segment_that_reads_again_leaves_the_book() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn failed_deferred_restore_holds_every_unconfirmed_segment_for_retry() {
+    let dir = tmp_dir("replay-restore-obstructed");
+    let staging = dir.join(REPLAYING_SUBDIR);
+    std::fs::create_dir_all(&staging).unwrap();
+    let pre_staged = write_wm_segment(&staging, 10, 1, WalEndpoint::MainFeed);
+    let live = write_wm_segment(&dir, 15, 1, WalEndpoint::MainFeed);
+    let restored = write_wm_segment(&staging, 20, 1, WalEndpoint::MainFeed);
+    let blocked = write_wm_segment(&staging, 30, 1, WalEndpoint::MainFeed);
+    let obstruction = dir.join(blocked.file_name().unwrap());
+    std::fs::create_dir(&obstruction).unwrap();
+
+    // Only the first segment fits. Returning the third succeeds; returning
+    // the fourth fails because a directory occupies its live destination.
+    let failed = replay_all_with_report_guarded(&dir, 1, || None, None, WAL_REPLAY_RSS_STOP_PCT);
+    assert!(
+        failed
+            .err()
+            .expect("failed restore must hold the pass")
+            .to_string()
+            .contains("could not be restored")
+    );
+    assert!(pre_staged.is_file() && live.is_file() && blocked.is_file());
+    assert!(!restored.exists() && dir.join(restored.file_name().unwrap()).is_file());
+    assert!(wal_segments_in(&dir.join(ARCHIVE_SUBDIR)).is_empty());
+
+    std::fs::remove_dir(&obstruction).unwrap();
+    let retry =
+        replay_all_with_report_guarded(&dir, usize::MAX, || None, None, WAL_REPLAY_RSS_STOP_PCT)
+            .expect("both restored and still-staged segments must be offered again");
+    let sequences: Vec<_> = retry.frames.iter().map(|frame| frame.frame_seq).collect();
+    assert_eq!(sequences, [wm_seq(10), wm_seq(15), wm_seq(20), wm_seq(30)]);
+    confirm_replayed(&dir);
+    assert_eq!(wal_segments_in(&dir.join(ARCHIVE_SUBDIR)).len(), 4);
+    assert!(wal_segments_in(&staging).is_empty() && wal_segments_in(&dir).is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
