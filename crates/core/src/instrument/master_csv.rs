@@ -1052,7 +1052,7 @@ mod tests {
     const HEADER: &str = "SECURITY_ID,ISIN,SYMBOL_NAME,EXCH_ID,SEGMENT,SERIES";
 
     #[test]
-    fn detailed_master_keeps_only_unambiguous_reported_nse_cash_equity_mtf_terms() {
+    fn parse_detailed_master_keeps_only_unambiguous_reported_nse_cash_equity_mtf_terms() {
         let header = format!("{HEADER},Instrument,Mtf_Leverage");
         let body = master_with(
             &header,

@@ -301,7 +301,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn preserves_last_modified_from_the_response_that_supplied_the_csv() {
+    async fn fetch_csv_with_provenance_preserves_last_modified_from_the_csv_response() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await

@@ -171,19 +171,65 @@ pub(crate) fn archive_segment(from: &Path, to: &Path, decision: ArchiveDecision)
     Ok(())
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn replaced_source_never_attaches_an_archive_decision_to_the_wrong_capture() {
+    fn test_directory(case: &str) -> std::path::PathBuf {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir =
-            std::env::temp_dir().join(format!("wal-provenance-{}-{nonce}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("wal-{case}-{}-{nonce}", std::process::id()));
         std::fs::create_dir(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn move_segment_preserves_both_files_on_collision_then_moves_to_an_unused_name() {
+        let dir = test_directory("move");
+        let source = dir.join("source");
+        let destination = dir.join("archived");
+        std::fs::write(&source, b"capture").unwrap();
+        std::fs::write(&destination, b"earlier").unwrap();
+        assert_eq!(
+            move_segment(&source, &destination).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(std::fs::read(&source).unwrap(), b"capture");
+        assert_eq!(std::fs::read(&destination).unwrap(), b"earlier");
+        let unused = dir.join("unused");
+        move_segment(&source, &unused).unwrap();
+        assert!(!source.exists());
+        assert_eq!(std::fs::read(unused).unwrap(), b"capture");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_hashed_segment_refuses_a_same_size_replacement_then_removes_the_verified_inode() {
+        let dir = test_directory("prune");
+        let path = dir.join("capture");
+        let pinned_name = dir.join("pinned");
+        std::fs::write(&path, b"first").unwrap();
+        let verified = std::fs::File::open(&path).unwrap().metadata().unwrap();
+        std::fs::rename(&path, &pinned_name).unwrap();
+        std::fs::write(&path, b"other").unwrap();
+        assert_eq!(
+            remove_hashed_segment(&path, &verified).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"other");
+        remove_hashed_segment(&pinned_name, &verified).unwrap();
+        assert!(!pinned_name.exists());
+        assert_eq!(std::fs::read(&path).unwrap(), b"other");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn replaced_source_never_attaches_an_archive_decision_to_the_wrong_capture() {
+        let dir = test_directory("provenance");
         let source = dir.join("source");
         let replaced = dir.join("replaced");
         let archive = dir.join("archive");

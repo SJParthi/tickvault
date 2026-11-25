@@ -511,7 +511,7 @@ fn failed_deferred_restore_holds_every_unconfirmed_segment_for_retry() {
 }
 
 #[test]
-fn conflicting_replay_identities_preserve_both_captures_until_resolved() {
+fn check_replay_names_preserves_both_conflicting_captures_until_resolved() {
     let dir = tmp_dir("replay-name-conflict");
     let staging = dir.join(REPLAYING_SUBDIR);
     std::fs::create_dir_all(&staging).unwrap();

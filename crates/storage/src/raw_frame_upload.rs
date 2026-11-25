@@ -1987,7 +1987,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn verified_prune_log_links_an_early_upload_to_the_later_archive_decision() {
+    async fn last_archive_decision_links_verified_prune_to_the_exact_archived_capture() {
         let dir = temp_wal_dir("early-upload-prune-event");
         let path = plant(&dir, SEG, b"closed capture");
         let store = FakeStore::default();
