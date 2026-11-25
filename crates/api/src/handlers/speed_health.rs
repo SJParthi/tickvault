@@ -624,7 +624,7 @@ pub(crate) fn tick_window(ist_now: i64) -> (i64, i64) {
 pub(crate) fn conservation_sql(ist_now: i64) -> String {
     format!(
         "SELECT trading_date_ist, feed, verdict, reason, accepted_rows, db_tick_rows, \
-         not_landed_rows, shortfall FROM tick_conservation_audit WHERE ts >= '{}' \
+         not_landed_rows, shortfall, ts, count_reads FROM tick_conservation_audit WHERE ts >= '{}' \
          ORDER BY ts DESC LIMIT {CONSERVATION_ROWS}",
         ist_literal(ist_now - CONSERVATION_LOOKBACK_DAYS * SECS_PER_DAY),
     )
@@ -843,7 +843,9 @@ fn conservation_result(
         ("match" | "unverified", _) => ("count agreement unverified", Light::Amber),
         ("partial", _) => ("partial session counts", Light::Amber),
         ("mismatch", "extra_db_rows") => ("extra database rows", Light::Red),
-        ("mismatch", "unexplained_shortfall") => ("fewer database rows than expected", Light::Red),
+        ("mismatch", "unexplained_shortfall") => {
+            ("fewer stored rows than accepted writes", Light::Red)
+        }
         ("mismatch", _) => ("row counts differ", Light::Red),
         _ => ("unknown result", Light::Grey),
     }
@@ -907,15 +909,22 @@ fn conservation_section(outcome: &QueryOutcome, ist_now: i64) -> Section {
                     // The writer uses zero as a placeholder for an unreadable count.
                     let shortfall = database.and_then(|_| cell("shortfall")?.as_i64());
                     let (value, status) = conservation_result(verdict, reason, accepted, database, shortfall);
+                    // This table stores IST wall time in its designated timestamp.
+                    let checked = cell("ts")
+                        .and_then(Value::as_str)
+                        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                        .map_or_else(|| "unknown".to_string(), |ts| ts.format("%Y-%m-%d %H:%M:%S%.6f IST").to_string());
                     let number = |value: Option<i64>| value.map_or_else(|| "unknown".to_string(), format_signed);
                     Tile::new(format!("{day} · {}", short_text(feed)), value, status)
                         .with_detail(format!(
-                            "accepted {} · in the database {} · spill, failure or deferral counter {} · difference {} · reason {}",
+                            "accepted writes {} · in the database {} · spill, failure or deferral counter {} · difference {} · reason {} · checked {} · count reads {}",
                             number(accepted),
                             number(database),
                             number(count("not_landed_rows")),
                             number(shortfall),
                             short_text(&reason.replace('_', " ")),
+                            checked,
+                            number(count("count_reads")),
                         ))
                 }))
                 .collect()
@@ -931,7 +940,7 @@ fn conservation_section(outcome: &QueryOutcome, ist_now: i64) -> Section {
     };
     Section {
         title: "Daily tick counts",
-        note: "The 15:45 check compares accepted tick rows with rows counted in the database."
+        note: "At 15:45 the app compares writes accepted by its buffer with stored trades and quotes. Replaying the same key can count a write twice while the database keeps one row. Identifying a missing tick requires comparing capture keys."
             .to_string(),
         tiles,
     }
@@ -2336,6 +2345,8 @@ garbage line without a number x
                 "db_tick_rows",
                 "not_landed_rows",
                 "shortfall",
+                "ts",
+                "count_reads",
             ],
             vec![
                 vec![
@@ -2347,6 +2358,8 @@ garbage line without a number x
                     Value::from(64_349_753),
                     Value::from(0),
                     Value::from(0),
+                    json_str("2026-10-29T15:49:02.891119Z"),
+                    Value::from(3),
                 ],
                 vec![
                     json_str("2026-10-28T00:00:00.000000Z"),
@@ -2368,7 +2381,21 @@ garbage line without a number x
         assert_eq!(section.tiles[1].label, "2026-10-29 · dhan");
         assert_eq!(section.tiles[1].value, "row counts agree");
         assert_eq!(section.tiles[1].status, Light::Green);
-        assert!(section.tiles[1].detail.contains("accepted 64,349,753"));
+        assert!(
+            section.tiles[1]
+                .detail
+                .contains("accepted writes 64,349,753")
+        );
+        assert!(
+            section.tiles[1]
+                .detail
+                .contains("checked 2026-10-29 15:49:02.891119 IST · count reads 3")
+        );
+        assert!(
+            section.tiles[2]
+                .detail
+                .contains("checked unknown · count reads unknown")
+        );
         assert_eq!(section.tiles[2].status, Light::Amber);
         assert!(section.tiles[2].detail.contains("in the database unknown"));
         assert!(section.tiles[2].detail.contains("difference unknown"));
@@ -2422,6 +2449,11 @@ garbage line without a number x
             );
         }
         for (row, label, status) in [
+            (
+                serde_json::json!(["mismatch", "unexplained_shortfall", 4, 2, 2]),
+                "fewer stored rows than accepted writes",
+                Light::Red,
+            ),
             (
                 serde_json::json!(["mismatch", "extra_db_rows", 100, 101, -1]),
                 "extra database rows",
@@ -2934,7 +2966,7 @@ garbage line without a number x
         let parsed: Value = serde_json::from_slice(&body).expect("json");
         let text = parsed.to_string();
         assert!(
-            text.contains("fewer database rows than expected"),
+            text.contains("fewer stored rows than accepted writes"),
             "conservation row read: {text}"
         );
         assert!(text.contains("1.0 GB"), "metrics page read: {text}");

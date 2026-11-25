@@ -520,8 +520,8 @@ fn report(row: &TickConservationRow, inputs: ConservationInputs) {
             not_landed_rows = inputs.not_landed_rows,
             shortfall = row.shortfall(),
             count_reads = row.count_reads,
-            "TICK-CONSERVE-01: today's ticks rows do not reconcile with the rows this \
-             process accepted, after every counted spill, failure and WAL deferral"
+            "TICK-CONSERVE-01: accepted buffer writes and stored trade and quote rows differ. \
+             Compare capture keys to distinguish repeated writes from missing rows"
         ),
         "unverified" => warn!(
             reason = row.reason,
