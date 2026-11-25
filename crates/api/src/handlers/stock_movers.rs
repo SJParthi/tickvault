@@ -1098,13 +1098,10 @@ mod tests {
         assert_eq!(t.leverage_by_security_id.len(), MAX_SOURCE_ROWS + 1);
         assert_eq!(t.leverage_by_security_id.get(&2_000), Some(&0.0));
         let published = serde_json::to_vec(&u).unwrap();
-        assert!(published.len() < MAX_UNIVERSE_BYTES);
-        eprintln!(
-            "MTF fixture daily mapping {} of {} bytes; published universe (1,001 terms and OHLC quotes) {} of {} bytes",
-            bytes.len(),
-            MAX_MAPPING_BYTES,
-            published.len(),
-            MAX_UNIVERSE_BYTES
+        assert!(
+            published.len() < MAX_UNIVERSE_BYTES,
+            "1,001 MTF terms and OHLC quotes occupied {} bytes (limit {MAX_UNIVERSE_BYTES})",
+            published.len()
         );
         for (key, invalid) in [
             ("mtf_observed_at_epoch_secs", serde_json::Value::Null),
