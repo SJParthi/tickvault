@@ -3343,3 +3343,7 @@ Publish the daily receipt's complete ILP row in the bounded audit disk tier befo
 Check healthy direct writes, process death during the first send, ambiguous acknowledgement, schema refusal and retry, unavailable disk and recovery after restart. Compare the local files and keyed QuestDB rows in an isolated fixture. A process crash before publication, or both unwriteable local storage and an unreachable database, can leave no audit row.
 
 Keep STORAGE-GAP-03 stages for queued receipts and unconfirmed copies. Use the existing table-labelled spill and replay counters. On rollback, preserve outstanding files under `data/spill/audit/tick_conservation_audit/` and drain them with a compatible build.
+
+### November 25 · Daily WebSocket audit evidence
+
+The same-day feed scoreboard reads the five producer drop reasons and both writer error stages seeded by the Rust metrics exporter. A known dropped event or rejected append marks the report degraded. A failed flush, missing series, unreadable scrape or malformed zero leaves the report partial until its delivery evidence can be established. Historical backfills use their existing database evidence. The integration fixture exercises complete, degraded and partial outcomes, partial label sets and unavailable scrapes.

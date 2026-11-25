@@ -1377,6 +1377,86 @@ pub fn should_suppress_episode_overwrite(
     existing_run_partial == Some(false) && new_run_partial
 }
 
+/// Drop reasons registered on startup and required to prove a measured zero.
+pub const WS_AUDIT_DROP_REASONS: [&str; 5] = [
+    "subscription_change",
+    "live_feed_lifecycle",
+    "live_feed_forward",
+    "full",
+    "closed",
+];
+
+#[derive(Default)]
+struct AuditCounterSample {
+    count: u64,
+    seen: bool,
+    invalid: bool,
+}
+
+impl AuditCounterSample {
+    fn observe(&mut self, raw: Option<&str>) {
+        // The local Rust exporter renders integer counter values in base ten.
+        // Accept its exact format so a small positive fraction cannot round to zero.
+        match raw.and_then(|v| v.parse::<u64>().ok()) {
+            Some(n) => {
+                self.count = self.count.saturating_add(n);
+                self.seen = true;
+            }
+            None => self.invalid = true,
+        }
+    }
+
+    fn reading(&self) -> Option<u64> {
+        (self.count > 0 || (self.seen && !self.invalid)).then_some(self.count)
+    }
+}
+
+/// Read the seven boot-seeded series in one pass. A positive count proves a
+/// lower bound even if the exporter omitted or damaged another series.
+fn socket_audit_counters(body: &str) -> (Option<u64>, Option<u64>, Option<u64>) {
+    let mut drops = AuditCounterSample::default();
+    let mut append = AuditCounterSample::default();
+    let mut flush = AuditCounterSample::default();
+    let mut seen_reasons = [false; WS_AUDIT_DROP_REASONS.len()];
+    for line in body.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(metric) = fields.next() else {
+            continue;
+        };
+        match metric {
+            r#"tv_ws_event_audit_write_errors_total{stage="append"}"# => {
+                append.observe(fields.next())
+            }
+            r#"tv_ws_event_audit_write_errors_total{stage="flush"}"# => {
+                flush.observe(fields.next())
+            }
+            _ => {
+                let Some(labels) = metric.strip_prefix("tv_ws_event_audit_dropped_total") else {
+                    continue;
+                };
+                if !labels.is_empty() && !labels.starts_with('{') {
+                    continue;
+                }
+                let reason = labels
+                    .strip_prefix(r#"{reason=""#)
+                    .and_then(|s| s.strip_suffix(r#""}"#));
+                if let Some(index) = WS_AUDIT_DROP_REASONS
+                    .iter()
+                    .position(|&expected| Some(expected) == reason)
+                {
+                    seen_reasons[index] = true;
+                } else {
+                    // An unlabelled or unknown zero cannot certify the seeded reasons.
+                    drops.invalid = true;
+                }
+                drops.observe(fields.next());
+            }
+        }
+    }
+    drops.invalid |= seen_reasons.contains(&false);
+    (drops.reading(), append.reading(), flush.reading())
+}
+
 /// Sum EVERY series of a counter across its label sets (the bare name AND
 /// `name{labels}` lines) from a Prometheus exposition body. Pure. `None`
 /// when the metric is entirely absent (never silently zero).
@@ -3503,19 +3583,34 @@ async fn run_feed_scoreboard_attempt(
     let mut degraded = false;
     if is_same_day_run {
         let metrics_url = format!("http://127.0.0.1:{metrics_port}/metrics");
-        if let Ok(resp) = client.get(&metrics_url).send().await
-            && resp.status().is_success()
-            && let Ok(body) = resp.text().await
-            && let Some(dropped) = parse_prom_counter_sum(&body, "tv_ws_event_audit_dropped_total")
-            && dropped > 0
-        {
+        let body = match client.get(metrics_url).send().await {
+            Ok(resp) if resp.status().is_success() => resp.text().await.ok(),
+            _ => None,
+        };
+        // Both single-label writer series are seeded at boot. Rejected appends
+        // lose the event; failed flush attempts may recover on a later retry.
+        let (dropped, append_errors, flush_errors) = body
+            .as_deref()
+            .map_or((None, None, None), socket_audit_counters);
+        if dropped.is_some_and(|n| n > 0) || append_errors.is_some_and(|n| n > 0) {
             degraded = true;
             scoreboard_finding!(
                 ctx,
                 stage = "audit_drop_crosscheck",
-                dropped,
-                "SCOREBOARD-01: ws_event_audit dropped rows this session — the \
-                 day's episode counts are a floor, not a truth (outcome=degraded)"
+                ?dropped,
+                ?append_errors,
+                ?flush_errors,
+                "SCOREBOARD-01: ws_event_audit rejected rows this session; the day's episode counts are a lower bound"
+            );
+        } else if (dropped, append_errors, flush_errors) != (Some(0), Some(0), Some(0)) {
+            sources_complete = false;
+            scoreboard_finding!(
+                ctx,
+                stage = "audit_drop_crosscheck",
+                ?dropped,
+                ?append_errors,
+                ?flush_errors,
+                "SCOREBOARD-01: today's socket audit counters are incomplete or include a failed flush whose delivery is unverified"
             );
         }
     }
