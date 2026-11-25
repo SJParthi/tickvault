@@ -85,7 +85,8 @@ use tickvault_storage::feed_scoreboard_persistence::{
 
 /// Reads the single nonnegative LONG returned by a QuestDB count query.
 /// The optional envelope `count` is the number of result rows, even when
-/// the aggregate itself is zero.
+/// the aggregate itself is zero. Older responses omit column metadata or
+/// its type. When supplied, the column must describe the requested count.
 #[must_use]
 pub fn parse_questdb_count(body: &str) -> Option<i64> {
     let response: serde_json::Value = serde_json::from_str(body).ok()?;
@@ -93,6 +94,18 @@ pub fn parse_questdb_count(body: &str) -> Option<i64> {
         || response.get("count").is_some_and(|n| n.as_u64() != Some(1))
     {
         return None;
+    }
+    if let Some(columns) = response.get("columns") {
+        let [column] = columns.as_array()?.as_slice() else {
+            return None;
+        };
+        if !matches!(column.get("name")?.as_str()?, "count" | "count()")
+            || column
+                .get("type")
+                .is_some_and(|ty| ty.as_str() != Some("LONG"))
+        {
+            return None;
+        }
     }
     let [row] = response.get("dataset")?.as_array()?.as_slice() else {
         return None;
@@ -3793,6 +3806,30 @@ mod tests {
             parse_questdb_count(r#"{"dataset":[[9223372036854775807]]}"#),
             Some(i64::MAX)
         );
+        // Older responses can name the aggregate without describing its type.
+        for columns in [
+            r#"[{"name":"count"}]"#,
+            r#"[{"name":"count()","type":"LONG"}]"#,
+        ] {
+            let response = format!(r#"{{"columns":{columns},"dataset":[[42]]}}"#);
+            assert_eq!(parse_questdb_count(&response), Some(42), "{response}");
+        }
+        for columns in [
+            "null",
+            "{}",
+            "[]",
+            "[null]",
+            r#"[{"name":"count"},{"name":"count"}]"#,
+            r#"[{"type":"LONG"}]"#,
+            r#"[{"name":null}]"#,
+            r#"[{"name":"temperature","type":"LONG"}]"#,
+            r#"[{"name":"temperature","type":"INT"}]"#,
+            r#"[{"name":"count","type":"INT"}]"#,
+            r#"[{"name":"count","type":null}]"#,
+        ] {
+            let response = format!(r#"{{"columns":{columns},"dataset":[[42]]}}"#);
+            assert_eq!(parse_questdb_count(&response), None, "{response}");
+        }
         for invalid in [
             "not json",
             "{}",

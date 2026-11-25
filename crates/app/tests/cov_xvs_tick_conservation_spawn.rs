@@ -141,7 +141,11 @@ impl Scenario {
         let srv = FakeQuestDb::start(Arc::new(|q: &str| {
             if q.contains("count(") {
                 // Each of the two tables counts 5 rows.
-                (200, r#"{"columns":[],"dataset":[[5]]}"#.to_owned())
+                (
+                    200,
+                    r#"{"columns":[{"name":"count()","type":"LONG"}],"dataset":[[5]],"count":1}"#
+                        .to_owned(),
+                )
             } else {
                 (200, r#"{"ddl":"OK"}"#.to_owned())
             }
