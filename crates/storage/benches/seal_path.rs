@@ -218,13 +218,6 @@ impl Rig {
     fn seal_at(&self, i: usize) -> BufferedSeal {
         self.seals[i % SEAL_POOL]
     }
-
-    fn reset_writer_every_batch(&mut self, i: usize) {
-        if i % APPEND_BATCH == APPEND_BATCH - 1 {
-            self.writer.discard_pending();
-            self.own_writer.discard_pending();
-        }
-    }
 }
 
 impl Drop for Rig {
@@ -321,12 +314,7 @@ impl Step {
                     panic!("bench: the seal queue refused a send"); // APPROVED: bench setup
                 }
             }
-            Self::IlpAppendUnlabelled
-            | Self::IlpAppendLabelled
-            | Self::OwnAppendUnlabelled
-            | Self::OwnAppendLabelled => rig.reset_writer_every_batch(i),
             Self::DrainPopAppend | Self::OwnPopAppend => {
-                rig.reset_writer_every_batch(i);
                 let s = rig.seal_at(i);
                 if !matches!(
                     rig.pipeline.submit(s, NOW_UNIX_SECS),
@@ -335,13 +323,19 @@ impl Step {
                     panic!("bench: the ring did not buffer the seal"); // APPROVED: bench setup
                 }
             }
-            Self::RowBuild | Self::LedgerProbeMiss | Self::LedgerProbeHit => {}
+            Self::IlpAppendUnlabelled
+            | Self::IlpAppendLabelled
+            | Self::OwnAppendUnlabelled
+            | Self::OwnAppendLabelled
+            | Self::RowBuild
+            | Self::LedgerProbeMiss
+            | Self::LedgerProbeHit => {}
         }
     }
 
     /// The timed call.
     #[inline]
-    fn run(self, rig: &mut Rig, i: usize) {
+    fn run(self, rig: &mut Rig, i: usize) -> anyhow::Result<()> {
         match self {
             Self::HandoffTrySend => {
                 let s = rig.seal_at(i);
@@ -358,21 +352,25 @@ impl Step {
             }
             Self::IlpAppendUnlabelled | Self::IlpAppendLabelled => {
                 let s = &rig.seals[i % SEAL_POOL];
-                black_box(rig.writer.append_seal(black_box(s)).is_ok());
+                return rig.writer.append_seal(black_box(s));
             }
             Self::DrainPopAppend => {
-                if let Some(s) = rig.pipeline.pop_oldest() {
-                    black_box(rig.writer.append_seal(&s).is_ok());
-                }
+                let s = rig
+                    .pipeline
+                    .pop_oldest()
+                    .ok_or_else(|| anyhow::anyhow!("empty seal ring"))?;
+                return rig.writer.append_seal(&s);
             }
             Self::OwnAppendUnlabelled | Self::OwnAppendLabelled => {
                 let s = &rig.seals[i % SEAL_POOL];
-                black_box(rig.own_writer.append_seal(black_box(s)).is_ok());
+                return rig.own_writer.append_seal(black_box(s));
             }
             Self::OwnPopAppend => {
-                if let Some(s) = rig.pipeline.pop_oldest() {
-                    black_box(rig.own_writer.append_seal(&s).is_ok());
-                }
+                let s = rig
+                    .pipeline
+                    .pop_oldest()
+                    .ok_or_else(|| anyhow::anyhow!("empty seal ring"))?;
+                return rig.own_writer.append_seal(&s);
             }
             Self::LedgerProbeMiss => {
                 // Pool index 1.. never spilled: a miss.
@@ -385,7 +383,68 @@ impl Step {
                 black_box(rig.spill.note_live_commits(black_box(s), NOW_UNIX_SECS));
             }
         }
+        Ok(())
     }
+
+    /// Measure only the call. Check its result and validate every complete or
+    /// final partial writer batch before handing its timing to the caller.
+    fn time_call(self, rig: &mut Rig, i: usize, last: bool) -> Duration {
+        self.prepare(rig, i);
+        let start = Instant::now();
+        let result = self.run(rig, i);
+        let elapsed = start.elapsed();
+        result.unwrap_or_else(|err| panic!("{} failed at call {i}: {err:#}", self.id()));
+
+        let batch_len = i % APPEND_BATCH + 1;
+        if last || batch_len == APPEND_BATCH {
+            let writer = match self {
+                Self::IlpAppendUnlabelled | Self::IlpAppendLabelled | Self::DrainPopAppend => {
+                    &mut rig.writer
+                }
+                Self::OwnAppendUnlabelled | Self::OwnAppendLabelled | Self::OwnPopAppend => {
+                    &mut rig.own_writer
+                }
+                _ => return elapsed,
+            };
+            verify_wire_batch(writer, batch_len)
+                .unwrap_or_else(|err| panic!("{}: {err}", self.id()));
+            writer.discard_pending();
+        }
+        elapsed
+    }
+}
+
+// The generated fixture names and fields have no embedded line breaks.
+// Each physical newline therefore terminates exactly one encoded row.
+fn verify_wire_batch(writer: &ShadowCandleWriter, expected: usize) -> anyhow::Result<()> {
+    let bytes = writer.buffer_bytes();
+    let pending = writer.pending_count();
+    let rows = writer.buffer_row_count();
+    let lines = bytes.iter().filter(|&&byte| byte == b'\n').count();
+    let terminated = bytes.ends_with(b"\n");
+    anyhow::ensure!(
+        pending == expected && rows == expected && lines == expected && terminated,
+        "expected {expected} completed ILP rows; pending={pending}, encoded={rows}, lines={lines}, terminated={terminated}"
+    );
+    Ok(())
+}
+
+// The writer legitimately returns Ok when its session filter drops a row.
+// Verify with real writers that such a call cannot buy a timing result.
+fn check_filtered_row_control() -> anyhow::Result<()> {
+    for encoder in [TickIlpEncoder::Library, TickIlpEncoder::Own] {
+        let mut writer = ShadowCandleWriter::for_test_with_encoder(encoder);
+        let mut filtered = seal(0);
+        filtered.state.bucket_start_ist_secs = 0;
+        writer.append_seal(&seal(1))?;
+        writer.append_seal(&filtered)?;
+        verify_wire_batch(&writer, 1)?;
+        anyhow::ensure!(
+            verify_wire_batch(&writer, 2).is_err(),
+            "filtered control row counted"
+        );
+    }
+    Ok(())
 }
 
 fn bench_steps(
@@ -400,11 +459,7 @@ fn bench_steps(
             b.iter_custom(|iters| {
                 let mut total = Duration::ZERO;
                 for n in 0..iters {
-                    let i = n as usize;
-                    step.prepare(&mut rig, i);
-                    let t = Instant::now();
-                    step.run(&mut rig, i);
-                    total += t.elapsed();
+                    total += step.time_call(&mut rig, n as usize, n + 1 == iters);
                 }
                 total
             });
@@ -498,16 +553,13 @@ fn samples_of(step: Step) -> Vec<u64> {
     let mut rig = Rig::new(&format!("tail-{}", step.id()));
     // Warm the caches and the buffer's capacity first, untimed.
     for i in 0..APPEND_BATCH {
-        step.prepare(&mut rig, i);
-        step.run(&mut rig, i);
+        step.time_call(&mut rig, i, i + 1 == APPEND_BATCH);
     }
     let mut samples = Vec::with_capacity(TAIL_SAMPLES);
     for n in 0..TAIL_SAMPLES {
         let i = APPEND_BATCH + n;
-        step.prepare(&mut rig, i);
-        let t = Instant::now();
-        step.run(&mut rig, i);
-        let ns = u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let elapsed = step.time_call(&mut rig, i, n + 1 == TAIL_SAMPLES);
+        let ns = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
         samples.push(ns);
     }
     samples.sort_unstable();
@@ -568,6 +620,9 @@ criterion_group!(benches, bench_seal_path);
 /// `criterion_main!` plus the p99 gate. The gate runs only under
 /// `cargo bench` (`--bench`); a test-mode run is unoptimised.
 fn main() {
+    if let Err(err) = check_filtered_row_control() {
+        panic!("seal_path writer control failed: {err:#}"); // APPROVED: bench setup
+    }
     benches();
     Criterion::default().configure_from_args().final_summary();
     if std::env::args().any(|a| a == "--bench")
