@@ -1079,7 +1079,7 @@ mod tests {
         let parsed = parse_detailed_master(&body).unwrap();
         assert_eq!(
             parsed.mtf_leverage_by_security_id,
-            [(1, 1.0), (2, 0.0), (3, 3.57)].into()
+            HashMap::from([(1, 1.0), (2, 0.0), (3, 3.57)])
         );
         assert_eq!(parse_master_csv(&body).unwrap(), parsed.rows);
         let legacy = master_with(HEADER, &["1,INE1,ONE,NSE,E,EQ"]);
