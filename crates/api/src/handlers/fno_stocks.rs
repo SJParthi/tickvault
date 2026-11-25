@@ -406,15 +406,42 @@ pub(super) fn build_fno_stocks_sql(
     window_end_ist: chrono::NaiveDateTime,
     row_limit: usize,
 ) -> String {
-    let id_list = ids.iter().map(u64::to_string).collect::<Vec<_>>().join(",");
+    build_equity_stocks_sql(ids, window_start_ist, window_end_ist, row_limit, None)
+}
+
+/// Price Movers can permit a wider interval for this date’s F&O
+/// IDs. The outer time predicate still prunes partitions before LATEST ON.
+pub(super) fn build_equity_stocks_sql(
+    ids: &[u64],
+    start: chrono::NaiveDateTime,
+    end: chrono::NaiveDateTime,
+    row_limit: usize,
+    auction: Option<(&[u64], chrono::NaiveDateTime, chrono::NaiveDateTime)>,
+) -> String {
+    let stamp = |t: chrono::NaiveDateTime| t.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string();
+    let id_list = |ids: &[u64]| ids.iter().map(u64::to_string).collect::<Vec<_>>().join(",");
+    let (lower, upper, extra) = match auction {
+        Some((eligible, lower, upper)) if !eligible.is_empty() => (
+            lower,
+            upper,
+            format!(
+                " AND ((ts >= '{}' AND ts <= '{}') OR security_id IN ({}))",
+                stamp(start),
+                stamp(end),
+                id_list(eligible)
+            ),
+        ),
+        _ => (start, end, String::new()),
+    };
     format!(
         "SELECT security_id, segment, ltp, close, volume, avg_price, ts, open, high, low FROM ticks \
          WHERE segment = '{}' AND feed = '{FNO_STOCKS_FEED}' AND ts >= '{}' AND ts <= '{}' \
-         AND security_id IN ({id_list}) \
+         AND security_id IN ({}){extra} \
          LATEST ON ts PARTITION BY security_id, segment LIMIT {row_limit}",
         segment_code_to_str(EXCHANGE_SEGMENT_NSE_EQ),
-        window_start_ist.format("%Y-%m-%dT%H:%M:%S%.6fZ"),
-        window_end_ist.format("%Y-%m-%dT%H:%M:%S%.6fZ"),
+        stamp(lower),
+        stamp(upper),
+        id_list(ids),
     )
 }
 

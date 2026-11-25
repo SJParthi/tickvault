@@ -224,6 +224,50 @@ struct ReadPlan {
     /// `(start, end, closed)` of the query window; `None` before the day's
     /// 09:15 on a closed read (nothing is queried).
     window: Option<(chrono::NaiveDateTime, chrono::NaiveDateTime, bool)>,
+    /// Actual price observations only, for securities in this date's F&O list.
+    /// Membership does not certify the exchange's separate per-security CAS flag.
+    auction_window: Option<(chrono::NaiveDateTime, chrono::NaiveDateTime)>,
+}
+
+/// NSE CM CAS FAQ v3 (Oct 23, §§72,81), revised FAQ effective Dec 7
+/// (Nov 9, §§12,17). Collection does not produce continuous trades. Preserve
+/// the last rolling window before collection and keep actual match times.
+fn cash_auction_window(
+    at: chrono::NaiveDateTime,
+    start: chrono::NaiveDateTime,
+    end: chrono::NaiveDateTime,
+    closed: bool,
+) -> Option<(chrono::NaiveDateTime, chrono::NaiveDateTime)> {
+    use chrono::{Duration, NaiveDate, NaiveTime};
+    use tickvault_common::constants::{CAS_WINDOW_OPEN_SECS_OF_DAY_IST, MARKET_CLOSE_IST_NANOS};
+    let launch = NaiveDate::from_ymd_opt(2026, 8, 3)?;
+    let revision = NaiveDate::from_ymd_opt(2026, 12, 7)?;
+    let date = at.date();
+    if date < launch {
+        return None;
+    }
+    let day = date.and_time(NaiveTime::MIN);
+    if closed {
+        // The capture service may still stop at 15:40. Read any real prints
+        // already in storage through the revised cash auction close.
+        let later_end = at.min(day + Duration::minutes(15 * 60 + 45));
+        return (date >= revision && end < later_end).then_some((start, later_end));
+    }
+    let end_of_session = if date < revision {
+        Duration::nanoseconds(MARKET_CLOSE_IST_NANOS)
+    } else {
+        Duration::minutes(15 * 60 + 45)
+    };
+    if at >= day + end_of_session {
+        return None;
+    }
+    let collection = if date < revision {
+        Duration::seconds(i64::from(CAS_WINDOW_OPEN_SECS_OF_DAY_IST))
+    } else {
+        Duration::minutes(15 * 60 + 30)
+    };
+    let previous_window = fno_stocks::window_start(day + collection);
+    (previous_window < start).then_some((previous_window, end))
 }
 
 fn plan_read(
@@ -244,11 +288,14 @@ fn plan_read(
     } else {
         fno_stocks::closed_session_window(at).map(|(start, end)| (start, end, true))
     };
+    let auction_window =
+        window.and_then(|(start, end, closed)| cash_auction_window(at, start, end, closed));
     ReadPlan {
         observed,
         open,
         at,
         window,
+        auction_window,
     }
 }
 
@@ -301,6 +348,9 @@ fn assemble_universe(
     membership: Option<&Memberships>,
     fetched: Fetched,
 ) -> MoversUniverse {
+    let auction_window = plan
+        .auction_window
+        .filter(|_| fno.is_some_and(|f| !f.is_empty()));
     let prices = match (fetched, plan.window) {
         (Fetched::BeforeSession, _) | (Fetched::Rows(_), None) => UniversePrices::BeforeSession,
         (Fetched::NoQuery, _) => UniversePrices::Rows { rows: Vec::new() },
@@ -309,7 +359,19 @@ fn assemble_universe(
         (Fetched::Rows(rows), Some((start, end, _))) => UniversePrices::Rows {
             rows: rows
                 .into_iter()
-                .filter(|r| r.ltp.is_finite() && r.ltp > 0.0 && r.ts >= start && r.ts <= end)
+                .filter(|r| {
+                    if !r.ltp.is_finite() || r.ltp <= 0.0 {
+                        return false;
+                    }
+                    (start <= r.ts && r.ts <= end)
+                        || auction_window.is_some_and(|(lower, upper)| {
+                            lower <= r.ts
+                                && r.ts <= upper
+                                && fno.is_some_and(|f| {
+                                    f.names.contains_key(&(r.security_id, r.segment_code))
+                                })
+                        })
+                })
                 .map(|r| PriceRow {
                     security_id: r.security_id,
                     segment_code: r.segment_code,
@@ -324,8 +386,12 @@ fn assemble_universe(
                 .collect(),
         },
     };
-    let window_secs = match plan.window {
-        Some((start, end, true)) => (end - start)
+    let window_secs = match (plan.window, auction_window) {
+        (Some((_, _, closed)), Some((start, end))) => ((if closed { end } else { plan.at })
+            - start)
+            .num_seconds()
+            .clamp(1, fno_stocks::FNO_STOCKS_MAX_WINDOW_SECS),
+        (Some((start, end, true)), None) => (end - start)
             .num_seconds()
             .clamp(1, fno_stocks::FNO_STOCKS_MAX_WINDOW_SECS),
         _ => UNIVERSE_DEFAULT_WINDOW_SECS,
@@ -399,7 +465,16 @@ async fn build_universe(inputs: FnoStocksInputs<'_>) -> MoversUniverse {
         Some(_) if ids.len() > MAX_UNIVERSE_PRICE_ROWS => Fetched::Failed(QueryFailure::Refused),
         Some((start, window_end, closed)) => {
             let bound = ids.len().max(fno_stocks::FNO_STOCKS_MAX_ROWS);
-            let sql = fno_stocks::build_fno_stocks_sql(&ids, start, window_end, bound + 1);
+            let eligible = plan
+                .auction_window
+                .and(fno.as_ref())
+                .map(|f| f.sorted_ids());
+            let auction = plan
+                .auction_window
+                .zip(eligible.as_deref())
+                .map(|((lower, upper), ids)| (ids, lower, upper));
+            let sql =
+                fno_stocks::build_equity_stocks_sql(&ids, start, window_end, bound + 1, auction);
             let timeout = if closed {
                 inputs.timeout.max(Duration::from_secs(
                     fno_stocks::FNO_STOCKS_CLOSED_QUERY_TIMEOUT_SECS,
@@ -473,7 +548,11 @@ pub fn closed_read_key(clock: LiveClock) -> Option<ClosedReadKey> {
     match plan.window {
         Some((_, end, true)) if !plan.open => Some(ClosedReadKey {
             date_ist: plan.at.format("%Y-%m-%d").to_string(),
-            window_end_ist_secs: end.and_utc().timestamp(),
+            window_end_ist_secs: plan
+                .auction_window
+                .map_or(end, |(_, upper)| upper)
+                .and_utc()
+                .timestamp(),
         }),
         _ => None,
     }
@@ -1002,6 +1081,219 @@ mod tests {
         match reply.outcome {
             Outcome::Snapshot { snapshot } => *snapshot,
             other => panic!("expected snapshot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn auction_windows_follow_the_effective_date_and_preserve_historical_cutoffs() {
+        for (clock, live, chosen, extra) in [
+            ("2026-07-31 15:34:00", true, None, None),
+            ("2026-08-03 15:14:59", true, None, None),
+            ("2026-11-25 15:15:00", true, None, None),
+            (
+                "2026-11-25 15:30:00",
+                true,
+                None,
+                Some(("15:00:00", "15:30:05")),
+            ),
+            (
+                "2026-11-25 15:34:59",
+                true,
+                None,
+                Some(("15:00:00", "15:35:04")),
+            ),
+            (
+                "2026-11-25 15:39:59",
+                true,
+                None,
+                Some(("15:00:00", "15:40:04")),
+            ),
+            ("2026-11-25 15:41:00", false, None, None),
+            ("2026-11-25 17:00:00", false, Some("15:34:00"), None),
+            ("2026-12-07 15:29:59", true, None, None),
+            (
+                "2026-12-07 15:34:00",
+                true,
+                None,
+                Some(("15:15:00", "15:34:05")),
+            ),
+            (
+                "2026-12-07 15:41:00",
+                false,
+                None,
+                Some(("09:15:00", "15:41:00")),
+            ),
+            ("2026-12-07 17:00:00", false, Some("15:39:00"), None),
+            (
+                "2026-12-07 17:00:00",
+                false,
+                Some("15:42:00"),
+                Some(("09:15:00", "15:42:00")),
+            ),
+            (
+                "2026-12-07 17:00:00",
+                false,
+                None,
+                Some(("09:15:00", "15:45:00")),
+            ),
+        ] {
+            let day = &clock[..10];
+            let p = plan_read(at(clock), live, chosen.map(|t| at(&format!("{day} {t}"))));
+            assert_eq!(
+                p.auction_window,
+                extra.map(|(a, b)| (at(&format!("{day} {a}")), at(&format!("{day} {b}")))),
+                "{clock} {chosen:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn auction_closed_reuse_key_keeps_moving_until_the_revised_match_ends() {
+        let key = |at| closed_read_key(clock(at, false)).unwrap();
+        assert_ne!(key("2026-12-07 15:41:00"), key("2026-12-07 15:42:00"));
+        assert_ne!(key("2026-12-07 15:44:59"), key("2026-12-07 15:45:00"));
+        assert_eq!(key("2026-12-07 15:45:00"), key("2026-12-07 18:00:00"));
+        assert_eq!(key("2026-11-25 15:40:00"), key("2026-11-25 18:00:00"));
+        assert!(
+            plan_read(at("2026-11-25 18:00:00"), true, None)
+                .auction_window
+                .is_none()
+        );
+        assert!(
+            plan_read(at("2026-12-07 15:45:00"), true, None)
+                .auction_window
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn auction_sql_and_reader_keep_only_real_dated_fno_prices_inside_each_window() {
+        let fno = FnoUnderlyings {
+            names: [
+                ((2, EXCHANGE_SEGMENT_NSE_EQ), "STOCK002".into()),
+                ((4, EXCHANGE_SEGMENT_NSE_EQ), "STOCK004".into()),
+            ]
+            .into(),
+        };
+        for (date, now, live, cutoff, old_fno_stamp, non_fno_stamp, outside, expected_window) in [
+            (
+                "2026-11-25",
+                "15:30:00",
+                true,
+                None,
+                "15:14:59",
+                "15:14:59",
+                "14:59:59.999999",
+                1800,
+            ),
+            (
+                "2026-11-25",
+                "15:34:00",
+                true,
+                None,
+                "15:14:59",
+                "15:14:59",
+                "14:59:59.999999",
+                2040,
+            ),
+            (
+                "2026-12-07",
+                "17:00:00",
+                false,
+                Some("15:42:00"),
+                "15:41:59",
+                "15:41:59",
+                "15:42:00.000001",
+                23220,
+            ),
+        ] {
+            let at_time = |clock: &str| {
+                chrono::NaiveDateTime::parse_from_str(
+                    &format!("{date} {clock}"),
+                    "%Y-%m-%d %H:%M:%S%.f",
+                )
+                .unwrap()
+            };
+            let plan = plan_read(at_time(now), live, cutoff.map(at_time));
+            let mut artifact = mapping(4);
+            artifact["trading_date_ist"] = json!(date);
+            let membership =
+                parse_memberships(&serde_json::to_vec(&artifact).unwrap(), date).unwrap();
+            let ids = union_ids(Some(&fno), Some(&membership));
+            let (start, end, _) = plan.window.unwrap();
+            let (lower, upper) = plan.auction_window.unwrap();
+            let sql = fno_stocks::build_equity_stocks_sql(
+                &ids,
+                start,
+                end,
+                1001,
+                Some((&fno.sorted_ids(), lower, upper)),
+            );
+            assert!(
+                sql.contains("OR security_id IN (2,4)") && sql.contains("security_id IN (1,2,3,4)")
+            );
+            eprintln!("auction fixture {date} {now}: {sql}");
+            let sample = |id, ts| TickRow {
+                security_id: id,
+                segment_code: EXCHANGE_SEGMENT_NSE_EQ,
+                ltp: 102.0,
+                close: Some(100.0),
+                volume: Some(15),
+                avg_price: Some(101.0),
+                session_open: Some(100.0),
+                session_high: Some(102.0),
+                session_low: Some(100.0),
+                ts: at_time(ts),
+            };
+            let rows = vec![
+                sample(2, old_fno_stamp),
+                sample(1, non_fno_stamp),
+                sample(4, outside),
+                sample(3, "15:29:59"),
+            ];
+            let u = assemble_universe(
+                &plan,
+                Some(&fno),
+                Some(&membership),
+                Fetched::Rows(rows.clone()),
+            );
+            let age = (plan.at - at_time(old_fno_stamp)).num_seconds();
+            let s = snapshot(select(&u, &Filter::default()));
+            assert_eq!(s.rows.len(), 1);
+            assert_eq!(
+                (
+                    s.rows[0].price.security_id,
+                    s.rows[0].price.last_trade_ist.as_str()
+                ),
+                (2, old_fno_stamp)
+            );
+            assert_eq!(
+                s.status,
+                if live {
+                    SourceStatus::Stale
+                } else {
+                    SourceStatus::Closed
+                }
+            );
+            assert_eq!(s.data_age_secs, Some(age));
+            assert_eq!(s.window_secs, expected_window);
+            let all = snapshot(select(
+                &u,
+                &Filter {
+                    fno_only: false,
+                    ..Filter::default()
+                },
+            ));
+            assert_eq!((all.universe_total, all.stocks_priced), (4, 2));
+            let no_list = assemble_universe(&plan, None, Some(&membership), Fetched::Rows(rows));
+            let all = snapshot(select(
+                &no_list,
+                &Filter {
+                    fno_only: false,
+                    ..Filter::default()
+                },
+            ));
+            assert_eq!(all.stocks_priced, 1);
         }
     }
 
