@@ -37,6 +37,8 @@ pub enum MoversCategory {
     /// `Gainers` selects open = day low, `Losers` selects open = day high.
     /// Signed changes measure LTP relative to that session's open.
     ExtremeOpenings,
+    /// Equities with a reported positive Dhan margin-trading multiplier.
+    Mtf,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -229,6 +231,9 @@ pub enum MembershipStatus {
 pub struct MemberStock {
     #[serde(flatten)]
     pub price: Stock,
+    /// Dhan daily master multiple. Present only for a verified MTF match.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtf_leverage: Option<f64>,
     /// Absent when the current daily mapping contains only a trading symbol.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub company_name: Option<String>,
@@ -241,9 +246,38 @@ pub struct MemberStock {
     /// Unknown when today's canonical F&O artifact cannot be read.
     pub fno: Option<bool>,
 }
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct MtfCoverage {
+    pub selected: usize,
+    pub assessed: usize,
+    pub eligible: usize,
+    pub observed_at_epoch_secs: i64,
+}
+
+impl MtfCoverage {
+    /// A response may only use terms known by the requested IST minute.
+    fn valid_at_cutoff(&self, captured: i64, as_of: Option<&str>) -> bool {
+        use crate::operator_movers_universe::{UNIVERSE_IST_OFFSET_SECS, ist_date_of_epoch};
+        let cutoff = match as_of {
+            None => captured,
+            Some(text) => {
+                let Ok(local) = chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%dT%H:%M")
+                else {
+                    return false;
+                };
+                (local.and_utc().timestamp() - UNIVERSE_IST_OFFSET_SECS).min(captured)
+            }
+        };
+        self.observed_at_epoch_secs <= cutoff
+            && ist_date_of_epoch(self.observed_at_epoch_secs)
+                .is_some_and(|day| Some(day) == ist_date_of_epoch(cutoff))
+    }
+}
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct Snapshot {
     pub filter: Filter,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtf_coverage: Option<MtfCoverage>,
     pub status: SourceStatus,
     pub market_open: bool,
     pub as_of_ist: Option<String>,
@@ -293,6 +327,21 @@ impl Snapshot {
         {
             return false;
         }
+        let mtf = self.filter.category == Some(MoversCategory::Mtf);
+        let coverage_valid = match self.mtf_coverage {
+            Some(c) => {
+                mtf && self.universe_available
+                    && c.selected <= MAX_SOURCE_ROWS
+                    && c.assessed <= c.selected
+                    && c.eligible <= c.assessed
+                    && c.eligible == self.universe_total
+                    && c.observed_at_epoch_secs > 0
+            }
+            None => !mtf || (!self.universe_available && self.universe_total == 0),
+        };
+        if self.status == SourceStatus::NoMtfList && (!mtf || self.mtf_coverage.is_some()) {
+            return false;
+        }
         let status_valid = match self.status {
             SourceStatus::Live => {
                 self.market_open
@@ -307,10 +356,15 @@ impl Snapshot {
         };
         let mut ids = std::collections::HashSet::with_capacity(self.rows.len());
         status_valid
+            && coverage_valid
             && self.rows.iter().all(|row| {
                 row.price.security_id != 0
                     && row.price.security_id <= MAX_BROWSER_SECURITY_ID
                     && row.price.valid()
+                    && match row.mtf_leverage {
+                        Some(n) => mtf && n.is_finite() && n >= 1.0,
+                        None => !mtf,
+                    }
                     && row
                         .company_name
                         .as_ref()
@@ -372,7 +426,13 @@ impl Reply {
             && self.captured_at_epoch_secs <= now.saturating_add(5)
             && self.captured_at_epoch_secs >= now.saturating_sub(60)
             && match &self.outcome {
-                Outcome::Snapshot { snapshot } => snapshot.filter == *filter && snapshot.valid(),
+                Outcome::Snapshot { snapshot } => {
+                    snapshot.filter == *filter
+                        && snapshot.valid()
+                        && snapshot.mtf_coverage.is_none_or(|c| {
+                            c.valid_at_cutoff(self.captured_at_epoch_secs, filter.as_of.as_deref())
+                        })
+                }
                 Outcome::Error { .. } => true,
             }
     }
@@ -477,6 +537,7 @@ mod tests {
     }
     fn snapshot() -> Snapshot {
         Snapshot {
+            mtf_coverage: None,
             filter: Filter::default(),
             status: SourceStatus::Live,
             market_open: true,
@@ -494,6 +555,7 @@ mod tests {
             fno_list_available: true,
             rows: (1..=2)
                 .map(|id| MemberStock {
+                    mtf_leverage: None,
                     price: Stock {
                         security_id: id,
                         segment: "NSE_EQ".into(),

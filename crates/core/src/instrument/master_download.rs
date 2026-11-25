@@ -146,15 +146,33 @@ pub fn content_type_is_allowed(header: Option<&str>) -> bool {
 ///
 /// # Errors
 /// [`DownloadError`] — every variant refuses the whole body.
-// TEST-EXEMPT: network I/O. Every DECISION it makes is factored out and unit-tested —
-// `content_type_is_allowed` (the allowlist), `sanitize_transport_error` (the URL/credential
-// scrub) and the `DownloadError` Display. What remains here is reqwest orchestration, which
-// a unit test could only cover by mocking reqwest into asserting itself.
 pub async fn fetch_csv_hardened(
     client: &reqwest::Client,
     url: &str,
     user_agent: Option<&str>,
 ) -> Result<String, DownloadError> {
+    Ok(fetch_csv_with_provenance(client, url, user_agent)
+        .await?
+        .body)
+}
+
+/// A validated body and the publisher's optional HTTP Last-Modified field.
+pub struct DownloadedCsv {
+    /// UTF-8 body that passed the CSV content and length checks.
+    pub body: String,
+    /// Untrusted until parsed and checked against the requested trading date.
+    pub last_modified: Option<String>,
+}
+
+/// Fetches the same bounded body as [`fetch_csv_hardened`] with its provenance.
+///
+/// # Errors
+/// Returns [`DownloadError`] when the transport or CSV checks fail.
+pub async fn fetch_csv_with_provenance(
+    client: &reqwest::Client,
+    url: &str,
+    user_agent: Option<&str>,
+) -> Result<DownloadedCsv, DownloadError> {
     let mut req = client.get(url);
     if let Some(ua) = user_agent {
         req = req.header(reqwest::header::USER_AGENT, ua);
@@ -180,6 +198,11 @@ pub async fn fetch_csv_hardened(
     if !content_type_is_allowed(content_type.as_deref()) {
         return Err(DownloadError::ContentType(content_type.unwrap_or_default()));
     }
+    let last_modified = resp
+        .headers()
+        .get(reqwest::header::LAST_MODIFIED)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
 
     // A declared length over the cap is refused BEFORE a single byte of body
     // is read — the cheapest possible refusal. It is only an optimisation:
@@ -213,7 +236,10 @@ pub async fn fetch_csv_hardened(
         body.extend_from_slice(&chunk);
     }
 
-    String::from_utf8(body).map_err(|_| DownloadError::NotUtf8)
+    Ok(DownloadedCsv {
+        body: String::from_utf8(body).map_err(|_| DownloadError::NotUtf8)?,
+        last_modified,
+    })
 }
 
 /// Strips the URL out of a transport error string.
@@ -273,6 +299,42 @@ pub const fn nse_user_agent() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn preserves_last_modified_from_the_response_that_supplied_the_csv() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let url = format!("http://{}/daily.csv", listener.local_addr().unwrap());
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let serve = async {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = BufReader::new(stream);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                assert!(stream.read_line(&mut line).await.unwrap() > 0);
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            stream.get_mut().write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/csv\r\nLast-Modified: Wed, 25 Nov 2026 02:50:07 GMT\r\nContent-Length: 3\r\nConnection: close\r\n\r\na,b").await.unwrap();
+        };
+        let download = async {
+            tokio::join!(serve, fetch_csv_with_provenance(&client, &url, None))
+                .1
+                .unwrap()
+        };
+        let fetched = tokio::time::timeout(Duration::from_secs(5), download)
+            .await
+            .unwrap();
+        assert_eq!(fetched.body, "a,b");
+        assert_eq!(
+            fetched.last_modified.as_deref(),
+            Some("Wed, 25 Nov 2026 02:50:07 GMT")
+        );
+    }
 
     #[test]
     fn test_build_hardened_csv_client_builds() {

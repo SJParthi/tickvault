@@ -51,6 +51,7 @@ pub enum SourceStatus {
     Closed,
     NoFnoList,
     NoIndexList,
+    NoMtfList,
     NoData,
     Unreachable,
     QueryFailed,

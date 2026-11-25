@@ -30,18 +30,21 @@
 //! way a day cannot pass without a build attempt, which is the property that
 //! actually matters.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use tickvault_common::config::{DhanUniverseConfig, QuestDbConfig};
 use tickvault_common::constants::{
-    DHAN_DETAILED_CSV_URL, INDEX_CONSTITUENCY_SLUGS, IST_UTC_OFFSET_SECONDS_I64,
+    DHAN_DETAILED_CSV_URL, INDEX_CONSTITUENCY_SLUGS, IST_UTC_OFFSET_SECONDS,
+    IST_UTC_OFFSET_SECONDS_I64,
 };
 use tickvault_core::instrument::master_csv::{
     Constituent, JoinOutcome, NSE_MEMBERSHIP_TOLERANCE, build_isin_index, join_constituents,
-    parse_master_csv, split_csv_line,
+    parse_detailed_master, split_csv_line,
 };
 use tickvault_core::instrument::master_download::{
-    build_hardened_csv_client, fetch_csv_hardened, nse_index_csv_url, nse_user_agent,
+    build_hardened_csv_client, fetch_csv_hardened, fetch_csv_with_provenance, nse_index_csv_url,
+    nse_user_agent,
 };
 use tracing::{error, info, warn};
 
@@ -349,6 +352,8 @@ struct FnoUnderlyingArtifact {
 #[derive(Debug, serde::Serialize)]
 struct MappingArtifact {
     trading_date_ist: String,
+    #[serde(flatten)]
+    mtf: Option<DailyMtfTerms>,
     master_rows: usize,
     isin_index_len: usize,
     ambiguous_isins: usize,
@@ -377,6 +382,48 @@ struct MappingArtifact {
     /// operator can see which security failed, not merely how many did.
     unresolved_detail: Vec<String>,
     mappings: Vec<MappingEntry>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct DailyMtfTerms {
+    // APPROVED: this wire field contains only the master's NSE/E/EQ/EQUITY terms.
+    mtf_leverage_by_security_id: HashMap<u64, f64>,
+    mtf_observed_at_epoch_secs: i64,
+    mtf_source_modified_at_epoch_secs: i64,
+}
+
+impl DailyMtfTerms {
+    /// The stable master URL serves the latest file. Unverified or stale
+    /// publisher dates must not supply terms for a different trading day.
+    fn for_date(
+        trading_date: &str,
+        observed: chrono::DateTime<chrono::Utc>,
+        last_modified: Option<&str>,
+        // APPROVED: the sole producer is parse_detailed_master's NSE/E/EQ/EQUITY map.
+        terms: HashMap<u64, f64>,
+    ) -> Option<Self> {
+        let date = chrono::NaiveDate::parse_from_str(trading_date, "%Y-%m-%d").ok()?;
+        let modified = chrono::DateTime::parse_from_rfc2822(last_modified?)
+            .ok()?
+            .to_utc();
+        let ist = chrono::FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS)?;
+        if terms.is_empty()
+            || modified > observed
+            || modified.with_timezone(&ist).date_naive() != date
+            || observed.with_timezone(&ist).date_naive() != date
+        {
+            return None;
+        }
+        // A subsecond observation did not yet exist at the start of its second.
+        let observed_by = observed
+            .timestamp()
+            .checked_add(i64::from(observed.timestamp_subsec_nanos() > 0))?;
+        Some(Self {
+            mtf_leverage_by_security_id: terms,
+            mtf_observed_at_epoch_secs: observed_by,
+            mtf_source_modified_at_epoch_secs: modified.timestamp(),
+        })
+    }
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -974,16 +1021,31 @@ async fn build_once(date: &str, questdb: &QuestDbConfig) -> anyhow::Result<JoinO
         source = "dhan_master",
         date, "downloading instrument master"
     );
-    let master_csv = fetch_csv_hardened(&client, DHAN_DETAILED_CSV_URL, None)
+    let master_csv = fetch_csv_with_provenance(&client, DHAN_DETAILED_CSV_URL, None)
         .await
         .map_err(|e| anyhow::anyhow!("dhan master download: {e}"))?;
-    let master = parse_master_csv(&master_csv).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let observed = chrono::Utc::now();
+    let detailed = parse_detailed_master(&master_csv.body).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mtf = DailyMtfTerms::for_date(
+        date,
+        observed,
+        master_csv.last_modified.as_deref(),
+        detailed.mtf_leverage_by_security_id,
+    );
+    drop(master_csv);
+    let master = detailed.rows;
     let index = build_isin_index(&master);
     info!(
         source = "dhan_master",
         rows = master.len(),
         isins = index.len(),
         ambiguous = index.ambiguous.len(),
+        mtf_equities_with_reported_terms = mtf
+            .as_ref()
+            .map_or(0, |terms| terms.mtf_leverage_by_security_id.len()),
+        mtf_source_modified_at_epoch_secs = mtf
+            .as_ref()
+            .map(|terms| terms.mtf_source_modified_at_epoch_secs),
         "instrument master parsed"
     );
 
@@ -1180,7 +1242,7 @@ async fn build_once(date: &str, questdb: &QuestDbConfig) -> anyhow::Result<JoinO
     // this fix, and doing it badly would risk the correctness of a daily
     // artifact for a second-order scheduling gain. Recorded rather than
     // silently settled for.
-    tokio::task::block_in_place(|| write_mapping_atomic(date, &master, &index, &outcome))?;
+    tokio::task::block_in_place(|| write_mapping_atomic(date, &master, &index, &outcome, mtf))?;
 
     // No `instrument_lifecycle` / `instrument_lifecycle_audit` write.
     //
@@ -1396,6 +1458,7 @@ fn write_mapping_atomic(
     master: &[tickvault_core::instrument::master_csv::MasterRow],
     index: &tickvault_core::instrument::master_csv::IsinIndex,
     outcome: &JoinOutcome,
+    mtf: Option<DailyMtfTerms>,
 ) -> anyhow::Result<()> {
     // Path-traversal guard BEFORE the filename is built (§18 row 4). The date
     // is derived internally, but a validated input is validated regardless of
@@ -1406,6 +1469,7 @@ fn write_mapping_atomic(
     );
     let artifact = MappingArtifact {
         trading_date_ist: date.to_string(),
+        mtf,
         master_rows: master.len(),
         isin_index_len: index.len(),
         ambiguous_isins: index.ambiguous.len(),
@@ -1944,6 +2008,48 @@ mod constituent_bound_tests {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn daily_mtf_terms_require_observed_same_day_publication_and_serialize_known_zero() {
+        let observed = "2026-11-25T01:00:00.500Z"
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .unwrap();
+        let publish = |date, modified| {
+            super::DailyMtfTerms::for_date(date, observed, modified, [(1, 1.0), (2, 0.0)].into())
+        };
+        // The HTTP timestamp is UTC. The publisher and observer were both
+        // on Nov 25 in IST, on opposite sides of UTC midnight.
+        let modified = Some("Tue, 24 Nov 2026 21:00:00 GMT");
+        let recorded = serde_json::to_value(publish("2026-11-25", modified).unwrap()).unwrap();
+        assert_eq!(recorded["mtf_leverage_by_security_id"]["1"], 1.0);
+        assert_eq!(recorded["mtf_leverage_by_security_id"]["2"], 0.0);
+        assert_eq!(
+            recorded["mtf_observed_at_epoch_secs"],
+            observed.timestamp() + 1
+        );
+        assert_eq!(
+            recorded["mtf_source_modified_at_epoch_secs"],
+            observed.timestamp() - 4 * 3600
+        );
+        for header in [
+            None,
+            Some("invalid"),
+            Some("Tue, 24 Nov 2026 18:00:00 GMT"),
+            Some("Wed, 25 Nov 2026 01:00:01 GMT"),
+        ] {
+            assert!(publish("2026-11-25", header).is_none());
+        }
+        assert!(publish("2026-11-24", modified).is_none());
+        assert!(
+            super::DailyMtfTerms::for_date("2026-11-25", observed, modified, Default::default())
+                .is_none()
+        );
+        let whole_second = chrono::DateTime::from_timestamp(observed.timestamp(), 0).unwrap();
+        let exact =
+            super::DailyMtfTerms::for_date("2026-11-25", whole_second, modified, [(1, 1.0)].into())
+                .unwrap();
+        assert_eq!(exact.mtf_observed_at_epoch_secs, whole_second.timestamp());
+    }
 
     // Audit OBS-2 (2026-10-11): failed writes to the SEBI lifecycle and
     // constituency tables were coded WS-GAP-03 (a socket state), the lifecycle

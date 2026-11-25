@@ -273,7 +273,7 @@ body.stocks-open{padding:0;background:#000;color:#ccc;font-family:Arial,Helvetic
             <div class="category-tabs" aria-label="Stocks category">
               <button type="button" class="category-tab" data-category="intraday" data-label="Change" aria-pressed="false" title="Today’s gainers and losers by change from previous close; starts with all mapped NSE equities">Intraday Movers</button>
               <button type="button" class="category-tab" disabled title="Benchmark comparison data is not available">Outperformers</button>
-              <button type="button" class="category-tab" disabled title="Margin funding data is not available">MTF</button>
+              <button type="button" class="category-tab" data-category="mtf" data-label="Change" aria-pressed="false" title="Stocks with a published Dhan margin trading multiplier for the selected date. Change is measured from previous close">MTF</button>
               <button type="button" class="category-tab" data-category="extreme_openings" data-label="From open" aria-pressed="false" title="Select stocks whose session open equals the reported day low or high. From open measures the move to LTP">Extreme Openings</button>
               <button type="button" class="category-tab selected" data-category="" data-label="Change" aria-pressed="true" title="Change from the previous close to the latest price">Price Movers</button>
               <button type="button" class="category-tab" disabled title="Breakout data is not available">Breakouts</button>
@@ -288,7 +288,7 @@ body.stocks-open{padding:0;background:#000;color:#ccc;font-family:Arial,Helvetic
           <input type="hidden" id="movers-universe" value="fno"><input type="hidden" id="movers-index" value=""><input type="hidden" id="movers-direction" value="gainers">
           <template id="stock-row-template"><tr><td><input type="checkbox"></td><td><div class="stock-name"></div><div class="stock-detail"></div></td><td data-field="ltp"></td><td data-field="change"></td><td data-field="change_pct"></td><td data-field="value_cr" title="Actual traded value is not captured."></td><td data-field="volume" title="Stored day volume; zero or absent values do not prove reported volume."></td></tr></template>
           <template id="watch-row-template"><div class="watch-row"><button type="button" class="watch-open"><span><span class="watch-name"></span><small class="watch-market">NSE</small></span><span class="watch-quote"><span class="watch-price" title="Only current verified page prices are shown; individual stored ticks may be older."></span><small class="watch-change"></small></span></button><button type="button" class="watch-remove">×</button></div></template>
-          <div id="movers-messages" data-invalid_search="Search is too long or contains unsupported characters. Use a shorter stock symbol." hidden data-instance_stopped="The AWS instance is stopped. No prices can be read." data-instance_unavailable="AWS instance status could not be checked." data-bridge_unavailable="The private connection or installed movers helper is unavailable." data-credentials_unavailable="The app credential could not be loaded on the server." data-app_unauthorized="The app rejected its server-side credential." data-app_unavailable="The app could not serve movers." data-timeout="The movers request timed out." data-invalid_response="The server returned incomplete or invalid movers data." data-response_too_large="The response exceeded the safe transport size." data-busy="Another movers refresh is running. Try again shortly." data-closed="Market closed — showing the last stored prices of the latest session (empty before 9:15 AM and on holidays)." data-no_fno_list="Today's F&amp;O stock list is unavailable." data-no_index_list="Today's selected index membership is unavailable." data-no_data="No captured prices are available in this universe." data-unreachable="The price database is unreachable." data-query_failed="The price query failed." data-expired="Refresh required — snapshot freshness can no longer be confirmed." data-empty="No verified snapshot. Refresh to try again." data-locked="Unlock this tab to view movers." data-loading="Reading a verified snapshot…" data-stale="Source reports stale prices." data-fresh="Newest stored tick: at most 60s old. Individual stocks may be older." data-unknown="Freshness unconfirmed — refresh before using these prices."></div>
+          <div id="movers-messages" data-invalid_search="Search is too long or contains unsupported characters. Use a shorter stock symbol." hidden data-instance_stopped="The AWS instance is stopped. No prices can be read." data-instance_unavailable="AWS instance status could not be checked." data-bridge_unavailable="The private connection or installed movers helper is unavailable." data-credentials_unavailable="The app credential could not be loaded on the server." data-app_unauthorized="The app rejected its server-side credential." data-app_unavailable="The app could not serve movers." data-timeout="The movers request timed out." data-invalid_response="The server returned incomplete or invalid movers data." data-response_too_large="The response exceeded the safe transport size." data-busy="Another movers refresh is running. Try again shortly." data-closed="Market closed — showing the last stored prices of the latest session (empty before 9:15 AM and on holidays)." data-no_fno_list="Today's F&amp;O stock list is unavailable." data-no_mtf_list="Dhan MTF leverage is unavailable for this date and selection." data-no_index_list="Today's selected index membership is unavailable." data-no_data="No captured prices are available in this universe." data-unreachable="The price database is unreachable." data-query_failed="The price query failed." data-expired="Refresh required — snapshot freshness can no longer be confirmed." data-empty="No verified snapshot. Refresh to try again." data-locked="Unlock this tab to view movers." data-loading="Reading a verified snapshot…" data-stale="Source reports stale prices." data-fresh="Newest stored tick: at most 60s old. Individual stocks may be older." data-unknown="Freshness unconfirmed — refresh before using these prices."></div>
           <div class="stocks-table-scroll">
             <table id="movers-table" class="stocks-table" aria-label="Stocks price movers"><thead><tr>
               <th><input id="stocks-select-all" type="checkbox" aria-label="Add or remove this page in watchlist"></th>
@@ -966,16 +966,44 @@ function renderMovers(){
   const freshness=s.filter.category==='extreme_openings'&&s.status==='no_data'?'No quotes with a usable session open, high and low.':moversMessage(s.status==='live'?(age!==null&&age<=60?'fresh':'unknown'):s.status),partial=s.stocks_priced<s.universe_total||s.membership_status!=='available'||!s.fno_list_available;
   $('movers-status').textContent=freshness+(partial?' Partial coverage — '+(s.membership_status==='unavailable'?'index memberships unavailable; ':s.membership_status==='partial'?'index membership incomplete; ':'')+(!s.fno_list_available?'F&O eligibility unknown; ':'')+(s.universe_available?(s.universe_total-s.stocks_priced)+(s.filter.category==='extreme_openings'?' eligible stocks without a usable opening range.':' eligible stocks unpriced.'):'eligible count unknown.'):'');
   $('movers-meta').textContent=s.stocks_priced+' of '+(s.universe_available?s.universe_total:'unknown')+' eligible '+(s.filter.fno_only?'F&O stocks':'mapped equities')+(s.filter.category==='extreme_openings'?' with usable opening ranges':' priced')+' · newest stored tick '+(s.as_of_ist||'—')+' IST · conservative tick age '+(age===null?'unknown':age+'s')+' · snapshot '+new Date(reply.captured_at_epoch_secs*1000).toLocaleString('en-IN',{timeZone:'Asia/Kolkata'})+' IST';
+  if(s.filter.category==='mtf'){
+    const coverage=s.mtf_coverage;
+    if(coverage){
+      const zero=coverage.assessed-coverage.eligible,unknown=coverage.selected-coverage.assessed;
+      const termsTime=new Date(coverage.observed_at_epoch_secs*1000).toLocaleString('en-IN',{timeZone:'Asia/Kolkata'});
+      $('movers-meta').textContent+=` · Dhan MTF terms as of ${termsTime} IST · ${coverage.eligible} with leverage · ${zero} reported zero · ${unknown} unknown`;
+      if(!coverage.eligible&&s.universe_available&&['no_data','closed','live','stale','no_mtf_list'].includes(s.status)){
+        $('movers-status').textContent=unknown?'No published MTF multiplier among the assessed stocks. Some terms are unknown.':'No stocks in this selection have a published MTF multiplier.';
+      }
+    }else{
+      $('movers-meta').textContent='';
+      if(s.status==='no_mtf_list')moversNote('no_mtf_list');
+    }
+  }
   $('movers-value-basis').textContent=s.value_basis||'Actual traded value is not captured; Value (Cr.) is unavailable.';
   for(const stock of s.rows){
     const row=$('stock-row-template').content.firstElementChild.cloneNode(true),check=row.querySelector('input'),name=row.cells[1],membership=stock.indices.length?stock.indices.map(i=>s.index_names[i]).join(', '):s.membership_status==='unavailable'?'Membership unknown':'No recorded membership',fno=stock.fno===null?'F&O unknown':stock.fno?'F&O':'Not F&O';
-    check.dataset.watchId=String(stock.security_id);check.checked=stockWatch.has(watchKey(stock));check.disabled=!validWatch(stock);check.setAttribute('aria-label','Watch '+stock.name);if(check.disabled)check.title='Identifier exceeds browser precision.';name.querySelector('.stock-name').textContent=stock.company_name||stock.name;name.querySelector('.stock-detail').textContent=(stock.company_name?stock.name+' · ':'')+fno+' · '+membership;name.title=stock.name+' · '+membership+' · stored tick '+stock.last_trade_ist+' IST; individual ticks may be older.';
+    const leverage=s.filter.category==='mtf'?'MTF '+stock.mtf_leverage+'× · ':'';
+    check.dataset.watchId=String(stock.security_id);check.checked=stockWatch.has(watchKey(stock));check.disabled=!validWatch(stock);check.setAttribute('aria-label','Watch '+stock.name);if(check.disabled)check.title='Identifier exceeds browser precision.';name.querySelector('.stock-name').textContent=stock.company_name||stock.name;name.querySelector('.stock-detail').textContent=leverage+(stock.company_name?stock.name+' · ':'')+fno+' · '+membership;name.title=stock.name+' · '+leverage+membership+' · stored tick '+stock.last_trade_ist+' IST; individual ticks may be older.';
     const values=[stockNumber(stock.ltp),stockNumber(stock.change,true),stock.change_pct==null?'—':stockNumber(stock.change_pct,true)+'%',stockNumber(stock.value_cr),stockVolume(stock)];
     values.forEach((value,i)=>{const td=row.cells[i+2];td.textContent=value;td.className=value==='—'?'unavailable':i===1||i===2?(stock.change_pct>0?'positive':stock.change_pct<0?'negative':''):'';});rows.appendChild(row);
   }
   moversVisible=s.rows;watchPrices=s.status==='live'&&age!==null&&age<=60?(s.filter.category==='extreme_openings'?s.rows.map(dailyWatchPrice):s.rows):[];renderWatch();$('stocks-select-all').disabled=!s.rows.some(validWatch);$('stocks-select-all').checked=s.rows.length>0&&s.rows.every(stock=>validWatch(stock)&&stockWatch.has(watchKey(stock)));
   $('movers-selection').textContent='Showing '+(s.rows.length?s.filter.offset+1:0)+'–'+(s.rows.length?s.filter.offset+s.rows.length:0)+' of '+s.matching_total+' matches.';
   $('movers-prev').disabled=s.filter.offset===0;$('movers-next').disabled=s.filter.offset+s.rows.length>=s.matching_total;
+}
+function validMtfPage(snapshot,captured){
+  const coverage=snapshot.mtf_coverage;
+  if(coverage==null)return !snapshot.universe_available&&snapshot.rows.length===0&&snapshot.universe_total===0&&snapshot.stocks_priced===0;
+  const {selected,assessed,eligible,observed_at_epoch_secs:observed}=coverage;
+  const requested=snapshot.filter.as_of?Date.parse(snapshot.filter.as_of+':00+05:30')/1000:captured;
+  const cutoff=Math.min(captured,requested),istDay=epoch=>Math.floor((epoch+19800)/86400);
+  return [selected,assessed,eligible,observed].every(Number.isSafeInteger)&&
+    snapshot.universe_available&&eligible>=0&&eligible<=assessed&&assessed<=selected&&
+    observed>0&&observed<=cutoff&&istDay(observed)===istDay(cutoff)&&
+    eligible===snapshot.universe_total&&Number.isSafeInteger(snapshot.stocks_priced)&&
+    snapshot.rows.length<=snapshot.stocks_priced&&snapshot.stocks_priced<=eligible&&
+    snapshot.rows.every(stock=>Number.isFinite(stock?.mtf_leverage)&&stock.mtf_leverage>=1);
 }
 function verifiedMoversReply(j,filter){
   const r=j?.movers;
@@ -984,7 +1012,7 @@ function verifiedMoversReply(j,filter){
      !Number.isSafeInteger(r.valid_until_epoch_secs)||r.valid_until_epoch_secs<=j.observed_at_epoch_secs||
      r.valid_until_epoch_secs>r.captured_at_epoch_secs+60)return null;
   if(r.result==='error')return r;
-  return r.result==='snapshot'&&sameMoversFilter(r.snapshot?.filter,filter)&&Array.isArray(r.snapshot.rows)&&Array.isArray(r.snapshot.index_names)?r:null;
+  return r.result==='snapshot'&&sameMoversFilter(r.snapshot?.filter,filter)&&Array.isArray(r.snapshot.rows)&&Array.isArray(r.snapshot.index_names)&&(filter.category!=='mtf'||validMtfPage(r.snapshot,r.captured_at_epoch_secs))?r:null;
 }
 async function loadMovers(){
   if(moversBusy||!TOKEN||document.hidden)return;const filter=moversFilter();

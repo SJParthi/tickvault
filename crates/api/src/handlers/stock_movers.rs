@@ -29,7 +29,7 @@ use tickvault_common::constants::{
     EXCHANGE_SEGMENT_NSE_EQ, INDEX_CONSTITUENCY_SLUGS, IST_UTC_OFFSET_SECONDS_I64,
 };
 use tickvault_common::operator_movers_universe::{
-    ListedStock, MAX_UNIVERSE_PRICE_ROWS, MoversUniverse, PriceRow, StockIndices,
+    ListedStock, MAX_UNIVERSE_PRICE_ROWS, MoversUniverse, MtfTerms, PriceRow, StockIndices,
     UNIVERSE_DEFAULT_WINDOW_SECS, UNIVERSE_FORMAT_VERSION, UniverseMembership, UniversePrices,
     select, snapshot_deadline,
 };
@@ -59,10 +59,47 @@ pub(crate) struct MoversCache {
 }
 #[derive(Deserialize)]
 struct MappingArtifact {
+    #[serde(default)]
+    mtf_leverage_by_security_id: Option<serde_json::Value>,
+    #[serde(default)]
+    mtf_observed_at_epoch_secs: Option<serde_json::Value>,
+    #[serde(default)]
+    mtf_source_modified_at_epoch_secs: Option<serde_json::Value>,
     trading_date_ist: String,
     resolved: usize,
     unresolved: usize,
     mappings: Vec<MappingEntry>,
+}
+impl MappingArtifact {
+    fn mtf_terms(&self, date: &str) -> Option<MtfTerms> {
+        use tickvault_common::operator_movers_universe::ist_date_of_epoch;
+        let observed = self.mtf_observed_at_epoch_secs.as_ref()?.as_i64()?;
+        let modified = self.mtf_source_modified_at_epoch_secs.as_ref()?.as_i64()?;
+        if modified > observed
+            || [observed, modified]
+                .into_iter()
+                .any(|t| ist_date_of_epoch(t).as_deref() != Some(date))
+        {
+            return None;
+        }
+        let entries = self.mtf_leverage_by_security_id.as_ref()?.as_object()?;
+        if entries.is_empty() || entries.len() > MAX_MAPPING_ROWS {
+            return None;
+        }
+        let leverage_by_security_id = entries
+            .iter()
+            .filter_map(|(key, value)| {
+                let id: u64 = key.parse().ok()?;
+                let n = value.as_f64()?;
+                (id > 0 && id.to_string() == *key && (n == 0.0 || (n.is_finite() && n >= 1.0)))
+                    .then_some((id, n))
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        (!leverage_by_security_id.is_empty()).then_some(MtfTerms {
+            observed_at_epoch_secs: observed,
+            leverage_by_security_id,
+        })
+    }
 }
 #[derive(Deserialize)]
 struct MappingEntry {
@@ -73,6 +110,7 @@ struct MappingEntry {
 }
 #[derive(Debug)]
 struct Memberships {
+    mtf: Option<MtfTerms>,
     names: HashMap<(u64, u8), String>,
     indices: Vec<String>,
     by_stock: HashMap<(u64, u8), Vec<usize>>,
@@ -86,6 +124,7 @@ fn parse_memberships(bytes: &[u8], date: &str) -> Option<Memberships> {
     if artifact.trading_date_ist != date || artifact.mappings.len() > MAX_MAPPING_ROWS {
         return None;
     }
+    let mtf = artifact.mtf_terms(date);
     let equity_rows: Vec<_> = artifact
         .mappings
         .into_iter()
@@ -138,6 +177,7 @@ fn parse_memberships(bytes: &[u8], date: &str) -> Option<Memberships> {
             .iter()
             .any(|(name, _)| indices.binary_search_by(|s| s.as_str().cmp(name)).is_err());
     Some(Memberships {
+        mtf,
         names,
         indices,
         by_stock,
@@ -311,6 +351,17 @@ fn assemble_universe(
                 .collect();
             by_stock.sort_unstable_by_key(|s| (s.security_id, s.segment_code));
             UniverseMembership {
+                mtf: m.mtf.as_ref().map(|terms| MtfTerms {
+                    observed_at_epoch_secs: terms.observed_at_epoch_secs,
+                    leverage_by_security_id: m
+                        .names
+                        .keys()
+                        .chain(fno.into_iter().flat_map(|f| f.names.keys()))
+                        .filter_map(|(id, _)| {
+                            terms.leverage_by_security_id.get(id).map(|n| (*id, *n))
+                        })
+                        .collect(),
+                }),
                 names: sorted_listed(&m.names),
                 indices: m.indices.clone(),
                 by_stock,
@@ -631,6 +682,7 @@ mod oracle {
             let eligible = fno.map(|f| f.name_of(key.0, key.1).is_some());
             let volume_text = price.volume.map(|volume| volume.to_string());
             selected.push(MemberStock {
+                mtf_leverage: None,
                 price,
                 company_name: None,
                 volume_text,
@@ -650,6 +702,7 @@ mod oracle {
             .take(SELECTION_LIMIT)
             .collect();
         let snapshot = Snapshot {
+            mtf_coverage: None,
             filter: filter.clone(),
             status,
             market_open: prices.market_open,
@@ -949,6 +1002,127 @@ mod tests {
         match reply.outcome {
             Outcome::Snapshot { snapshot } => *snapshot,
             other => panic!("expected snapshot, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mtf_reader_proves_eligibility_at_or_before_the_selected_ist_minute() {
+        use tickvault_common::operator_stock_movers_wire::MoversCategory;
+        let f = Fixture::new(6);
+        let observed = at("2026-10-30 10:00:00").and_utc().timestamp() - IST_UTC_OFFSET_SECONDS_I64;
+        let mut artifact = mapping(6);
+        artifact["mtf_observed_at_epoch_secs"] = json!(observed);
+        artifact["mtf_source_modified_at_epoch_secs"] = json!(observed - 1800);
+        artifact["mtf_leverage_by_security_id"] =
+            json!({"2":1.0,"4":2.75,"6":0.0,"1":0.1,"3":"unexpected","05":4.0});
+        std::fs::write(
+            f.0.join(format!("{INDEX_MAPPING_PREFIX}{DATE}.json")),
+            serde_json::to_vec(&artifact).unwrap(),
+        )
+        .unwrap();
+        for (as_of, known) in [("09:59", false), ("10:00", true)] {
+            let filter = Filter {
+                category: Some(MoversCategory::Mtf),
+                fno_only: false,
+                as_of: Some(format!("{DATE}T{as_of}")),
+                ..Filter::default()
+            };
+            let url = http("200 OK", prices(6, "2026-10-30T09:58:30Z")).await;
+            let reply = run(&f.0, &url, true, filter.clone()).await;
+            assert!(reply.valid_at(reply.captured_at_epoch_secs, &filter));
+            let s = snapshot(reply);
+            assert_eq!(s.universe_available, known);
+            if known {
+                let c = s.mtf_coverage.unwrap();
+                assert_eq!((c.selected, c.assessed, c.eligible), (6, 3, 2));
+                assert_eq!(
+                    s.rows
+                        .iter()
+                        .map(|r| (r.price.security_id, r.mtf_leverage))
+                        .collect::<Vec<_>>(),
+                    [(4, Some(2.75)), (2, Some(1.0))]
+                );
+            } else {
+                assert_eq!(s.status, SourceStatus::NoMtfList);
+                assert!(s.rows.is_empty() && s.mtf_coverage.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn mtf_mapping_is_optional_bounded_and_compact_at_full_master_cardinality() {
+        use tickvault_common::operator_movers_universe::MAX_UNIVERSE_BYTES;
+        let now = at("2026-10-30 10:00:00");
+        let observed = now.and_utc().timestamp() - IST_UTC_OFFSET_SECONDS_I64;
+        let mut artifact = mapping(MAX_SOURCE_ROWS);
+        let terms: std::collections::BTreeMap<_, _> = (1..=10_102)
+            .map(|id| (id, if id <= 1_924 { 2.55 } else { 0.0 }))
+            .collect();
+        artifact["mtf_observed_at_epoch_secs"] = json!(observed);
+        artifact["mtf_source_modified_at_epoch_secs"] = json!(observed - 1800);
+        artifact["mtf_leverage_by_security_id"] = json!(terms);
+        let bytes = serde_json::to_vec(&artifact).unwrap();
+        assert!(bytes.len() < MAX_MAPPING_BYTES);
+        assert!(parse_memberships(&bytes[..bytes.len() - 1], DATE).is_none());
+        let m = parse_memberships(&bytes, DATE).unwrap();
+        assert_eq!(
+            m.mtf.as_ref().unwrap().leverage_by_security_id.len(),
+            10_102
+        );
+        let fno = FnoUnderlyings {
+            names: [((2_000, EXCHANGE_SEGMENT_NSE_EQ), "FNO-ONLY".into())].into(),
+        };
+        let prices = union_ids(Some(&fno), Some(&m))
+            .into_iter()
+            .map(|security_id| TickRow {
+                security_id,
+                segment_code: EXCHANGE_SEGMENT_NSE_EQ,
+                ltp: 101.23,
+                close: Some(100.0),
+                session_open: Some(99.95),
+                session_high: Some(110.25),
+                session_low: Some(90.55),
+                volume: Some(2_345_678),
+                avg_price: Some(101.01),
+                ts: now,
+            })
+            .collect();
+        let u = assemble_universe(
+            &plan_read(now, true, None),
+            Some(&fno),
+            Some(&m),
+            Fetched::Rows(prices),
+        );
+        assert!(u.valid());
+        let t = u.membership.as_ref().unwrap().mtf.as_ref().unwrap();
+        assert_eq!(t.leverage_by_security_id.len(), MAX_SOURCE_ROWS + 1);
+        assert_eq!(t.leverage_by_security_id.get(&2_000), Some(&0.0));
+        let published = serde_json::to_vec(&u).unwrap();
+        assert!(published.len() < MAX_UNIVERSE_BYTES);
+        eprintln!(
+            "MTF fixture daily mapping {} of {} bytes; published universe (1,001 terms and OHLC quotes) {} of {} bytes",
+            bytes.len(),
+            MAX_MAPPING_BYTES,
+            published.len(),
+            MAX_UNIVERSE_BYTES
+        );
+        for (key, invalid) in [
+            ("mtf_observed_at_epoch_secs", serde_json::Value::Null),
+            ("mtf_observed_at_epoch_secs", json!(observed - 86_400)),
+            ("mtf_observed_at_epoch_secs", json!("yesterday")),
+            ("mtf_source_modified_at_epoch_secs", serde_json::Value::Null),
+            ("mtf_source_modified_at_epoch_secs", json!(observed + 1)),
+            (
+                "mtf_source_modified_at_epoch_secs",
+                json!(observed - 86_400),
+            ),
+        ] {
+            let mut invalid_artifact = artifact.clone();
+            invalid_artifact[key] = invalid;
+            let m =
+                parse_memberships(&serde_json::to_vec(&invalid_artifact).unwrap(), DATE).unwrap();
+            assert!(m.mtf.is_none());
+            assert_eq!(m.names.len(), MAX_SOURCE_ROWS);
         }
     }
 
@@ -1537,9 +1711,22 @@ mod tests {
     async fn api_cache_answers_every_live_filter_from_one_universe_and_retains_original_clock() {
         let state = fno_stocks::tests::mock_state(1);
         let observed = chrono::Utc::now().timestamp() - 10;
-        seed_cache(&state, None, cached_universe(observed)).await;
+        let mut universe = cached_universe(observed);
+        Arc::make_mut(&mut universe)
+            .membership
+            .as_mut()
+            .unwrap()
+            .mtf = Some(MtfTerms {
+            observed_at_epoch_secs: observed,
+            leverage_by_security_id: [(1, 1.0)].into(),
+        });
+        seed_cache(&state, None, universe).await;
         for f in [
             Filter::default(),
+            Filter {
+                category: Some(tickvault_common::operator_stock_movers_wire::MoversCategory::Mtf),
+                ..Filter::default()
+            },
             Filter {
                 fno_only: false,
                 ..Filter::default()
@@ -1552,7 +1739,11 @@ mod tests {
                 reply.captured_at_epoch_secs, observed,
                 "original clock kept"
             );
-            assert_eq!(snapshot(reply).filter, f);
+            let answer = snapshot(reply);
+            if f.category.is_some() {
+                assert_eq!(answer.mtf_coverage.unwrap().eligible, 1);
+            }
+            assert_eq!(answer.filter, f);
         }
         // A chosen minute is a different universe: never served from the live one.
         let response = get_stock_movers(
@@ -1600,6 +1791,7 @@ mod tests {
             prices: UniversePrices::Rows { rows: Vec::new() },
             fno: Some(vec![listed.clone()]),
             membership: Some(UniverseMembership {
+                mtf: None,
                 names: vec![listed],
                 indices: vec!["Nifty 50".into()],
                 by_stock: vec![StockIndices {
@@ -1705,6 +1897,7 @@ mod tests {
             .map(|n| format!("{n:02}{}", "\\".repeat(MAX_INDEX_NAME_BYTES - 2)))
             .collect();
         let membership = Memberships {
+            mtf: None,
             names: HashMap::new(),
             indices,
             by_stock: (1..=20)
@@ -2118,6 +2311,7 @@ mod select_equivalence {
             })
             .collect();
         Memberships {
+            mtf: None,
             names,
             indices,
             by_stock,

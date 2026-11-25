@@ -307,6 +307,7 @@ const COL_UNDERLYING_SYMBOL: &str = "UNDERLYING_SYMBOL";
 /// size (trading multiple)"), and until 2026-09-07 this parser resolved every
 /// other derivative column and dropped this one.
 const COL_LOT_SIZE: &str = "LOT_SIZE";
+const COL_MTF_LEVERAGE: &str = "MTF_LEVERAGE";
 
 /// Days in `month` of `year`, Gregorian.
 ///
@@ -591,6 +592,26 @@ pub fn split_csv_line(line: &str, out: &mut Vec<String>) {
 /// owned `String` per FIELD (~26 on the real master), and each retained row
 /// keeps five more. Cold path — see the module header.
 pub fn parse_master_csv(csv: &str) -> Result<Vec<MasterRow>, MasterParseError> {
+    Ok(parse_detailed_master(csv)?.rows)
+}
+
+/// Rows and the optional MTF terms from the same Dhan master response.
+#[derive(Debug)]
+pub struct DetailedMaster {
+    /// The existing instrument universe, including non-equities.
+    pub rows: Vec<MasterRow>,
+    /// Published multipliers keyed by NSE cash equity security ID. Zero is a
+    /// reported zero, 1x is a published term, and an absent ID is unknown.
+    // APPROVED: parse_detailed_master filters NSE/E/EQ/EQUITY before every insertion.
+    pub mtf_leverage_by_security_id: HashMap<u64, f64>,
+}
+
+/// Parses the daily master and retains Dhan's MTF_LEVERAGE column for NSE EQ
+/// equities in the same pass. A missing optional column leaves the terms empty.
+///
+/// # Errors
+/// Returns the same whole-file errors as [`parse_master_csv`].
+pub fn parse_detailed_master(csv: &str) -> Result<DetailedMaster, MasterParseError> {
     let csv = csv.strip_prefix('\u{feff}').unwrap_or(csv);
     let mut lines = csv.lines().filter(|l| !l.trim().is_empty());
     let header = lines.next().ok_or(MasterParseError::Empty)?;
@@ -640,6 +661,13 @@ pub fn parse_master_csv(csv: &str) -> Result<Vec<MasterRow>, MasterParseError> {
     let i_leg = opt_col(COL_OPTION_TYPE);
     let i_underlying = opt_col(COL_UNDERLYING_SYMBOL);
     let i_lot = opt_col(COL_LOT_SIZE);
+    let i_mtf = opt_col(COL_MTF_LEVERAGE).filter(|_| {
+        upper
+            .iter()
+            .filter(|name| *name == COL_MTF_LEVERAGE)
+            .count()
+            == 1
+    });
 
     // `widest` bounds the mandatory columns ONLY. An optional column that
     // lands beyond a short row is read as absent for that row, never as a bad
@@ -651,6 +679,7 @@ pub fn parse_master_csv(csv: &str) -> Result<Vec<MasterRow>, MasterParseError> {
         .unwrap_or(0);
 
     let mut rows = Vec::new();
+    let mut mtf_terms = HashMap::new();
     let mut bad = 0usize;
     let mut total = 0usize;
     for line in lines {
@@ -667,7 +696,7 @@ pub fn parse_master_csv(csv: &str) -> Result<Vec<MasterRow>, MasterParseError> {
             bad += 1;
             continue;
         };
-        rows.push(MasterRow {
+        let row = MasterRow {
             security_id,
             // Uppercased at parse so every downstream comparison is already
             // case-normalised; ISIN is defined uppercase but vendors drift.
@@ -704,7 +733,23 @@ pub fn parse_master_csv(csv: &str) -> Result<Vec<MasterRow>, MasterParseError> {
             lot_size: i_lot
                 .and_then(|i| fields.get(i))
                 .map_or(0, |v| parse_lot_size(v)),
-        });
+        };
+        if let Some(column) = i_mtf
+            && row.class == InstrumentClass::Equity
+            && row.is_nse_cash_equity()
+            && security_id != 0
+            && !row.isin.is_empty()
+        {
+            let leverage = fields
+                .get(column)
+                .and_then(|field| parse_mtf_leverage(field));
+            // A repeated SID cannot establish a unique equity identity.
+            mtf_terms
+                .entry(security_id)
+                .and_modify(|v| *v = None)
+                .or_insert(leverage);
+        }
+        rows.push(row);
     }
 
     let bad_fraction = ratio(bad, total);
@@ -717,7 +762,23 @@ pub fn parse_master_csv(csv: &str) -> Result<Vec<MasterRow>, MasterParseError> {
             min: MIN_PLAUSIBLE_MASTER_ROWS,
         });
     }
-    Ok(rows)
+    Ok(DetailedMaster {
+        rows,
+        mtf_leverage_by_security_id: mtf_terms
+            .into_iter()
+            .filter_map(|(id, value)| value.map(|v| (id, v)))
+            .collect(),
+    })
+}
+
+fn parse_mtf_leverage(field: &str) -> Option<f64> {
+    let decimal = field.trim();
+    if !decimal.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
+        return None;
+    }
+    let value = decimal.parse::<f64>().ok()?;
+    let reported_zero = decimal.bytes().all(|b| b == b'0' || b == b'.');
+    (value.is_finite() && (value >= 1.0 || reported_zero)).then_some(value)
 }
 
 /// One NSE index constituent, as read from a niftyindices list.
@@ -989,6 +1050,56 @@ mod tests {
     }
 
     const HEADER: &str = "SECURITY_ID,ISIN,SYMBOL_NAME,EXCH_ID,SEGMENT,SERIES";
+
+    #[test]
+    fn detailed_master_keeps_only_unambiguous_reported_nse_cash_equity_mtf_terms() {
+        let header = format!("{HEADER},Instrument,Mtf_Leverage");
+        let body = master_with(
+            &header,
+            &[
+                "1,INE1,ONE,NSE,E,EQ,EQUITY,1.00",
+                "2,INE2,TWO,NSE,E,EQ,EQUITY,0.00",
+                "3,INE3,THREE,NSE,E,EQ,EQUITY, 3.57 ",
+                "3,INE3,THREE,BSE,E,EQ,EQUITY,4.00",
+                "4,INE4,FOUR,NSE,E,BE,EQUITY,3.00",
+                "5,INE5,FIVE,NSE,D,EQ,FUTSTK,3.00",
+                "6,INE6,SIX,NSE,E,EQ,EQUITY,NaN",
+                "7,INE7,SEVEN,NSE,E,EQ,EQUITY,",
+                "8,INE8,EIGHT,NSE,E,EQ,EQUITY,-2",
+                "9,INE9,NINE,NSE,E,EQ,EQUITY,4.0",
+                "9,INEX,OTHER,NSE,E,EQ,EQUITY,0",
+                "10,INE10,TEN,NSE,E,EQ,EQUITY",
+                "11,INE11,ELEVEN,NSE,E,EQ,EQUITY,0.4",
+                "12,,MISSING ISIN,NSE,E,EQ,EQUITY,3",
+                "13,INE13,THIRTEEN,NSE,E,EQ,INDEX,3",
+                "14,INE14,FOURTEEN,NSE,E,EQ,EQUITY,1e2",
+                "0,INE0,ZERO SID,NSE,E,EQ,EQUITY,2",
+            ],
+        );
+        let parsed = parse_detailed_master(&body).unwrap();
+        assert_eq!(
+            parsed.mtf_leverage_by_security_id,
+            [(1, 1.0), (2, 0.0), (3, 3.57)].into()
+        );
+        assert_eq!(parse_master_csv(&body).unwrap(), parsed.rows);
+        let legacy = master_with(HEADER, &["1,INE1,ONE,NSE,E,EQ"]);
+        let ambiguous = master_with(
+            &format!("{header},MTF_LEVERAGE"),
+            &["1,INE1,ONE,NSE,E,EQ,EQUITY,1,3"],
+        );
+        assert!(
+            parse_detailed_master(&ambiguous)
+                .unwrap()
+                .mtf_leverage_by_security_id
+                .is_empty()
+        );
+        assert!(
+            parse_detailed_master(&legacy)
+                .unwrap()
+                .mtf_leverage_by_security_id
+                .is_empty()
+        );
+    }
 
     #[test]
     fn test_parse_master_csv_reads_columns_by_name_not_position() {

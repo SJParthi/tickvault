@@ -40,7 +40,7 @@ use crate::operator_movers_wire::{
 };
 use crate::operator_stock_movers_wire::{
     Direction, FILTERED_PROTOCOL_VERSION, Filter, MAX_INDEX_NAME_BYTES, MAX_INDEX_NAMES,
-    MemberStock, MembershipStatus, MoversCategory, Outcome, Reply, Snapshot,
+    MemberStock, MembershipStatus, MoversCategory, MtfCoverage, Outcome, Reply, Snapshot,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -204,10 +204,20 @@ pub struct StockIndices {
     pub indices: Vec<usize>,
 }
 
+/// Observed daily broker terms keyed by NSE cash security ID. An explicit
+/// zero is distinguishable from an instrument with no usable master entry.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct MtfTerms {
+    pub observed_at_epoch_secs: i64,
+    pub leverage_by_security_id: std::collections::BTreeMap<u64, f64>,
+}
+
 /// The day's index-membership mapping, as the API read it.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct UniverseMembership {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtf: Option<MtfTerms>,
     pub names: Vec<ListedStock>,
     /// Index labels, strictly ascending.
     pub indices: Vec<String>,
@@ -461,6 +471,7 @@ struct MembershipView<'a> {
     indices: &'a [String],
     by_stock: HashMap<Key, &'a [usize]>,
     partial: bool,
+    mtf: Option<&'a MtfTerms>,
 }
 
 impl<'a> MembershipView<'a> {
@@ -474,6 +485,7 @@ impl<'a> MembershipView<'a> {
                 .map(|s| ((s.security_id, s.segment_code), s.indices.as_slice()))
                 .collect(),
             partial: m.partial,
+            mtf: m.mtf.as_ref(),
         }
     }
 }
@@ -676,6 +688,7 @@ fn finish(
     filter: &Filter,
     membership: Option<&MembershipView<'_>>,
     fno: Option<&HashMap<Key, &str>>,
+    mtf_coverage: Option<MtfCoverage>,
 ) -> Reply {
     let observed = prices.observed;
     let index_names = membership.map_or_else(Vec::new, |m| m.indices.to_vec());
@@ -714,7 +727,15 @@ fn finish(
             .unwrap_or_default();
         let eligible = fno.map(|f| f.contains_key(&key));
         let volume_text = price.volume.map(|volume| volume.to_string());
+        let mtf_leverage = mtf_coverage.and_then(|_| {
+            membership?
+                .mtf?
+                .leverage_by_security_id
+                .get(&price.security_id)
+                .copied()
+        });
         selected.push(MemberStock {
+            mtf_leverage,
             price,
             company_name: None,
             volume_text,
@@ -725,19 +746,22 @@ fn finish(
     let matching_total = selected.len();
     let rows = select_page(selected, filter);
     let snapshot = Snapshot {
+        mtf_coverage,
         filter: filter.clone(),
         status: prices.status,
         market_open: prices.market_open,
         as_of_ist: prices.as_of_ist,
         data_age_secs: prices.data_age_secs,
-        universe_available: (if filter.fno_only {
-            fno.is_some()
-        } else {
-            membership.is_some()
-        }) && filter
-            .index
-            .as_ref()
-            .is_none_or(|name| membership.is_some_and(|m| m.indices.binary_search(name).is_ok())),
+        universe_available: (filter.category != Some(MoversCategory::Mtf)
+            || mtf_coverage.is_some())
+            && (if filter.fno_only {
+                fno.is_some()
+            } else {
+                membership.is_some()
+            })
+            && filter.index.as_ref().is_none_or(|name| {
+                membership.is_some_and(|m| m.indices.binary_search(name).is_ok())
+            }),
         universe_total: prices.total,
         stocks_priced: prices.stocks_priced,
         matching_total,
@@ -783,19 +807,20 @@ pub fn select(universe: &MoversUniverse, filter: &Filter) -> Reply {
     let closed_or = |status| {
         if open { status } else { SourceStatus::Closed }
     };
-    let finish_empty = |status| {
+    let finish_empty = |status, coverage| {
         finish(
             PriceView::empty(status, open, 0, now),
             filter,
             membership.as_ref(),
             fno.as_ref(),
+            coverage,
         )
     };
     if filter.fno_only && fno.is_none() {
-        return finish_empty(closed_or(SourceStatus::NoFnoList));
+        return finish_empty(closed_or(SourceStatus::NoFnoList), None);
     }
     if (!filter.fno_only || filter.index.is_some()) && membership.is_none() {
-        return finish_empty(closed_or(SourceStatus::NoIndexList));
+        return finish_empty(closed_or(SourceStatus::NoIndexList), None);
     }
     let names = if filter.fno_only {
         fno.as_ref()
@@ -803,16 +828,16 @@ pub fn select(universe: &MoversUniverse, filter: &Filter) -> Reply {
         membership.as_ref().map(|m| &m.names)
     };
     let Some(names) = names else {
-        return finish_empty(closed_or(SourceStatus::NoIndexList));
+        return finish_empty(closed_or(SourceStatus::NoIndexList), None);
     };
     let selected_index = filter
         .index
         .as_ref()
         .and_then(|name| membership.as_ref()?.indices.binary_search(name).ok());
     if filter.index.is_some() && selected_index.is_none() {
-        return finish_empty(closed_or(SourceStatus::NoIndexList));
+        return finish_empty(closed_or(SourceStatus::NoIndexList), None);
     }
-    let names: HashMap<Key, &str> = names
+    let mut names: HashMap<Key, &str> = names
         .iter()
         .filter(|(key, _)| {
             selected_index.is_none_or(|index| {
@@ -827,14 +852,45 @@ pub fn select(universe: &MoversUniverse, filter: &Filter) -> Reply {
     if names.len() > MAX_SOURCE_ROWS {
         return Reply::error(BridgeError::ResponseTooLarge, now);
     }
+    let mut mtf_coverage = None;
+    if filter.category == Some(MoversCategory::Mtf) {
+        let cutoff = universe
+            .read_at_ist_secs
+            .saturating_sub(UNIVERSE_IST_OFFSET_SECS);
+        let Some(terms) = membership.as_ref().and_then(|m| m.mtf).filter(|t| {
+            t.observed_at_epoch_secs > 0
+                && t.observed_at_epoch_secs <= cutoff
+                && ist_date_of_epoch(t.observed_at_epoch_secs).as_deref()
+                    == Some(universe.trading_date_ist.as_str())
+                && t.leverage_by_security_id.len() <= MAX_UNIVERSE_LIST_ROWS
+        }) else {
+            return finish_empty(SourceStatus::NoMtfList, None);
+        };
+        let selected = names.len();
+        let mut assessed = 0;
+        names.retain(|&(id, _), _| match terms.leverage_by_security_id.get(&id) {
+            Some(&n) if n == 0.0 || (n.is_finite() && n >= 1.0) => {
+                assessed += 1;
+                n >= 1.0
+            }
+            _ => false,
+        });
+        mtf_coverage = Some(MtfCoverage {
+            selected,
+            assessed,
+            eligible: names.len(),
+            observed_at_epoch_secs: terms.observed_at_epoch_secs,
+        });
+    }
     if names.is_empty() {
-        return finish_empty(closed_or(SourceStatus::NoData));
+        return finish_empty(closed_or(SourceStatus::NoData), mtf_coverage);
     }
     finish(
         price_view(universe, &names, filter),
         filter,
         membership.as_ref(),
         fno.as_ref(),
+        mtf_coverage,
     )
 }
 
@@ -865,6 +921,7 @@ mod tests {
             prices: UniversePrices::Rows { rows },
             fno: Some((1..=4).map(|id| listed(id * 2)).collect()),
             membership: Some(UniverseMembership {
+                mtf: None,
                 names: (1..=8).map(listed).collect(),
                 indices: vec!["Nifty 50".into(), "Nifty Bank".into()],
                 by_stock: (1..=8)
@@ -896,6 +953,130 @@ mod tests {
             Outcome::Snapshot { snapshot } => *snapshot,
             Outcome::Error { code } => panic!("expected snapshot, got {code:?}"),
         }
+    }
+
+    #[test]
+    fn mtf_counts_known_zeros_unknowns_and_unpriced_eligible_stocks() {
+        let mut stocks = universe(vec![row(2, 95.0, 5), row(6, 110.0, 4), row(8, 125.0, 3)]);
+        stocks.membership.as_mut().unwrap().mtf = Some(MtfTerms {
+            observed_at_epoch_secs: OBSERVED - 10,
+            leverage_by_security_id: [(2, 1.0), (4, 3.75), (6, 0.0)].into(),
+        });
+        let filter = Filter {
+            category: Some(MoversCategory::Mtf),
+            ..Filter::default()
+        };
+        let reply = select(&stocks, &filter);
+        assert!(reply.valid_at(OBSERVED, &filter));
+        let s = snapshot(reply);
+        let c = s.mtf_coverage.unwrap();
+        assert_eq!((c.selected, c.assessed, c.eligible), (4, 3, 2));
+        assert_eq!(
+            (s.universe_total, s.stocks_priced, s.matching_total),
+            (2, 1, 1)
+        );
+        assert_eq!(
+            (s.rows[0].price.security_id, s.rows[0].mtf_leverage),
+            (2, Some(1.0))
+        );
+        for (leverage, valid) in [(1.0, true), (0.0, false), (0.9, false)] {
+            let mut changed = s.clone();
+            changed.rows[0].mtf_leverage = Some(leverage);
+            assert_eq!(changed.valid(), valid);
+        }
+        let mut changed = s.clone();
+        changed.rows[0].mtf_leverage = None;
+        assert!(!changed.valid());
+        let mut changed = s;
+        changed.mtf_coverage.as_mut().unwrap().eligible = 4;
+        assert!(!changed.valid());
+
+        let daily = select(&stocks, &Filter::default());
+        stocks.membership.as_mut().unwrap().mtf = None;
+        assert_eq!(daily, select(&stocks, &Filter::default()));
+        let s = snapshot(select(&stocks, &filter));
+        assert_eq!(s.status, SourceStatus::NoMtfList);
+        assert!(!s.universe_available);
+        assert!(s.mtf_coverage.is_none());
+    }
+
+    #[test]
+    fn mtf_rejects_future_wrong_day_and_cross_cutoff_wire_terms() {
+        let mut stocks = universe(vec![row(2, 101.0, 0)]);
+        let filter = Filter {
+            category: Some(MoversCategory::Mtf),
+            as_of: Some(
+                chrono::DateTime::from_timestamp(ist(OBSERVED), 0)
+                    .unwrap()
+                    .format("%Y-%m-%dT%H:%M")
+                    .to_string(),
+            ),
+            ..Filter::default()
+        };
+        stocks.market_open = false;
+        stocks.read_at_ist_secs = ist(OBSERVED) - 30;
+        for stamp in [OBSERVED, OBSERVED - 86_400, 0] {
+            stocks.membership.as_mut().unwrap().mtf = Some(MtfTerms {
+                observed_at_epoch_secs: stamp,
+                leverage_by_security_id: [(2, 1.0)].into(),
+            });
+            let answer = select(&stocks, &filter);
+            assert!(answer.valid_at(OBSERVED, &filter));
+            assert_eq!(snapshot(answer).status, SourceStatus::NoMtfList);
+        }
+        stocks
+            .membership
+            .as_mut()
+            .unwrap()
+            .mtf
+            .as_mut()
+            .unwrap()
+            .observed_at_epoch_secs = OBSERVED - 30;
+        let answer = select(&stocks, &filter);
+        assert!(answer.valid_at(OBSERVED, &filter));
+        for stamp in [OBSERVED - 29, OBSERVED - 86_400] {
+            let mut changed = answer.clone();
+            let Outcome::Snapshot { snapshot } = &mut changed.outcome else {
+                panic!("snapshot")
+            };
+            snapshot
+                .mtf_coverage
+                .as_mut()
+                .unwrap()
+                .observed_at_epoch_secs = stamp;
+            assert!(!changed.valid_at(OBSERVED, &filter));
+        }
+    }
+
+    #[test]
+    fn mtf_all_known_ineligible_survives_price_failure_and_invalid_values_stay_unknown() {
+        let mut stocks = universe(vec![]);
+        stocks.prices = UniversePrices::Unreachable;
+        stocks.membership.as_mut().unwrap().mtf = Some(MtfTerms {
+            observed_at_epoch_secs: OBSERVED,
+            leverage_by_security_id: [(2, 0.0), (4, -1.0), (6, f64::NAN), (8, 0.5)].into(),
+        });
+        let filter = Filter {
+            category: Some(MoversCategory::Mtf),
+            ..Filter::default()
+        };
+        let s = snapshot(select(&stocks, &filter));
+        let c = s.mtf_coverage.unwrap();
+        assert_eq!((c.selected, c.assessed, c.eligible), (4, 1, 0));
+        assert!(s.universe_available);
+        assert_eq!(s.status, SourceStatus::NoData);
+        stocks
+            .membership
+            .as_mut()
+            .unwrap()
+            .mtf
+            .as_mut()
+            .unwrap()
+            .leverage_by_security_id
+            .insert(4, 2.0);
+        let s = snapshot(select(&stocks, &filter));
+        assert_eq!(s.status, SourceStatus::Unreachable);
+        assert_eq!(s.universe_total, 1);
     }
 
     #[test]

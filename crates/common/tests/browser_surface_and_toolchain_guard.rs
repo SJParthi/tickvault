@@ -798,7 +798,7 @@ const JS_VOLUME_BUDGET: &[(&str, usize)] = &[
     ("crates/api/src/handlers/dashboard_page.rs", 275),
     ("crates/api/src/handlers/feeds_page.rs", 226),
     // Public portal Top Movers, user-requested 2026-10-31; scope/measurement in §0.16.
-    ("crates/aws-lambdas/src/operator_control_console.html", 538),
+    ("crates/aws-lambdas/src/operator_control_console.html", 566),
 ];
 
 /// Inline event-handler attributes (`onclick=`, `onerror=`, …) per file.
@@ -1254,7 +1254,7 @@ const JS_BYTE_BUDGET: &[(&str, usize)] = &[
     // Stocks watchlists, verified opening prices and socket readouts (§0.23, 2026-11-25).
     (
         "crates/aws-lambdas/src/operator_control_console.html",
-        46_928,
+        49_015,
     ),
 ];
 

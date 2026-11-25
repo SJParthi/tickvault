@@ -1527,11 +1527,12 @@ including script tags. The guard records the byte count for this page.
 The requested Stocks view adds six watchlist slots, symbol lookup on explicit
 submit, and selectors for intraday movers and open-at-high or open-at-low stocks. The page
 uses the existing authenticated Stocks action. Rust compares intraday prices with
-the previous close and evaluates opening extremes from the same exchange tick. Saved watchlist
-selections stay in the browser tab.
+the previous close and evaluates opening extremes from the same exchange tick.
+The MTF view reads the dated leverage multiple in Dhan’s daily instrument
+master. Saved watchlist selections stay in the browser tab.
 
 The operator latency screen displays receive-buffer readings from the app and
 validates the database response before showing elapsed time. The existing
 read-only SSM commands retain the three bounded HTTP reads. Their measured
 string literals total 27 lines and 1,819 bytes. The reviewed console script
-is 538 lines and 46,928 bytes, including script tags.
+is 566 lines and 49,015 bytes, including script tags.

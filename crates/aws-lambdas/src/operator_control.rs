@@ -3511,6 +3511,7 @@ mod tests {
             },
             fno: Some(vec![listed.clone()]),
             membership: Some(UniverseMembership {
+                mtf: None,
                 names: vec![listed],
                 indices: vec!["Nifty 50".into()],
                 by_stock: vec![StockIndices {
@@ -3533,6 +3534,28 @@ mod tests {
             published_universe: published,
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn mtf_reads_a_valid_published_daily_list_without_an_extra_ssm_call() {
+        use crate::operator_movers_universe::{MoversUniverse, MtfTerms};
+        let now = MockShell::default().now;
+        let mut universe: MoversUniverse =
+            serde_json::from_slice(&published_universe(now - 3, false)).unwrap();
+        universe.membership.as_mut().unwrap().mtf = Some(MtfTerms {
+            observed_at_epoch_secs: now - 4,
+            leverage_by_security_id: [(2, 1.0)].into(),
+        });
+        let shell = box_shell(Ok(serde_json::to_vec(&universe).unwrap()));
+        let response = post(
+            &shell,
+            json!({"action":"stock-movers","filter":{"category":"mtf"}}),
+        )
+        .await;
+        let movers = &body_of(&response)["movers"];
+        assert_eq!(movers["snapshot"]["rows"][0]["mtf_leverage"], 1.0);
+        assert_eq!(movers["snapshot"]["mtf_coverage"]["assessed"], 1);
+        assert!(shell.captured_sync.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -3565,7 +3588,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn opening_views_refuse_an_older_box_reply_that_ignores_the_requested_category() {
+    async fn stock_categories_refuse_an_older_box_reply_that_ignores_the_requested_category() {
         use crate::operator_movers_wire::BridgeError;
         use crate::operator_stock_movers::read;
         use crate::operator_stock_movers_wire::{Filter, MoversCategory, Outcome};
@@ -3576,7 +3599,11 @@ mod tests {
             };
             let mut shell = box_shell(Err("no published artifact".into()));
             shell.sync_output = healthy_box_reply(shell.now, &daily);
-            for category in [MoversCategory::Intraday, MoversCategory::ExtremeOpenings] {
+            for category in [
+                MoversCategory::Intraday,
+                MoversCategory::ExtremeOpenings,
+                MoversCategory::Mtf,
+            ] {
                 let request = Filter {
                     category: Some(category),
                     ..daily.clone()
@@ -4269,9 +4296,9 @@ mod tests {
         let hex: String = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(
             hex,
-            "701681ff70fdf6c70eb57454e0c70864760a7ff63c9372a63a37040ecf6151be"
+            "44a496bcb33248259090586308dd0f4a5a561401d6b16aa6332356b3704209cf"
         );
-        assert_eq!(CONSOLE_HTML.len(), 100_006);
+        assert_eq!(CONSOLE_HTML.len(), 102_306);
     }
 
     #[test]
